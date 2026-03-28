@@ -4,7 +4,13 @@ const cors = require("cors");
 
 const app = express();
 app.use(express.json());
-app.use(cors());
+
+// Explicit CORS for all origins
+app.use(cors({
+  origin: "*",
+  methods: ["GET", "POST"],
+  allowedHeaders: ["Content-Type"]
+}));
 
 // Mongoose Schema & Model
 const SensorSchema = new mongoose.Schema({
@@ -64,6 +70,20 @@ app.get("/sensor", async (req, res) => {
   }
 });
 
-// Start server
+// Latest sensor data route with logging
+app.get("/sensor/latest", async (req, res) => {
+  try {
+    const latestData = await Sensor.findOne().sort({ timestamp: -1 });
+    console.log(`[${new Date().toISOString()}] Latest data sent:`, latestData);
+    res.json(latestData);
+  } catch (err) {
+    console.error("Error fetching latest sensor data:", err);
+    res.status(500).send("Error fetching latest data");
+  }
+});
+
+// Start server on all network interfaces
 const PORT = 3000;
-app.listen(PORT, () => console.log(`[${new Date().toISOString()}] Server started on port ${PORT}`));``
+app.listen(PORT, "0.0.0.0", () =>
+  console.log(`[${new Date().toISOString()}] Server started on port ${PORT}`)
+);
