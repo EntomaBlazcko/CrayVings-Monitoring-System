@@ -12,6 +12,7 @@
   "dependencies": {
     "axios": "^1.15.0",
     "cors": "^2.8.6",
+    "dom": "^0.0.3",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
     "lucide-react": "^1.8.0",
@@ -19,6 +20,7 @@
     "pg": "^8.20.0",
     "react": "^19.2.4",
     "react-dom": "^19.2.4",
+    "react-router": "^7.14.1",
     "react-router-dom": "^7.14.1",
     "recharts": "^3.8.1"
   },
