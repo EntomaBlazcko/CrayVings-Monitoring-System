@@ -18,68 +18,78 @@ export default function App() {
   const [activeMenu, setActiveMenu] = useState<MenuKey>("Dashboard");
   const [loading, setLoading] = useState(true);
 
-  useEffect(() => {
-    let mounted = true;
+  const fetchSensorData = async () => {
+    try {
+      const [latestRes, historyRes] = await Promise.all([
+        axios.get<SensorEntry>(`${API_BASE}/sensor/latest`),
+        axios.get<SensorEntry[]>(`${API_BASE}/sensor`),
+      ]);
 
-    const fetchSensorData = async () => {
-      try {
-        const [latestRes, historyRes] = await Promise.all([
-          axios.get<SensorEntry>(`${API_BASE}/sensor/latest`),
-          axios.get<SensorEntry[]>(`${API_BASE}/sensor`),
-        ]);
+      setData(latestRes.data);
+      setHistory(
+        (historyRes.data || [])
+          .slice()
+          .reverse()
+          .map((item) => ({
+            name: item.timestamp
+              ? new Date(item.timestamp).toLocaleTimeString([], {
+                  hour: "2-digit",
+                  minute: "2-digit",
+                })
+              : "--:--",
+            temperature: item.temperature ?? 0,
+            water_level: item.water_level ?? 0,
+            ph: item.ph ?? 0,
+            dissolved_oxygen: item.dissolved_oxygen ?? 0,
+            ammonia: item.ammonia ?? 0,
+          }))
+      );
 
-        if (!mounted) return;
+      setError("");
+    } catch (err: unknown) {
+      console.error("Fetch error:", err);
 
-        setData(latestRes.data);
-        setHistory(
-          (historyRes.data || [])
-            .slice()
-            .reverse()
-            .map((item) => ({
-              name: item.timestamp
-                ? new Date(item.timestamp).toLocaleTimeString([], {
-                    hour: "2-digit",
-                    minute: "2-digit",
-                  })
-                : "--:--",
-              temperature: item.temperature ?? 0,
-              water_level: item.water_level ?? 0,
-              ph: item.ph ?? 0,
-              dissolved_oxygen: item.dissolved_oxygen ?? 0,
-              ammonia: item.ammonia ?? 0,
-            }))
-        );
-
-        setError("");
-      } catch (err: unknown) {
-        console.error("Fetch error:", err);
-
-        const errorObj = err as { response?: { status?: number } };
-        if (errorObj.response?.status === 404) {
-          setData(null);
-          setHistory([]);
-          setError("No sensor data found in the database yet.");
-        } else {
-          setError("Failed to fetch sensor data. Check server, IP address, and network.");
-        }
-      } finally {
-        if (mounted) setLoading(false);
+      const errorObj = err as { response?: { status?: number } };
+      if (errorObj.response?.status === 404) {
+        setData(null);
+        setHistory([]);
+        setError("No sensor data found in the database yet.");
+      } else {
+        setError("Failed to fetch sensor data. Check server, IP address, and network.");
       }
-    };
+    } finally {
+      setLoading(false);
+    }
+  };
 
+  const handleRefresh = () => {
+    setLoading(true);
+    fetchSensorData();
+  };
+
+  useEffect(() => {
     fetchSensorData();
     const interval = setInterval(fetchSensorData, 3000);
 
     return () => {
-      mounted = false;
       clearInterval(interval);
     };
   }, []);
 
+  const handleNavigate = (menu: MenuKey) => {
+    setActiveMenu(menu);
+  };
+
   const renderPage = () => {
     switch (activeMenu) {
       case "Home":
-        return <HomePage />;
+        return (
+          <HomePage
+            data={data}
+            onRefresh={handleRefresh}
+            onNavigate={handleNavigate}
+          />
+        );
       case "Dashboard":
         return <DashboardPage data={data} history={history} />;
       case "Sensors":
