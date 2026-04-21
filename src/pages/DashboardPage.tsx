@@ -22,6 +22,7 @@ export default function DashboardPage({ data, history }: Props) {
   // ✅ ESP32 ONLINE/OFFLINE LOGIC (10s timeout)
   const isOnline =
     data?.timestamp &&
+    // eslint-disable-next-line react-hooks/purity
     Date.now() - new Date(data.timestamp).getTime() < 10000;
 
   return (
@@ -139,6 +140,7 @@ export default function DashboardPage({ data, history }: Props) {
               {history.slice(-5).reverse().map((h, i) => (
                 <tr key={i} className="border-t">
                   <td>{new Date(h.timestamp).toLocaleTimeString()}</td>
+                  <td>{h.name}</td>
                   <td className="text-center">{h.temperature}°C</td>
                   <td className="text-center">{h.water_level} cm</td>
                   <td className="text-center">{h.ph}</td>
