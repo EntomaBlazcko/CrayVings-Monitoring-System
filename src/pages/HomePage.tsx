@@ -157,7 +157,7 @@ export default function HomePage({ data }: Props) {
                 <span className="w-1.5 h-1.5 rounded-full bg-red-500" />
                 {alert}
               </div>
-            ))}
+            ))}git
           </div>
         </section>
       )}
