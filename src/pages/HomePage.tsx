@@ -1,13 +1,7 @@
-import { Thermometer, Droplets, Waves, FlaskConical, AlertTriangle, AlertCircle, CheckCircle } from "lucide-react";
-import type { SensorEntry } from "../types";
-import { getAlerts } from "../utils/alerts";
-
-type Props = {
-  data: SensorEntry | null;
-import { useEffect, useState } from "react";
+import { useState } from "react";
+import { Thermometer, Droplets, Waves, FlaskConical, AlertTriangle, AlertCircle, CheckCircle, RefreshCw, BellOff, Settings } from "lucide-react";
 import type { SensorEntry, MenuKey } from "../types";
 import { getAlerts } from "../utils/alerts";
-import { RefreshCw, BellOff, Settings } from "lucide-react";
 
 type Props = {
   data: SensorEntry | null;
@@ -36,8 +30,9 @@ function StatCard({ title, value, description, gradient, icon }: Stat) {
   );
 }
 
-export default function HomePage({ data }: Props) {
+export default function HomePage({ data, onRefresh, onNavigate }: Props) {
   const hasData = !!data;
+  const [alertsDismissed, setAlertsDismissed] = useState(false);
   const alerts = getAlerts(data);
   const safe = alerts.length === 1 && alerts[0] === "Tank is Safe";
 
@@ -96,43 +91,6 @@ export default function HomePage({ data }: Props) {
       icon: <Waves size={24} />,
     },
   ];
-export default function HomePage({ data, onRefresh, onNavigate }: Props) {
-  const [stats, setStats] = useState<Stat[]>([]);
-  const [alertsDismissed, setAlertsDismissed] = useState(false);
-  const alerts = getAlerts(data);
-  const isSafe = alerts.length === 1 && alerts[0] === "Tank is Safe";
-
-  useEffect(() => {
-    if (data) {
-      // eslint-disable-next-line react-hooks/set-state-in-effect
-      setStats([
-        {
-          title: "Water Temperature",
-          value: `${data.temperature ?? "--"}°C`,
-          description: "Current tank temperature",
-          gradient: "from-blue-500 to-cyan-500",
-        },
-        {
-          title: "pH Level",
-          value: `${data.ph ?? "--"}`,
-          description: "Normal water acidity",
-          gradient: "from-emerald-400 to-teal-400",
-        },
-        {
-          title: "Dissolved Oxygen",
-          value: `${data.dissolved_oxygen ?? "--"} mg/L`,
-          description: "Healthy oxygen range",
-          gradient: "from-sky-400 to-cyan-500",
-        },
-        {
-          title: "Ammonia Level",
-          value: `${data.ammonia ?? "--"} ppm`,
-          description: "Safe water condition",
-          gradient: "from-orange-400 to-red-400",
-        },
-      ]);
-    }
-  }, [data]);
 
   const highlights = [
     { label: "Temperature", value: data ? `${data.temperature}°C` : "--", color: "bg-blue-50 border-blue-200 text-blue-700" },
@@ -159,7 +117,6 @@ export default function HomePage({ data, onRefresh, onNavigate }: Props) {
               </span>
               {getStatusBadge()}
             </div>
-           
 
             <h1 className="text-3xl font-bold text-gray-900 lg:text-4xl">
               Welcome to CRAYvings Water Monitoring Home
@@ -192,7 +149,7 @@ export default function HomePage({ data, onRefresh, onNavigate }: Props) {
                   <div
                     key={index}
                     className={`rounded-lg p-3 font-bold text-sm ${
-                      isSafe ? "bg-emerald-100 text-emerald-700" : "bg-red-100 text-red-700"
+                      safe ? "bg-emerald-100 text-emerald-700" : "bg-red-100 text-red-700"
                     }`}
                   >
                     {alert}
@@ -227,7 +184,7 @@ export default function HomePage({ data, onRefresh, onNavigate }: Props) {
         ))}
       </section>
 
-      <section className="mt-6 grid grid-cols-1 gap-4 lg:grid-cols-4">
+      <section className="grid grid-cols-1 gap-4 lg:grid-cols-4">
         <div className="rounded-2xl border border-gray-200 bg-white p-6 shadow-sm lg:col-span-1">
           <h3 className="mb-4 text-lg font-bold text-gray-800">Quick Controls</h3>
           <div className="flex flex-col gap-3">
