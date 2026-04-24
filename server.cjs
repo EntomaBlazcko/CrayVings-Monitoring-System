@@ -1,6 +1,7 @@
 const express = require("express");
 const cors = require("cors");
 const { Pool } = require("pg");
+const { z } = require("zod");
 require("dotenv").config();
 
 const app = express();
@@ -8,20 +9,35 @@ const PORT = process.env.PORT || 3000;
 
 app.use(express.json());
 
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "http://localhost:5173,http://localhost:3001").split(",");
 app.use(
   cors({
-    origin: "*",
+    origin: (origin, callback) => {
+      if (!origin || ALLOWED_ORIGINS.includes(origin)) {
+        callback(null, true);
+      } else {
+        callback(new Error("Not allowed by CORS"));
+      }
+    },
     methods: ["GET", "POST"],
     allowedHeaders: ["Content-Type"],
   })
 );
+
+if (!process.env.PG_PASSWORD) {
+  console.error("Error: PG_PASSWORD environment variable is required");
+  process.exit(1);
+}
 
 const pool = new Pool({
   host: process.env.PG_HOST || "localhost",
   port: process.env.PG_PORT || 5432,
   database: process.env.PG_DATABASE || "crayvings_monitoring_system_db",
   user: process.env.PG_USER || "postgres",
-  password: process.env.PG_PASSWORD || "JAPAN1234",
+  password: process.env.PG_PASSWORD,
+  max: 20,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 2000,
 });
 
 app.get("/", (req, res) => {
@@ -29,6 +45,16 @@ app.get("/", (req, res) => {
     message: "Server running",
     routes: ["/", "/health", "/sensor", "/sensor/latest", "/logs", "/logs (POST)"],
   });
+});
+
+const sensorSchema = z.object({
+  device_id: z.string().min(1).max(50),
+  temperature: z.coerce.number().min(-10).max(50),
+  water_level: z.coerce.number().min(0).max(100),
+  ph: z.coerce.number().min(0).max(14),
+  dissolved_oxygen: z.coerce.number().min(0).max(20),
+  ammonia: z.coerce.number().min(0).max(10),
+  timestamp: z.string().datetime().optional(),
 });
 
 app.get("/health", async (req, res) => {
@@ -51,6 +77,15 @@ app.get("/health", async (req, res) => {
 
 app.post("/sensor", async (req, res) => {
   try {
+    const result = sensorSchema.safeParse(req.body);
+    
+    if (!result.success) {
+      return res.status(400).json({
+        message: "Validation error",
+        errors: result.error.flatten().fieldErrors,
+      });
+    }
+
     const {
       device_id,
       temperature,
@@ -59,20 +94,14 @@ app.post("/sensor", async (req, res) => {
       dissolved_oxygen,
       ammonia,
       timestamp,
-    } = req.body;
+    } = result.data;
 
-    if (!device_id) {
-      return res.status(400).json({
-        message: "device_id is required",
-      });
-    }
-
-    const lastResult = await pool.query(
+    const lastReading = await pool.query(
       "SELECT * FROM sensors ORDER BY timestamp DESC LIMIT 1"
     );
-    const lastData = lastResult.rows[0];
+    const lastData = lastReading.rows[0];
 
-    const result = await pool.query(
+    const insertResult = await pool.query(
       `INSERT INTO sensors (device_id, temperature, water_level, ph, dissolved_oxygen, ammonia, timestamp)
        VALUES ($1, $2, $3, $4, $5, $6, $7)
        RETURNING *`,
@@ -87,7 +116,7 @@ app.post("/sensor", async (req, res) => {
       ]
     );
 
-    console.log(`[${new Date().toISOString()}] Sensor data saved:`, result.rows[0]);
+    console.log(`[${new Date().toISOString()}] Sensor data saved:`, insertResult.rows[0]);
 
     const settingsResult = await pool.query("SELECT * FROM sensor_settings LIMIT 1");
     const settings = settingsResult.rows[0] || {
@@ -131,7 +160,7 @@ app.post("/sensor", async (req, res) => {
 
     res.status(201).json({
       message: "Saved to database",
-      data: result.rows[0],
+      data: insertResult.rows[0],
     });
   } catch (err) {
     console.error(`[${new Date().toISOString()}] Error saving sensor:`, err);
@@ -358,6 +387,18 @@ async function startServer() {
       
       await client.query(`
         ALTER TABLE sensor_settings ADD COLUMN IF NOT EXISTS ammonia_min DECIMAL(5,2) DEFAULT 0.0
+      `);
+
+      await client.query(`
+        CREATE INDEX IF NOT EXISTS idx_sensors_timestamp ON sensors(timestamp DESC)
+      `);
+
+      await client.query(`
+        CREATE INDEX IF NOT EXISTS idx_sensors_device_id ON sensors(device_id)
+      `);
+
+      await client.query(`
+        CREATE INDEX IF NOT EXISTS idx_system_logs_timestamp ON system_logs(timestamp DESC)
       `);
       
       const logsCount = await client.query("SELECT COUNT(*) FROM system_logs");

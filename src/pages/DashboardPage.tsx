@@ -1,30 +1,27 @@
-import { useMemo } from "react";
-import {
-  Thermometer,
-  Waves,
-  FlaskConical,
-  Droplets,
-  AlertTriangle,
-} from "lucide-react";
+import { Thermometer, Waves, FlaskConical, Droplets, AlertTriangle } from "lucide-react";
 import type { ChartPoint, SensorEntry } from "../types";
 import StatCard from "../components/StatCard";
 import TrendCard from "../components/TrendCard";
-import { getAlerts } from "../utils/alerts";
+import { useSensors } from "../hooks/useSensors";
 
 type Props = {
   data: SensorEntry | null;
-  history: ChartPoint[];
+  history?: ChartPoint[];
 };
 
-export default function DashboardPage({ data, history }: Props) {
-  const alerts = getAlerts(data);
-  const safe = alerts.length === 1 && alerts[0] === "Tank is Safe";
-
-  const isOnline = useMemo(() => {
-    if (!data?.timestamp) return false;
-    // eslint-disable-next-line react-hooks/purity
-    return Date.now() - new Date(data.timestamp).getTime() < 10000;
-  }, [data?.timestamp]);
+export default function DashboardPage({ data: propsData }: Props) {
+  const { data, history, connectionStatus, lastUpdate } = useSensors();
+  
+  const displayData = data ?? propsData;
+  const displayHistory = history.length ? history : [];
+  const isOnline = connectionStatus === "online";
+  const safe = !displayData || (
+    displayData.temperature >= 20 && displayData.temperature <= 31 &&
+    displayData.ph >= 6.5 && displayData.ph <= 8.5 &&
+    displayData.dissolved_oxygen >= 5 &&
+    displayData.ammonia <= 0.5 &&
+    displayData.water_level >= 10
+  );
 
   return (
     <>
@@ -104,7 +101,7 @@ export default function DashboardPage({ data, history }: Props) {
             </span>
           </div>
           <div className="text-xs text-gray-500 mt-4">
-            Updated: {data?.timestamp ? new Date(data.timestamp).toLocaleTimeString() : "N/A"}
+            Updated: {lastUpdate ? lastUpdate.toLocaleTimeString() : "N/A"}
           </div>
         </div>
 
@@ -124,7 +121,7 @@ export default function DashboardPage({ data, history }: Props) {
                 </tr>
               </thead>
               <tbody>
-                {history.slice(-5).reverse().map((h, i) => (
+                {displayHistory.slice(-5).reverse().map((h, i) => (
                   <tr key={i} className="border-t">
                     <td className="py-1">{h.name}</td>
                     <td className="text-center py-1">{h.temperature}°C</td>
@@ -144,7 +141,7 @@ export default function DashboardPage({ data, history }: Props) {
               Tank Status
             </div>
             <div className={`rounded-lg p-2 text-xs font-bold text-center ${safe ? "bg-emerald-100 text-emerald-700" : "bg-red-100 text-red-700"}`}>
-              {safe ? "Tank is Safe" : alerts[0]}
+              {safe ? "Tank is Safe" : "Alert: Check parameters"}
             </div>
           </div>
 

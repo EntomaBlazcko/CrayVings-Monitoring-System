@@ -1,7 +1,9 @@
 import { useState, useEffect } from "react";
-import axios from "axios";
+import { useSensorSettings } from "../hooks/useSensors";
+import { saveSettings as apiSaveSettings } from "../api/client";
+import type { SensorSettings } from "../types";
+import { API_BASE } from "../types";
 import { Settings, Server, RefreshCw, AlertTriangle, Save } from "lucide-react";
-import { API_BASE, SETTINGS_ENDPOINT, type SensorSettings } from "../types";
 
 const DEFAULT_SETTINGS: SensorSettings = {
   temp_min: 20.0,
@@ -17,64 +19,41 @@ const DEFAULT_SETTINGS: SensorSettings = {
 };
 
 export default function SettingsPage() {
-  const [apiUrl] = useState(API_BASE);
-  const [settings, setSettings] = useState<SensorSettings>(DEFAULT_SETTINGS);
+  const { settings: serverSettings } = useSensorSettings();
+  const [localSettings, setLocalSettings] = useState<SensorSettings>(DEFAULT_SETTINGS);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
   const [error, setError] = useState("");
 
   useEffect(() => {
-    fetchSettings();
-  }, []);
-
-  const fetchSettings = async () => {
-    try {
-      setLoading(true);
-      const res = await axios.get<SensorSettings>(SETTINGS_ENDPOINT);
-      if (res.data) {
-        setSettings(res.data);
-      }
-      setError("");
-    } catch (err) {
-      console.error("Fetch settings error:", err);
-      setError("Failed to load settings");
-    } finally {
+    if (serverSettings) {
+      setLocalSettings(serverSettings);
+      setLoading(false);
+    } else {
       setLoading(false);
     }
-  };
+  }, [serverSettings]);
 
   const handleSave = async () => {
     try {
       setSaving(true);
-      const settingsToSave = {
-        temp_min: settings.temp_min,
-        temp_max: settings.temp_max,
-        ph_min: settings.ph_min,
-        ph_max: settings.ph_max,
-        do_min: settings.do_min,
-        do_max: settings.do_max,
-        water_level_min: settings.water_level_min,
-        water_level_max: settings.water_level_max,
-        ammonia_min: settings.ammonia_min,
-        ammonia_max: settings.ammonia_max,
-      };
-      await axios.post(SETTINGS_ENDPOINT, settingsToSave);
+      await apiSaveSettings(localSettings);
       setSaved(true);
       setTimeout(() => setSaved(false), 2000);
     } catch (err) {
-      console.error("Save settings error:", err);
-      setError("Failed to save settings");
+      console.error("Save localSettings error:", err);
+      setError("Failed to save localSettings");
     } finally {
       setSaving(false);
     }
   };
 
   const updateSetting = (key: keyof SensorSettings, value: number) => {
-    setSettings(prev => ({ ...prev, [key]: value }));
+    setLocalSettings(prev => ({ ...prev, [key]: value }));
   };
 
-  if (loading) {
+if (loading) {
     return (
       <div className="flex items-center justify-center p-8">
         <div className="text-gray-500">Loading settings...</div>
@@ -113,7 +92,7 @@ export default function SettingsPage() {
               </label>
               <input
                 type="text"
-                value={apiUrl}
+                value={API_BASE}
                 disabled
                 className="w-full px-3 py-2 border border-gray-200 rounded-lg text-sm bg-gray-50 text-gray-500"
               />
@@ -167,7 +146,7 @@ export default function SettingsPage() {
                 <input
                   type="number"
                   step="0.1"
-                  value={settings.temp_min}
+                  value={localSettings.temp_min}
                   onChange={(e) => updateSetting("temp_min", Number(e.target.value))}
                   className="w-full px-2 py-1.5 border border-gray-200 rounded text-sm focus:outline-none focus:ring-2 focus:ring-orange-500 focus:border-transparent"
                 />
@@ -177,7 +156,7 @@ export default function SettingsPage() {
                 <input
                   type="number"
                   step="0.1"
-                  value={settings.temp_max}
+                  value={localSettings.temp_max}
                   onChange={(e) => updateSetting("temp_max", Number(e.target.value))}
                   className="w-full px-2 py-1.5 border border-gray-200 rounded text-sm focus:outline-none focus:ring-2 focus:ring-orange-500 focus:border-transparent"
                 />
@@ -193,7 +172,7 @@ export default function SettingsPage() {
                 <input
                   type="number"
                   step="0.1"
-                  value={settings.ph_min}
+                  value={localSettings.ph_min}
                   onChange={(e) => updateSetting("ph_min", Number(e.target.value))}
                   className="w-full px-2 py-1.5 border border-gray-200 rounded text-sm focus:outline-none focus:ring-2 focus:ring-orange-500 focus:border-transparent"
                 />
@@ -203,7 +182,7 @@ export default function SettingsPage() {
                 <input
                   type="number"
                   step="0.1"
-                  value={settings.ph_max}
+                  value={localSettings.ph_max}
                   onChange={(e) => updateSetting("ph_max", Number(e.target.value))}
                   className="w-full px-2 py-1.5 border border-gray-200 rounded text-sm focus:outline-none focus:ring-2 focus:ring-orange-500 focus:border-transparent"
                 />
@@ -219,7 +198,7 @@ export default function SettingsPage() {
                 <input
                   type="number"
                   step="0.1"
-                  value={settings.do_min}
+                  value={localSettings.do_min}
                   onChange={(e) => updateSetting("do_min", Number(e.target.value))}
                   className="w-full px-2 py-1.5 border border-gray-200 rounded text-sm focus:outline-none focus:ring-2 focus:ring-orange-500 focus:border-transparent"
                 />
@@ -229,7 +208,7 @@ export default function SettingsPage() {
                 <input
                   type="number"
                   step="0.1"
-                  value={settings.do_max}
+                  value={localSettings.do_max}
                   onChange={(e) => updateSetting("do_max", Number(e.target.value))}
                   className="w-full px-2 py-1.5 border border-gray-200 rounded text-sm focus:outline-none focus:ring-2 focus:ring-orange-500 focus:border-transparent"
                 />
@@ -245,7 +224,7 @@ export default function SettingsPage() {
                 <input
                   type="number"
                   step="0.1"
-                  value={settings.water_level_min}
+                  value={localSettings.water_level_min}
                   onChange={(e) => updateSetting("water_level_min", Number(e.target.value))}
                   className="w-full px-2 py-1.5 border border-gray-200 rounded text-sm focus:outline-none focus:ring-2 focus:ring-orange-500 focus:border-transparent"
                 />
@@ -255,7 +234,7 @@ export default function SettingsPage() {
                 <input
                   type="number"
                   step="0.1"
-                  value={settings.water_level_max}
+                  value={localSettings.water_level_max}
                   onChange={(e) => updateSetting("water_level_max", Number(e.target.value))}
                   className="w-full px-2 py-1.5 border border-gray-200 rounded text-sm focus:outline-none focus:ring-2 focus:ring-orange-500 focus:border-transparent"
                 />
@@ -271,7 +250,7 @@ export default function SettingsPage() {
                 <input
                   type="number"
                   step="0.1"
-                  value={settings.ammonia_min}
+                  value={localSettings.ammonia_min}
                   onChange={(e) => updateSetting("ammonia_min", Number(e.target.value))}
                   className="w-full px-2 py-1.5 border border-gray-200 rounded text-sm focus:outline-none focus:ring-2 focus:ring-orange-500 focus:border-transparent"
                 />
@@ -281,7 +260,7 @@ export default function SettingsPage() {
                 <input
                   type="number"
                   step="0.1"
-                  value={settings.ammonia_max}
+                  value={localSettings.ammonia_max}
                   onChange={(e) => updateSetting("ammonia_max", Number(e.target.value))}
                   className="w-full px-2 py-1.5 border border-gray-200 rounded text-sm focus:outline-none focus:ring-2 focus:ring-orange-500 focus:border-transparent"
                 />

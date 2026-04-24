@@ -1,61 +1,34 @@
-import { useEffect, useState, useCallback } from "react";
-import axios from "axios";
-import { 
-  AlertTriangle, 
-  AlertCircle, 
-  Clock,
-} from "lucide-react";
-import type { LogEntry } from "../types";
-import { LOGS_ENDPOINT } from "../types";
-
-type AlertLog = LogEntry & {
-  severity?: "warning" | "critical" | "info";
-};
+import { useState, useMemo } from "react";
+import { AlertTriangle, AlertCircle, Clock } from "lucide-react";
+import { useSensors } from "../hooks/useSensors";
 
 export default function AlertsPage() {
-  const [logs, setLogs] = useState<AlertLog[]>([]);
-  const [loading, setLoading] = useState(true);
+  const { logs, loading } = useSensors();
   const [filter, setFilter] = useState<"all" | "Alert" | "Change">("all");
 
-  const fetchData = useCallback(async () => {
-    try {
-      const logsRes = await axios.get<LogEntry[]>(LOGS_ENDPOINT);
+  const processedLogs = useMemo(() => {
+    return (logs || []).map(log => {
+      const isAlert = log.action === "Alert";
+      let severity: "warning" | "critical" | "info" = "info";
       
-      const data = (logsRes.data || []).map(log => {
-        const isAlert = log.action === "Alert";
-        let severity: "warning" | "critical" | "info" = "info";
+      if (isAlert) {
+        const param = log.parameter;
+        const val = Number(log.new_value);
         
-        if (isAlert) {
-          const param = log.parameter;
-          const val = Number(log.new_value);
-          
-          if (param === "Temperature") {
-            if (val > 31 || val < 15) severity = "critical";
-            else severity = "warning";
-          } else if (param === "pH Level") {
-            if (val > 9 || val < 5) severity = "critical";
-            else severity = "warning";
-          } else if (param === "Dissolved Oxygen") {
-            severity = "critical";
-          } else if (param === "Ammonia") {
-            severity = "critical";
-          }
+        if (param === "Temperature") {
+          if (val > 31 || val < 15) severity = "critical";
+          else severity = "warning";
+        } else if (param === "pH Level") {
+          if (val > 9 || val < 5) severity = "critical";
+          else severity = "warning";
+        } else if (param === "Dissolved Oxygen" || param === "Ammonia") {
+          severity = "critical";
         }
-        
-        return { ...log, severity };
-      });
+      }
       
-      setLogs(data);
-    } catch (err) {
-      console.error("Fetch alerts error:", err);
-    } finally {
-      setLoading(false);
-    }
-  }, []);
-
-  useEffect(() => {
-    fetchData();
-  }, [fetchData]);
+      return { ...log, severity };
+    });
+  }, [logs]);
 
   const getSeverityColor = (severity?: string) => {
     switch (severity) {
@@ -66,7 +39,7 @@ export default function AlertsPage() {
     }
   };
 
-  const filteredLogs = logs.filter(log => 
+  const filteredLogs = processedLogs.filter(log => 
     filter === "all" || log.action === filter
   );
 

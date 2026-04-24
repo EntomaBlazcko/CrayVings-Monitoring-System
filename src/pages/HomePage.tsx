@@ -1,11 +1,9 @@
 import { useState } from "react";
 import { Thermometer, Droplets, Waves, FlaskConical, AlertTriangle, AlertCircle, CheckCircle, RefreshCw, BellOff, Settings } from "lucide-react";
-import type { SensorEntry, MenuKey } from "../types";
-import { getAlerts } from "../utils/alerts";
+import type { MenuKey } from "../types";
+import { useSensors } from "../hooks/useSensors";
 
 type Props = {
-  data: SensorEntry | null;
-  onRefresh?: () => void;
   onNavigate?: (menu: MenuKey) => void;
 };
 
@@ -30,11 +28,31 @@ function StatCard({ title, value, description, gradient, icon }: Stat) {
   );
 }
 
-export default function HomePage({ data, onRefresh, onNavigate }: Props) {
+export default function HomePage({ onNavigate }: Props) {
+  const { data, refetch } = useSensors();
   const hasData = !!data;
   const [alertsDismissed, setAlertsDismissed] = useState(false);
-  const alerts = getAlerts(data);
-  const safe = alerts.length === 1 && alerts[0] === "Tank is Safe";
+  
+  const safe = hasData && (
+    data.temperature >= 20 && data.temperature <= 31 &&
+    data.ph >= 6.5 && data.ph <= 8.5 &&
+    data.dissolved_oxygen >= 5 &&
+    data.ammonia <= 0.5 &&
+    data.water_level >= 10
+  );
+
+  const getAlerts = () => {
+    if (!hasData) return [];
+    const alerts: string[] = [];
+    if (data.temperature < 20 || data.temperature > 31) alerts.push(`Temperature ${data.temperature < 20 ? "low" : "high"} at ${data.temperature}°C`);
+    if (data.ph < 6.5 || data.ph > 8.5) alerts.push(`pH ${data.ph < 6.5 ? "low" : "high"} at ${data.ph}`);
+    if (data.dissolved_oxygen < 5) alerts.push(`DO low at ${data.dissolved_oxygen} mg/L`);
+    if (data.ammonia > 0.5) alerts.push(`Ammonia high at ${data.ammonia} ppm`);
+    if (data.water_level < 10) alerts.push(`Water level low at ${data.water_level}`);
+    return alerts.length ? alerts : ["Tank is Safe"];
+  };
+
+  const alerts = getAlerts();
 
   const getStatusBadge = () => {
     if (!hasData) {
@@ -189,7 +207,7 @@ export default function HomePage({ data, onRefresh, onNavigate }: Props) {
           <h3 className="mb-4 text-lg font-bold text-gray-800">Quick Controls</h3>
           <div className="flex flex-col gap-3">
             <button
-              onClick={onRefresh}
+              onClick={() => refetch()}
               className="flex items-center gap-2 rounded-lg bg-blue-500 px-4 py-3 text-sm font-semibold text-white transition hover:bg-blue-600"
             >
               <RefreshCw className="h-4 w-4" />

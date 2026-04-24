@@ -1,5 +1,4 @@
-import { useEffect, useState } from "react";
-import axios from "axios";
+import { useState } from "react";
 import {
   Menu,
   X,
@@ -12,8 +11,7 @@ import {
   FileText,
 } from "lucide-react";
 import logo from "./assets/craybitch without background.png";
-import type { MenuKey, SensorEntry, ChartPoint } from "./types";
-import { API_BASE } from "./types";
+import type { MenuKey } from "./types";
 import Header from "./components/Header";
 import HomePage from "./pages/HomePage";
 import DashboardPage from "./pages/DashboardPage";
@@ -22,6 +20,8 @@ import AlertsPage from "./pages/AlertsPage";
 import HistoricalDataPage from "./pages/HistoricalDataPage";
 import SettingsPage from "./pages/SettingsPage";
 import LogsPage from "./pages/LogsPage";
+import { SensorProvider } from "./contexts/SensorProvider";
+import { useSensors } from "./hooks/useSensors";
 
 const menuItems: { label: MenuKey; icon: React.ReactNode }[] = [
   { label: "Home", icon: <Home size={18} /> },
@@ -33,76 +33,15 @@ const menuItems: { label: MenuKey; icon: React.ReactNode }[] = [
   { label: "Settings", icon: <Settings size={18} /> },
 ];
 
-export default function App() {
-  const [data, setData] = useState<SensorEntry | null>(null);
-  const [history, setHistory] = useState<ChartPoint[]>([]);
-  const [error, setError] = useState("");
+function AppContent() {
+  const { data, loading, error } = useSensors();
   const getInitialMenu = (): MenuKey => {
     const saved = localStorage.getItem("activeMenu") as MenuKey;
     return saved && menuItems.some(item => item.label === saved) ? saved : "Home";
   };
 
   const [activeMenu, setActiveMenu] = useState<MenuKey>(getInitialMenu);
-  const [loading, setLoading] = useState(true);
   const [sidebarOpen, setSidebarOpen] = useState(false);
-
-  const fetchSensorData = async () => {
-    try {
-      const [latestRes, historyRes] = await Promise.all([
-        axios.get<SensorEntry>(`${API_BASE}/sensor/latest`),
-        axios.get<SensorEntry[]>(`${API_BASE}/sensor`),
-      ]);
-
-      setData(latestRes.data);
-      setHistory(
-        (historyRes.data || [])
-          .slice()
-          .reverse()
-          .map((item) => ({
-            name: item.timestamp
-              ? new Date(item.timestamp).toLocaleTimeString([], {
-                  hour: "2-digit",
-                  minute: "2-digit",
-                })
-              : "--:--",
-            temperature: item.temperature ?? 0,
-            water_level: item.water_level ?? 0,
-            ph: item.ph ?? 0,
-            dissolved_oxygen: item.dissolved_oxygen ?? 0,
-            ammonia: item.ammonia ?? 0,
-          }))
-      );
-
-      setError("");
-    } catch (err: unknown) {
-      console.error("Fetch error:", err);
-
-      const errorObj = err as { response?: { status?: number } };
-      if (errorObj.response?.status === 404) {
-        setData(null);
-        setHistory([]);
-        setError("No sensor data found in the database yet.");
-      } else {
-        setError("Failed to fetch sensor data. Check server, IP address, and network.");
-      }
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const handleRefresh = () => {
-    setLoading(true);
-    fetchSensorData();
-  };
-
-  useEffect(() => {
-    fetchSensorData();
-    const interval = setInterval(fetchSensorData, 3000);
-
-    return () => {
-      clearInterval(interval);
-    };
-  }, []);
 
   const handleNavigate = (menu: MenuKey) => {
     setActiveMenu(menu);
@@ -113,27 +52,21 @@ export default function App() {
   const renderPage = () => {
     switch (activeMenu) {
       case "Home":
-        return (
-          <HomePage
-            data={data}
-            onRefresh={handleRefresh}
-            onNavigate={handleNavigate}
-          />
-        );
+        return <HomePage onNavigate={handleNavigate} />;
       case "Dashboard":
-        return <DashboardPage data={data} history={history} />;
+        return <DashboardPage data={data} history={[]} />;
       case "Sensors":
         return <SensorsPage data={data} />;
       case "Alerts":
         return <AlertsPage />;
       case "Historical Data":
-        return <HistoricalDataPage history={history} />;
+        return <HistoricalDataPage history={[]} />;
       case "Logs":
         return <LogsPage />;
       case "Settings":
         return <SettingsPage />;
       default:
-        return <DashboardPage data={data} history={history} />;
+        return <DashboardPage data={data} history={[]} />;
     }
   };
 
@@ -220,5 +153,13 @@ export default function App() {
         </div>
       </div>
     </div>
+  );
+}
+
+export default function App() {
+  return (
+    <SensorProvider>
+      <AppContent />
+    </SensorProvider>
   );
 }
