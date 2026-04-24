@@ -43,8 +43,10 @@ export type SensorSettings = {
   ph_min: number;
   ph_max: number;
   do_min: number;
+  do_max: number;
   water_level_min: number;
   water_level_max: number;
+  ammonia_min: number;
   ammonia_max: number;
   updated_at?: string;
 };

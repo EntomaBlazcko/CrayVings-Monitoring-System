@@ -37,7 +37,12 @@ export default function App() {
   const [data, setData] = useState<SensorEntry | null>(null);
   const [history, setHistory] = useState<ChartPoint[]>([]);
   const [error, setError] = useState("");
-  const [activeMenu, setActiveMenu] = useState<MenuKey>("Dashboard");
+  const getInitialMenu = (): MenuKey => {
+    const saved = localStorage.getItem("activeMenu") as MenuKey;
+    return saved && menuItems.some(item => item.label === saved) ? saved : "Home";
+  };
+
+  const [activeMenu, setActiveMenu] = useState<MenuKey>(getInitialMenu);
   const [loading, setLoading] = useState(true);
   const [sidebarOpen, setSidebarOpen] = useState(false);
 
@@ -101,6 +106,7 @@ export default function App() {
 
   const handleNavigate = (menu: MenuKey) => {
     setActiveMenu(menu);
+    localStorage.setItem("activeMenu", menu);
     setSidebarOpen(false);
   };
 

@@ -9,8 +9,10 @@ const DEFAULT_SETTINGS: SensorSettings = {
   ph_min: 6.5,
   ph_max: 8.5,
   do_min: 5.0,
+  do_max: 10.0,
   water_level_min: 10.0,
   water_level_max: 100.0,
+  ammonia_min: 0.0,
   ammonia_max: 0.5,
 };
 
@@ -45,7 +47,19 @@ export default function SettingsPage() {
   const handleSave = async () => {
     try {
       setSaving(true);
-      await axios.post(SETTINGS_ENDPOINT, settings);
+      const settingsToSave = {
+        temp_min: settings.temp_min,
+        temp_max: settings.temp_max,
+        ph_min: settings.ph_min,
+        ph_max: settings.ph_max,
+        do_min: settings.do_min,
+        do_max: settings.do_max,
+        water_level_min: settings.water_level_min,
+        water_level_max: settings.water_level_max,
+        ammonia_min: settings.ammonia_min,
+        ammonia_max: settings.ammonia_max,
+      };
+      await axios.post(SETTINGS_ENDPOINT, settingsToSave);
       setSaved(true);
       setTimeout(() => setSaved(false), 2000);
     } catch (err) {
@@ -215,9 +229,9 @@ export default function SettingsPage() {
                 <input
                   type="number"
                   step="0.1"
-                  value={10}
-                  disabled
-                  className="w-full px-2 py-1.5 border border-gray-200 rounded text-sm bg-gray-100 text-gray-400"
+                  value={settings.do_max}
+                  onChange={(e) => updateSetting("do_max", Number(e.target.value))}
+                  className="w-full px-2 py-1.5 border border-gray-200 rounded text-sm focus:outline-none focus:ring-2 focus:ring-orange-500 focus:border-transparent"
                 />
               </div>
             </div>
@@ -257,9 +271,9 @@ export default function SettingsPage() {
                 <input
                   type="number"
                   step="0.1"
-                  value={0}
-                  disabled
-                  className="w-full px-2 py-1.5 border border-gray-200 rounded text-sm bg-gray-100 text-gray-400"
+                  value={settings.ammonia_min}
+                  onChange={(e) => updateSetting("ammonia_min", Number(e.target.value))}
+                  className="w-full px-2 py-1.5 border border-gray-200 rounded text-sm focus:outline-none focus:ring-2 focus:ring-orange-500 focus:border-transparent"
                 />
               </div>
               <div>
