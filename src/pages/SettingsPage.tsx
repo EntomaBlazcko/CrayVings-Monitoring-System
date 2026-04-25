@@ -1,59 +1,150 @@
-import { useState, useEffect } from "react";
-import { useSensorSettings } from "../hooks/useSensors";
-import { saveSettings as apiSaveSettings } from "../api/client";
+import { useState, useCallback, useEffect, useMemo } from "react";
+import { useSensorSettings, useActivityLogger } from "../hooks/useSensors";
+import { Settings, Save, AlertTriangle } from "lucide-react";
 import type { SensorSettings } from "../types";
-import { API_BASE } from "../types";
-import { Settings, Server, RefreshCw, AlertTriangle, Save } from "lucide-react";
+import { DEFAULT_SETTINGS, getSettingsThresholds } from "../types";
 
-const DEFAULT_SETTINGS: SensorSettings = {
-  temp_min: 20.0,
-  temp_max: 31.0,
-  ph_min: 6.5,
-  ph_max: 8.5,
-  do_min: 5.0,
-  do_max: 10.0,
-  water_level_min: 10.0,
-  water_level_max: 100.0,
-  ammonia_min: 0.0,
-  ammonia_max: 0.5,
+const SETTING_BOUNDS: Record<string, { min: number; max: number }> = {
+  temp_min: { min: -10, max: 50 },
+  temp_max: { min: -10, max: 50 },
+  ph_min: { min: 0, max: 14 },
+  ph_max: { min: 0, max: 14 },
+  do_min: { min: 0, max: 20 },
+  do_max: { min: 0, max: 20 },
+  water_level_min: { min: 0, max: 100 },
+  water_level_max: { min: 0, max: 100 },
+  ammonia_min: { min: 0, max: 10 },
+  ammonia_max: { min: 0, max: 10 },
 };
 
+const KEY_MAPPING: Record<string, { min: keyof SensorSettings; max: keyof SensorSettings }> = {
+  temperature: { min: "temp_min", max: "temp_max" },
+  ph: { min: "ph_min", max: "ph_max" },
+  dissolved_oxygen: { min: "do_min", max: "do_max" },
+  water_level: { min: "water_level_min", max: "water_level_max" },
+  ammonia: { min: "ammonia_min", max: "ammonia_max" },
+};
+
+const THRESHOLD_COLORS: Record<string, { bg: string; border: string }> = {
+  temperature: { bg: "bg-blue-50", border: "border-blue-100" },
+  ph: { bg: "bg-emerald-50", border: "border-emerald-100" },
+  dissolved_oxygen: { bg: "bg-sky-50", border: "border-sky-100" },
+  water_level: { bg: "bg-indigo-50", border: "border-indigo-100" },
+  ammonia: { bg: "bg-orange-50", border: "border-orange-100" },
+};
+
+function validateSetting(key: keyof SensorSettings, value: number): { valid: boolean; message?: string } {
+  const bounds = SETTING_BOUNDS[key];
+  if (!bounds) return { valid: true };
+  
+  if (value < bounds.min || value > bounds.max) {
+    return { 
+      valid: false, 
+      message: `Value must be between ${bounds.min} and ${bounds.max}` 
+    };
+  }
+  
+  return { valid: true };
+}
+
+function validateRange(key: string, settingsToValidate: SensorSettings): { valid: boolean; message?: string } {
+  const keys = KEY_MAPPING[key];
+  if (!keys) return { valid: true };
+  
+  const min = settingsToValidate[keys.min];
+  const max = settingsToValidate[keys.max];
+  
+  if (typeof min === 'number' && typeof max === 'number' && min >= max) {
+    return { valid: false, message: `${key.charAt(0).toUpperCase() + key.slice(1)} min must be less than max` };
+  }
+  
+  return { valid: true };
+}
+
 export default function SettingsPage() {
-  const { settings: serverSettings } = useSensorSettings();
-  const [localSettings, setLocalSettings] = useState<SensorSettings>(DEFAULT_SETTINGS);
-  const [loading, setLoading] = useState(true);
-  const [saving, setSaving] = useState(false);
-  const [saved, setSaved] = useState(false);
-  const [error, setError] = useState("");
+  const { 
+    settings, 
+    settingsLoading, 
+    settingsError, 
+    saveError,
+    saveSettings, 
+    settingsSaved, 
+    settingsSaving 
+  } = useSensorSettings();
+  const logActivity = useActivityLogger();
+  
+  const [localSettings, setLocalSettings] = useState<SensorSettings | null>(null);
+  const [validationErrors, setValidationErrors] = useState<Record<string, string>>({});
+  const [localSaveError, setLocalSaveError] = useState<string | null>(null);
+
+  const displaySettings = useMemo(() => {
+    return localSettings ?? settings ?? DEFAULT_SETTINGS;
+  }, [localSettings, settings]);
 
   useEffect(() => {
-    if (serverSettings) {
-      setLocalSettings(serverSettings);
-      setLoading(false);
-    } else {
-      setLoading(false);
+    if (settings && !localSettings) {
+      setLocalSettings(settings);
     }
-  }, [serverSettings]);
+  }, [settings, localSettings]);
 
-  const handleSave = async () => {
+  const updateSetting = useCallback((key: keyof SensorSettings, value: string) => {
+    const numValue = parseFloat(value);
+    if (isNaN(numValue)) return;
+    
+    const validation = validateSetting(key, numValue);
+    setValidationErrors((prev) => {
+      const next = { ...prev };
+      if (validation.valid) {
+        delete next[key];
+      } else {
+        next[key] = validation.message!;
+      }
+      return next;
+    });
+    
+    setLocalSettings((prev) => {
+      const base = prev ?? settings ?? DEFAULT_SETTINGS;
+      return { ...base, [key]: numValue };
+    });
+  }, [settings]);
+
+  const handleSave = useCallback(async () => {
+    if (!localSettings) return;
+    
+    setLocalSaveError(null);
+    
+    const settingsToValidate = localSettings ?? settings ?? DEFAULT_SETTINGS;
+    const rangeValidations = Object.keys(KEY_MAPPING).map((key) =>
+      validateRange(key, settingsToValidate)
+    );
+    
+    const invalidRange = rangeValidations.find((v) => !v.valid);
+    if (invalidRange) {
+      setLocalSaveError(invalidRange.message!);
+      return;
+    }
+    
+    if (Object.keys(validationErrors).length > 0) {
+      setLocalSaveError("Please fix validation errors before saving");
+      return;
+    }
+    
     try {
-      setSaving(true);
-      await apiSaveSettings(localSettings);
-      setSaved(true);
-      setTimeout(() => setSaved(false), 2000);
-    } catch (err) {
-      console.error("Save localSettings error:", err);
-      setError("Failed to save localSettings");
-    } finally {
-      setSaving(false);
+      await saveSettings(localSettings);
+      logActivity("settings_change", "Updated sensor thresholds", "Settings");
+    } catch {
+      setLocalSaveError("Failed to save settings");
     }
-  };
+  }, [localSettings, settings, saveSettings, validationErrors]);
 
-  const updateSetting = (key: keyof SensorSettings, value: number) => {
-    setLocalSettings(prev => ({ ...prev, [key]: value }));
-  };
+  const thresholdConfig = useMemo(
+    () => getSettingsThresholds(displaySettings),
+    [displaySettings]
+  );
 
-if (loading) {
+  const showError = localSaveError || saveError || settingsError;
+
+  if (settingsLoading) {
     return (
       <div className="flex items-center justify-center p-8">
         <div className="text-gray-500">Loading settings...</div>
@@ -63,9 +154,9 @@ if (loading) {
 
   return (
     <div className="space-y-4">
-      {error && (
+      {showError && (
         <div className="bg-red-50 border border-red-200 text-red-700 rounded-lg p-3 text-sm">
-          {error}
+          {localSaveError || saveError || settingsError}
         </div>
       )}
 
@@ -74,60 +165,9 @@ if (loading) {
           <Settings className="text-gray-600" size={20} />
           <h2 className="mt-0 text-gray-800">Settings</h2>
         </div>
-        <p className="text-gray-600 mb-0">Configure sensor thresholds. Alerts are logged when values go outside the safe range.</p>
-      </div>
-
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-        <div className="bg-white rounded-xl border border-gray-100 p-4 shadow-sm">
-          <div className="flex items-center gap-2 mb-4">
-            <Server className="text-blue-600" size={18} />
-            <div className="text-xs font-bold text-gray-500 uppercase tracking-wide">
-              API Configuration
-            </div>
-          </div>
-          <div className="space-y-3">
-            <div>
-              <label className="block text-sm font-medium text-gray-700 mb-1">
-                Backend API URL
-              </label>
-              <input
-                type="text"
-                value={API_BASE}
-                disabled
-                className="w-full px-3 py-2 border border-gray-200 rounded-lg text-sm bg-gray-50 text-gray-500"
-              />
-            </div>
-            <div className="text-xs text-gray-500">
-              Connected to backend server.
-            </div>
-          </div>
-        </div>
-
-        <div className="bg-white rounded-xl border border-gray-100 p-4 shadow-sm">
-          <div className="flex items-center gap-2 mb-4">
-            <RefreshCw className="text-green-600" size={18} />
-            <div className="text-xs font-bold text-gray-500 uppercase tracking-wide">
-              Data Refresh
-            </div>
-          </div>
-          <div className="space-y-3">
-            <div>
-              <label className="block text-sm font-medium text-gray-700 mb-1">
-                Refresh Interval (seconds)
-              </label>
-              <input
-                type="number"
-                min="1"
-                max="60"
-                defaultValue={3}
-                className="w-full px-3 py-2 border border-gray-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-green-500 focus:border-transparent"
-              />
-            </div>
-            <div className="text-xs text-gray-500">
-              How often to fetch new sensor data (1-60 seconds).
-            </div>
-          </div>
-        </div>
+        <p className="text-gray-600 mb-0">
+          Configure sensor thresholds. Alerts are logged when values go outside the safe range.
+        </p>
       </div>
 
       <div className="bg-white rounded-xl border border-gray-100 p-4 shadow-sm">
@@ -137,149 +177,72 @@ if (loading) {
             Alert Thresholds
           </div>
         </div>
-        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-          <div className="bg-blue-50 rounded-lg p-3 border border-blue-100">
-            <div className="text-xs font-semibold text-blue-700 uppercase mb-2">Temperature (°C)</div>
-            <div className="grid grid-cols-2 gap-2">
-              <div>
-                <label className="block text-[10px] text-gray-500 mb-0.5">Min</label>
-                <input
-                  type="number"
-                  step="0.1"
-                  value={localSettings.temp_min}
-                  onChange={(e) => updateSetting("temp_min", Number(e.target.value))}
-                  className="w-full px-2 py-1.5 border border-gray-200 rounded text-sm focus:outline-none focus:ring-2 focus:ring-orange-500 focus:border-transparent"
-                />
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5 gap-4">
+          {(Object.keys(KEY_MAPPING) as Array<keyof typeof KEY_MAPPING>).map((key) => {
+            const threshold = thresholdConfig[key];
+            const keys = KEY_MAPPING[key];
+            const colors = THRESHOLD_COLORS[key];
+            
+            return (
+              <div
+                key={key}
+                className={`rounded-lg p-3 border ${colors.bg} ${colors.border}`}
+              >
+                <div className="text-xs font-semibold uppercase mb-2">
+                  {threshold.name}
+                  <span className="font-normal text-gray-500 ml-1">({threshold.unit})</span>
+                </div>
+                <div className="grid grid-cols-2 gap-2">
+                  <div>
+                    <label className="block text-[10px] text-gray-500 mb-0.5">Min</label>
+                    <input
+                      type="number"
+                      step="0.1"
+                      value={displaySettings[keys.min] ?? threshold.range.min}
+                      onChange={(e) => updateSetting(keys.min, e.target.value)}
+                      className={`w-full px-2 py-1.5 border rounded text-sm focus:outline-none focus:ring-2 focus:ring-orange-500 focus:border-transparent ${
+                        validationErrors[keys.min]
+                          ? "border-red-500"
+                          : "border-gray-200"
+                      }`}
+                    />
+                    {validationErrors[keys.min] && (
+                      <div className="text-[10px] text-red-500 mt-1">
+                        {validationErrors[keys.min]}
+                      </div>
+                    )}
+                  </div>
+                  <div>
+                    <label className="block text-[10px] text-gray-500 mb-0.5">Max</label>
+                    <input
+                      type="number"
+                      step="0.1"
+                      value={displaySettings[keys.max] ?? threshold.range.max}
+                      onChange={(e) => updateSetting(keys.max, e.target.value)}
+                      className={`w-full px-2 py-1.5 border rounded text-sm focus:outline-none focus:ring-2 focus:ring-orange-500 focus:border-transparent ${
+                        validationErrors[keys.max]
+                          ? "border-red-500"
+                          : "border-gray-200"
+                      }`}
+                    />
+                  </div>
+                </div>
               </div>
-              <div>
-                <label className="block text-[10px] text-gray-500 mb-0.5">Max</label>
-                <input
-                  type="number"
-                  step="0.1"
-                  value={localSettings.temp_max}
-                  onChange={(e) => updateSetting("temp_max", Number(e.target.value))}
-                  className="w-full px-2 py-1.5 border border-gray-200 rounded text-sm focus:outline-none focus:ring-2 focus:ring-orange-500 focus:border-transparent"
-                />
-              </div>
-            </div>
-          </div>
-
-          <div className="bg-emerald-50 rounded-lg p-3 border border-emerald-100">
-            <div className="text-xs font-semibold text-emerald-700 uppercase mb-2">pH Level</div>
-            <div className="grid grid-cols-2 gap-2">
-              <div>
-                <label className="block text-[10px] text-gray-500 mb-0.5">Min</label>
-                <input
-                  type="number"
-                  step="0.1"
-                  value={localSettings.ph_min}
-                  onChange={(e) => updateSetting("ph_min", Number(e.target.value))}
-                  className="w-full px-2 py-1.5 border border-gray-200 rounded text-sm focus:outline-none focus:ring-2 focus:ring-orange-500 focus:border-transparent"
-                />
-              </div>
-              <div>
-                <label className="block text-[10px] text-gray-500 mb-0.5">Max</label>
-                <input
-                  type="number"
-                  step="0.1"
-                  value={localSettings.ph_max}
-                  onChange={(e) => updateSetting("ph_max", Number(e.target.value))}
-                  className="w-full px-2 py-1.5 border border-gray-200 rounded text-sm focus:outline-none focus:ring-2 focus:ring-orange-500 focus:border-transparent"
-                />
-              </div>
-            </div>
-          </div>
-
-          <div className="bg-sky-50 rounded-lg p-3 border border-sky-100">
-            <div className="text-xs font-semibold text-sky-700 uppercase mb-2">Dissolved Oxygen (mg/L)</div>
-            <div className="grid grid-cols-2 gap-2">
-              <div>
-                <label className="block text-[10px] text-gray-500 mb-0.5">Min</label>
-                <input
-                  type="number"
-                  step="0.1"
-                  value={localSettings.do_min}
-                  onChange={(e) => updateSetting("do_min", Number(e.target.value))}
-                  className="w-full px-2 py-1.5 border border-gray-200 rounded text-sm focus:outline-none focus:ring-2 focus:ring-orange-500 focus:border-transparent"
-                />
-              </div>
-              <div>
-                <label className="block text-[10px] text-gray-500 mb-0.5">Max</label>
-                <input
-                  type="number"
-                  step="0.1"
-                  value={localSettings.do_max}
-                  onChange={(e) => updateSetting("do_max", Number(e.target.value))}
-                  className="w-full px-2 py-1.5 border border-gray-200 rounded text-sm focus:outline-none focus:ring-2 focus:ring-orange-500 focus:border-transparent"
-                />
-              </div>
-            </div>
-          </div>
-
-          <div className="bg-indigo-50 rounded-lg p-3 border border-indigo-100">
-            <div className="text-xs font-semibold text-indigo-700 uppercase mb-2">Water Level (%)</div>
-            <div className="grid grid-cols-2 gap-2">
-              <div>
-                <label className="block text-[10px] text-gray-500 mb-0.5">Min</label>
-                <input
-                  type="number"
-                  step="0.1"
-                  value={localSettings.water_level_min}
-                  onChange={(e) => updateSetting("water_level_min", Number(e.target.value))}
-                  className="w-full px-2 py-1.5 border border-gray-200 rounded text-sm focus:outline-none focus:ring-2 focus:ring-orange-500 focus:border-transparent"
-                />
-              </div>
-              <div>
-                <label className="block text-[10px] text-gray-500 mb-0.5">Max</label>
-                <input
-                  type="number"
-                  step="0.1"
-                  value={localSettings.water_level_max}
-                  onChange={(e) => updateSetting("water_level_max", Number(e.target.value))}
-                  className="w-full px-2 py-1.5 border border-gray-200 rounded text-sm focus:outline-none focus:ring-2 focus:ring-orange-500 focus:border-transparent"
-                />
-              </div>
-            </div>
-          </div>
-
-          <div className="bg-orange-50 rounded-lg p-3 border border-orange-100">
-            <div className="text-xs font-semibold text-orange-700 uppercase mb-2">Ammonia (ppm)</div>
-            <div className="grid grid-cols-2 gap-2">
-              <div>
-                <label className="block text-[10px] text-gray-500 mb-0.5">Min</label>
-                <input
-                  type="number"
-                  step="0.1"
-                  value={localSettings.ammonia_min}
-                  onChange={(e) => updateSetting("ammonia_min", Number(e.target.value))}
-                  className="w-full px-2 py-1.5 border border-gray-200 rounded text-sm focus:outline-none focus:ring-2 focus:ring-orange-500 focus:border-transparent"
-                />
-              </div>
-              <div>
-                <label className="block text-[10px] text-gray-500 mb-0.5">Max</label>
-                <input
-                  type="number"
-                  step="0.1"
-                  value={localSettings.ammonia_max}
-                  onChange={(e) => updateSetting("ammonia_max", Number(e.target.value))}
-                  className="w-full px-2 py-1.5 border border-gray-200 rounded text-sm focus:outline-none focus:ring-2 focus:ring-orange-500 focus:border-transparent"
-                />
-              </div>
-            </div>
-          </div>
+            );
+          })}
         </div>
       </div>
 
       <div className="flex items-center gap-3">
         <button
           onClick={handleSave}
-          disabled={saving}
+          disabled={settingsSaving || Object.keys(validationErrors).length > 0}
           className="flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-700 disabled:bg-blue-400 text-white rounded-lg text-sm font-medium transition-colors"
         >
           <Save size={16} />
-          {saving ? "Saving..." : "Save Settings"}
+          {settingsSaving ? "Saving..." : "Save Settings"}
         </button>
-        {saved && (
+        {settingsSaved && (
           <span className="text-sm text-green-600 font-medium">Settings saved!</span>
         )}
       </div>

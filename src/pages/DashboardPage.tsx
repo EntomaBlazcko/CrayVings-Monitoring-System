@@ -1,31 +1,42 @@
+import { useMemo } from "react";
 import { Thermometer, Waves, FlaskConical, Droplets, AlertTriangle } from "lucide-react";
-import type { ChartPoint, SensorEntry } from "../types";
 import StatCard from "../components/StatCard";
 import TrendCard from "../components/TrendCard";
 import { useSensors } from "../hooks/useSensors";
+import { getSettingsThresholds, getThresholdStatus } from "../types";
 
-type Props = {
-  data: SensorEntry | null;
-  history?: ChartPoint[];
-};
-
-export default function DashboardPage({ data: propsData }: Props) {
-  const { data, history, connectionStatus, lastUpdate } = useSensors();
+export default function DashboardPage() {
+  const { data, history, connectionStatus, lastUpdate, settings } = useSensors();
   
-  const displayData = data ?? propsData;
-  const displayHistory = history.length ? history : [];
+  const thresholds = useMemo(() => getSettingsThresholds(settings), [settings]);
+  
   const isOnline = connectionStatus === "online";
-  const safe = !displayData || (
-    displayData.temperature >= 20 && displayData.temperature <= 31 &&
-    displayData.ph >= 6.5 && displayData.ph <= 8.5 &&
-    displayData.dissolved_oxygen >= 5 &&
-    displayData.ammonia <= 0.5 &&
-    displayData.water_level >= 10
-  );
+  
+  const tankStatus = useMemo(() => {
+    if (!data) return { safe: true, messages: ["No sensor data"] };
+    
+    const messages: string[] = [];
+    const sensorKeys = ["temperature", "ph", "dissolved_oxygen", "ammonia", "water_level"] as const;
+    
+    for (const key of sensorKeys) {
+      const threshold = thresholds[key];
+      const value = data[key];
+      const status = getThresholdStatus(value, threshold.range, threshold.isMinOnly);
+      
+      if (status === "warning") {
+        const direction = value < threshold.range.min ? "below" : "above";
+        messages.push(`${threshold.name} ${direction} threshold`);
+      }
+    }
+    
+    return {
+      safe: messages.length === 0,
+      messages: messages.length > 0 ? messages : ["All parameters within safe range"],
+    };
+  }, [data, thresholds]);
 
   return (
     <>
-      {/* STAT CARDS - Responsive: 5 cols on XL, 3 on md, 2 on small */}
       <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-5 gap-2 md:gap-3 mb-4">
         <StatCard
           title="Temperature"
@@ -59,7 +70,6 @@ export default function DashboardPage({ data: propsData }: Props) {
         />
       </div>
 
-      {/* CHARTS - Responsive: 3 cols on XL, stack on mobile */}
       <div className="grid grid-cols-1 md:grid-cols-3 gap-3 mb-4">
         <TrendCard
           title="Temperature"
@@ -81,10 +91,7 @@ export default function DashboardPage({ data: propsData }: Props) {
         />
       </div>
 
-      {/* ALERT + HUB + TABLE - Responsive grid */}
       <div className="grid grid-cols-1 md:grid-cols-12 gap-3">
-
-        {/* SENSOR HUB STATUS */}
         <div className="bg-white rounded-xl border border-gray-100 p-4 shadow-sm md:col-span-3">
           <div className="text-xs font-bold text-gray-500 mb-2">
             Sensor Hub Status
@@ -105,7 +112,6 @@ export default function DashboardPage({ data: propsData }: Props) {
           </div>
         </div>
 
-        {/* RECENT READINGS TABLE */}
         <div className="bg-white rounded-xl border border-gray-100 p-4 shadow-sm overflow-auto md:col-span-6">
           <div className="text-xs font-bold text-gray-500 mb-3">
             Recent Readings
@@ -121,7 +127,7 @@ export default function DashboardPage({ data: propsData }: Props) {
                 </tr>
               </thead>
               <tbody>
-                {displayHistory.slice(-5).reverse().map((h, i) => (
+                {history.slice(-5).reverse().map((h, i) => (
                   <tr key={i} className="border-t">
                     <td className="py-1">{h.name}</td>
                     <td className="text-center py-1">{h.temperature}°C</td>
@@ -134,14 +140,17 @@ export default function DashboardPage({ data: propsData }: Props) {
           </div>
         </div>
 
-        {/* ALERT PANEL */}
         <div className="flex flex-col gap-3 md:col-span-3">
           <div className="bg-white rounded-xl border border-gray-100 p-3 shadow-sm">
             <div className="text-xs font-bold text-gray-500 mb-2">
               Tank Status
             </div>
-            <div className={`rounded-lg p-2 text-xs font-bold text-center ${safe ? "bg-emerald-100 text-emerald-700" : "bg-red-100 text-red-700"}`}>
-              {safe ? "Tank is Safe" : "Alert: Check parameters"}
+            <div className={`rounded-lg p-2 text-xs font-bold text-center ${
+              tankStatus.safe 
+                ? "bg-emerald-100 text-emerald-700" 
+                : "bg-red-100 text-red-700"
+            }`}>
+              {tankStatus.safe ? "Tank is Safe" : "Alert: Check parameters"}
             </div>
           </div>
 
@@ -160,7 +169,6 @@ export default function DashboardPage({ data: propsData }: Props) {
         </div>
       </div>
 
-      {/* DEVICE INFO */}
       <div className="mt-4 bg-white rounded-lg border border-gray-100 p-3 text-sm text-gray-600">
         <div className="flex flex-wrap gap-x-4 gap-y-1">
           <span><strong>Device:</strong> {data?.device_id ?? "N/A"}</span>

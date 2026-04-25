@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useCallback, useRef } from "react";
 import {
   Menu,
   X,
@@ -9,9 +9,11 @@ import {
   History,
   Settings,
   FileText,
+  ClipboardList,
 } from "lucide-react";
 import logo from "./assets/craybitch without background.png";
 import type { MenuKey } from "./types";
+import { isValidMenuKey } from "./types";
 import Header from "./components/Header";
 import HomePage from "./pages/HomePage";
 import DashboardPage from "./pages/DashboardPage";
@@ -20,8 +22,9 @@ import AlertsPage from "./pages/AlertsPage";
 import HistoricalDataPage from "./pages/HistoricalDataPage";
 import SettingsPage from "./pages/SettingsPage";
 import LogsPage from "./pages/LogsPage";
+import ActivityLogsPage from "./pages/ActivityLogsPage";
 import { SensorProvider } from "./contexts/SensorProvider";
-import { useSensors } from "./hooks/useSensors";
+import { useActivityLogs } from "./contexts/SensorContext";
 
 const menuItems: { label: MenuKey; icon: React.ReactNode }[] = [
   { label: "Home", icon: <Home size={18} /> },
@@ -29,50 +32,59 @@ const menuItems: { label: MenuKey; icon: React.ReactNode }[] = [
   { label: "Sensors", icon: <Activity size={18} /> },
   { label: "Alerts", icon: <Bell size={18} /> },
   { label: "Historical Data", icon: <History size={18} /> },
-  { label: "Logs", icon: <FileText size={18} /> },
+  { label: "Activity Logs", icon: <ClipboardList size={18} /> },
   { label: "Settings", icon: <Settings size={18} /> },
+  { label: "Logs", icon: <FileText size={18} /> },
 ];
 
 function AppContent() {
-  const { data, loading, error } = useSensors();
-  const getInitialMenu = (): MenuKey => {
-    const saved = localStorage.getItem("activeMenu") as MenuKey;
-    return saved && menuItems.some(item => item.label === saved) ? saved : "Home";
-  };
+  const { logActivity } = useActivityLogs();
+  const previousMenuRef = useRef<MenuKey>("Home");
+
+  const getInitialMenu = useCallback((): MenuKey => {
+    const saved = localStorage.getItem("activeMenu");
+    if (saved && isValidMenuKey(saved)) {
+      return saved;
+    }
+    return "Home";
+  }, []);
 
   const [activeMenu, setActiveMenu] = useState<MenuKey>(getInitialMenu);
   const [sidebarOpen, setSidebarOpen] = useState(false);
 
-  const handleNavigate = (menu: MenuKey) => {
+  const handleNavigate = useCallback((menu: MenuKey) => {
+    logActivity("navigation", `Navigated to ${menu}`, previousMenuRef.current);
+    previousMenuRef.current = activeMenu;
     setActiveMenu(menu);
     localStorage.setItem("activeMenu", menu);
     setSidebarOpen(false);
-  };
+  }, [logActivity, activeMenu]);
 
-  const renderPage = () => {
+  const renderPage = useCallback(() => {
     switch (activeMenu) {
       case "Home":
         return <HomePage onNavigate={handleNavigate} />;
       case "Dashboard":
-        return <DashboardPage data={data} history={[]} />;
+        return <DashboardPage />;
       case "Sensors":
-        return <SensorsPage data={data} />;
+        return <SensorsPage />;
       case "Alerts":
         return <AlertsPage />;
       case "Historical Data":
-        return <HistoricalDataPage history={[]} />;
+        return <HistoricalDataPage />;
+      case "Activity Logs":
+        return <ActivityLogsPage />;
       case "Logs":
         return <LogsPage />;
       case "Settings":
         return <SettingsPage />;
       default:
-        return <DashboardPage data={data} history={[]} />;
+        return <HomePage onNavigate={handleNavigate} />;
     }
-  };
+  }, [activeMenu, handleNavigate]);
 
   return (
     <div className="flex min-h-screen bg-gray-100 font-sans">
-      {/* Mobile menu button */}
       <button
         onClick={() => setSidebarOpen(!sidebarOpen)}
         className="fixed top-4 left-4 z-50 p-2 bg-white rounded-lg shadow-lg md:hidden"
@@ -80,7 +92,6 @@ function AppContent() {
         {sidebarOpen ? <X size={24} /> : <Menu size={24} />}
       </button>
 
-      {/* Mobile sidebar overlay */}
       {sidebarOpen && (
         <div
           className="fixed inset-0 bg-black/50 z-40 md:hidden"
@@ -88,7 +99,6 @@ function AppContent() {
         />
       )}
 
-      {/* Sidebar */}
       <div
         className={`fixed md:static inset-y-0 left-0 z-50 w-24 bg-[#f5efe9] border-r border-[#eadfd6] min-h-screen flex flex-col items-center pt-4 transform transition-transform duration-300 ${
           sidebarOpen ? "translate-x-0" : "-translate-x-full md:translate-x-0"
@@ -124,7 +134,6 @@ function AppContent() {
         </div>
       </div>
 
-      {/* Main content */}
       <div className="flex-1 flex flex-col w-full md:w-auto">
         <Header />
 
@@ -136,18 +145,6 @@ function AppContent() {
           <div className="text-xs text-gray-400 mb-4">
             Current live sensor data and tank overview
           </div>
-
-          {loading && (
-            <div className="mb-3 bg-blue-50 border border-blue-200 text-blue-700 rounded-lg p-2.5 text-sm font-semibold">
-              Loading sensor data...
-            </div>
-          )}
-
-          {error && (
-            <div className="mb-3 bg-rose-50 border border-rose-200 text-rose-700 rounded-lg p-2.5 text-sm font-semibold">
-              {error}
-            </div>
-          )}
 
           {renderPage()}
         </div>

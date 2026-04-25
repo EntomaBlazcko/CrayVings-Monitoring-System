@@ -9,13 +9,14 @@ const PORT = process.env.PORT || 3000;
 
 app.use(express.json());
 
-const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "http://localhost:5173,http://localhost:3001").split(",");
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "http://localhost:5173,http://localhost:5174,http://localhost:3001,http://192.168.1.20:3000").split(",");
 app.use(
   cors({
     origin: (origin, callback) => {
-      if (!origin || ALLOWED_ORIGINS.includes(origin)) {
+      if (!origin || ALLOWED_ORIGINS.includes(origin) || origin.startsWith("http://localhost:") || origin.match(/^http:\/\/\d+\.\d+\.\d+\.\d+:/)) {
         callback(null, true);
       } else {
+        console.log("CORS blocked origin:", origin);
         callback(new Error("Not allowed by CORS"));
       }
     },
@@ -52,8 +53,8 @@ const sensorSchema = z.object({
   temperature: z.coerce.number().min(-10).max(50),
   water_level: z.coerce.number().min(0).max(100),
   ph: z.coerce.number().min(0).max(14),
-  dissolved_oxygen: z.coerce.number().min(0).max(20),
-  ammonia: z.coerce.number().min(0).max(10),
+  dissolved_oxygen: z.coerce.number().min(0).max(20).optional(),
+  ammonia: z.coerce.number().min(0).max(10).optional(),
   timestamp: z.string().datetime().optional(),
 });
 
@@ -140,13 +141,13 @@ app.post("/sensor", async (req, res) => {
     if (phVal < settings.ph_min || phVal > settings.ph_max) {
       alerts.push({ parameter: "pH Level", old_value: phVal < settings.ph_min ? "Low" : "High", new_value: phVal });
     }
-    if (doVal < settings.do_min || doVal > settings.do_max) {
+    if (doVal > 0 && (doVal < settings.do_min || doVal > settings.do_max)) {
       alerts.push({ parameter: "Dissolved Oxygen", old_value: doVal < settings.do_min ? "Low" : "High", new_value: doVal });
     }
     if (wlVal < settings.water_level_min || wlVal > settings.water_level_max) {
       alerts.push({ parameter: "Water Level", old_value: wlVal < settings.water_level_min ? "Low" : "High", new_value: wlVal });
     }
-    if (ammVal < settings.ammonia_min || ammVal > settings.ammonia_max) {
+    if (ammVal > 0 && (ammVal < settings.ammonia_min || ammVal > settings.ammonia_max)) {
       alerts.push({ parameter: "Ammonia", old_value: ammVal < settings.ammonia_min ? "Low" : "High", new_value: ammVal });
     }
 
@@ -243,12 +244,22 @@ app.post("/logs", async (req, res) => {
 
 app.get("/system-logs", async (req, res) => {
   try {
-    console.log(`[${new Date().toISOString()}] ✓ /system-logs endpoint hit`);
+    const page = Math.max(1, parseInt(req.query.page) || 1);
+    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 20));
+    const offset = (page - 1) * limit;
+    
+    console.log(`[${new Date().toISOString()}] ✓ /system-logs endpoint hit (page ${page}, limit ${limit})`);
+    
+    const countResult = await pool.query("SELECT COUNT(*) FROM system_logs");
+    const total = parseInt(countResult.rows[0].count);
+    
     const result = await pool.query(
-      "SELECT * FROM system_logs ORDER BY timestamp DESC LIMIT 100"
+      "SELECT * FROM system_logs ORDER BY timestamp DESC LIMIT $1 OFFSET $2",
+      [limit, offset]
     );
-    console.log(`[${new Date().toISOString()}] Logs found:`, result.rows.length);
-    res.json(result.rows);
+    
+    console.log(`[${new Date().toISOString()}] Logs found: ${result.rows.length} (total: ${total})`);
+    res.json({ data: result.rows, total });
   } catch (err) {
     console.error(`[${new Date().toISOString()}] Error fetching logs:`, err);
     res.status(500).json({
@@ -336,6 +347,73 @@ app.post("/settings", async (req, res) => {
   }
 });
 
+app.post("/activity-logs", async (req, res) => {
+  try {
+    const { user_name, action_type, description, module } = req.body;
+    
+    if (!action_type) {
+      return res.status(400).json({ message: "action_type is required" });
+    }
+    
+    const result = await pool.query(
+      `INSERT INTO activity_logs (user_name, action_type, description, module)
+       VALUES ($1, $2, $3, $4) RETURNING *`,
+      [user_name || "Admin", action_type, description || "", module || ""]
+    );
+    
+    res.status(201).json({ message: "Activity logged", data: result.rows[0] });
+  } catch (err) {
+    console.error(`[${new Date().toISOString()}] Error logging activity:`, err);
+    res.status(500).json({ message: "Error logging activity" });
+  }
+});
+
+app.get("/activity-logs", async (req, res) => {
+  try {
+    const page = Math.max(1, parseInt(req.query.page) || 1);
+    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 20));
+    const offset = (page - 1) * limit;
+    const search = (req.query.search || "").trim();
+    const sortBy = req.query.sortBy === "oldest" ? "ASC" : "DESC";
+    const actionFilter = req.query.actionType;
+    
+    let whereClause = "";
+    const params = [];
+    let paramIndex = 1;
+    
+    if (search) {
+      whereClause = `WHERE (description ILIKE $${paramIndex} OR user_name ILIKE $${paramIndex} OR action_type ILIKE $${paramIndex} OR module ILIKE $${paramIndex})`;
+      params.push(`%${search}%`);
+      paramIndex++;
+    }
+    
+    if (actionFilter) {
+      whereClause += whereClause ? " AND" : "WHERE";
+      whereClause += ` action_type = $${paramIndex}`;
+      params.push(actionFilter);
+      paramIndex++;
+    }
+    
+    const countQuery = `SELECT COUNT(*) FROM activity_logs ${whereClause}`;
+    const countResult = await pool.query(countQuery, params);
+    const total = parseInt(countResult.rows[0].count);
+    
+    const dataQuery = `SELECT * FROM activity_logs ${whereClause} ORDER BY timestamp ${sortBy} LIMIT $${paramIndex} OFFSET $${paramIndex + 1}`;
+    const result = await pool.query(dataQuery, [...params, limit, offset]);
+    
+    res.json({
+      data: result.rows,
+      total,
+      page,
+      limit,
+      totalPages: Math.ceil(total / limit)
+    });
+  } catch (err) {
+    console.error(`[${new Date().toISOString()}] Error fetching activity logs:`, err);
+    res.status(500).json({ message: "Error fetching activity logs" });
+  }
+});
+
 async function startServer() {
   try {
     const client = await pool.connect();
@@ -387,6 +465,25 @@ async function startServer() {
       
       await client.query(`
         ALTER TABLE sensor_settings ADD COLUMN IF NOT EXISTS ammonia_min DECIMAL(5,2) DEFAULT 0.0
+      `);
+
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS activity_logs (
+          id SERIAL PRIMARY KEY,
+          user_name VARCHAR(100) DEFAULT 'Admin',
+          action_type VARCHAR(50) NOT NULL,
+          description TEXT,
+          module VARCHAR(100),
+          timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+      `);
+      
+      await client.query(`
+        CREATE INDEX IF NOT EXISTS idx_activity_logs_timestamp ON activity_logs(timestamp DESC)
+      `);
+      
+      await client.query(`
+        CREATE INDEX IF NOT EXISTS idx_activity_logs_action_type ON activity_logs(action_type)
       `);
 
       await client.query(`

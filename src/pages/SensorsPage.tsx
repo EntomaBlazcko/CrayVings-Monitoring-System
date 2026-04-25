@@ -1,137 +1,97 @@
-import { useEffect, useState, useMemo } from "react";
-import axios from "axios";
+import { useMemo } from "react";
 import { 
   Thermometer, 
   Waves, 
   FlaskConical, 
-  Droplets, 
+  Droplets,
   AlertTriangle,
   Radio,
-  Wifi,
-  Clock,
   Activity,
   CheckCircle,
-  XCircle
+  XCircle,
+  Clock,
 } from "lucide-react";
-import type { SensorEntry, SensorSettings } from "../types";
-import { SETTINGS_ENDPOINT } from "../types";
+import { useSensors } from "../hooks/useSensors";
+import { getSettingsThresholds, getThresholdStatus } from "../types";
 
-type Props = {
-  data: SensorEntry | null;
-};
-
-function TimeAgo({ timestamp }: { timestamp: string }) {
-  const [secondsAgo, setSecondsAgo] = useState(0);
-
-  useEffect(() => {
-    if (!timestamp) return;
-    
-    const update = () => {
-      setSecondsAgo(Math.floor((Date.now() - new Date(timestamp).getTime()) / 1000));
-    };
-    
-    update();
-    const interval = setInterval(update, 1000);
-    return () => clearInterval(interval);
-  }, [timestamp]);
-
-  return <span>{secondsAgo}s ago</span>;
+function formatTimeAgo(timestamp: string): string {
+  const date = new Date(timestamp);
+  if (isNaN(date.getTime())) return "Invalid date";
+  
+  const seconds = Math.floor((Date.now() - date.getTime()) / 1000);
+  if (seconds < 0) return "Just now";
+  if (seconds < 60) return `${seconds}s ago`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  return `${days}d ago`;
 }
 
-export default function SensorsPage({ data }: Props) {
-  const [settings, setSettings] = useState<SensorSettings | null>(null);
-
-  const fetchSettings = async () => {
-    try {
-      const res = await axios.get<SensorSettings>(SETTINGS_ENDPOINT);
-      setSettings(res.data);
-    } catch (err) {
-      console.error("Fetch settings error:", err);
-    }
-  };
-
-  useEffect(() => {
-    fetchSettings();
-  }, []);
-
+export default function SensorsPage() {
+  const { data, connectionStatus, settings, settingsLoading, settingsError } = useSensors();
+  
+  const thresholds = useMemo(() => getSettingsThresholds(settings), [settings]);
+  
   const isOnline = useMemo(() => {
+    if (connectionStatus === "online") return true;
     if (!data?.timestamp) return false;
-    // eslint-disable-next-line react-hooks/purity
     return Date.now() - new Date(data.timestamp).getTime() < 10000;
-  }, [data?.timestamp]);
+  }, [data?.timestamp, connectionStatus]);
 
-  const getSensorStatus = (current: number, min: number, max: number, isMinOnly = false) => {
-    if (isMinOnly) {
-      return current >= min ? "good" : "warning";
-    }
-    if (current < min || current > max) return "warning";
-    return "good";
-  };
+  const sensors = useMemo(() => {
+    const sensorKeys = ["temperature", "ph", "dissolved_oxygen", "water_level", "ammonia"] as const;
+    
+    const icons: Record<string, React.ReactNode> = {
+      temperature: <Thermometer size={20} />,
+      ph: <FlaskConical size={20} />,
+      dissolved_oxygen: <Droplets size={20} />,
+      water_level: <Waves size={20} />,
+      ammonia: <AlertTriangle size={20} />,
+    };
+    
+    const colors: Record<string, { color: string; bg: string; border: string }> = {
+      temperature: { color: "text-orange-500", bg: "bg-orange-50", border: "border-orange-200" },
+      ph: { color: "text-purple-500", bg: "bg-purple-50", border: "border-purple-200" },
+      dissolved_oxygen: { color: "text-sky-500", bg: "bg-sky-50", border: "border-sky-200" },
+      water_level: { color: "text-blue-500", bg: "bg-blue-50", border: "border-blue-200" },
+      ammonia: { color: "text-amber-500", bg: "bg-amber-50", border: "border-amber-200" },
+    };
+    
+    return sensorKeys.map((key) => {
+      const threshold = thresholds[key];
+      const value = data?.[key] ?? null;
+      const status = value !== null 
+        ? getThresholdStatus(value, threshold.range, threshold.isMinOnly)
+        : "warning";
+      const isWarning = status !== "good";
+      const colorScheme = colors[key];
+      
+      return {
+        name: threshold.name,
+        value,
+        unit: threshold.unit,
+        threshold,
+        status,
+        isWarning,
+        icon: icons[key],
+        ...colorScheme,
+      };
+    });
+  }, [data, thresholds]);
 
-  const sensors = [
-    { 
-      name: "Temperature", 
-      value: data?.temperature, 
-      unit: "°C",
-      min: settings?.temp_min ?? 20, 
-      max: settings?.temp_max ?? 31,
-      isMinOnly: false,
-      icon: <Thermometer size={20} />,
-      color: "text-orange-500",
-      bg: "bg-orange-50",
-      border: "border-orange-200"
-    },
-    { 
-      name: "pH Level", 
-      value: data?.ph, 
-      unit: "",
-      min: settings?.ph_min ?? 6.5, 
-      max: settings?.ph_max ?? 8.5,
-      isMinOnly: false,
-      icon: <FlaskConical size={20} />,
-      color: "text-purple-500",
-      bg: "bg-purple-50",
-      border: "border-purple-200"
-    },
-    { 
-      name: "Dissolved Oxygen", 
-      value: data?.dissolved_oxygen, 
-      unit: "mg/L",
-      min: settings?.do_min ?? 5, 
-      max: settings?.do_max ?? 10,
-      isMinOnly: false,
-      icon: <Droplets size={20} />,
-      color: "text-sky-500",
-      bg: "bg-sky-50",
-      border: "border-sky-200"
-    },
-    { 
-      name: "Water Level", 
-      value: data?.water_level, 
-      unit: "%",
-      min: settings?.water_level_min ?? 10, 
-      max: settings?.water_level_max ?? 100,
-      isMinOnly: false,
-      icon: <Waves size={20} />,
-      color: "text-blue-500",
-      bg: "bg-blue-50",
-      border: "border-blue-200"
-    },
-    { 
-      name: "Ammonia", 
-      value: data?.ammonia, 
-      unit: "ppm",
-      min: settings?.ammonia_min ?? 0, 
-      max: settings?.ammonia_max ?? 0.5,
-      isMinOnly: false,
-      icon: <AlertTriangle size={20} />,
-      color: "text-amber-500",
-      bg: "bg-amber-50",
-      border: "border-amber-200"
-    },
-  ];
+  if (settingsLoading) {
+    return (
+      <div className="bg-white rounded-xl border border-gray-100 p-8 text-center">
+        <Activity size={40} className="mx-auto mb-3 text-gray-400" />
+        <h2 className="mt-0 text-gray-800">Sensors</h2>
+        <p className="text-gray-600">Loading settings...</p>
+      </div>
+    );
+  }
 
-  if (!data) {
+  if (settingsError || !data) {
     return (
       <div className="bg-white rounded-xl border border-gray-100 p-8 text-center">
         <Activity size={40} className="mx-auto mb-3 text-gray-400" />
@@ -146,7 +106,6 @@ export default function SensorsPage({ data }: Props) {
 
   return (
     <div className="space-y-4">
-      {/* Header */}
       <div className="bg-white rounded-xl border border-gray-100 p-5">
         <div className="flex items-center justify-between">
           <div>
@@ -167,56 +126,51 @@ export default function SensorsPage({ data }: Props) {
         </div>
       </div>
 
-      {/* Sensor Cards */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3 md:gap-4">
-        {sensors.map((sensor) => {
-          const status = getSensorStatus(Number(sensor.value), sensor.min, sensor.max, sensor.isMinOnly);
-          const isWarning = status === "warning";
-
-          return (
-            <div key={sensor.name} className={`rounded-xl border ${sensor.border} ${sensor.bg} p-3 md:p-4`}>
-              <div className="flex items-center justify-between mb-2 md:mb-3">
-                <div className={`${sensor.color}`}>
-                  {sensor.icon}
-                </div>
-                {isWarning ? (
-                  <XCircle size={16} className="text-red-500" />
-                ) : (
-                  <CheckCircle size={16} className="text-green-500" />
-                )}
+        {sensors.map((sensor) => (
+          <div
+            key={sensor.name}
+            className={`rounded-xl border ${sensor.border} ${sensor.bg} p-3 md:p-4`}
+          >
+            <div className="flex items-center justify-between mb-2 md:mb-3">
+              <div className={sensor.color}>
+                {sensor.icon}
               </div>
-              
-              <div className="text-xs font-semibold text-gray-500 uppercase mb-1">
-                {sensor.name}
-              </div>
-              
-              <div className="text-xl md:text-2xl font-bold text-gray-800">
-                {sensor.value ?? "--"}{sensor.unit}
-              </div>
-
-              <div className="mt-2 pt-2 border-t border-gray-200/50 text-xs text-gray-600">
-                <span className="font-medium">Threshold:</span>{" "}
-                {sensor.isMinOnly 
-                  ? `> ${sensor.min}${sensor.unit}`
-                  : `${sensor.min} - ${sensor.max}${sensor.unit}`
-                }
-              </div>
-
-              {isWarning && (
-                <div className="mt-2 text-xs font-semibold text-red-600">
-                  {Number(sensor.value) < sensor.min ? "Below" : "Above"} threshold!
-                </div>
+              {sensor.isWarning ? (
+                <XCircle size={16} className="text-red-500" />
+              ) : (
+                <CheckCircle size={16} className="text-green-500" />
               )}
             </div>
-          );
-        })}
+            
+            <div className="text-xs font-semibold text-gray-500 uppercase mb-1">
+              {sensor.name}
+            </div>
+            
+            <div className="text-xl md:text-2xl font-bold text-gray-800">
+              {sensor.value ?? "--"}{sensor.unit}
+            </div>
+
+            <div className="mt-2 pt-2 border-t border-gray-200/50 text-xs text-gray-600">
+              <span className="font-medium">Threshold:</span>{" "}
+              {sensor.threshold.isMinOnly 
+                ? `> ${sensor.threshold.range.min}${sensor.unit}`
+                : `${sensor.threshold.range.min} - ${sensor.threshold.range.max}${sensor.unit}`
+              }
+            </div>
+
+            {sensor.isWarning && sensor.value !== null && (
+              <div className="mt-2 text-xs font-semibold text-red-600">
+                {sensor.value < sensor.threshold.range.min ? "Below" : "Above"} threshold!
+              </div>
+            )}
+          </div>
+        ))}
       </div>
 
-      {/* Device Info */}
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
         <div className="bg-white rounded-xl border border-gray-100 p-4">
           <div className="text-xs font-bold text-gray-500 uppercase mb-3 flex items-center gap-2">
-            <Wifi size={16} />
             Connection Info
           </div>
           <div className="space-y-2 text-sm">
@@ -248,7 +202,7 @@ export default function SensorsPage({ data }: Props) {
             <div className="flex justify-between">
               <span className="text-gray-600">Time Ago</span>
               <span className="font-medium">
-                {data.timestamp ? <TimeAgo timestamp={data.timestamp} /> : "N/A"}
+                {data.timestamp ? formatTimeAgo(data.timestamp) : "N/A"}
               </span>
             </div>
           </div>

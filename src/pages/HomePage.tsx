@@ -1,7 +1,8 @@
-import { useState } from "react";
+import { useState, useMemo } from "react";
 import { Thermometer, Droplets, Waves, FlaskConical, AlertTriangle, AlertCircle, CheckCircle, RefreshCw, BellOff, Settings } from "lucide-react";
 import type { MenuKey } from "../types";
 import { useSensors } from "../hooks/useSensors";
+import { getSettingsThresholds, getThresholdStatus } from "../types";
 
 type Props = {
   onNavigate?: (menu: MenuKey) => void;
@@ -29,30 +30,35 @@ function StatCard({ title, value, description, gradient, icon }: Stat) {
 }
 
 export default function HomePage({ onNavigate }: Props) {
-  const { data, refetch } = useSensors();
-  const hasData = !!data;
+  const { data, refetch, settings } = useSensors();
   const [alertsDismissed, setAlertsDismissed] = useState(false);
   
-  const safe = hasData && (
-    data.temperature >= 20 && data.temperature <= 31 &&
-    data.ph >= 6.5 && data.ph <= 8.5 &&
-    data.dissolved_oxygen >= 5 &&
-    data.ammonia <= 0.5 &&
-    data.water_level >= 10
-  );
-
-  const getAlerts = () => {
-    if (!hasData) return [];
+  const thresholds = useMemo(() => getSettingsThresholds(settings), [settings]);
+  
+  const hasData = !!data;
+  
+  const tankStatus = useMemo(() => {
+    if (!hasData) return { safe: false, alerts: ["No sensor data"] };
+    
     const alerts: string[] = [];
-    if (data.temperature < 20 || data.temperature > 31) alerts.push(`Temperature ${data.temperature < 20 ? "low" : "high"} at ${data.temperature}°C`);
-    if (data.ph < 6.5 || data.ph > 8.5) alerts.push(`pH ${data.ph < 6.5 ? "low" : "high"} at ${data.ph}`);
-    if (data.dissolved_oxygen < 5) alerts.push(`DO low at ${data.dissolved_oxygen} mg/L`);
-    if (data.ammonia > 0.5) alerts.push(`Ammonia high at ${data.ammonia} ppm`);
-    if (data.water_level < 10) alerts.push(`Water level low at ${data.water_level}`);
-    return alerts.length ? alerts : ["Tank is Safe"];
-  };
-
-  const alerts = getAlerts();
+    const sensorKeys = ["temperature", "ph", "dissolved_oxygen", "ammonia", "water_level"] as const;
+    
+    for (const key of sensorKeys) {
+      const threshold = thresholds[key];
+      const value = data[key];
+      const status = getThresholdStatus(value, threshold.range, threshold.isMinOnly);
+      
+      if (status === "warning") {
+        const direction = value < threshold.range.min ? "low" : "high";
+        alerts.push(`${threshold.name} ${direction} at ${value}${threshold.unit}`);
+      }
+    }
+    
+    return {
+      safe: alerts.length === 0,
+      alerts: alerts.length > 0 ? alerts : ["Tank is Safe"],
+    };
+  }, [data, thresholds, hasData]);
 
   const getStatusBadge = () => {
     if (!hasData) {
@@ -63,7 +69,7 @@ export default function HomePage({ onNavigate }: Props) {
         </span>
       );
     }
-    if (safe) {
+    if (tankStatus.safe) {
       return (
         <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold bg-emerald-100 text-emerald-700">
           <CheckCircle size={14} />
@@ -83,28 +89,28 @@ export default function HomePage({ onNavigate }: Props) {
     {
       title: "Water Temperature",
       value: data ? `${data.temperature}°C` : "--°C",
-      description: "Current tank temperature",
+      description: `Threshold: ${thresholds.temperature.range.min}-${thresholds.temperature.range.max}°C`,
       gradient: "from-blue-500 to-cyan-500",
       icon: <Thermometer size={24} />,
     },
     {
       title: "pH Level",
       value: data ? `${data.ph}` : "--",
-      description: "Normal water acidity (6.5-8.5)",
+      description: `Threshold: ${thresholds.ph.range.min}-${thresholds.ph.range.max}`,
       gradient: "from-emerald-400 to-teal-400",
       icon: <FlaskConical size={24} />,
     },
     {
       title: "Dissolved Oxygen",
       value: data ? `${data.dissolved_oxygen} mg/L` : "-- mg/L",
-      description: "Healthy oxygen range",
+      description: `Min threshold: ${thresholds.dissolved_oxygen.range.min} mg/L`,
       gradient: "from-sky-400 to-cyan-500",
       icon: <Droplets size={24} />,
     },
     {
       title: "Water Level",
       value: data ? `${data.water_level} cm` : "-- cm",
-      description: "Tank water level",
+      description: `Threshold: ${thresholds.water_level.range.min}-${thresholds.water_level.range.max}%`,
       gradient: "from-indigo-500 to-blue-500",
       icon: <Waves size={24} />,
     },
@@ -116,7 +122,7 @@ export default function HomePage({ onNavigate }: Props) {
     { label: "Water Level", value: data ? `${data.water_level} cm` : "--", color: "bg-indigo-50 border-indigo-200 text-indigo-700" },
   ];
 
-  const recentAlerts = alerts.slice(0, 4);
+  const recentAlerts = tankStatus.alerts.slice(0, 4);
 
   return (
     <div className="space-y-6">
@@ -163,11 +169,11 @@ export default function HomePage({ onNavigate }: Props) {
               <p className="text-sm text-gray-400">Alerts dismissed</p>
             ) : (
               <div className="flex flex-col gap-2">
-                {alerts.map((alert, index) => (
+                {tankStatus.alerts.map((alert, index) => (
                   <div
                     key={index}
                     className={`rounded-lg p-3 font-bold text-sm ${
-                      safe ? "bg-emerald-100 text-emerald-700" : "bg-red-100 text-red-700"
+                      tankStatus.safe ? "bg-emerald-100 text-emerald-700" : "bg-red-100 text-red-700"
                     }`}
                   >
                     {alert}
@@ -179,7 +185,7 @@ export default function HomePage({ onNavigate }: Props) {
         </div>
       </section>
 
-      {!safe && hasData && (
+      {!tankStatus.safe && hasData && (
         <section className="rounded-xl border border-red-200 bg-red-50 p-4">
           <div className="flex items-center gap-2 mb-3">
             <AlertTriangle className="text-red-600" size={18} />
@@ -236,22 +242,30 @@ export default function HomePage({ onNavigate }: Props) {
             <div className="rounded-xl bg-blue-50 p-4">
               <p className="text-xs text-gray-500">Temperature</p>
               <p className="mt-1 text-2xl font-bold text-blue-600">{data?.temperature ?? "--"}°C</p>
-              <p className="mt-1 text-xs text-gray-400">Optimal: 20-31°C</p>
+              <p className="mt-1 text-xs text-gray-400">
+                Optimal: {thresholds.temperature.range.min}-{thresholds.temperature.range.max}°C
+              </p>
             </div>
             <div className="rounded-xl bg-emerald-50 p-4">
               <p className="text-xs text-gray-500">pH Level</p>
               <p className="mt-1 text-2xl font-bold text-emerald-600">{data?.ph ?? "--"}</p>
-              <p className="mt-1 text-xs text-gray-400">Optimal: 6.5-8.5</p>
+              <p className="mt-1 text-xs text-gray-400">
+                Optimal: {thresholds.ph.range.min}-{thresholds.ph.range.max}
+              </p>
             </div>
             <div className="rounded-xl bg-sky-50 p-4">
               <p className="text-xs text-gray-500">Dissolved Oxygen</p>
               <p className="mt-1 text-2xl font-bold text-sky-600">{data?.dissolved_oxygen ?? "--"} mg/L</p>
-              <p className="mt-1 text-xs text-gray-400">Optimal: 5 mg/L</p>
+              <p className="mt-1 text-xs text-gray-400">
+                Optimal: {thresholds.dissolved_oxygen.range.min} mg/L+
+              </p>
             </div>
             <div className="rounded-xl bg-orange-50 p-4">
               <p className="text-xs text-gray-500">Ammonia</p>
               <p className="mt-1 text-2xl font-bold text-orange-600">{data?.ammonia ?? "--"} ppm</p>
-              <p className="mt-1 text-xs text-gray-400">Safe: 0.5 ppm</p>
+              <p className="mt-1 text-xs text-gray-400">
+                Safe: {'<'}{thresholds.ammonia.range.max} ppm
+              </p>
             </div>
           </div>
         </div>

@@ -1,55 +1,20 @@
-import { useEffect, useState, useCallback } from "react";
-import axios from "axios";
+import { useState, useMemo } from "react";
 import { 
   History, 
   Thermometer, 
   Waves, 
-  FlaskConical, 
+  FlaskConical,
   Droplets,
-  Filter
+  Filter,
 } from "lucide-react";
 import TrendCard from "../components/TrendCard";
-import type { ChartPoint, SensorEntry } from "../types";
-import { API_BASE } from "../types";
-
-type Props = {
-  history: ChartPoint[];
-};
+import { useSensors } from "../hooks/useSensors";
 
 type TimeRange = "1h" | "6h" | "24h" | "all";
 
-export default function HistoricalDataPage({ history: propHistory }: Props) {
+export default function HistoricalDataPage() {
+  const { history, loading, error } = useSensors();
   const [timeRange, setTimeRange] = useState<TimeRange>("all");
-  const [sensorHistory, setSensorHistory] = useState<SensorEntry[]>([]);
-  const [loading, setLoading] = useState(false);
-
-  const fetchHistory = useCallback(async () => {
-    try {
-      setLoading(true);
-      const res = await axios.get<SensorEntry[]>(`${API_BASE}/sensor`);
-      let data = res.data || [];
-      
-      if (timeRange !== "all") {
-        const now = Date.now();
-        const hours = timeRange === "1h" ? 1 : timeRange === "6h" ? 6 : 24;
-        const cutoff = now - hours * 60 * 60 * 1000;
-        
-        data = data.filter((item: SensorEntry) => 
-          item.timestamp && new Date(item.timestamp).getTime() > cutoff
-        );
-      }
-      
-      setSensorHistory(data.slice().reverse());
-    } catch (err) {
-      console.error("Fetch history error:", err);
-    } finally {
-      setLoading(false);
-    }
-  }, [timeRange]);
-
-  useEffect(() => {
-    fetchHistory();
-  }, [fetchHistory]);
 
   const timeRanges: { value: TimeRange; label: string }[] = [
     { value: "1h", label: "1 Hour" },
@@ -58,20 +23,48 @@ export default function HistoricalDataPage({ history: propHistory }: Props) {
     { value: "all", label: "All Time" },
   ];
 
-  const chartData = sensorHistory.map((item) => ({
-    name: item.timestamp 
-      ? new Date(item.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
-      : "--:--",
-    temperature: Number(item.temperature) || 0,
-    water_level: Number(item.water_level) || 0,
-    ph: Number(item.ph) || 0,
-    dissolved_oxygen: Number(item.dissolved_oxygen) || 0,
-    ammonia: Number(item.ammonia) || 0,
-  }));
+  const filteredHistory = useMemo(() => {
+    if (timeRange === "all" || history.length === 0) {
+      return history;
+    }
+    
+    const now = Date.now();
+    const hours = timeRange === "1h" ? 1 : timeRange === "6h" ? 6 : 24;
+    const cutoff = now - hours * 60 * 60 * 1000;
+    
+    return history.filter((item) => {
+      const timestamp = new Date(item.name).getTime();
+      return timestamp > cutoff || item.name === "--:--";
+    });
+  }, [history, timeRange]);
 
-  const latestReading = sensorHistory[sensorHistory.length - 1];
+  const chartData = useMemo(
+    () => filteredHistory.slice(0, 50),
+    [filteredHistory]
+  );
 
-  if (!propHistory.length && !sensorHistory.length) {
+  const latestReading = chartData[chartData.length - 1];
+
+  if (loading) {
+    return (
+      <div className="bg-white rounded-xl border border-gray-100 p-8 text-center">
+        <History size={40} className="mx-auto mb-3 text-gray-400" />
+        <p className="text-gray-600">Loading historical data...</p>
+      </div>
+    );
+  }
+
+  if (error) {
+    return (
+      <div className="bg-white rounded-xl border border-gray-100 p-8 text-center">
+        <History size={40} className="mx-auto mb-3 text-red-400" />
+        <p className="text-gray-600">Failed to load historical data</p>
+        <p className="text-sm text-gray-500 mt-2">{error}</p>
+      </div>
+    );
+  }
+
+  if (!history.length) {
     return (
       <div className="bg-white rounded-xl border border-gray-100 p-8 text-center">
         <History size={40} className="mx-auto mb-3 text-gray-400" />
@@ -94,6 +87,9 @@ export default function HistoricalDataPage({ history: propHistory }: Props) {
               View sensor data trends over time
             </p>
           </div>
+          <div className="text-sm text-gray-500">
+            {chartData.length} readings
+          </div>
         </div>
       </div>
 
@@ -114,7 +110,7 @@ export default function HistoricalDataPage({ history: propHistory }: Props) {
         ))}
       </div>
 
-      {sensorHistory.length > 0 && (
+      {chartData.length > 0 && (
         <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
           <div className="bg-white rounded-xl border border-gray-100 p-4">
             <div className="flex items-center gap-2 text-gray-500 mb-1">
@@ -158,11 +154,7 @@ export default function HistoricalDataPage({ history: propHistory }: Props) {
         </div>
       )}
 
-      {loading ? (
-        <div className="bg-white rounded-xl border border-gray-100 p-8 text-center">
-          <p className="text-gray-600">Loading chart data...</p>
-        </div>
-      ) : chartData.length > 0 ? (
+      {chartData.length > 0 ? (
         <div className="grid grid-cols-2 gap-3">
           <TrendCard
             title="Temperature"
@@ -193,43 +185,6 @@ export default function HistoricalDataPage({ history: propHistory }: Props) {
         <div className="bg-white rounded-xl border border-gray-100 p-8 text-center">
           <History size={40} className="mx-auto mb-3 text-gray-400" />
           <p className="text-gray-600">No data for selected time range.</p>
-        </div>
-      )}
-
-      {sensorHistory.length > 0 && (
-        <div className="bg-white rounded-xl border border-gray-100 overflow-hidden">
-          <div className="px-4 py-3 border-b border-gray-100">
-            <h3 className="font-semibold text-gray-800">Raw Data</h3>
-          </div>
-          <div className="overflow-x-auto">
-            <table className="w-full text-xs">
-              <thead className="bg-gray-50 text-gray-500">
-                <tr>
-                  <th className="px-4 py-2 text-left">Time</th>
-                  <th className="px-4 py-2 text-center">Temp (°C)</th>
-                  <th className="px-4 py-2 text-center">pH</th>
-                  <th className="px-4 py-2 text-center">Water Level (%)</th>
-                  <th className="px-4 py-2 text-center">DO (mg/L)</th>
-                </tr>
-              </thead>
-              <tbody>
-                {sensorHistory.slice(0, 20).map((item, i) => (
-                  <tr key={i} className="border-t">
-                    <td className="px-4 py-2 text-gray-600">
-                      {item.timestamp 
-                        ? new Date(item.timestamp).toLocaleString() 
-                        : "N/A"
-                      }
-                    </td>
-                    <td className="px-4 py-2 text-center font-medium">{item.temperature}</td>
-                    <td className="px-4 py-2 text-center font-medium">{item.ph}</td>
-                    <td className="px-4 py-2 text-center font-medium">{item.water_level}</td>
-                    <td className="px-4 py-2 text-center font-medium">{item.dissolved_oxygen}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
         </div>
       )}
     </div>
