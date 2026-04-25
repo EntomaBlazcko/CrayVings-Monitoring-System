@@ -168,13 +168,6 @@ export default function DashboardPage() {
           </div>
         </div>
       </div>
-
-      <div className="mt-4 bg-white rounded-lg border border-gray-100 p-3 text-sm text-gray-600">
-        <div className="flex flex-wrap gap-x-4 gap-y-1">
-          <span><strong>Device:</strong> {data?.device_id ?? "N/A"}</span>
-          <span><strong>Last Update:</strong> {data?.timestamp ? new Date(data.timestamp).toLocaleString() : "N/A"}</span>
-        </div>
-      </div>
     </>
   );
 }

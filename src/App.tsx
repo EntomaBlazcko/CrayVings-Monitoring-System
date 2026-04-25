@@ -25,6 +25,8 @@ import LogsPage from "./pages/LogsPage";
 import ActivityLogsPage from "./pages/ActivityLogsPage";
 import { SensorProvider } from "./contexts/SensorProvider";
 import { useActivityLogs } from "./contexts/SensorContext";
+import { FloatingAlertProvider, FloatingAlertContainer } from "./components/FloatingAlert";
+import { useThresholdAlert } from "./hooks/useThresholdAlert";
 
 const menuItems: { label: MenuKey; icon: React.ReactNode }[] = [
   { label: "Home", icon: <Home size={18} /> },
@@ -40,6 +42,7 @@ const menuItems: { label: MenuKey; icon: React.ReactNode }[] = [
 function AppContent() {
   const { logActivity } = useActivityLogs();
   const previousMenuRef = useRef<MenuKey>("Home");
+  useThresholdAlert();
 
   const getInitialMenu = useCallback((): MenuKey => {
     const saved = localStorage.getItem("activeMenu");
@@ -156,7 +159,10 @@ function AppContent() {
 export default function App() {
   return (
     <SensorProvider>
-      <AppContent />
+      <FloatingAlertProvider>
+        <AppContent />
+        <FloatingAlertContainer />
+      </FloatingAlertProvider>
     </SensorProvider>
   );
 }

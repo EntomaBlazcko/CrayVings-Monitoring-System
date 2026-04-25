@@ -7,6 +7,16 @@ require("dotenv").config();
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+const ALERT_DEDUP_INTERVAL_MS = 60 * 60 * 1000;
+
+const lastAlertedState = {
+  Temperature: { value: null, timestamp: null },
+  "pH Level": { value: null, timestamp: null },
+  "Dissolved Oxygen": { value: null, timestamp: null },
+  "Water Level": { value: null, timestamp: null },
+  Ammonia: { value: null, timestamp: null },
+};
+
 app.use(express.json());
 
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "http://localhost:5173,http://localhost:5174,http://localhost:3001,http://192.168.1.20:3000").split(",");
@@ -152,11 +162,24 @@ app.post("/sensor", async (req, res) => {
     }
 
     for (const alert of alerts) {
-      await pool.query(
-        `INSERT INTO system_logs (action, parameter, old_value, new_value) VALUES ($1, $2, $3, $4)`,
-        ["Alert", alert.parameter, alert.old_value, alert.new_value]
-      );
-      console.log(`[${new Date().toISOString()}] Alert logged: ${alert.parameter} ${alert.old_value}`);
+      const alertKey = alert.parameter;
+      const lastAlert = lastAlertedState[alertKey];
+      const now = new Date();
+      
+      const shouldLogAlert = !lastAlert.value || 
+        lastAlert.value !== alert.new_value || 
+        (now.getTime() - new Date(lastAlert.timestamp).getTime()) > ALERT_DEDUP_INTERVAL_MS;
+      
+      if (shouldLogAlert) {
+        await pool.query(
+          `INSERT INTO system_logs (action, parameter, old_value, new_value) VALUES ($1, $2, $3, $4)`,
+          ["Alert", alert.parameter, alert.old_value, alert.new_value]
+        );
+        lastAlertedState[alertKey] = { value: alert.new_value, timestamp: now.toISOString() };
+        console.log(`[${now.toISOString()}] Alert logged: ${alert.parameter} ${alert.old_value} (value: ${alert.new_value})`);
+      } else {
+        console.log(`[${now.toISOString()}] Alert suppressed (duplicate within 1hr): ${alert.parameter} ${alert.old_value} (value: ${alert.new_value})`);
+      }
     }
 
     res.status(201).json({
