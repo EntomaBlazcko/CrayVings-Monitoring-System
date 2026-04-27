@@ -34,7 +34,6 @@ export default function SensorsPage() {
   
   const thresholds = useMemo(() => getSettingsThresholds(settings), [settings]);
   
-  // eslint-disable-next-line react-hooks/purity
   const isOnline = useMemo(() => {
     if (connectionStatus === "online") return true;
     if (!data?.timestamp) return false;

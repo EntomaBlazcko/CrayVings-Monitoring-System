@@ -363,17 +363,25 @@ function useActivityLogsManager() {
 
   const abortControllerRef = useRef<AbortController | null>(null);
   const isMountedRef = useRef(true);
+  const searchRef = useRef(state.activitySearch);
+  const sortRef = useRef(state.activitySortBy);
+  const filterRef = useRef(state.activityActionFilter);
 
-  // eslint-disable-next-line react-hooks/preserve-manual-memoization
+  useEffect(() => {
+    searchRef.current = state.activitySearch;
+    sortRef.current = state.activitySortBy;
+    filterRef.current = state.activityActionFilter;
+  });
+
   const fetchData = useCallback(async (page = 1, search?: string, sortBy?: "newest" | "oldest", actionFilter?: string) => {
     if (abortControllerRef.current) {
       abortControllerRef.current.abort();
     }
     abortControllerRef.current = new AbortController();
 
-    const currentSearch = search ?? state.activitySearch;
-    const currentSort = sortBy ?? state.activitySortBy;
-    const currentFilter = actionFilter ?? state.activityActionFilter;
+    const currentSearch = search ?? searchRef.current;
+    const currentSort = sortBy ?? sortRef.current;
+    const currentFilter = actionFilter ?? filterRef.current;
 
     try {
       const response = await fetchActivityLogs(
@@ -417,7 +425,7 @@ function useActivityLogsManager() {
         abortControllerRef.current.abort();
       }
     };
-  }, []);
+  }, [fetchData]);
 
   const refetch = useCallback(() => {
     setState((prev) => ({ ...prev, activityLogsLoading: true, activityLogsError: null }));
@@ -534,7 +542,6 @@ export function SensorProvider({ children }: { children: ReactNode }) {
     <SensorDataContext.Provider value={dataContextValue}>
       <SensorSettingsContext.Provider value={settingsContextValue}>
         <LogsContext.Provider value={logsContextValue}>
-          {/* eslint-disable-next-line react-refresh/only-export-components */}
           <ActivityLogsContext.Provider value={activityLogsContextValue}>
             {children}
           </ActivityLogsContext.Provider>
@@ -544,8 +551,4 @@ export function SensorProvider({ children }: { children: ReactNode }) {
   );
 }
 
-// eslint-disable-next-line react-refresh/only-export-components
-export { useSensorData, useSensorSettings, useSystemLogs, useActivityLogs } from "./SensorContext";
-
-// eslint-disable-next-line react-refresh/only-export-components
 export default SensorProvider;

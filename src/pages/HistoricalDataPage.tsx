@@ -31,7 +31,6 @@ export default function HistoricalDataPage() {
     const hours = timeRange === "1h" ? 1 : timeRange === "6h" ? 6 : 24;
     const cutoffTime = hours * 60 * 60 * 1000;
     
-    // eslint-disable-next-line react-hooks/purity
     return history.filter((item) => {
       const timestamp = new Date(item.name).getTime();
       return timestamp > Date.now() - cutoffTime || item.name === "--:--";
