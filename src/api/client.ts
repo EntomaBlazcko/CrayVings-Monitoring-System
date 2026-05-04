@@ -213,11 +213,22 @@ export async function fetchLogs(
 /**
  * GET /settings
  * Fetches current sensor threshold settings.
+ * Converts PostgreSQL NUMERIC strings to JavaScript numbers.
  * Used by SensorProvider on initialization and when settings change.
  */
 export async function fetchSettings(signal?: AbortSignal): Promise<SensorSettings> {
   const response = await client.get<SensorSettings>("/settings", { signal });
-  return response.data;
+  const data = response.data as Record<string, unknown>;
+  return {
+    id: data.id as number,
+    temp_min: Number(data.temp_min),
+    temp_max: Number(data.temp_max),
+    ph_min: Number(data.ph_min),
+    ph_max: Number(data.ph_max),
+    water_level_min: Number(data.water_level_min),
+    water_level_max: Number(data.water_level_max),
+    updated_at: data.updated_at as string,
+  };
 }
 
 /**

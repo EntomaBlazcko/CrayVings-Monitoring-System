@@ -7,7 +7,7 @@
 // This component has NO visible UI (returns null). It works as a background
 // watcher that:
 //   1. Watches the connectionStatus from the sensor data context
-//   2. Detects transitions from any state to "offline"
+//   2. Detects transitions to "offline" (includes sensorData === null path)
 //   3. Detects transitions from "offline" to "online" (reconnection)
 //   4. On disconnect: plays critical sound, adds floating notification,
 //      logs the event, and triggers SMS alerts to all recipients
@@ -32,24 +32,29 @@ type ConnectionStatus = "online" | "offline" | "connecting" | "unknown";
  * Renders nothing (returns null) - it's a pure logic component.
  */
 export function DeviceConnectionMonitor() {
-  const { connectionStatus, consecutiveFailures } = useSensorData();
+  const { connectionStatus, consecutiveFailures, lastUpdate } = useSensorData();
   const { addNotification, removeNotification } = useFloatingAlerts();
   const logActivity = useActivityLogger();
   const prevStatusRef = useRef<ConnectionStatus>("connecting");
+  const prevFailuresRef = useRef(0);
   const disconnectAlertIdRef = useRef<string | null>(null);
   const smsSentRef = useRef(false);
 
   // Monitor connection status changes
   useEffect(() => {
     const prevStatus = prevStatusRef.current;
+    const prevFailures = prevFailuresRef.current;
     prevStatusRef.current = connectionStatus;
+    prevFailuresRef.current = consecutiveFailures;
 
     // Detect transition: any state -> offline (device disconnected)
     const wentOffline =
       connectionStatus === "offline" && prevStatus !== "offline";
     // Detect transition: offline -> online (device reconnected)
+    // Also catch when consecutiveFailures drop to 0 (fresh data restored)
     const cameOnline =
-      connectionStatus === "online" && prevStatus === "offline";
+      (connectionStatus === "online" && prevStatus === "offline") ||
+      (consecutiveFailures === 0 && prevFailures > 0 && connectionStatus === "online");
 
     if (wentOffline) {
       // Reset SMS sent flag for this disconnect event
@@ -106,7 +111,7 @@ export function DeviceConnectionMonitor() {
         threshold: "min",
       });
     }
-  }, [connectionStatus, consecutiveFailures, addNotification, logActivity, removeNotification]);
+  }, [connectionStatus, consecutiveFailures, lastUpdate, addNotification, logActivity, removeNotification]);
 
   // This component renders nothing - it's a background watcher
   return null;

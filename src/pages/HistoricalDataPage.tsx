@@ -111,6 +111,7 @@ export default function HistoricalDataPage() {
     if (!shouldFetchDynamic(timeRange)) return;
 
     const controller = new AbortController();
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setDynamicLoading(true);
 
     fetchDynamicData(timeRange, controller.signal)

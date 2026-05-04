@@ -4,9 +4,9 @@
 // PURPOSE: User activity tracking page with search, filter, and sort.
 //
 // This page displays user interaction logs (navigation, settings changes,
-// logins, etc.) from the activity_logs database table with:
+// device connect/disconnect, etc.) from the activity_logs database table with:
 //   1. Search bar with debounced input (300ms delay)
-//   2. Action type filter dropdown (navigation, settings_change, etc.)
+//   2. Action type filter dropdown (navigation, settings_change, device_connect, device_disconnect)
 //   3. Sort toggle (newest first / oldest first)
 //   4. Refresh button for manual re-fetch
 //   5. Paginated table with time, user, action, description, module
@@ -16,7 +16,6 @@
 //   - settings_change: Orange
 //   - device_connect: Green
 //   - device_disconnect: Red
-//   - login: Cyan
 //   - Others: Various colors
 //
 // DATA: Activity logs from SensorProvider (fetched on mount, refreshed on demand)
@@ -29,6 +28,8 @@ import { useActivityLogs } from "../hooks/useSensors";
 const FILTER_ACTION_TYPES = [
   "navigation",
   "settings_change",
+  "device_connect",
+  "device_disconnect",
 ];
 
 const ACTION_TYPE_COLORS: Record<string, string> = {

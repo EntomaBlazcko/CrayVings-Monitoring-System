@@ -408,6 +408,7 @@ export default function SettingsPage() {
   }, [isAdmin, showToast]);
 
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     void loadRecipients();
   }, [loadRecipients]);
 

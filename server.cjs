@@ -278,18 +278,18 @@ function getThresholdStatus(value, min, max) {
 //   - Hourly status update messages with all sensor readings
 //   - Exponential backoff retry (up to 2 retries)
 //   - SMS logging to database (sms_logs table) for audit trail
-//   - Configurable cooldowns to prevent alert spam:
-//     * Warning: 1 hour between repeats
-//     * Critical: 5 minutes between repeats
+//   - Configurable cooldowns (default: 2 minutes for both warning and critical)
 //   - Mute functionality to temporarily pause all SMS alerts
+//   - Async background processing via setImmediate (non-blocking ESP32 response)
+//   - Parallel SMS sending via Promise.allSettled (one failure doesn't block others)
 //
 // ENVIRONMENT VARIABLES:
 //   SKYSMS_API_KEY         - API key for SkySMS service
 //   SKYSMS_API_URL         - Base URL for SkySMS API (default: skysms.skyio.site)
 //   HOURLY_SMS_ENABLED     - Enable/disable hourly updates (default: true)
 //   HOURLY_SMS_INTERVAL_MS - Interval for hourly updates (default: 3600000ms = 1hr)
-//   WARNING_SMS_COOLDOWN_MS - Cooldown between warning SMS (default: 3600000ms = 1hr)
-//   SMS_COOLDOWN_MS         - Cooldown between critical SMS (default: 300000ms = 5min)
+//   WARNING_SMS_COOLDOWN_MS - Cooldown between warning SMS (default: 120000ms = 2min)
+//   SMS_COOLDOWN_MS         - Cooldown between critical SMS (default: 120000ms = 2min)
 // =============================================================================
 
 const SKYSMS_API_KEY = process.env.SKYSMS_API_KEY;
@@ -316,8 +316,8 @@ const SMS_CONFIG = {
   },
   // Cooldown periods to prevent alert spam (time between repeated alerts)
   cooldown: {
-    warning: parseInt(process.env.WARNING_SMS_COOLDOWN_MS) || 3600000,   // 1 hour
-    critical: parseInt(process.env.SMS_COOLDOWN_MS) || 300000            // 5 minutes
+    warning: parseInt(process.env.WARNING_SMS_COOLDOWN_MS) || 120000,   // 2 minutes
+    critical: parseInt(process.env.SMS_COOLDOWN_MS) || 120000            // 2 minutes
   },
   // Retry configuration for failed SMS sends (exponential backoff)
   retry: { maxRetries: 2, baseDelayMs: 2000 },
@@ -449,25 +449,24 @@ app.get("/", (req, res) => {
  * PRIMARY DATA INGESTION ENDPOINT - Called by the ESP32 device.
  *
  * Receives sensor readings (temperature, water_level, pH) from the ESP32,
- * stores them in the PostgreSQL sensors table, then evaluates thresholds
- * and sends SMS alerts if readings are outside the safe range.
+ * stores them in the PostgreSQL sensors table, then responds immediately.
+ * Threshold evaluation and SMS alerts run asynchronously in the background.
  *
  * Request body:
  *   - device_id (required): Identifier for the ESP32 device
- *   - temperature: Water temperature in Celsius
- *   - water_level: Water level percentage
- *   - ph: pH level of the water
+ *   - temperature: Water temperature in Celsius (-1 if sensor failed)
+ *   - water_level: Water level percentage (-1 if sensor failed)
+ *   - ph: pH level of the water (-1 if sensor failed)
  *
- * Alert logic:
+ * Alert logic (runs in background via setImmediate):
  *   1. Fetches current threshold settings from sensor_settings table
- *   2. For each sensor (temp, pH, water_level), checks if value is outside range
- *   3. If outside range, determines warning vs critical based on deviation
- *   4. Checks cooldown period to avoid spam (1hr for warning, 5min for critical)
- *   5. Fetches active SMS recipients from authorized_recipients table
- *   6. Sends SMS to all active recipients with formatted alert message
- *   7. Records alert in system_logs and last_alerts tables
- *
- * NOTE: Temperature and pH readings of 0 are skipped (sensor may not be connected)
+ *   2. For each sensor (temp, pH, water_level), skips negative values (-1 = sensor failed)
+ *   3. If value outside range, determines warning vs critical based on 15% deviation
+ *   4. Checks cooldown period (2 minutes for both warning and critical)
+ *   5. Checks if SMS alerts are muted (smsMuteUntil)
+ *   6. Fetches active SMS recipients from authorized_recipients table
+ *   7. Sends SMS to all recipients in parallel via Promise.allSettled
+ *   8. Records alert in system_logs and last_alerts tables
  */
 app.post("/sensor", async (req, res) => {
   try {
@@ -482,80 +481,116 @@ app.post("/sensor", async (req, res) => {
     );
     console.log(`[${new Date().toISOString()}] Sensor data saved from ${device_id}`);
 
-    // Fetch threshold settings from the database (with defaults if not configured)
-    const settingsResult = await pool.query("SELECT * FROM sensor_settings LIMIT 1");
-    const settings = settingsResult.rows[0] || { temp_min: 20, temp_max: 31, ph_min: 6.5, ph_max: 8.5, water_level_min: 10, water_level_max: 100 };
+    // Respond immediately to ESP32 — process alerts in the background
+    res.status(201).json({ message: "Saved", data: result.rows[0] });
 
-    // Define sensor checks with their current values and threshold ranges
-    const sensorChecks = [
-      { key: "Temperature", val: Number(temperature), min: Number(settings.temp_min), max: Number(settings.temp_max) },
-      { key: "pH Level", val: Number(ph), min: Number(settings.ph_min), max: Number(settings.ph_max) },
-      { key: "Water Level", val: Number(water_level), min: Number(settings.water_level_min), max: Number(settings.water_level_max) },
-    ];
+    // Background: evaluate thresholds and send SMS alerts asynchronously
+    setImmediate(async () => {
+      try {
+        const settingsResult = await pool.query("SELECT * FROM sensor_settings LIMIT 1");
+        const settings = settingsResult.rows[0] || { temp_min: 20, temp_max: 31, ph_min: 6.5, ph_max: 8.5, water_level_min: 10, water_level_max: 100 };
 
-    // Track hourly update state on global object
-    const nowTs = ts.getTime();
-    const hourlyEnabled = SMS_CONFIG.hourly.enabled;
-    if (hourlyEnabled && !global.lastHourlyUpdateTs) global.lastHourlyUpdateTs = nowTs;
+        const sensorChecks = [
+          { key: "Temperature", val: Number(temperature), min: Number(settings.temp_min), max: Number(settings.temp_max) },
+          { key: "pH Level", val: Number(ph), min: Number(settings.ph_min), max: Number(settings.ph_max) },
+          { key: "Water Level", val: Number(water_level), min: Number(settings.water_level_min), max: Number(settings.water_level_max) },
+        ];
 
-    // Evaluate each sensor against its thresholds
-    for (const sensor of sensorChecks) {
-      // Skip zero readings for Temperature and pH (sensor may not be connected)
-      // Water Level can legitimately be 0
-      if (sensor.val === 0 && sensor.key !== "Water Level") continue;
-      const status = getThresholdStatus(sensor.val, sensor.min, sensor.max);
-      const last = lastAlertedState[sensor.key] || {};
-      const lastTs = last.timestamp ? new Date(last.timestamp).getTime() : 0;
+        const nowTs = ts.getTime();
+        const hourlyEnabled = SMS_CONFIG.hourly.enabled;
+        if (hourlyEnabled && !global.lastHourlyUpdateTs) global.lastHourlyUpdateTs = nowTs;
 
-      // If reading is back to normal, update state and skip alerting
-      if (status === "good") {
-        if (last.status && last.status !== "good") {
+        // Evaluate each sensor against its thresholds
+        for (const sensor of sensorChecks) {
+          // Skip invalid sensor readings (-1 means sensor failed on ESP32)
+          if (sensor.val < 0) continue;
+          const status = getThresholdStatus(sensor.val, sensor.min, sensor.max);
+          const last = lastAlertedState[sensor.key] || {};
+          const lastTs = last.timestamp ? new Date(last.timestamp).getTime() : 0;
+
+          // If reading is back to normal, update state and skip alerting
+          if (status === "good") {
+            if (last.status && last.status !== "good") {
+              await pool.query(
+                `INSERT INTO last_alerts (sensor_key, status, value, timestamp) VALUES ($1, $2, $3, $4) ON CONFLICT (sensor_key) DO UPDATE SET status = $2, value = $3, timestamp = $4`,
+                [sensor.key, "good", sensor.val, ts.toISOString()]
+              );
+              lastAlertedState[sensor.key] = { status: "good", value: sensor.val, timestamp: ts.toISOString() };
+            }
+            continue;
+          }
+
+          // Check cooldown period to prevent alert spam
+          const interval = status === "critical" ? SMS_CONFIG.cooldown.critical : SMS_CONFIG.cooldown.warning;
+          if (status === last.status && nowTs - lastTs < interval) continue;
+
+          // Determine if the value is above or below threshold
+          const direction = sensor.val < sensor.min ? "Low" : "High";
+
+          // Log the alert to system_logs
+          await pool.query(`INSERT INTO system_logs (action, parameter, old_value, new_value) VALUES ($1, $2, $3, $4)`,
+            ["Alert", sensor.key, direction, sensor.val]);
+
+          // Update last_alerts table (upsert: insert or update on conflict)
           await pool.query(
             `INSERT INTO last_alerts (sensor_key, status, value, timestamp) VALUES ($1, $2, $3, $4) ON CONFLICT (sensor_key) DO UPDATE SET status = $2, value = $3, timestamp = $4`,
-            [sensor.key, "good", sensor.val, ts.toISOString()]
+            [sensor.key, status, sensor.val, ts.toISOString()]
           );
-          lastAlertedState[sensor.key] = { status: "good", value: sensor.val, timestamp: ts.toISOString() };
+          lastAlertedState[sensor.key] = { status, value: sensor.val, timestamp: ts.toISOString() };
+
+          // Check if SMS alerts are currently muted
+          if (smsMuteUntil && new Date() < new Date(smsMuteUntil)) {
+            console.log(`[${new Date().toISOString()}] SMS alerts muted until ${smsMuteUntil}, skipping SMS for ${sensor.key} ${status}`);
+            continue;
+          }
+
+          // Fetch recipients and send SMS in parallel
+          const recipients = await pool.query("SELECT phone_number, name FROM authorized_recipients WHERE is_active = true");
+          if (recipients.rows.length > 0) {
+            const isCritical = status === "critical";
+            const template = isCritical ? SMS_CONFIG.messages.critical : SMS_CONFIG.messages.warning;
+            const timestamp = ts.toLocaleString("en-PH", { timeZone: "Asia/Manila", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: true });
+            // Send all recipient SMS in parallel instead of one-by-one
+            const smsPromises = recipients.rows.map(async (r) => {
+              const message = buildMessage(template, {
+                SENSOR: SMS_CONFIG.sensorNames[sensor.key] || sensor.key,
+                NAME: r.name || "User", VALUE: sensor.val, UNIT: SMS_CONFIG.units[sensor.key] || "",
+                THRESHOLD: direction === "Low" ? sensor.min : sensor.max, TIME: timestamp
+              });
+              return sendSingleSMS(r.phone_number, message);
+            });
+            await Promise.allSettled(smsPromises);
+          }
         }
-        continue;
-      }
 
-      // Check cooldown period to prevent alert spam
-      const interval = status === "critical" ? SMS_CONFIG.cooldown.critical : SMS_CONFIG.cooldown.warning;
-      if (status === last.status && nowTs - lastTs < interval) continue;
+        // Check and send hourly SMS updates
+        if (hourlyEnabled && nowTs - global.lastHourlyUpdateTs >= SMS_CONFIG.hourly.intervalMs) {
+          global.lastHourlyUpdateTs = nowTs;
 
-      // Determine if the value is above or below threshold
-      const direction = sensor.val < sensor.min ? "Low" : "High";
-      
-      // Log the alert to system_logs
-      await pool.query(`INSERT INTO system_logs (action, parameter, old_value, new_value) VALUES ($1, $2, $3, $4)`,
-        ["Alert", sensor.key, direction, sensor.val]);
-
-      // Update last_alerts table (upsert: insert or update on conflict)
-      await pool.query(
-        `INSERT INTO last_alerts (sensor_key, status, value, timestamp) VALUES ($1, $2, $3, $4) ON CONFLICT (sensor_key) DO UPDATE SET status = $2, value = $3, timestamp = $4`,
-        [sensor.key, status, sensor.val, ts.toISOString()]
-      );
-      lastAlertedState[sensor.key] = { status, value: sensor.val, timestamp: ts.toISOString() };
-
-      // Fetch all active SMS recipients and send alerts
-      const recipients = await pool.query("SELECT phone_number, name FROM authorized_recipients WHERE is_active = true");
-      if (recipients.rows.length > 0) {
-        const isCritical = status === "critical";
-        const template = isCritical ? SMS_CONFIG.messages.critical : SMS_CONFIG.messages.warning;
-        // Format timestamp in Philippine timezone for SMS readability
-        const timestamp = ts.toLocaleString("en-PH", { timeZone: "Asia/Manila", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: true });
-        for (const r of recipients.rows) {
-          const message = buildMessage(template, {
-            SENSOR: SMS_CONFIG.sensorNames[sensor.key] || sensor.key,
-            NAME: r.name || "User", VALUE: sensor.val, UNIT: SMS_CONFIG.units[sensor.key] || "",
-            THRESHOLD: direction === "Low" ? sensor.min : sensor.max, TIME: timestamp
-          });
-          await sendSingleSMS(r.phone_number, message);
+          // Check if SMS alerts are currently muted
+          if (smsMuteUntil && new Date() < new Date(smsMuteUntil)) {
+            console.log(`[${new Date().toISOString()}] SMS alerts muted until ${smsMuteUntil}, skipping hourly update`);
+          } else {
+            const hourlyRecipients = await pool.query("SELECT phone_number, name FROM authorized_recipients WHERE is_active = true");
+            if (hourlyRecipients.rows.length > 0) {
+              const tempStatus = getStatusText(getThresholdStatus(Number(temperature), Number(settings.temp_min), Number(settings.temp_max)));
+              const phStatus = getStatusText(getThresholdStatus(Number(ph), Number(settings.ph_min), Number(settings.ph_max)));
+              const waterStatus = getStatusText(getThresholdStatus(Number(water_level), Number(settings.water_level_min), Number(settings.water_level_max)));
+              const hourlyTimestamp = ts.toLocaleString("en-PH", { timeZone: "Asia/Manila", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: true });
+              const summary = (tempStatus === "✅ Good" && phStatus === "✅ Good" && waterStatus === "✅ Good") ? "All systems normal" : "Some parameters need attention";
+              const hourlyMessage = buildMessage(SMS_CONFIG.messages.hourlyUpdate, {
+                TIME: hourlyTimestamp, TEMP: temperature ?? "N/A", TEMP_STATUS: tempStatus,
+                PH: ph ?? "N/A", PH_STATUS: phStatus, WATER: water_level ?? "N/A", WATER_STATUS: waterStatus, SUMMARY: summary
+              });
+              const hourlyPromises = hourlyRecipients.rows.map(async (r) => sendSingleSMS(r.phone_number, hourlyMessage));
+              await Promise.allSettled(hourlyPromises);
+            }
+          }
         }
+      } catch (bgErr) {
+        console.error(`[${new Date().toISOString()}] Background SMS processing error:`, bgErr.message);
       }
-    }
-
-    res.status(201).json({ message: "Saved", data: result.rows[0] });
+    });
   } catch (err) {
     console.error(`[${new Date().toISOString()}] Error saving sensor:`, err.message);
     res.status(500).json({ message: "Error saving data", error: err.message });
@@ -719,7 +754,18 @@ app.get("/settings", async (req, res) => {
     if (result.rows.length === 0) {
       return res.json({ temp_min: 20, temp_max: 31, ph_min: 6.5, ph_max: 8.5, water_level_min: 10, water_level_max: 100 });
     }
-    res.json(result.rows[0]);
+    // Convert PostgreSQL NUMERIC strings to JavaScript numbers for frontend compatibility
+    const row = result.rows[0];
+    res.json({
+      id: Number(row.id),
+      temp_min: Number(row.temp_min),
+      temp_max: Number(row.temp_max),
+      ph_min: Number(row.ph_min),
+      ph_max: Number(row.ph_max),
+      water_level_min: Number(row.water_level_min),
+      water_level_max: Number(row.water_level_max),
+      updated_at: row.updated_at,
+    });
   } catch (err) {
     res.status(500).json({ message: "Error fetching settings", error: err.message });
   }

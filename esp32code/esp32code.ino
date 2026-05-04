@@ -1,3 +1,36 @@
+// =============================================================================
+// FILE: esp32code.ino
+// =============================================================================
+// PURPOSE: ESP32 firmware for the CRAYvings Aquaculture Monitoring System.
+//
+// This firmware:
+//   1. Reads temperature (DS18B20 via OneWire)
+//   2. Measures water level (HC-SR04 ultrasonic sensor)
+//   3. Reads pH level (analog pH sensor with median filtering)
+//   4. Sends sensor data to the backend server via HTTP POST
+//   5. Auto-reconnects to WiFi if connection drops
+//
+// DATA FLOW:
+//   Sensors -> Validation -> HTTP POST to server -> PostgreSQL storage
+//
+// INVALID SENSOR HANDLING:
+//   - Invalid/failed sensors are sent as -1 (not 0) to distinguish from valid readings
+//   - Server skips negative values during threshold evaluation and SMS alerts
+//   - Temperature: -1 when sensor disconnected (DS18B20 returns -127)
+//   - Water level: -1 when ultrasonic sensor gets no echo
+//   - pH: -1 when reading is outside 0-14 range
+//
+// HARDWARE:
+//   - ESP32 development board
+//   - DS18B20 temperature sensor (OneWire, pin 4)
+//   - HC-SR04 ultrasonic sensor (Trig: pin 5, Echo: pin 18)
+//   - Analog pH sensor (pin 34)
+//
+// WATCHDOG:
+//   - 120-second hardware watchdog timer to prevent system hangs
+//   - Reset in main loop and during WiFi connection
+// =============================================================================
+
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WiFiMulti.h>
@@ -15,7 +48,7 @@
 // Add all your networks here — ESP32 will auto-connect to whichever is available
 WiFiMulti wifiMulti;
 
-const char* serverName = "http://192.168.1.34:3000/sensor";
+const char* serverName = "http://10.91.241.9:3000/sensor";
 
 const float TANK_HEIGHT_CM = 36.0f;
 const int ULTRASONIC_SAMPLES = 5;
@@ -182,17 +215,7 @@ void setup() {
   pinMode(PH_PIN, INPUT);
   sensors.begin();
 
-  // =============================================
-  // ADD YOUR WIFI NETWORKS HERE
-  // Format: wifiMulti.addAP("SSID", "password");
-  // =============================================
-  
-   
-   
-   wifiMulti.addAP("PLDTHOMEFIBR5bHBq", "PLDTWIFIHft74");
-   
- 
-  // Add more networks as needed
+  wifiMulti.addAP("Mwa", "dikoalam");
 
   esp_task_wdt_config_t wdt_config = {
     .timeout_ms = 120000,
@@ -236,17 +259,23 @@ void loop() {
   bool levelOK = isWaterLevelValid(waterLevel);
   bool phOK    = isPHValid(phValue);
 
-  // Send data only if WiFi connected AND all sensors valid
-  if (WiFi.status() == WL_CONNECTED && tempOK && levelOK && phOK) {
+  // Send data if WiFi is connected, regardless of individual sensor validation
+  // Invalid sensors are sent as -1 so server can distinguish "sensor failed" from actual readings
+  if (WiFi.status() == WL_CONNECTED) {
     HTTPClient http;
     http.setTimeout(HTTP_TIMEOUT_MS);
     http.begin(serverName);
     http.addHeader("Content-Type", "application/json");
 
+    // Prepare values: use -1 for invalid sensors so server can skip them
+    float sendTemp = (tempOK) ? tempC : -1.0f;
+    float sendLevel = (levelOK) ? waterLevel : -1.0f;
+    float sendPH = (phOK) ? phValue : -1.0f;
+
     char json[128];
     snprintf(json, sizeof(json),
              "{\"device_id\":\"%s\",\"temperature\":%.2f,\"water_level\":%.2f,\"ph\":%.2f}",
-             DEVICE_ID, tempC, waterLevel, phValue);
+             DEVICE_ID, sendTemp, sendLevel, sendPH);
 
     int code = http.POST(json);
 
@@ -263,10 +292,8 @@ void loop() {
     }
 
     http.end();
-  } else if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("WiFi not connected, cannot send data.");
   } else {
-    Serial.println("Data not sent: one or more sensor readings invalid.");
+    Serial.println("WiFi not connected, cannot send data.");
   }
 
   // Print readings
