@@ -24,7 +24,7 @@ import { useSensors } from "../hooks/useSensors";
 import { parseAlertSeverity, type AlertSeverity } from "../types";
 
 export default function AlertsPage() {
-  const { logs, logsLoading, logsError, logsPage, logsTotal, setLogsPage } = useSensors();
+  const { logs, logsLoading, logsError, logsPage, logsTotal, logsCounts, setLogsPage } = useSensors();
   const [filter, setFilter] = useState<"all" | "Alert" | "Change">("all");
 
   const processedLogs = useMemo(() => {
@@ -54,10 +54,10 @@ export default function AlertsPage() {
   const alertCounts = useMemo(
     () => ({
       all: logsTotal ?? logs.length,
-      Alert: logs.filter((l) => l.action === "Alert").length,
-      Change: logs.filter((l) => l.action === "Change").length,
+      Alert: logsCounts?.Alert ?? logs.filter((l) => l.action === "Alert").length,
+      Change: logsCounts?.Change ?? logs.filter((l) => l.action === "Change").length,
     }),
-    [logs, logsTotal]
+    [logs, logsTotal, logsCounts]
   );
 
   const logsTotalPages = useMemo(() => {

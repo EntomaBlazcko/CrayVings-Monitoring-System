@@ -65,6 +65,7 @@ export function useSensors() {
     refetchLogs: logsContext.refetchLogs,
     logsPage: logsContext.logsPage,
     logsTotal: logsContext.logsTotal,
+    logsCounts: logsContext.logsCounts,
     setLogsPage: logsContext.setLogsPage,
     // Activity logs fields
     activityLogs: activityLogsContext.activityLogs,

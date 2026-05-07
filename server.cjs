@@ -379,7 +379,16 @@ async function sendSingleSMS(phoneNumber, message) {
       return true;
     } catch (error) {
       const errorMessage = error.response?.data?.message || error.message;
+      const statusCode = error.response?.status;
       console.error(`❌ Failed to send SMS to ${phoneNumber} (attempt ${attempt + 1}/${maxRetries + 1}): ${errorMessage}`);
+      
+      // Don't retry on 403 (invalid key/no credits) or 400 (bad request)
+      if (statusCode === 403 || statusCode === 400) {
+        console.error(`❌ SMS failed with status ${statusCode} - not retrying (check API key/credits)`);
+        await logSMS(phoneNumber, message, "failed", `Status ${statusCode}: ${errorMessage}`, null);
+        return false;
+      }
+      
       if (attempt === maxRetries) {
         await logSMS(phoneNumber, message, "failed", errorMessage, null);
         return false;
@@ -412,6 +421,78 @@ async function logSMS(phone, message, status, error, smsId = null) {
 // smsMuteUntil: ISO timestamp until which all SMS alerts are suppressed
 let lastAlertedState = {};
 let smsMuteUntil = null;
+
+// Hourly SMS timestamp - loaded from DB on startup, persisted on each send
+let lastHourlyUpdateTs = null;
+
+// Initialize hourly update timestamp from database on server start
+(async () => {
+  try {
+    // Create system_state table if it doesn't exist
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS system_state (
+        key VARCHAR(255) PRIMARY KEY,
+        value TEXT
+      )
+    `);
+    const result = await pool.query("SELECT value FROM system_state WHERE key = 'last_hourly_update_ts'");
+    if (result.rows.length > 0 && result.rows[0].value) {
+      lastHourlyUpdateTs = new Date(result.rows[0].value).getTime();
+      console.log(`[${new Date().toISOString()}] Loaded lastHourlyUpdateTs from DB: ${new Date(lastHourlyUpdateTs).toISOString()}`);
+    }
+  } catch (err) {
+    console.error(`[${new Date().toISOString()}] Error initializing system_state:`, err.message);
+  }
+})();
+
+// =============================================================================
+// DATABASE OPTIMIZATION & CLEANUP
+// =============================================================================
+// Create indexes on large tables for better query performance
+(async () => {
+  try {
+    // Indexes for system_logs (faster pagination and counting)
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_system_logs_timestamp ON system_logs (timestamp DESC)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_system_logs_action ON system_logs (action)`);
+    
+    // Indexes for sms_logs (faster auditing)
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_sms_logs_sent_at ON sms_logs (sent_at DESC)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_sms_logs_status ON sms_logs (status)`);
+    
+    // Indexes for sensors (faster latest/history queries)
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_sensors_timestamp ON sensors (timestamp DESC)`);
+    
+    console.log(`[${new Date().toISOString()}] Database indexes verified/created`);
+  } catch (err) {
+    console.error(`[${new Date().toISOString()}] Error creating indexes:`, err.message);
+  }
+})();
+
+// Auto-cleanup: keep only last 30 days of logs (run on startup and daily)
+const LOGS_RETENTION_DAYS = 30;
+async function cleanupOldLogs() {
+  try {
+    const result = await pool.query(
+      `DELETE FROM system_logs WHERE timestamp < NOW() - INTERVAL '${LOGS_RETENTION_DAYS} days' RETURNING id`
+    );
+    if (result.rowCount > 0) {
+      console.log(`[${new Date().toISOString()}] Cleaned up ${result.rowCount} old system_logs entries`);
+    }
+    
+    const smsResult = await pool.query(
+      `DELETE FROM sms_logs WHERE sent_at < NOW() - INTERVAL '${LOGS_RETENTION_DAYS} days' RETURNING id`
+    );
+    if (smsResult.rowCount > 0) {
+      console.log(`[${new Date().toISOString()}] Cleaned up ${smsResult.rowCount} old sms_logs entries`);
+    }
+  } catch (err) {
+    console.error(`[${new Date().toISOString()}] Error cleaning up logs:`, err.message);
+  }
+}
+
+// Run cleanup on startup, then daily
+cleanupOldLogs();
+setInterval(cleanupOldLogs, 24 * 60 * 60 * 1000);
 
 // =============================================================================
 // API ROUTES
@@ -498,7 +579,7 @@ app.post("/sensor", async (req, res) => {
 
         const nowTs = ts.getTime();
         const hourlyEnabled = SMS_CONFIG.hourly.enabled;
-        if (hourlyEnabled && !global.lastHourlyUpdateTs) global.lastHourlyUpdateTs = nowTs;
+        if (hourlyEnabled && !lastHourlyUpdateTs) lastHourlyUpdateTs = nowTs;
 
         // Evaluate each sensor against its thresholds
         for (const sensor of sensorChecks) {
@@ -508,7 +589,7 @@ app.post("/sensor", async (req, res) => {
           const last = lastAlertedState[sensor.key] || {};
           const lastTs = last.timestamp ? new Date(last.timestamp).getTime() : 0;
 
-          // If reading is back to normal, update state and skip alerting
+          // If reading is back to normal, update state, log resolution, and skip alerting
           if (status === "good") {
             if (last.status && last.status !== "good") {
               await pool.query(
@@ -516,6 +597,9 @@ app.post("/sensor", async (req, res) => {
                 [sensor.key, "good", sensor.val, ts.toISOString()]
               );
               lastAlertedState[sensor.key] = { status: "good", value: sensor.val, timestamp: ts.toISOString() };
+              // Log "Alert Resolved" to system_logs
+              await pool.query(`INSERT INTO system_logs (action, parameter, old_value, new_value) VALUES ($1, $2, $3, $4)`,
+                ["Alert Resolved", sensor.key, last.status, "good"]);
             }
             continue;
           }
@@ -541,6 +625,23 @@ app.post("/sensor", async (req, res) => {
           // Check if SMS alerts are currently muted
           if (smsMuteUntil && new Date() < new Date(smsMuteUntil)) {
             console.log(`[${new Date().toISOString()}] SMS alerts muted until ${smsMuteUntil}, skipping SMS for ${sensor.key} ${status}`);
+            // Log muted SMS to sms_logs for audit trail
+            const recipients = await pool.query("SELECT phone_number FROM authorized_recipients WHERE is_active = true");
+            const isCritical = status === "critical";
+            const template = isCritical ? SMS_CONFIG.messages.critical : SMS_CONFIG.messages.warning;
+            const timestamp = ts.toLocaleString("en-PH", { timeZone: "Asia/Manila", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: true });
+            const direction = sensor.val < sensor.min ? "Low" : "High";
+            for (const r of recipients.rows) {
+              const message = buildMessage(template, {
+                SENSOR: SMS_CONFIG.sensorNames[sensor.key] || sensor.key,
+                NAME: r.name || "User", VALUE: sensor.val, UNIT: SMS_CONFIG.units[sensor.key] || "",
+                THRESHOLD: direction === "Low" ? sensor.min : sensor.max, TIME: timestamp
+              });
+              await logSMS(r.phone_number, message, "muted", `SMS muted until ${smsMuteUntil}`, null);
+            }
+            // Log to system_logs
+            await pool.query(`INSERT INTO system_logs (action, parameter, old_value, new_value) VALUES ($1, $2, $3, $4)`,
+              ["Alert Muted", sensor.key, status, `Muted until ${smsMuteUntil}`]);
             continue;
           }
 
@@ -564,12 +665,29 @@ app.post("/sensor", async (req, res) => {
         }
 
         // Check and send hourly SMS updates
-        if (hourlyEnabled && nowTs - global.lastHourlyUpdateTs >= SMS_CONFIG.hourly.intervalMs) {
-          global.lastHourlyUpdateTs = nowTs;
+        if (hourlyEnabled && nowTs - lastHourlyUpdateTs >= SMS_CONFIG.hourly.intervalMs) {
+          lastHourlyUpdateTs = nowTs;
+          // Persist to DB
+          await pool.query(`INSERT INTO system_state (key, value) VALUES ('last_hourly_update_ts', $1) ON CONFLICT (key) DO UPDATE SET value = $1`,
+            [new Date(nowTs).toISOString()]);
 
           // Check if SMS alerts are currently muted
           if (smsMuteUntil && new Date() < new Date(smsMuteUntil)) {
             console.log(`[${new Date().toISOString()}] SMS alerts muted until ${smsMuteUntil}, skipping hourly update`);
+            // Log muted hourly SMS to sms_logs
+            const hourlyRecipients = await pool.query("SELECT phone_number, name FROM authorized_recipients WHERE is_active = true");
+            if (hourlyRecipients.rows.length > 0) {
+              const hourlyMessage = buildMessage(SMS_CONFIG.messages.hourlyUpdate, {
+                TIME: ts.toLocaleString("en-PH", { timeZone: "Asia/Manila", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: true }),
+                TEMP: temperature ?? "N/A", TEMP_STATUS: "N/A", PH: ph ?? "N/A", PH_STATUS: "N/A",
+                WATER: water_level ?? "N/A", WATER_STATUS: "N/A", SUMMARY: "SMS muted"
+              });
+              for (const r of hourlyRecipients.rows) {
+                await logSMS(r.phone_number, hourlyMessage, "muted", `SMS muted until ${smsMuteUntil}`, null);
+              }
+              await pool.query(`INSERT INTO system_logs (action, parameter, old_value, new_value) VALUES ($1, $2, $3, $4)`,
+                ["Hourly Update Muted", "SMS", "hourly", `Muted until ${smsMuteUntil}`]);
+            }
           } else {
             const hourlyRecipients = await pool.query("SELECT phone_number, name FROM authorized_recipients WHERE is_active = true");
             if (hourlyRecipients.rows.length > 0) {
@@ -962,9 +1080,9 @@ app.post("/logs", async (req, res) => {
 
 /**
  * GET /system-logs
- * Returns paginated system log entries.
+ * Returns paginated system log entries with per-action counts.
  * Query parameters: page (default: 1), limit (default: 20, max: 100)
- * Returns: { data: [], total: number, page: number, limit: number }
+ * Returns: { data: [], total: number, page: number, limit: number, counts: { action: count } }
  */
 app.get("/system-logs", async (req, res) => {
   try {
@@ -973,7 +1091,10 @@ app.get("/system-logs", async (req, res) => {
     const offset = (page - 1) * limit;
     const result = await pool.query("SELECT * FROM system_logs ORDER BY timestamp DESC LIMIT $1 OFFSET $2", [limit, offset]);
     const countResult = await pool.query("SELECT COUNT(*) FROM system_logs");
-    res.json({ data: result.rows, total: parseInt(countResult.rows[0].count), page, limit });
+    const countsResult = await pool.query("SELECT action, COUNT(*)::int AS count FROM system_logs GROUP BY action");
+    const counts = {};
+    countsResult.rows.forEach(row => { counts[row.action] = row.count; });
+    res.json({ data: result.rows, total: parseInt(countResult.rows[0].count), page, limit, counts });
   } catch (err) {
     res.status(500).json({ message: "Error fetching logs", error: err.message });
   }
@@ -1000,17 +1121,22 @@ app.post('/alert/device-disconnect', async (req, res) => {
     if (smsMuteUntil && new Date() < new Date(smsMuteUntil)) {
       console.log('[' + new Date().toISOString() + '] SMS alerts muted until ' + smsMuteUntil + ', skipping disconnect alert');
       await pool.query('INSERT INTO system_logs (action, parameter, old_value, new_value) VALUES ($1, $2, $3, $4)', ['Device Disconnect Muted', 'ESP32', String(consecutive_failures || 0), 'Muted until ' + smsMuteUntil]);
+      // Log muted SMS to sms_logs for audit trail
+      const muteTimestamp = new Date().toLocaleString('en-PH', { timeZone: 'Asia/Manila', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: true });
+      const muteMessage = 'CRAYVINGS DEVICE ALERT\nESP32 device disconnected\n' + (description || 'No data received for 15+ seconds') + '\nFailed polls: ' + (consecutive_failures || 0) + '\nTime: ' + muteTimestamp;
+      for (const r of recipients.rows) {
+        await logSMS(r.phone_number, muteMessage, 'muted', 'SMS muted until ' + smsMuteUntil, null);
+      }
       return res.json({ message: 'SMS alerts muted', sent: 0, total: recipients.rows.length, muted: true, muteExpires: smsMuteUntil });
     }
 
     const timestamp = new Date().toLocaleString('en-PH', { timeZone: 'Asia/Manila', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: true });
     const message = 'CRAYVINGS DEVICE ALERT\nESP32 device disconnected\n' + (description || 'No data received for 15+ seconds') + '\nFailed polls: ' + (consecutive_failures || 0) + '\nTime: ' + timestamp;
 
-    let sent = 0;
-    for (const r of recipients.rows) {
-      const success = await sendSingleSMS(r.phone_number, message);
-      if (success) sent++;
-    }
+    // Send all SMS in parallel instead of sequentially
+    const smsPromises = recipients.rows.map(async (r) => sendSingleSMS(r.phone_number, message));
+    const results = await Promise.allSettled(smsPromises);
+    const sent = results.filter(r => r.status === 'fulfilled' && r.value === true).length;
 
     await pool.query('INSERT INTO system_logs (action, parameter, old_value, new_value) VALUES ($1, $2, $3, $4)', ['Device Disconnect', 'ESP32', String(consecutive_failures || 0), description || '']);
     res.json({ message: 'Disconnect alerts sent', sent, total: recipients.rows.length });

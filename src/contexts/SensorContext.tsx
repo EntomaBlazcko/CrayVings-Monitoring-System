@@ -80,7 +80,7 @@ export interface SensorSettingsContextValue {
 // ========================
 /**
  * Context value shape for system log entries.
- * Contains paginated logs and page navigation.
+ * Contains paginated logs, page navigation, and per-action counts.
  */
 export interface LogsContextValue {
   logs: LogEntry[];                    // Current page of log entries
@@ -89,6 +89,7 @@ export interface LogsContextValue {
   refetchLogs: () => void;             // Manual trigger to re-fetch logs
   logsPage: number;                    // Current page number
   logsTotal: number;                   // Total number of log entries
+  logsCounts: Record<string, number>;  // Per-action counts from API
   setLogsPage: (page: number) => void; // Navigate to a specific page
 }
 

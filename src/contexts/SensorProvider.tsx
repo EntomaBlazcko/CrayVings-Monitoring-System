@@ -107,6 +107,7 @@ interface LogsState {
   logsError: string | null;
   logsPage: number;
   logsTotal: number;
+  logsCounts: Record<string, number>;
 }
 
 // ========================
@@ -378,6 +379,7 @@ function useLogsManager(): LogsState & { refetch: () => void; setPage: (page: nu
     logsError: null,
     logsPage: 1,
     logsTotal: 0,
+    logsCounts: {},
   });
 
   const abortControllerRef = useRef<AbortController | null>(null);
@@ -398,6 +400,7 @@ function useLogsManager(): LogsState & { refetch: () => void; setPage: (page: nu
         logsError: null,
         logsPage: response.page,
         logsTotal: response.total,
+        logsCounts: response.counts || {},
       }));
     } catch {
       setState((prev) => ({
@@ -650,6 +653,7 @@ export function SensorProvider({ children }: { children: ReactNode }) {
       refetchLogs: logsState.refetch,
       logsPage: logsState.logsPage,
       logsTotal: logsState.logsTotal,
+      logsCounts: logsState.logsCounts,
       setLogsPage: logsState.setPage,
     }),
     [logsState]
