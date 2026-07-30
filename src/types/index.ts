@@ -32,7 +32,6 @@ export type SensorEntry = {
   device_id: string;       // ESP32 device identifier
   temperature: number;     // Water temperature in Celsius
   water_level: number;     // Water level as percentage
-  ph: number;              // pH level of the water
   timestamp?: string;      // ISO 8601 timestamp of the reading
 };
 
@@ -46,7 +45,6 @@ export type ChartPoint = {
   timestamp: string;       // ISO 8601 timestamp
   temperature: number;     // Temperature value for charting
   water_level: number;     // Water level value for charting
-  ph: number;              // pH value for charting
 };
 
 // ========================
@@ -97,7 +95,7 @@ export function isValidMenuKey(value: string): value is MenuKey {
 export type LogEntry = {
   id?: number;
   action: string;              // e.g., "Alert", "Change", "Device Disconnect"
-  parameter: string;           // e.g., "Temperature", "pH Level", "Water Level"
+  parameter: string;           // e.g., "Temperature", "Water Level"
   old_value: string | number;  // Previous value or threshold direction ("Low"/"High")
   new_value: string | number;  // New sensor reading value
   timestamp?: string;          // ISO 8601 timestamp
@@ -115,25 +113,21 @@ export type LogEntry = {
  */
 export type SensorSettings = {
   id?: number;
-  temp_min: number;           // Minimum acceptable temperature (°C)
-  temp_max: number;           // Maximum acceptable temperature (°C)
-  ph_min: number;             // Minimum acceptable pH level
-  ph_max: number;             // Maximum acceptable pH level
-  water_level_min: number;    // Minimum acceptable water level (%)
-  water_level_max: number;    // Maximum acceptable water level (%)
-  updated_at?: string;        // Last update timestamp
+  temp_min: number;
+  temp_max: number;
+  water_level_min: number;
+  water_level_max: number;
+  updated_at?: string;
 };
 
 /**
  * Default threshold values used when no settings exist in the database.
  * These represent safe ranges for crayfish aquaculture.
- * Temperature: 20-31°C, pH: 6.5-8.5, Water Level: 10-100%
+ * Temperature: 20-31°C, Water Level: 10-100%
  */
 export const DEFAULT_SETTINGS: SensorSettings = {
   temp_min:20.0,
   temp_max:31.0,
-  ph_min:6.5,
-  ph_max:8.5,
   water_level_min:10.0,
   water_level_max:100.0,
 };
@@ -167,7 +161,7 @@ export type SensorThreshold = {
 /**
  * Converts SensorSettings into a map of SensorThreshold configurations.
  * Maps database field names (temp_min/temp_max) to sensor keys
- * (temperature/ph/water_level) used throughout the frontend.
+ * (temperature/water_level) used throughout the frontend.
  */
 export function getSettingsThresholds(settings: SensorSettings | null): Record<string, SensorThreshold> {
   const defaults = settings ?? DEFAULT_SETTINGS;
@@ -178,13 +172,6 @@ export function getSettingsThresholds(settings: SensorSettings | null): Record<s
       range: { min: defaults.temp_min, max: defaults.temp_max },
       isMinOnly: false,
       color: "text-orange-500",
-    },
-    ph: {
-      name: "pH Level",
-      unit: "",
-      range: { min: defaults.ph_min, max: defaults.ph_max },
-      isMinOnly: false,
-      color: "text-purple-500",
     },
     water_level: {
       name: "Water Level",
@@ -266,7 +253,6 @@ export interface AlertEntry extends LogEntry {
  * Determines the severity of an alert based on sensor parameter and value.
  * Uses hardcoded critical thresholds for classification:
  *   - Temperature: critical if >35°C or <15°C
- *   - pH Level: critical if >9 or <5
  *   - Water Level: always "warning" (no critical threshold defined)
  */
 export function parseAlertSeverity(log: LogEntry): AlertSeverity {
@@ -277,8 +263,6 @@ export function parseAlertSeverity(log: LogEntry): AlertSeverity {
   
   if (param === "Temperature") {
     return val > 35 || val < 15 ? "critical" : "warning";
-  } else if (param === "pH Level") {
-    return val > 9 || val < 5 ? "critical" : "warning";
   }
   return "warning";
 }
@@ -314,21 +298,19 @@ export function getApiBase(): string {
 
 /**
  * Maps internal sensor keys to human-readable display names.
- * e.g., "temperature" -> "Temperature", "ph" -> "pH Level"
+ * e.g., "temperature" -> "Temperature", "water_level" -> "Water Level"
  */
 export const SENSOR_KEY_TO_DISPLAY: Record<string, string> = {
   temperature: "Temperature",
-  ph: "pH Level",
   water_level: "Water Level",
 };
 
 /**
  * Maps display names back to internal sensor keys.
- * e.g., "Temperature" -> "temperature", "pH Level" -> "ph"
+ * e.g., "Temperature" -> "temperature", "Water Level" -> "water_level"
  */
 export const DISPLAY_TO_SENSOR_KEY: Record<string, string> = {
   "Temperature": "temperature",
-  "pH Level": "ph",
   "Water Level": "water_level",
 };
 

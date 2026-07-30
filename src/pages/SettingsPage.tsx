@@ -6,7 +6,7 @@
 // This is the largest page in the application. It manages:
 //
 // 1. ALERT THRESHOLDS (all users view, admin users edit):
-//    - Min/Max inputs for Temperature, pH, and Water Level
+//    - Min/Max inputs for Temperature and Water Level
 //    - Validation (bounds checking, min < max enforcement)
 //    - Save and Reset to Defaults buttons
 //    - Non-admin users see read-only fields with lock icon
@@ -73,29 +73,23 @@ import type { UserEntry, SmsRecipient } from "../api/client";
 const SETTING_BOUNDS: Record<string, { min: number; max: number }> = {
   temp_min: { min: -10, max: 50 },
   temp_max: { min: -10, max: 50 },
-  ph_min: { min: 0, max: 14 },
-  ph_max: { min: 0, max: 14 },
   water_level_min: { min: 0, max: 100 },
   water_level_max: { min: 0, max: 100 },
 };
 
 const KEY_MAPPING: Record<string, { min: keyof SensorSettings; max: keyof SensorSettings }> = {
   temperature: { min: "temp_min", max: "temp_max" },
-  ph: { min: "ph_min", max: "ph_max" },
   water_level: { min: "water_level_min", max: "water_level_max" },
 };
 
 const THRESHOLD_COLORS: Record<string, { bg: string; border: string }> = {
   temperature: { bg: "bg-blue-50", border: "border-blue-100" },
-  ph: { bg: "bg-emerald-50", border: "border-emerald-100" },
   water_level: { bg: "bg-indigo-50", border: "border-indigo-100" },
 };
 
 const SETTINGS_FIELDS: Array<keyof SensorSettings> = [
   "temp_min",
   "temp_max",
-  "ph_min",
-  "ph_max",
   "water_level_min",
   "water_level_max",
 ];

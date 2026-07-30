@@ -303,12 +303,12 @@ const SMS_CONFIG = {
     // Critical template: sent when a reading is dangerously outside the safe range
     critical: "🚨 {{SENSOR}} CRITICAL ALERT\nRecipient: {{NAME}}\nReading: {{VALUE}}{{UNIT}}\nThreshold: {{THRESHOLD}}{{UNIT}}\nTime: {{TIME}}\nStatus: CRITICAL",
     // Hourly update template: periodic summary of all sensor statuses
-    hourlyUpdate: "📊 CRAYVINGS HOURLY UPDATE\nTime: {{TIME}}\nTemperature: {{TEMP}}°C ({{TEMP_STATUS}})\npH Level: {{PH}} ({{PH_STATUS}})\nWater Level: {{WATER}}% ({{WATER_STATUS}})\n{{SUMMARY}}"
+    hourlyUpdate: "📊 CRAYVINGS HOURLY UPDATE\nTime: {{TIME}}\nTemperature: {{TEMP}}°C ({{TEMP_STATUS}})\nWater Level: {{WATER}}% ({{WATER_STATUS}})\n{{SUMMARY}}"
   },
   // Maps display names to SMS-friendly uppercase names
-  sensorNames: { "Temperature": "TEMPERATURE", "pH Level": "PH LEVEL", "Water Level": "WATER LEVEL" },
+  sensorNames: { "Temperature": "TEMPERATURE", "Water Level": "WATER LEVEL" },
   // Units for each sensor type in SMS messages
-  units: { "Temperature": "°C", "pH Level": "pH", "Water Level": "%" },
+  units: { "Temperature": "°C", "Water Level": "%" },
   // Hourly SMS update settings
   hourly: {
     enabled: process.env.HOURLY_SMS_ENABLED !== "false",
@@ -529,7 +529,7 @@ app.get("/", (req, res) => {
  * POST /sensor
  * PRIMARY DATA INGESTION ENDPOINT - Called by the ESP32 device.
  *
- * Receives sensor readings (temperature, water_level, pH) from the ESP32,
+ * Receives sensor readings (temperature, water_level) from the ESP32,
  * stores them in the PostgreSQL sensors table, then responds immediately.
  * Threshold evaluation and SMS alerts run asynchronously in the background.
  *
@@ -537,11 +537,10 @@ app.get("/", (req, res) => {
  *   - device_id (required): Identifier for the ESP32 device
  *   - temperature: Water temperature in Celsius (-1 if sensor failed)
  *   - water_level: Water level percentage (-1 if sensor failed)
- *   - ph: pH level of the water (-1 if sensor failed)
  *
  * Alert logic (runs in background via setImmediate):
  *   1. Fetches current threshold settings from sensor_settings table
- *   2. For each sensor (temp, pH, water_level), skips negative values (-1 = sensor failed)
+ *   2. For each sensor (temp, water_level), skips negative values (-1 = sensor failed)
  *   3. If value outside range, determines warning vs critical based on 15% deviation
  *   4. Checks cooldown period (2 minutes for both warning and critical)
  *   5. Checks if SMS alerts are muted (smsMuteUntil)
@@ -551,14 +550,14 @@ app.get("/", (req, res) => {
  */
 app.post("/sensor", async (req, res) => {
   try {
-    const { device_id, temperature, water_level, ph } = req.body;
+    const { device_id, temperature, water_level } = req.body;
     if (!device_id) return res.status(400).json({ message: "device_id is required" });
 
     // Store sensor reading in the database
     const ts = new Date();
     const result = await pool.query(
-      `INSERT INTO sensors (device_id, temperature, water_level, ph, timestamp) VALUES ($1, $2, $3, $4, $5) RETURNING *`,
-      [device_id, Number(temperature ?? 0), Number(water_level ?? 0), Number(ph ?? 0), ts]
+      `INSERT INTO sensors (device_id, temperature, water_level, timestamp) VALUES ($1, $2, $3, $4) RETURNING *`,
+      [device_id, Number(temperature ?? 0), Number(water_level ?? 0), ts]
     );
     console.log(`[${new Date().toISOString()}] Sensor data saved from ${device_id}`);
 
@@ -569,11 +568,10 @@ app.post("/sensor", async (req, res) => {
     setImmediate(async () => {
       try {
         const settingsResult = await pool.query("SELECT * FROM sensor_settings LIMIT 1");
-        const settings = settingsResult.rows[0] || { temp_min: 20, temp_max: 31, ph_min: 6.5, ph_max: 8.5, water_level_min: 10, water_level_max: 100 };
+        const settings = settingsResult.rows[0] || { temp_min: 20, temp_max: 31, water_level_min: 10, water_level_max: 100 };
 
         const sensorChecks = [
           { key: "Temperature", val: Number(temperature), min: Number(settings.temp_min), max: Number(settings.temp_max) },
-          { key: "pH Level", val: Number(ph), min: Number(settings.ph_min), max: Number(settings.ph_max) },
           { key: "Water Level", val: Number(water_level), min: Number(settings.water_level_min), max: Number(settings.water_level_max) },
         ];
 
@@ -679,7 +677,7 @@ app.post("/sensor", async (req, res) => {
             if (hourlyRecipients.rows.length > 0) {
               const hourlyMessage = buildMessage(SMS_CONFIG.messages.hourlyUpdate, {
                 TIME: ts.toLocaleString("en-PH", { timeZone: "Asia/Manila", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: true }),
-                TEMP: temperature ?? "N/A", TEMP_STATUS: "N/A", PH: ph ?? "N/A", PH_STATUS: "N/A",
+                TEMP: temperature ?? "N/A", TEMP_STATUS: "N/A",
                 WATER: water_level ?? "N/A", WATER_STATUS: "N/A", SUMMARY: "SMS muted"
               });
               for (const r of hourlyRecipients.rows) {
@@ -692,13 +690,12 @@ app.post("/sensor", async (req, res) => {
             const hourlyRecipients = await pool.query("SELECT phone_number, name FROM authorized_recipients WHERE is_active = true");
             if (hourlyRecipients.rows.length > 0) {
               const tempStatus = getStatusText(getThresholdStatus(Number(temperature), Number(settings.temp_min), Number(settings.temp_max)));
-              const phStatus = getStatusText(getThresholdStatus(Number(ph), Number(settings.ph_min), Number(settings.ph_max)));
               const waterStatus = getStatusText(getThresholdStatus(Number(water_level), Number(settings.water_level_min), Number(settings.water_level_max)));
               const hourlyTimestamp = ts.toLocaleString("en-PH", { timeZone: "Asia/Manila", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: true });
-              const summary = (tempStatus === "✅ Good" && phStatus === "✅ Good" && waterStatus === "✅ Good") ? "All systems normal" : "Some parameters need attention";
+              const summary = (tempStatus === "✅ Good" && waterStatus === "✅ Good") ? "All systems normal" : "Some parameters need attention";
               const hourlyMessage = buildMessage(SMS_CONFIG.messages.hourlyUpdate, {
                 TIME: hourlyTimestamp, TEMP: temperature ?? "N/A", TEMP_STATUS: tempStatus,
-                PH: ph ?? "N/A", PH_STATUS: phStatus, WATER: water_level ?? "N/A", WATER_STATUS: waterStatus, SUMMARY: summary
+                WATER: water_level ?? "N/A", WATER_STATUS: waterStatus, SUMMARY: summary
               });
               const hourlyPromises = hourlyRecipients.rows.map(async (r) => sendSingleSMS(r.phone_number, hourlyMessage));
               await Promise.allSettled(hourlyPromises);
@@ -870,16 +867,13 @@ app.get("/settings", async (req, res) => {
   try {
     const result = await pool.query("SELECT * FROM sensor_settings LIMIT 1");
     if (result.rows.length === 0) {
-      return res.json({ temp_min: 20, temp_max: 31, ph_min: 6.5, ph_max: 8.5, water_level_min: 10, water_level_max: 100 });
+      return res.json({ temp_min: 20, temp_max: 31, water_level_min: 10, water_level_max: 100 });
     }
-    // Convert PostgreSQL NUMERIC strings to JavaScript numbers for frontend compatibility
     const row = result.rows[0];
     res.json({
       id: Number(row.id),
       temp_min: Number(row.temp_min),
       temp_max: Number(row.temp_max),
-      ph_min: Number(row.ph_min),
-      ph_max: Number(row.ph_max),
       water_level_min: Number(row.water_level_min),
       water_level_max: Number(row.water_level_max),
       updated_at: row.updated_at,
@@ -897,12 +891,11 @@ app.get("/settings", async (req, res) => {
  */
 app.post("/settings", requireAdmin, async (req, res) => {
   try {
-    const { temp_min, temp_max, ph_min, ph_max, water_level_min, water_level_max } = req.body;
+    const { temp_min, temp_max, water_level_min, water_level_max } = req.body;
     const existing = await pool.query("SELECT * FROM sensor_settings LIMIT 1");
     let savedSettings;
     if (existing.rows.length > 0) {
-      // Only update if values have actually changed
-      const changes = getChangedFields(existing.rows[0], { temp_min, temp_max, ph_min, ph_max, water_level_min, water_level_max });
+      const changes = getChangedFields(existing.rows[0], { temp_min, temp_max, water_level_min, water_level_max });
       if (Object.keys(changes).length === 0) return res.json({ message: "No change", changed: false, data: existing.rows[0] });
       const keys = Object.keys(changes);
       const values = Object.values(changes);
@@ -911,8 +904,8 @@ app.post("/settings", requireAdmin, async (req, res) => {
       savedSettings = result.rows[0];
     } else {
       const result = await pool.query(
-        `INSERT INTO sensor_settings (temp_min, temp_max, ph_min, ph_max, water_level_min, water_level_max) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
-        [temp_min, temp_max, ph_min, ph_max, water_level_min, water_level_max]
+        `INSERT INTO sensor_settings (temp_min, temp_max, water_level_min, water_level_max) VALUES ($1, $2, $3, $4) RETURNING *`,
+        [temp_min, temp_max, water_level_min, water_level_max]
       );
       savedSettings = result.rows[0];
     }
@@ -928,19 +921,19 @@ app.post("/settings", requireAdmin, async (req, res) => {
  */
 app.post("/settings/reset", requireAdmin, async (req, res) => {
   try {
-    const defaults = { temp_min: 20, temp_max: 31, ph_min: 6.5, ph_max: 8.5, water_level_min: 10, water_level_max: 100 };
+    const defaults = { temp_min: 20, temp_max: 31, water_level_min: 10, water_level_max: 100 };
     const existing = await pool.query("SELECT * FROM sensor_settings LIMIT 1");
     let savedSettings;
     if (existing.rows.length > 0) {
       const result = await pool.query(
-        `UPDATE sensor_settings SET temp_min=$1, temp_max=$2, ph_min=$3, ph_max=$4, water_level_min=$5, water_level_max=$6, updated_at=NOW() WHERE id=$7 RETURNING *`,
-        [defaults.temp_min, defaults.temp_max, defaults.ph_min, defaults.ph_max, defaults.water_level_min, defaults.water_level_max, existing.rows[0].id]
+        `UPDATE sensor_settings SET temp_min=$1, temp_max=$2, water_level_min=$3, water_level_max=$4, updated_at=NOW() WHERE id=$5 RETURNING *`,
+        [defaults.temp_min, defaults.temp_max, defaults.water_level_min, defaults.water_level_max, existing.rows[0].id]
       );
       savedSettings = result.rows[0];
     } else {
       const result = await pool.query(
-        `INSERT INTO sensor_settings (temp_min, temp_max, ph_min, ph_max, water_level_min, water_level_max) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
-        [defaults.temp_min, defaults.temp_max, defaults.ph_min, defaults.ph_max, defaults.water_level_min, defaults.water_level_max]
+        `INSERT INTO sensor_settings (temp_min, temp_max, water_level_min, water_level_max) VALUES ($1, $2, $3, $4) RETURNING *`,
+        [defaults.temp_min, defaults.temp_max, defaults.water_level_min, defaults.water_level_max]
       );
       savedSettings = result.rows[0];
     }
@@ -1033,19 +1026,17 @@ app.post("/settings/recipients/test/:id", requireAdmin, async (req, res) => {
 
     // Fetch current settings and latest sensor reading to build the test message
     const settingsResult = await pool.query("SELECT * FROM sensor_settings LIMIT 1");
-    const settings = settingsResult.rows[0] || { temp_min: 20, temp_max: 31, ph_min: 6.5, ph_max: 8.5, water_level_min: 10, water_level_max: 100 };
+    const settings = settingsResult.rows[0] || { temp_min: 20, temp_max: 31, water_level_min: 10, water_level_max: 100 };
     const sensorResult = await pool.query("SELECT * FROM sensors ORDER BY timestamp DESC LIMIT 1");
     const sensor = sensorResult.rows[0] || null;
 
     const temp = sensor?.temperature ?? "N/A";
-    const ph = sensor?.ph ?? "N/A";
     const water = sensor?.water_level ?? "N/A";
     const tempStatus = sensor ? getStatusText(getThresholdStatus(Number(sensor.temperature), Number(settings.temp_min), Number(settings.temp_max))) : "N/A";
-    const phStatus = sensor ? getStatusText(getThresholdStatus(Number(sensor.ph), Number(settings.ph_min), Number(settings.ph_max))) : "N/A";
     const waterStatus = sensor ? getStatusText(getThresholdStatus(Number(sensor.water_level), Number(settings.water_level_min), Number(settings.water_level_max))) : "N/A";
     const timestamp = new Date().toLocaleString("en-PH", { timeZone: "Asia/Manila", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: true });
-    const summary = (tempStatus === "✅ Good" && phStatus === "✅ Good" && waterStatus === "✅ Good") ? "All systems normal" : "Some parameters need attention";
-    const testMessage = `📊 CRAYVINGS LIVE READINGS (TEST)\nTime: ${timestamp}\nTemperature: ${temp}°C (${tempStatus})\npH Level: ${ph} (${phStatus})\nWater Level: ${water}% (${waterStatus})\n${summary}\n(This is a test message)`;
+    const summary = (tempStatus === "✅ Good" && waterStatus === "✅ Good") ? "All systems normal" : "Some parameters need attention";
+    const testMessage = `📊 CRAYVINGS LIVE READINGS (TEST)\nTime: ${timestamp}\nTemperature: ${temp}°C (${tempStatus})\nWater Level: ${water}% (${waterStatus})\n${summary}\n(This is a test message)`;
 
     await sendSingleSMS(phone_number, testMessage);
     res.json({ success: true, message: "Test SMS sent" });

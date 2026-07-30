@@ -5,8 +5,8 @@
 //
 // This page allows users to view sensor trends over different time periods:
 //   1. Time range selector: 1 Hour / 6 Hours / 24 Hours / All Time
-//   2. Three summary cards showing Min/Average/Max for each sensor
-//   3. Three full-width line charts (vertical layout for readability)
+//   2. Two summary cards showing Min/Average/Max for each sensor
+//   3. Two full-width line charts (vertical layout for readability)
 //
 // FEATURES:
 //   - Dynamically fetches more data from the backend for longer time ranges
@@ -25,7 +25,6 @@ import {
   History,
   Thermometer,
   Waves,
-  FlaskConical,
   Filter,
   TrendingUp,
   TrendingDown,
@@ -42,10 +41,10 @@ type TimeRange = "1h" | "6h" | "24h" | "all";
  * Calculates min, max, and average statistics for each sensor parameter.
  * Returns null if no data is available.
  */
-function getStats(data: { temperature?: number | string; ph?: number | string; water_level?: number | string }[]) {
+function getStats(data: { temperature?: number | string; water_level?: number | string }[]) {
   if (!data || data.length === 0) return null;
 
-  const calc = (key: "temperature" | "ph" | "water_level") => {
+  const calc = (key: "temperature" | "water_level") => {
     const values = data
       .map(d => Number(d[key]))
       .filter(v => !isNaN(v));
@@ -59,7 +58,6 @@ function getStats(data: { temperature?: number | string; ph?: number | string; w
 
   return {
     temperature: calc("temperature"),
-    ph: calc("ph"),
     water_level: calc("water_level"),
   };
 }
@@ -173,8 +171,8 @@ export default function HistoricalDataPage() {
           <div className="h-6 bg-gray-200 rounded w-48 mb-2"></div>
           <div className="h-4 bg-gray-100 rounded w-64"></div>
         </div>
-        <div className="grid grid-cols-3 gap-3">
-          {[1, 2, 3].map(i => (
+        <div className="grid grid-cols-2 gap-3">
+          {[1, 2].map(i => (
             <div key={i} className="bg-white rounded-xl border border-gray-100 p-4 animate-pulse">
               <div className="h-4 bg-gray-200 rounded w-20 mb-2"></div>
               <div className="h-8 bg-gray-100 rounded w-16"></div>
@@ -182,7 +180,7 @@ export default function HistoricalDataPage() {
           ))}
         </div>
         <div className="grid grid-cols-1 gap-3">
-          {[1, 2, 3].map(i => (
+          {[1, 2].map(i => (
             <div key={i} className="bg-white rounded-xl border border-gray-100 p-4 animate-pulse h-48"></div>
           ))}
         </div>
@@ -248,7 +246,7 @@ export default function HistoricalDataPage() {
       </div>
 
       {/* Summary Cards */}
-      <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
         <div className="bg-white rounded-xl border border-gray-100 p-4 hover:shadow-sm transition">
           <div className="flex items-center justify-between mb-2">
             <div className="flex items-center gap-2 text-gray-500">
@@ -271,31 +269,6 @@ export default function HistoricalDataPage() {
           </div>
           <div className="text-2xl font-bold text-gray-800">
             {latestReading?.temperature != null ? Number(latestReading.temperature).toFixed(1) : "--"}<span className="text-base font-normal text-gray-500">°C</span>
-          </div>
-        </div>
-
-        <div className="bg-white rounded-xl border border-gray-100 p-4 hover:shadow-sm transition">
-          <div className="flex items-center justify-between mb-2">
-            <div className="flex items-center gap-2 text-gray-500">
-              <FlaskConical size={16} className="text-purple-500" />
-              <span className="text-xs font-semibold uppercase tracking-wide">pH Level</span>
-            </div>
-            {stats?.ph && (
-              <div className="flex gap-3 text-xs">
-                <span className="text-blue-600" title="Min">
-                  <TrendingDown size={12} className="inline" /> {stats.ph.min.toFixed(1)}
-                </span>
-                <span className="text-green-600" title="Average">
-                  <Activity size={12} className="inline" /> {stats.ph.avg.toFixed(1)}
-                </span>
-                <span className="text-red-600" title="Max">
-                  <TrendingUp size={12} className="inline" /> {stats.ph.max.toFixed(1)}
-                </span>
-              </div>
-            )}
-          </div>
-          <div className="text-2xl font-bold text-gray-800">
-            {latestReading?.ph != null ? Number(latestReading.ph).toFixed(1) : "--"}
           </div>
         </div>
 
@@ -339,12 +312,6 @@ export default function HistoricalDataPage() {
             data={filteredHistory}
             dataKey="water_level"
             stroke="#2563eb"
-          />
-          <TrendCard
-            title="pH Level"
-            data={filteredHistory}
-            dataKey="ph"
-            stroke="#6366f1"
           />
         </div>
       ) : (

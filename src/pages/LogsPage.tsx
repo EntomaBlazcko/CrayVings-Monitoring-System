@@ -4,7 +4,7 @@
 // PURPOSE: System logs page with parameter filtering and PDF export.
 //
 // This page displays system log entries in a table format with:
-//   1. Parameter filter buttons: All / Temperature / pH Level / Water Level
+//   1. Parameter filter buttons: All / Temperature / Water Level
 //   2. Paginated table showing timestamp, parameter, old value, new value, action
 //   3. PDF export functionality (via jsPDF + autoTable)
 //
@@ -19,7 +19,7 @@
 // =============================================================================
 
 import { useState, useMemo, useCallback } from "react";
-import { FileText, Download, Clock, Thermometer, Waves, FlaskConical } from "lucide-react";
+import { FileText, Download, Clock, Thermometer, Waves } from "lucide-react";
 import { useSensors } from "../hooks/useSensors";
 import { jsPDF } from "jspdf";
 import autoTable, { type HookData } from "jspdf-autotable";
@@ -27,14 +27,12 @@ import { SENSOR_KEY_TO_DISPLAY } from "../types";
 
 const PARAMETER_ICONS: Record<string, React.ReactNode> = {
   Temperature: <Thermometer size={14} className="text-blue-500" />,
-  "pH Level": <FlaskConical size={14} className="text-emerald-500" />,
   "Water Level": <Waves size={14} className="text-indigo-500" />,
   temperature: <Thermometer size={14} className="text-blue-500" />,
-  ph: <FlaskConical size={14} className="text-emerald-500" />,
   water_level: <Waves size={14} className="text-indigo-500" />,
 };
 
-const PARAMETERS = ["all", "Temperature", "pH Level", "Water Level"] as const;
+const PARAMETERS = ["all", "Temperature", "Water Level"] as const;
 type ParameterFilter = typeof PARAMETERS[number];
 
 export default function LogsPage() {
@@ -94,11 +92,11 @@ export default function LogsPage() {
 
   const parameterCounts = filteredLogs.reduce<Record<string, number>>((acc, log) => {
     const displayParam = getDisplayParameter(log.parameter);
-    if (["Temperature", "pH Level", "Water Level"].includes(displayParam)) {
+    if (["Temperature", "Water Level"].includes(displayParam)) {
       acc[displayParam] = (acc[displayParam] || 0) + 1;
     }
     return acc;
-  }, { Temperature: 0, "pH Level":0, "Water Level":0 });
+  }, { Temperature: 0, "Water Level":0 });
 
     const summaryY = 34;
     doc.setFontSize(11);
@@ -121,7 +119,7 @@ export default function LogsPage() {
   const tableData = filteredLogs
     .filter((log) => {
       const displayParam = getDisplayParameter(log.parameter);
-      return ["Temperature", "pH Level", "Water Level"].includes(displayParam);
+      return ["Temperature", "Water Level"].includes(displayParam);
     })
     .map((log) => [
       log.timestamp ? new Date(log.timestamp).toLocaleString() : "-",

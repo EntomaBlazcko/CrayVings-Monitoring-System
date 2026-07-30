@@ -1,39 +1,6 @@
-// =============================================================================
-// FILE: esp32code.ino
-// =============================================================================
-// PURPOSE: ESP32 firmware for the CRAYvings Aquaculture Monitoring System.
-//
-// This firmware:
-//   1. Reads temperature (DS18B20 via OneWire)
-//   2. Measures water level (HC-SR04 ultrasonic sensor)
-//   3. Reads pH level (analog pH sensor with median filtering)
-//   4. Sends sensor data to the backend server via HTTP POST
-//   5. Auto-reconnects to WiFi if connection drops
-//
-// DATA FLOW:
-//   Sensors -> Validation -> HTTP POST to server -> PostgreSQL storage
-//
-// INVALID SENSOR HANDLING:
-//   - Invalid/failed sensors are sent as -1 (not 0) to distinguish from valid readings
-//   - Server skips negative values during threshold evaluation and SMS alerts
-//   - Temperature: -1 when sensor disconnected (DS18B20 returns -127)
-//   - Water level: -1 when ultrasonic sensor gets no echo
-//   - pH: -1 when reading is outside 0-14 range
-//
-// HARDWARE:
-//   - ESP32 development board
-//   - DS18B20 temperature sensor (OneWire, pin 4)
-//   - HC-SR04 ultrasonic sensor (Trig: pin 5, Echo: pin 18)
-//   - Analog pH sensor (pin 34)
-//
-// WATCHDOG:
-//   - 120-second hardware watchdog timer to prevent system hangs
-//   - Reset in main loop and during WiFi connection
-// =============================================================================
-
 #include <Arduino.h>
 #include <WiFi.h>
-#include <WiFiMulti.h>
+#include <WiFiManager.h>
 #include <HTTPClient.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
@@ -44,11 +11,7 @@
 #define ECHO_PIN 18
 #define PH_PIN 34
 
-// ====================== WIFI NETWORKS ======================
-// Add all your networks here — ESP32 will auto-connect to whichever is available
-WiFiMulti wifiMulti;
-
-const char* serverName = "http://10.91.241.9:3000/sensor";
+char serverName[64] = "http://192.168.1.20:3000/sensor";
 
 const float TANK_HEIGHT_CM = 36.0f;
 const int ULTRASONIC_SAMPLES = 5;
@@ -80,7 +43,8 @@ DallasTemperature sensors(&oneWire);
 int buffer_arr[10];
 float ph_act;
 
-// ====================== VALIDATION ======================
+WiFiManager wm;
+
 bool isTemperatureValid(float temp) {
   if (temp <= TEMP_SENSOR_ERROR) {
     Serial.println("Warning: Temperature sensor disconnected or not found!");
@@ -116,7 +80,6 @@ bool isPHValid(float ph) {
   return true;
 }
 
-// ====================== ULTRASONIC ======================
 float readDistanceCM() {
   digitalWrite(TRIG_PIN, LOW);
   delayMicroseconds(2);
@@ -146,14 +109,12 @@ float getAverageDistance(int samples) {
   return (validReadings == 0) ? DISTANCE_SENSOR_ERROR : total / validReadings;
 }
 
-// ====================== pH SENSOR ======================
 float readPH() {
   for (int i = 0; i < 10; i++) {
     buffer_arr[i] = analogRead(PH_PIN);
     delay(30);
   }
 
-  // Insertion sort
   for (int i = 1; i < 10; i++) {
     int key = buffer_arr[i];
     int j = i - 1;
@@ -178,33 +139,6 @@ float readPH() {
   return ph_act;
 }
 
-// ====================== WIFI CONNECT ======================
-bool connectWiFi() {
-  Serial.print("Connecting to best available WiFi");
-
-  unsigned long startTime = millis();
-
-  while (wifiMulti.run() != WL_CONNECTED) {
-    esp_task_wdt_reset();
-
-    if (millis() - startTime >= WIFI_CONNECT_TIMEOUT_MS) {
-      Serial.println("\nWiFi connection timed out! Will retry next loop.");
-      return false;
-    }
-
-    delay(500);
-    Serial.print(".");
-  }
-
-  Serial.println("\nWiFi Connected!");
-  Serial.print("Connected to: ");
-  Serial.println(WiFi.SSID());
-  Serial.print("IP Address: ");
-  Serial.println(WiFi.localIP());
-  return true;
-}
-
-// ====================== SETUP ======================
 void setup() {
   Serial.begin(19200);
 
@@ -215,7 +149,27 @@ void setup() {
   pinMode(PH_PIN, INPUT);
   sensors.begin();
 
-  wifiMulti.addAP("Mwa", "dikoalam");
+  wm.setConfigPortalTimeout(180);
+  wm.setConnectTimeout(15);
+  wm.setDarkMode(true);
+  wm.setTitle("CRAYVings ESP32");
+
+  WiFiManagerParameter serverParam("server", "Server URL", serverName, 64);
+  wm.addParameter(&serverParam);
+
+  bool connected = wm.autoConnect("CRAYVings-ESP32");
+
+  if (!connected) {
+    Serial.println("WiFi connection failed! Rebooting...");
+    ESP.restart();
+  }
+
+  strlcpy(serverName, serverParam.getValue(), sizeof(serverName));
+  Serial.println("Connected to: " + WiFi.SSID());
+  Serial.print("Server: ");
+  Serial.println(serverName);
+  Serial.print("IP: ");
+  Serial.println(WiFi.localIP());
 
   esp_task_wdt_config_t wdt_config = {
     .timeout_ms = 120000,
@@ -224,15 +178,11 @@ void setup() {
   };
   esp_task_wdt_init(&wdt_config);
   esp_task_wdt_add(NULL);
-
-  connectWiFi();
 }
 
-// ====================== MAIN LOOP ======================
 void loop() {
   esp_task_wdt_reset();
 
-  // Read sensors
   float distanceCm = getAverageDistance(ULTRASONIC_SAMPLES);
   float waterLevel = DISTANCE_SENSOR_ERROR;
 
@@ -248,29 +198,27 @@ void loop() {
 
   float phValue = readPH();
 
-  // Auto-reconnect to best available network if WiFi drops
-  if (wifiMulti.run() != WL_CONNECTED) {
-    Serial.println("WiFi lost → reconnecting to best available network...");
-    connectWiFi();
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi lost, reconnecting...");
+    wm.setConfigPortalTimeout(0);
+    if (!wm.autoConnect("CRAYVings-ESP32")) {
+      Serial.println("Reconnection failed, will retry next loop.");
+    }
   }
 
-  // Validate sensors
   bool tempOK  = isTemperatureValid(tempC);
   bool levelOK = isWaterLevelValid(waterLevel);
   bool phOK    = isPHValid(phValue);
 
-  // Send data if WiFi is connected, regardless of individual sensor validation
-  // Invalid sensors are sent as -1 so server can distinguish "sensor failed" from actual readings
   if (WiFi.status() == WL_CONNECTED) {
     HTTPClient http;
     http.setTimeout(HTTP_TIMEOUT_MS);
     http.begin(serverName);
     http.addHeader("Content-Type", "application/json");
 
-    // Prepare values: use -1 for invalid sensors so server can skip them
-    float sendTemp = (tempOK) ? tempC : -1.0f;
-    float sendLevel = (levelOK) ? waterLevel : -1.0f;
-    float sendPH = (phOK) ? phValue : -1.0f;
+    float sendTemp = (tempOK) ? tempC : 0.0f;
+    float sendLevel = (levelOK) ? waterLevel : 0.0f;
+    float sendPH = (phOK) ? phValue : 0.0f;
 
     char json[128];
     snprintf(json, sizeof(json),
@@ -296,7 +244,6 @@ void loop() {
     Serial.println("WiFi not connected, cannot send data.");
   }
 
-  // Print readings
   Serial.print("Distance: ");
   Serial.print(distanceCm, 2);
   Serial.print(" cm | Water Level: ");

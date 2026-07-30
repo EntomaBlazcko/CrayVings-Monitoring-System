@@ -5,7 +5,7 @@
 //
 // This is the default page shown after login. It provides:
 //   1. Hero banner with connection status badge and tank safety status
-//   2. Three gradient stat cards showing live temperature, pH, and water level
+//   2. Two gradient stat cards showing live temperature and water level
 //   3. System alerts sidebar showing active threshold breaches
 //   4. Quick controls panel (refresh data, dismiss alerts, go to settings)
 //   5. Key metrics summary section with optimal ranges
@@ -19,7 +19,7 @@
 // =============================================================================
 
 import { useState, useMemo } from "react";
-import { Thermometer, Waves, FlaskConical, AlertTriangle, AlertCircle, CheckCircle, RefreshCw, BellOff, Settings } from "lucide-react";
+import { Thermometer, Waves, AlertTriangle, AlertCircle, CheckCircle, RefreshCw, BellOff, Settings } from "lucide-react";
 import type { MenuKey } from "../types";
 import { useSensors } from "../hooks/useSensors";
 import { getSettingsThresholds, getThresholdStatus } from "../types";
@@ -56,14 +56,17 @@ export default function HomePage({ onNavigate }: Props) {
   
   const thresholds = useMemo(() => getSettingsThresholds(settings), [settings]);
   
-  const hasData = !!data && !loading && !error;
+  const isOnline = connectionStatus === "online";
+  const isConnecting = connectionStatus === "connecting";
+  const hasData = !!data;
+  const isOfflineWithData = !isOnline && !isConnecting && hasData;
   
   const tankStatus = useMemo(() => {
-    if (error) return { safe: false, alerts: ["Device offline"] };
     if (!hasData) return { safe: false, alerts: ["No sensor data"] };
+    if (!data) return { safe: false, alerts: ["No sensor data"] };
     
     const alerts: string[] = [];
-    const sensorKeys = ["temperature", "ph", "water_level"] as const;
+    const sensorKeys = ["temperature", "water_level"] as const;
     
     for (const key of sensorKeys) {
       const threshold = thresholds[key];
@@ -80,7 +83,7 @@ export default function HomePage({ onNavigate }: Props) {
       safe: alerts.length === 0,
       alerts: alerts.length > 0 ? alerts : ["Tank is Safe"],
     };
-  }, [data, thresholds, hasData, error]);
+  }, [data, thresholds, hasData]);
 
   const getStatusBadge = () => {
     if (loading) {
@@ -91,15 +94,15 @@ export default function HomePage({ onNavigate }: Props) {
         </span>
       );
     }
-    if (error) {
+    if (isOfflineWithData) {
       return (
-        <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold bg-red-100 text-red-700">
+        <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold bg-yellow-100 text-yellow-700">
           <AlertCircle size={14} />
-          Connection Error
+          Offline - Last Data
         </span>
       );
     }
-    if (!hasData) {
+    if (!hasData && !loading) {
       return (
         <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold bg-gray-100 text-gray-600">
           <AlertCircle size={14} />
@@ -107,7 +110,7 @@ export default function HomePage({ onNavigate }: Props) {
         </span>
       );
     }
-    if (tankStatus.safe) {
+    if (tankStatus.safe && isOnline) {
       return (
         <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold bg-emerald-100 text-emerald-700">
           <CheckCircle size={14} />
@@ -115,56 +118,71 @@ export default function HomePage({ onNavigate }: Props) {
         </span>
       );
     }
+    if (hasData && !tankStatus.safe) {
+      return (
+        <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold bg-red-100 text-red-700">
+          <AlertTriangle size={14} />
+          Attention Needed
+        </span>
+      );
+    }
     return (
-      <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold bg-red-100 text-red-700">
-        <AlertTriangle size={14} />
-        Attention Needed
+      <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold bg-gray-100 text-gray-600">
+        <AlertCircle size={14} />
+        Unknown
       </span>
     );
   };
 
   const getConnectionStatusDot = () => {
     if (loading) return "bg-blue-500 animate-pulse";
-    if (error) return "bg-red-500";
-    if (connectionStatus === "online") return "bg-emerald-500";
-    if (connectionStatus === "connecting") return "bg-yellow-500 animate-pulse";
+    if (isOfflineWithData) return "bg-yellow-500";
+    if (isOnline) return "bg-emerald-500";
+    if (isConnecting) return "bg-yellow-500 animate-pulse";
     return "bg-gray-400";
+  };
+
+  const getCardGradient = (defaultGradient: string) => {
+    if (loading) return "from-gray-400 to-gray-500";
+    if (isOfflineWithData) return "from-yellow-400 to-yellow-500";
+    return defaultGradient;
   };
 
   const stats: Stat[] = [
     {
       title: "Water Temperature",
-      value: loading ? "Loading..." : error ? "Error" : data ? `${data.temperature}°C` : "--°C",
+      value: loading ? "Loading..." : data ? `${data.temperature}°C` : "--°C",
       description: `Threshold: ${thresholds.temperature.range.min}-${thresholds.temperature.range.max}°C`,
-      gradient: loading ? "from-gray-400 to-gray-500" : error ? "from-red-400 to-red-500" : "from-blue-500 to-cyan-500",
+      gradient: getCardGradient("from-blue-500 to-cyan-500"),
       icon: <Thermometer size={24} />,
     },
     {
-      title: "pH Level",
-      value: loading ? "Loading..." : error ? "Error" : data ? `${data.ph}` : "--",
-      description: `Threshold: ${thresholds.ph.range.min}-${thresholds.ph.range.max}`,
-      gradient: loading ? "from-gray-400 to-gray-500" : error ? "from-red-400 to-red-500" : "from-emerald-400 to-teal-400",
-      icon: <FlaskConical size={24} />,
-    },
-    {
       title: "Water Level",
-      value: loading ? "Loading..." : error ? "Error" : data ? `${data.water_level}%` : "--%",
+      value: loading ? "Loading..." : data ? `${data.water_level}%` : "--%",
       description: `Threshold: ${thresholds.water_level.range.min}-${thresholds.water_level.range.max}%`,
-      gradient: loading ? "from-gray-400 to-gray-500" : error ? "from-red-400 to-red-500" : "from-indigo-500 to-blue-500",
+      gradient: getCardGradient("from-indigo-500 to-blue-500"),
       icon: <Waves size={24} />,
     },
   ];
 
   const highlights = [
-    { label: "Temperature", value: error ? "Error" : loading ? "..." : data ? `${data.temperature}°C` : "--", color: error ? "bg-red-50 border-red-200 text-red-700" : "bg-blue-50 border-blue-200 text-blue-700" },
-    { label: "pH Level", value: error ? "Error" : loading ? "..." : data ? `${data.ph}` : "--", color: error ? "bg-red-50 border-red-200 text-red-700" : "bg-emerald-50 border-emerald-200 text-emerald-700" },
-    { label: "Water Level", value: error ? "Error" : loading ? "..." : data ? `${data.water_level}%` : "--", color: error ? "bg-red-50 border-red-200 text-red-700" : "bg-indigo-50 border-indigo-200 text-indigo-700" },
+    { label: "Temperature", value: loading ? "..." : data ? `${data.temperature}°C` : "--", color: isOfflineWithData ? "bg-yellow-50 border-yellow-200 text-yellow-700" : data ? "bg-blue-50 border-blue-200 text-blue-700" : "bg-red-50 border-red-200 text-red-700" },
+    { label: "Water Level", value: loading ? "..." : data ? `${data.water_level}%` : "--", color: isOfflineWithData ? "bg-yellow-50 border-yellow-200 text-yellow-700" : data ? "bg-indigo-50 border-indigo-200 text-indigo-700" : "bg-red-50 border-red-200 text-red-700" },
   ];
 
   const recentAlerts = tankStatus.alerts.filter(alert => alert !== "Tank is Safe").slice(0, 4);
 
   return (
     <div className="space-y-6">
+      {isOfflineWithData && (
+        <div className="bg-yellow-50 border border-yellow-200 rounded-xl p-3 flex items-center gap-2">
+          <AlertTriangle size={16} className="text-yellow-600 shrink-0" />
+          <span className="text-xs text-yellow-800">
+            ESP32 is offline — showing last known readings. Last update: {lastUpdate ? new Date(lastUpdate).toLocaleTimeString() : "N/A"}
+          </span>
+        </div>
+      )}
+
       <section className="relative overflow-hidden rounded-3xl border border-gray-200 bg-gradient-to-r from-cyan-50 via-blue-50 to-orange-50 shadow-sm">
         <div
           className="absolute inset-0 bg-cover bg-center opacity-10"
@@ -181,7 +199,7 @@ export default function HomePage({ onNavigate }: Props) {
               {getStatusBadge()}
               <span className="inline-flex items-center gap-1.5 text-xs text-gray-500">
                 <span className={`w-2 h-2 rounded-full ${getConnectionStatusDot()}`} />
-                {connectionStatus === "online" ? "Connected" : connectionStatus === "connecting" ? "Connecting..." : "Disconnected"}
+                {isOnline ? "Connected" : isConnecting ? "Connecting..." : isOfflineWithData ? "Offline" : "Disconnected"}
               </span>
               {lastUpdate && !loading && (
                 <span className="text-xs text-gray-400">
@@ -215,12 +233,12 @@ export default function HomePage({ onNavigate }: Props) {
               <h3 className="mb-4 text-xl font-bold text-gray-800">System Alerts and Notifications</h3>
               {alertsDismissed ? (
                 <p className="text-sm text-gray-400">Alerts dismissed</p>
-              ) : error ? (
-                <div className="rounded-lg p-3 font-bold text-sm bg-red-100 text-red-700">
-                  Failed to load sensor data. Please try refreshing.
-                </div>
               ) : loading ? (
                 <p className="text-sm text-gray-400">Loading alerts...</p>
+              ) : !hasData ? (
+                <div className="rounded-lg p-3 font-bold text-sm bg-red-100 text-red-700">
+                  No sensor data available. Waiting for ESP32.
+                </div>
               ) : (
                 <div className="flex flex-col gap-2">
                   {tankStatus.alerts.filter(alert => alert !== "Tank is Safe").length > 0 ? (
@@ -243,7 +261,7 @@ export default function HomePage({ onNavigate }: Props) {
         </div>
       </section>
 
-      {!loading && !error && !tankStatus.safe && hasData && (
+      {hasData && !tankStatus.safe && (
         <section className="rounded-xl border border-red-200 bg-red-50 p-4">
           <div className="flex items-center gap-2 mb-3">
             <AlertTriangle className="text-red-600" size={18} />
@@ -260,7 +278,7 @@ export default function HomePage({ onNavigate }: Props) {
         </section>
       )}
 
-      <section className="grid grid-cols-1 gap-4 md:grid-cols-3 xl:grid-cols-3">
+      <section className={`grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-2 ${isOfflineWithData ? "opacity-60" : ""}`}>
         {stats.map((stat) => (
           <StatCard key={stat.title} {...stat} />
         ))}
@@ -301,24 +319,17 @@ export default function HomePage({ onNavigate }: Props) {
 
         <div className="rounded-2xl border border-gray-200 bg-white p-6 shadow-sm lg:col-span-3">
           <h3 className="mb-4 text-lg font-bold text-gray-800">Key Metrics Summary</h3>
-          {error ? (
-            <div className="rounded-lg p-3 font-bold text-sm bg-red-100 text-red-700 text-center">
-              ESP32 device is offline. Metrics unavailable.
+          {!hasData ? (
+            <div className="rounded-lg p-3 font-bold text-sm bg-gray-100 text-gray-600 text-center">
+              No sensor data available yet.
             </div>
           ) : (
-            <div className="grid grid-cols-2 gap-4 md:grid-cols-3">
+            <div className={`grid grid-cols-2 gap-4 md:grid-cols-2 ${isOfflineWithData ? "opacity-60" : ""}`}>
               <div className="rounded-xl bg-blue-50 p-4">
                 <p className="text-xs text-gray-500">Temperature</p>
                 <p className="mt-1 text-2xl font-bold text-blue-600">{data?.temperature ?? "--"}°C</p>
                 <p className="mt-1 text-xs text-gray-400">
                   Optimal: {thresholds.temperature.range.min}-{thresholds.temperature.range.max}°C
-                </p>
-              </div>
-              <div className="rounded-xl bg-emerald-50 p-4">
-                <p className="text-xs text-gray-500">pH Level</p>
-                <p className="mt-1 text-2xl font-bold text-emerald-600">{data?.ph ?? "--"}</p>
-                <p className="mt-1 text-xs text-gray-400">
-                  Optimal: {thresholds.ph.range.min}-{thresholds.ph.range.max}
                 </p>
               </div>
               <div className="rounded-xl bg-indigo-50 p-4">

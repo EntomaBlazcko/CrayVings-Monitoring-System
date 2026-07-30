@@ -16,9 +16,8 @@
 //   the user is on any dashboard page.
 //
 // COOLDOWN MECHANISM:
-//   Each sensor+threshold combination (e.g., "temperature-min", "ph-max")
-//   has its own cooldown timer. This means you can get alerts for:
-//   - Temperature going high AND pH going low simultaneously
+//   Each sensor+threshold combination (e.g., "temperature-min")
+//   has its own cooldown timer.
 //   - But not repeated alerts for the same condition within 60 seconds
 // =============================================================================
 
@@ -30,7 +29,7 @@ import { getSettingsThresholds, getThresholdStatus, type ThresholdStatus } from 
 // 60-second cooldown between alerts for the same sensor+threshold
 const ALERT_COOLDOWN_MS = 60000;
 // Sensor keys to monitor (must match the keys in getSettingsThresholds)
-const SENSOR_KEYS = ["temperature", "water_level", "ph"] as const;
+const SENSOR_KEYS = ["temperature", "water_level"] as const;
 
 /**
  * Safely converts a value to a number.

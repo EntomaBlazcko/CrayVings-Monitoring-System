@@ -16,7 +16,7 @@
 // PROPS:
 //   - title: Chart title (e.g., "Temperature")
 //   - data: Array of ChartPoint objects from the API
-//   - dataKey: Which sensor value to plot ("temperature", "water_level", "ph")
+//   - dataKey: Which sensor value to plot ("temperature", "water_level")
 //   - stroke: Line color (hex string)
 // =============================================================================
 

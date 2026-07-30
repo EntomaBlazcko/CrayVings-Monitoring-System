@@ -165,7 +165,6 @@ export async function fetchSensorHistory(limit = 1000, signal?: AbortSignal): Pr
         timestamp: timestamp ? timestamp.toISOString() : "",
         temperature: item.temperature ?? 0,
         water_level: item.water_level ?? 0,
-        ph: item.ph ?? 0,
       };
     });
   
@@ -223,8 +222,6 @@ export async function fetchSettings(signal?: AbortSignal): Promise<SensorSetting
     id: data.id as number,
     temp_min: Number(data.temp_min),
     temp_max: Number(data.temp_max),
-    ph_min: Number(data.ph_min),
-    ph_max: Number(data.ph_max),
     water_level_min: Number(data.water_level_min),
     water_level_max: Number(data.water_level_max),
     updated_at: data.updated_at as string,

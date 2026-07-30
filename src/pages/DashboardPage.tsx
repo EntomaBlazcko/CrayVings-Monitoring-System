@@ -4,7 +4,7 @@
 // PURPOSE: Main monitoring dashboard with live readings and trend charts.
 //
 // This page provides a comprehensive real-time view of the aquaculture system:
-//   1. Three StatCards showing current temperature, water level, and pH
+//   1. Two StatCards showing current temperature and water level
 //   2. Three TrendCards with line charts showing historical trends
 //   3. Sensor Hub Status panel showing ESP32 connection state
 //   4. Recent Readings table with the last 5 sensor entries
@@ -15,7 +15,7 @@
 // =============================================================================
 
 import { useMemo } from "react";
-import { Thermometer, Waves, FlaskConical, AlertTriangle } from "lucide-react";
+import { Thermometer, Waves, AlertTriangle } from "lucide-react";
 import StatCard from "../components/StatCard";
 import TrendCard from "../components/TrendCard";
 import { useSensors } from "../hooks/useSensors";
@@ -28,12 +28,15 @@ export default function DashboardPage() {
   
   const isOnline = connectionStatus === "online";
   const isConnecting = connectionStatus === "connecting";
+  const hasData = !!data;
+  const isOfflineWithData = !isOnline && !isConnecting && hasData;
+  const offlineClass = isOfflineWithData ? "opacity-60" : "";
   
   const tankStatus = useMemo(() => {
     if (!data) return { safe: false, messages: ["No sensor data"] };
     
     const messages: string[] = [];
-    const sensorKeys = ["temperature", "ph", "water_level"] as const;
+    const sensorKeys = ["temperature", "water_level"] as const;
     
     for (const key of sensorKeys) {
       const threshold = thresholds[key];
@@ -54,31 +57,38 @@ export default function DashboardPage() {
 
   return (
     <>
-      <div className="grid grid-cols-2 md:grid-cols-3 gap-2 md:gap-3 mb-4">
-        <StatCard
-          title="Temperature"
-          value={loading ? "Loading..." : error ? "Error" : `${data?.temperature ?? "--"}°C`}
-          color={loading ? "#9ca3af" : error ? "#ef4444" : "#f97316"}
-          icon={<Thermometer size={18} />}
-        />
-        <StatCard
-          title="Water Level"
-          value={loading ? "Loading..." : error ? "Error" : `${data?.water_level ?? "--"}%`}
-          color={loading ? "#9ca3af" : error ? "#ef4444" : "#2563eb"}
-          icon={<Waves size={18} />}
-        />
-        <StatCard
-          title="pH Level"
-          value={loading ? "Loading..." : error ? "Error" : `${data?.ph ?? "--"}`}
-          color={loading ? "#9ca3af" : error ? "#ef4444" : "#6366f1"}
-          icon={<FlaskConical size={18} />}
-        />
+      <div className="grid grid-cols-2 gap-2 md:gap-3 mb-4">
+        <div className={offlineClass}>
+          <StatCard
+            title="Temperature"
+            value={loading ? "Loading..." : data ? `${data.temperature}°C` : "--°C"}
+            color={loading ? "#9ca3af" : isOfflineWithData ? "#9ca3af" : data ? "#f97316" : "#ef4444"}
+            icon={<Thermometer size={18} />}
+          />
+        </div>
+        <div className={offlineClass}>
+          <StatCard
+            title="Water Level"
+            value={loading ? "Loading..." : data ? `${data.water_level}%` : "--%"}
+            color={loading ? "#9ca3af" : isOfflineWithData ? "#9ca3af" : data ? "#2563eb" : "#ef4444"}
+            icon={<Waves size={18} />}
+          />
+        </div>
       </div>
 
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-3 mb-4">
+      {isOfflineWithData && (
+        <div className="bg-yellow-50 border border-yellow-200 rounded-xl p-3 mb-4 flex items-center gap-2">
+          <AlertTriangle size={16} className="text-yellow-600 shrink-0" />
+          <span className="text-xs text-yellow-800">
+            ESP32 is offline — showing last known readings from {lastUpdate?.toLocaleTimeString()}
+          </span>
+        </div>
+      )}
+
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mb-4">
         {loading ? (
           <>
-            {["Temperature", "Water Level", "pH Level"].map((title) => (
+            {["Temperature", "Water Level"].map((title) => (
               <div key={title} className="bg-white rounded-xl border border-gray-100 p-4 shadow-sm flex items-center justify-center">
                 <div className="text-xs text-gray-400">Loading chart...</div>
               </div>
@@ -97,12 +107,6 @@ export default function DashboardPage() {
               data={history}
               dataKey="water_level"
               stroke="#2563eb"
-            />
-            <TrendCard
-              title="pH Level"
-              data={history}
-              dataKey="ph"
-              stroke="#6366f1"
             />
           </>
         )}
@@ -149,7 +153,6 @@ export default function DashboardPage() {
                     <th className="text-left py-1">Time</th>
                     <th className="text-center py-1">Temp</th>
                     <th className="text-center py-1">Level</th>
-                    <th className="text-center py-1">pH</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -158,7 +161,6 @@ export default function DashboardPage() {
                       <td className="py-1">{new Date(h.timestamp).toLocaleTimeString()}</td>
                       <td className="text-center py-1">{h.temperature}°C</td>
                       <td className="text-center py-1">{h.water_level}%</td>
-                      <td className="text-center py-1">{h.ph}</td>
                     </tr>
                   ))}
                 </tbody>
@@ -176,7 +178,7 @@ export default function DashboardPage() {
               <div className="rounded-lg p-2 text-xs font-bold text-center bg-blue-100 text-blue-700">
                 Loading...
               </div>
-            ) : error ? (
+            ) : !data ? (
               <div className="rounded-lg p-2 text-xs font-bold text-center bg-red-100 text-red-700">
                 Connection Error
               </div>
@@ -203,16 +205,16 @@ export default function DashboardPage() {
             )}
           </div>
 
-          <div className="bg-orange-50 rounded-xl border border-orange-200 p-3 shadow-sm">
+          <div className={`${isOfflineWithData ? "bg-gray-50 border-gray-200" : "bg-orange-50 border-orange-200"} rounded-xl border p-3 shadow-sm`}>
             <div className="flex items-center gap-2 mb-2 text-orange-600 font-bold text-xs">
               <AlertTriangle size={14} />
               Temperature
             </div>
-            <div className="text-2xl md:text-3xl font-extrabold text-red-500">
-              {loading ? "..." : error ? "Error" : `${data?.temperature ?? "--"}°C`}
+            <div className={`text-2xl md:text-3xl font-extrabold ${data ? "text-red-500" : "text-gray-400"}`}>
+              {loading ? "..." : data ? `${data.temperature}°C` : "--°C"}
             </div>
-            <div className="text-xs text-orange-800 mt-1">
-              {loading ? "Fetching..." : error ? "Failed to load" : "Real-time monitoring"}
+            <div className={`text-xs mt-1 ${isOfflineWithData ? "text-gray-400" : "text-orange-800"}`}>
+              {loading ? "Fetching..." : isOfflineWithData ? "Last known reading (offline)" : "Real-time monitoring"}
             </div>
           </div>
         </div>
