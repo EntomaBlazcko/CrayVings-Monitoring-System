@@ -29,19 +29,19 @@ This can help reduce risks caused by poor water conditions and improve overall m
 ## Features
 
 ### Core Features
-- **Real-time sensor monitoring** - Temperature and water level (2 sensors via ESP32)
+- **Real-time sensor monitoring** - Temperature, water level, and ammonia (3 parameters via ESP32)
 - **ESP32-based data collection** - Wireless sensor data transmission with WiFiManager captive portal
 - **Web dashboard** - Responsive React UI with icon-based navigation
 - **Database storage** - PostgreSQL for historical data
 - **Smart connection detection** - Connection status based on actual sensor data timestamp, not API poll time
-- **Offline data display** - When ESP32 disconnects, pages show last known readings with yellow offline banner
+- **Offline data display** - When ESP32 disconnects, pages show last known readings with yellow offline banner; historical data remains viewable from the database
 - **Smart alerts** - Floating popup notifications with threshold-based alerts and cooldown
 - **SMS notifications** - Critical threshold alerts and device disconnect alerts via SkySMS API
 - **SMS mute/sleep** - Pause SMS alerts for 1, 2, 4, 6, 8, 12, or 24 hours
 - **Disconnect/reconnect alerts** - Floating popup, sound, and activity log when ESP32 goes offline or comes back online
 - **Recipient management** - Manage SMS alert recipients
 - **Custom alert sounds** - Audio alerts via Web Audio API
-- **PDF export** - Export system logs to PDF (LogsPage)
+- **PDF export** - Export system logs to PDF (LogsPage) and weekly reports to PDF (Historical Data)
 - **Activity logging** - Track user interactions including device connect/disconnect events
 - **WiFiManager** - ESP32 firmware uses captive portal for WiFi config (no hardcoded credentials)
 
@@ -50,13 +50,14 @@ This can help reduce risks caused by poor water conditions and improve overall m
 |-----------|--------|------------|
 | Temperature | DS18B20 | 20 - 31°C |
 | Water Level | Ultrasonic HC-SR04 | 10 - 100% |
+| Ammonia | Simulated (MQ-137 when available) | 0 - 1.0 mg/L |
 
 ### Dashboard Pages
 - **Home** - Overview, quick stats, connection status, system alerts
 - **Dashboard** - Live readings, trend charts, tank status, sensor hub status
 - **Sensors** - Individual sensor details with threshold info and connection status
 - **Alerts** - Alert history with filtering (Alert/Change)
-- **Historical Data** - Trend charts with time filtering (1h, 6h, 24h, all time)
+- **Historical Data** - Trend charts with time filtering (1h, 6h, 24h, 1 week, all time) and weekly report PDF export
 - **Activity Logs** - User activity tracking including device connect/disconnect events
 - **Logs** - System event logs with parameter filtering and PDF export
 - **Settings** - Configure thresholds, manage SMS recipients, mute/sleep SMS alerts, user management
@@ -69,6 +70,7 @@ This can help reduce risks caused by poor water conditions and improve overall m
 - **ESP32 DevKit V1** with WiFiManager support
 - **DS18B20** - Temperature sensor (GPIO4, OneWire)
 - **HC-SR04** - Ultrasonic distance sensor (GPIO5, GPIO18)
+- **Ammonia sensor** - Not yet installed; simulated in firmware (planned: MQ-137 on an analog pin)
 
 ### Software
 | Component | Technology | Version |
@@ -194,6 +196,7 @@ While muted, disconnect alerts still show as popups and are logged, but SMS is n
 | `/sensor` | POST | Submit sensor data |
 | `/sensor/latest` | GET | Get latest reading |
 | `/sensor` | GET | Get history (`limit`: 1-1000) |
+| `/report/weekly` | GET | Weekly report (summary, daily breakdown, alert counts) |
 | `/settings` | GET/POST | Get/update thresholds |
 | `/settings/recipients` | GET/POST | List/add SMS recipients |
 | `/settings/recipients/:id` | PUT/DELETE | Update/delete recipient |
@@ -201,7 +204,7 @@ While muted, disconnect alerts still show as popups and are logged, but SMS is n
 | `/alert/device-disconnect` | POST | Send disconnect alert SMS |
 | `/alert/mute` | POST | Mute SMS alerts (`{ hours }`) |
 | `/alert/mute-status` | GET | Check mute status |
-| `/system-logs` | GET | Get system logs |
+| `/system-logs` | GET | Get system logs (`page`, `limit`, `action`, `parameter` filters) |
 | `/activity-logs` | GET/POST | Get/create activity logs |
 
 ---
@@ -279,7 +282,7 @@ esp32code/esp32code.ino        # ESP32 firmware (WiFiManager)
 ```bash
 curl http://localhost:3000/health
 curl http://localhost:3000/sensor/latest
-curl -X POST http://localhost:3000/sensor -H "Content-Type: application/json" -d '{"device_id":"TEST","temperature":25,"water_level":75}'
+curl -X POST http://localhost:3000/sensor -H "Content-Type: application/json" -d '{"device_id":"TEST","temperature":25,"water_level":75,"ammonia":0.12}'
 curl -X POST http://localhost:3000/alert/mute -H "Content-Type: application/json" -d '{"hours": 4}'
 ```
 

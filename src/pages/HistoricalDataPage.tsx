@@ -20,11 +20,12 @@
 //   - Data is filtered by timestamp cutoff based on selected range
 // =============================================================================
 
-import { useState, useMemo, useEffect, useCallback, useRef } from "react";
+import { useState, useMemo, useEffect, useCallback } from "react";
 import {
   History,
   Thermometer,
   Waves,
+  FlaskConical,
   Filter,
   TrendingUp,
   TrendingDown,
@@ -46,13 +47,13 @@ type TimeRange = "1h" | "6h" | "24h" | "1w" | "all";
  * Calculates min, max, and average statistics for each sensor parameter.
  * Returns null if no data is available.
  */
-function getStats(data: { temperature?: number | string; water_level?: number | string }[]) {
+function getStats(data: { temperature?: number | string | null; water_level?: number | string | null; ammonia?: number | string | null }[]) {
   if (!data || data.length === 0) return null;
 
-  const calc = (key: "temperature" | "water_level") => {
+  const calc = (key: "temperature" | "water_level" | "ammonia") => {
     const values = data
-      .map(d => Number(d[key]))
-      .filter(v => !isNaN(v));
+      .map(d => d[key])
+      .filter((v): v is number => typeof v === "number" && !isNaN(v));
     if (values.length === 0) return null;
     return {
       min: Math.min(...values),
@@ -64,14 +65,16 @@ function getStats(data: { temperature?: number | string; water_level?: number | 
   return {
     temperature: calc("temperature"),
     water_level: calc("water_level"),
+    ammonia: calc("ammonia"),
   };
 }
 
 export default function HistoricalDataPage() {
-  const { history, loading, error } = useSensors();
+  const { history, loading, connectionStatus, lastUpdate } = useSensors();
   const [timeRange, setTimeRange] = useState<TimeRange>("all");
   const [dynamicHistory, setDynamicHistory] = useState<ChartPoint[]>([]);
   const [dynamicLoading, setDynamicLoading] = useState(false);
+  const [historyFetchError, setHistoryFetchError] = useState<string | null>(null);
   const [weeklyReport, setWeeklyReport] = useState<WeeklyReport | null>(null);
   const [weeklyReportLoading, setWeeklyReportLoading] = useState(false);
   const [weeklyReportError, setWeeklyReportError] = useState<string | null>(null);
@@ -96,21 +99,9 @@ export default function HistoricalDataPage() {
     }
   };
 
-  const shouldFetchDynamic = (range: TimeRange): boolean => {
-    const limit = getLimitForRange(range);
-    return limit > 300 || history.length === 0;
-  };
-
-  const prevTimeRangeRef = useRef<TimeRange>(timeRange);
-
-  useEffect(() => {
-    if (prevTimeRangeRef.current !== timeRange && !shouldFetchDynamic(timeRange)) {
-      setDynamicHistory([]);
-      setDynamicLoading(false);
-    }
-    prevTimeRangeRef.current = timeRange;
-  }, [timeRange, history.length]);
-
+  // The page always fetches its own history from the server (the DB), so it
+  // keeps working even when the live device is offline. Provider `history` is
+  // only used as an instant seed while the page fetch is in flight.
   const fetchDynamicData = useCallback(async (range: TimeRange, signal: AbortSignal) => {
     const limit = getLimitForRange(range);
     const data = await fetchSensorHistory(limit, signal);
@@ -118,8 +109,6 @@ export default function HistoricalDataPage() {
   }, []);
 
   useEffect(() => {
-    if (!shouldFetchDynamic(timeRange)) return;
-
     const controller = new AbortController();
     // eslint-disable-next-line react-hooks/set-state-in-effect
     setDynamicLoading(true);
@@ -127,19 +116,24 @@ export default function HistoricalDataPage() {
     fetchDynamicData(timeRange, controller.signal)
       .then(data => {
         setDynamicHistory(data);
+        setHistoryFetchError(null);
         setDynamicLoading(false);
       })
-      .catch(() => {
+      .catch((err: Error) => {
+        if (err.name !== 'AbortError') {
+          setHistoryFetchError(err?.message || 'Failed to load historical data');
+        }
         setDynamicLoading(false);
       });
 
     return () => {
       controller.abort();
     };
-  }, [timeRange, history.length, fetchDynamicData]);
+  }, [timeRange, fetchDynamicData]);
 
   useEffect(() => {
     if (timeRange !== "1w") {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setWeeklyReport(null);
       setWeeklyReportError(null);
       return;
@@ -168,6 +162,26 @@ export default function HistoricalDataPage() {
 
   const activeHistory = dynamicHistory.length > 0 ? dynamicHistory : history;
   const activeLoading = dynamicLoading || loading;
+
+  // Milliseconds since the last recorded reading (0 when not offline / unknown).
+  const offlineForMs =
+    connectionStatus === "offline" && lastUpdate
+      ? Date.now() - new Date(lastUpdate).getTime()
+      : 0;
+
+  // Window length for each range; null = always enabled ("All Time").
+  const rangeWindowMs: Record<TimeRange, number | null> = {
+    "1h": 60 * 60 * 1000,
+    "6h": 6 * 60 * 60 * 1000,
+    "24h": 24 * 60 * 60 * 1000,
+    "1w": 7 * 24 * 60 * 60 * 1000,
+    all: null,
+  };
+
+  const isRangeUnavailable = (range: TimeRange): boolean => {
+    const window = rangeWindowMs[range];
+    return window !== null && offlineForMs > window;
+  };
 
   const filteredHistory = useMemo(() => {
     if (!activeHistory || activeHistory.length === 0) return [];
@@ -219,6 +233,7 @@ export default function HistoricalDataPage() {
       }
     }
 
+    try {
     const doc = new jsPDF();
     const pageWidth = doc.internal.pageSize.getWidth();
     const pageHeight = doc.internal.pageSize.getHeight();
@@ -245,6 +260,7 @@ export default function HistoricalDataPage() {
     const s = [
       `Temperature: Avg ${(summary.temp_avg ?? 0).toFixed(1)}°C, Min ${(summary.temp_min ?? 0).toFixed(1)}°C, Max ${(summary.temp_max ?? 0).toFixed(1)}°C`,
       `Water Level: Avg ${(summary.water_avg ?? 0).toFixed(0)}%, Min ${(summary.water_min ?? 0).toFixed(0)}%, Max ${(summary.water_max ?? 0).toFixed(0)}%`,
+      `Ammonia: Avg ${(summary.ammonia_avg ?? 0).toFixed(2)} mg/L, Min ${(summary.ammonia_min ?? 0).toFixed(2)} mg/L, Max ${(summary.ammonia_max ?? 0).toFixed(2)} mg/L`,
       `Total Readings: ${(summary.total_readings ?? 0).toLocaleString()}`,
       `Total Alerts: ${report.alerts.total ?? 0}`,
     ];
@@ -254,13 +270,15 @@ export default function HistoricalDataPage() {
     const tableStartY = sy + 6;
     autoTable(doc, {
       startY: tableStartY,
-      head: [["Date", "Temp Avg", "Temp Range", "Water Avg", "Water Range", "Readings", "Alerts"]],
+      head: [["Date", "Temp Avg", "Temp Range", "Water Avg", "Water Range", "Ammonia Avg", "Ammonia Range", "Readings", "Alerts"]],
       body: report.daily.map(d => [
         new Date(d.date).toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" }),
         `${(d.temp_avg ?? 0).toFixed(1)}°C`,
         `${(d.temp_min ?? 0).toFixed(1)} - ${(d.temp_max ?? 0).toFixed(1)}°C`,
         `${(d.water_avg ?? 0).toFixed(0)}%`,
         `${(d.water_min ?? 0).toFixed(0)} - ${(d.water_max ?? 0).toFixed(0)}%`,
+        `${(d.ammonia_avg ?? 0).toFixed(2)} mg/L`,
+        `${(d.ammonia_min ?? 0).toFixed(2)} - ${(d.ammonia_max ?? 0).toFixed(2)} mg/L`,
         (d.readings ?? 0).toLocaleString(),
         String(d.alerts ?? 0),
       ]),
@@ -269,12 +287,14 @@ export default function HistoricalDataPage() {
       alternateRowStyles: { fillColor: [248, 250, 252] },
       columnStyles: {
         0: { cellWidth: 38 },
-        1: { cellWidth: 22, halign: "center" },
-        2: { cellWidth: 38, halign: "center" },
-        3: { cellWidth: 22, halign: "center" },
-        4: { cellWidth: 38, halign: "center" },
-        5: { cellWidth: 20, halign: "center" },
-        6: { cellWidth: 16, halign: "center" },
+        1: { halign: "center" },
+        2: { halign: "center" },
+        3: { halign: "center" },
+        4: { halign: "center" },
+        5: { halign: "center" },
+        6: { halign: "center" },
+        7: { halign: "center" },
+        8: { halign: "center" },
       },
       margin: { left: 14, right: 14 },
       didDrawPage: (data: HookData) => {
@@ -332,10 +352,14 @@ export default function HistoricalDataPage() {
     }
 
     doc.save(`CRAYvings_Weekly_Report_${new Date().toISOString().split("T")[0]}.pdf`);
-    setExportingPdf(false);
+    } finally {
+      setExportingPdf(false);
+    }
   }, [weeklyReport, exportingPdf]);
 
-  if (activeLoading) {
+  // Only show the loading skeleton on the very first load — keep the previous
+  // range's charts on screen while re-fetching after a range switch.
+  if (activeLoading && (!activeHistory || activeHistory.length === 0)) {
     return (
       <div className="space-y-4">
         <div className="bg-white rounded-xl border border-gray-100 p-5 animate-pulse">
@@ -359,12 +383,12 @@ export default function HistoricalDataPage() {
     );
   }
 
-  if (error && (!activeHistory || activeHistory.length === 0)) {
+  if (historyFetchError && (!activeHistory || activeHistory.length === 0)) {
     return (
       <div className="bg-red-50 border border-red-200 text-red-700 rounded-xl p-6 text-center">
         <History size={40} className="mx-auto mb-3 text-red-400" />
         <p className="font-semibold">Failed to load historical data</p>
-        <p className="text-sm mt-1">{error}</p>
+        <p className="text-sm mt-1">Unable to reach the server. Check your connection and try again.</p>
       </div>
     );
   }
@@ -382,11 +406,14 @@ export default function HistoricalDataPage() {
 
   return (
     <div className="space-y-4">
-      {/* Offline warning banner */}
-      {error && activeHistory && activeHistory.length > 0 && (
+      {/* Offline warning banner - history is still shown from the database */}
+      {connectionStatus === "offline" && (
         <div className="bg-amber-50 border border-amber-200 text-amber-800 rounded-xl p-3 text-sm flex items-center gap-2">
           <AlertTriangle size={16} className="shrink-0" />
-          <span>{error}</span>
+          <span>
+            Device offline — showing recorded data up to{" "}
+            {lastUpdate ? new Date(lastUpdate).toLocaleString() : "last connection"}
+          </span>
         </div>
       )}
 
@@ -404,19 +431,31 @@ export default function HistoricalDataPage() {
           </div>
           <div className="flex items-center gap-2 flex-wrap">
             <Filter size={16} className="text-gray-400" />
-            {timeRanges.map((range) => (
-              <button
-                key={range.value}
-                onClick={() => setTimeRange(range.value)}
-                className={`px-3 py-1.5 rounded-lg text-sm font-medium transition ${
-                  timeRange === range.value
-                    ? "bg-blue-500 text-white shadow-sm"
-                    : "bg-gray-50 border border-gray-200 text-gray-600 hover:bg-gray-100"
-                }`}
-              >
-                {range.label}
-              </button>
-            ))}
+            {timeRanges.map((range) => {
+              const unavailable = isRangeUnavailable(range.value);
+              const offlineHours = Math.max(1, Math.floor(offlineForMs / (60 * 60 * 1000)));
+              return (
+                <button
+                  key={range.value}
+                  onClick={() => setTimeRange(range.value)}
+                  disabled={unavailable}
+                  title={
+                    unavailable
+                      ? `Device has been offline for ${offlineHours}h — no readings in this window`
+                      : undefined
+                  }
+                  className={`px-3 py-1.5 rounded-lg text-sm font-medium transition ${
+                    timeRange === range.value
+                      ? "bg-blue-500 text-white shadow-sm"
+                      : unavailable
+                        ? "bg-gray-50 border border-gray-200 text-gray-300 cursor-not-allowed"
+                        : "bg-gray-50 border border-gray-200 text-gray-600 hover:bg-gray-100"
+                  }`}
+                >
+                  {range.label}
+                </button>
+              );
+            })}
             {timeRange === "1w" && (
               <button
                 onClick={handleExportPdf}
@@ -449,7 +488,7 @@ export default function HistoricalDataPage() {
       )}
 
       {/* Summary Cards */}
-      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
         <div className="bg-white rounded-xl border border-gray-100 p-4 hover:shadow-sm transition">
           <div className="flex items-center justify-between mb-2">
             <div className="flex items-center gap-2 text-gray-500">
@@ -523,6 +562,43 @@ export default function HistoricalDataPage() {
             {latestReading?.water_level != null ? Number(latestReading.water_level).toFixed(0) : "--"}<span className="text-base font-normal text-gray-500">%</span>
           </div>
         </div>
+
+        <div className="bg-white rounded-xl border border-gray-100 p-4 hover:shadow-sm transition">
+          <div className="flex items-center justify-between mb-2">
+            <div className="flex items-center gap-2 text-gray-500">
+              <FlaskConical size={16} className="text-emerald-500" />
+              <span className="text-xs font-semibold uppercase tracking-wide">Ammonia</span>
+            </div>
+            {timeRange === "1w" && weeklyReport ? (
+              <div className="flex gap-3 text-xs">
+                <span className="text-blue-600" title="Min">
+                  <TrendingDown size={12} className="inline" /> {(weeklyReport.summary.ammonia_min ?? 0).toFixed(2)}
+                </span>
+                <span className="text-green-600" title="Average">
+                  <Activity size={12} className="inline" /> {(weeklyReport.summary.ammonia_avg ?? 0).toFixed(2)}
+                </span>
+                <span className="text-red-600" title="Max">
+                  <TrendingUp size={12} className="inline" /> {(weeklyReport.summary.ammonia_max ?? 0).toFixed(2)}
+                </span>
+              </div>
+            ) : stats?.ammonia && (
+              <div className="flex gap-3 text-xs">
+                <span className="text-blue-600" title="Min">
+                  <TrendingDown size={12} className="inline" /> {stats.ammonia.min.toFixed(2)}
+                </span>
+                <span className="text-green-600" title="Average">
+                  <Activity size={12} className="inline" /> {stats.ammonia.avg.toFixed(2)}
+                </span>
+                <span className="text-red-600" title="Max">
+                  <TrendingUp size={12} className="inline" /> {stats.ammonia.max.toFixed(2)}
+                </span>
+              </div>
+            )}
+          </div>
+          <div className="text-2xl font-bold text-gray-800">
+            {latestReading?.ammonia != null ? Number(latestReading.ammonia).toFixed(2) : "--"}<span className="text-base font-normal text-gray-500"> mg/L</span>
+          </div>
+        </div>
       </div>
 
       {/* Charts - Vertical layout for better readability */}
@@ -539,6 +615,12 @@ export default function HistoricalDataPage() {
             data={filteredHistory}
             dataKey="water_level"
             stroke="#2563eb"
+          />
+          <TrendCard
+            title="Ammonia (mg/L)"
+            data={filteredHistory}
+            dataKey="ammonia"
+            stroke="#10b981"
           />
         </div>
       ) : (
@@ -575,6 +657,8 @@ export default function HistoricalDataPage() {
                     <th className="px-3 py-2.5 text-center text-xs font-bold text-gray-500 uppercase">Temp Range</th>
                     <th className="px-3 py-2.5 text-center text-xs font-bold text-gray-500 uppercase">Avg Water</th>
                     <th className="px-3 py-2.5 text-center text-xs font-bold text-gray-500 uppercase">Water Range</th>
+                    <th className="px-3 py-2.5 text-center text-xs font-bold text-gray-500 uppercase">Avg Ammonia</th>
+                    <th className="px-3 py-2.5 text-center text-xs font-bold text-gray-500 uppercase">Ammonia Range</th>
                     <th className="px-3 py-2.5 text-center text-xs font-bold text-gray-500 uppercase">Readings</th>
                     <th className="px-3 py-2.5 text-center text-xs font-bold text-gray-500 uppercase">Alerts</th>
                   </tr>
@@ -592,6 +676,10 @@ export default function HistoricalDataPage() {
                       <td className="px-3 py-2.5 text-center text-gray-600">{(day.water_avg ?? 0).toFixed(0)}%</td>
                       <td className="px-3 py-2.5 text-center text-gray-500 text-xs">
                         {(day.water_min ?? 0).toFixed(0)} - {(day.water_max ?? 0).toFixed(0)}%
+                      </td>
+                      <td className="px-3 py-2.5 text-center text-gray-600">{(day.ammonia_avg ?? 0).toFixed(2)}</td>
+                      <td className="px-3 py-2.5 text-center text-gray-500 text-xs">
+                        {(day.ammonia_min ?? 0).toFixed(2)} - {(day.ammonia_max ?? 0).toFixed(2)}
                       </td>
                       <td className="px-3 py-2.5 text-center text-gray-600">{(day.readings ?? 0).toLocaleString()}</td>
                       <td className="px-3 py-2.5 text-center">

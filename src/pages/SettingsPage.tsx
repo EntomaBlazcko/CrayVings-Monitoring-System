@@ -6,7 +6,7 @@
 // This is the largest page in the application. It manages:
 //
 // 1. ALERT THRESHOLDS (all users view, admin users edit):
-//    - Min/Max inputs for Temperature and Water Level
+//    - Min/Max inputs for Temperature, Water Level, and Ammonia
 //    - Validation (bounds checking, min < max enforcement)
 //    - Save and Reset to Defaults buttons
 //    - Non-admin users see read-only fields with lock icon
@@ -75,16 +75,20 @@ const SETTING_BOUNDS: Record<string, { min: number; max: number }> = {
   temp_max: { min: -10, max: 50 },
   water_level_min: { min: 0, max: 100 },
   water_level_max: { min: 0, max: 100 },
+  ammonia_min: { min: 0, max: 10 },
+  ammonia_max: { min: 0, max: 10 },
 };
 
 const KEY_MAPPING: Record<string, { min: keyof SensorSettings; max: keyof SensorSettings }> = {
   temperature: { min: "temp_min", max: "temp_max" },
   water_level: { min: "water_level_min", max: "water_level_max" },
+  ammonia: { min: "ammonia_min", max: "ammonia_max" },
 };
 
 const THRESHOLD_COLORS: Record<string, { bg: string; border: string }> = {
   temperature: { bg: "bg-blue-50", border: "border-blue-100" },
   water_level: { bg: "bg-indigo-50", border: "border-indigo-100" },
+  ammonia: { bg: "bg-emerald-50", border: "border-emerald-100" },
 };
 
 const SETTINGS_FIELDS: Array<keyof SensorSettings> = [
@@ -92,6 +96,8 @@ const SETTINGS_FIELDS: Array<keyof SensorSettings> = [
   "temp_max",
   "water_level_min",
   "water_level_max",
+  "ammonia_min",
+  "ammonia_max",
 ];
 
 const userSchema = z.object({
@@ -536,7 +542,7 @@ export default function SettingsPage() {
             Alert Thresholds
           </div>
         </div>
-        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5 gap-4">
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
           {(Object.keys(KEY_MAPPING) as Array<keyof typeof KEY_MAPPING>).map((key) => {
             const threshold = thresholdConfig[key];
             const keys = KEY_MAPPING[key];

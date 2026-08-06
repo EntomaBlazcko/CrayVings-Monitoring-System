@@ -18,14 +18,13 @@
 // DATA: System logs from SensorProvider (auto-polled every 5 seconds)
 // =============================================================================
 
-import { useState, useMemo } from "react";
+import { useMemo } from "react";
 import { AlertTriangle, AlertCircle, ChevronLeft, ChevronRight } from "lucide-react";
 import { useSensors } from "../hooks/useSensors";
 import { parseAlertSeverity, type AlertSeverity } from "../types";
 
 export default function AlertsPage() {
-  const { logs, logsLoading, logsError, logsPage, logsTotal, logsCounts, setLogsPage } = useSensors();
-  const [filter, setFilter] = useState<"all" | "Alert" | "Change">("all");
+  const { logs, logsLoading, logsError, logsPage, logsTotal, logsCounts, setLogsPage, logsActionFilter, setLogsActionFilter } = useSensors();
 
   const processedLogs = useMemo(() => {
     return logs.map((log) => ({
@@ -47,17 +46,13 @@ export default function AlertsPage() {
     }
   };
 
-  const filteredLogs = processedLogs.filter((log) =>
-    filter === "all" || log.action === filter
-  );
-
   const alertCounts = useMemo(
     () => ({
-      all: logsTotal ?? logs.length,
-      Alert: logsCounts?.Alert ?? logs.filter((l) => l.action === "Alert").length,
-      Change: logsCounts?.Change ?? logs.filter((l) => l.action === "Change").length,
+      all: Object.values(logsCounts || {}).reduce((sum, c) => sum + c, 0) || logs.length,
+      Alert: logsCounts?.Alert ?? 0,
+      Change: logsCounts?.Change ?? 0,
     }),
-    [logs, logsTotal, logsCounts]
+    [logs, logsCounts]
   );
 
   const logsTotalPages = useMemo(() => {
@@ -109,9 +104,9 @@ export default function AlertsPage() {
         {(["all", "Alert", "Change"] as const).map((f) => (
           <button
             key={f}
-            onClick={() => setFilter(f)}
+            onClick={() => setLogsActionFilter(f === "all" ? "" : f)}
             className={`px-3 py-1.5 rounded-lg text-sm font-medium transition ${
-              filter === f
+              (f === "all" && logsActionFilter === "") || logsActionFilter === f
                 ? "bg-orange-500 text-white"
                 : "bg-white border border-gray-200 text-gray-600 hover:bg-gray-50"
             }`}
@@ -121,20 +116,20 @@ export default function AlertsPage() {
         ))}
       </div>
 
-      {filteredLogs.length === 0 ? (
+      {processedLogs.length === 0 ? (
         <div className="bg-white rounded-xl border border-gray-100 p-8 text-center">
           <AlertCircle size={40} className="mx-auto mb-3 text-green-500" />
           <h3 className="mt-0 text-gray-800">No Alerts</h3>
           <p className="text-gray-600">
-            {filter === "all"
+            {logsActionFilter === "all" || logsActionFilter === ""
               ? "No alerts recorded yet. Alerts appear when sensors go outside thresholds."
-              : `No ${filter.toLowerCase()} alerts found.`}
+              : `No ${logsActionFilter.toLowerCase()} alerts found.`}
           </p>
         </div>
       ) : (
         <>
           <div className="space-y-2">
-            {filteredLogs.map((log, index) => (
+            {processedLogs.map((log, index) => (
               <div
                 key={log.id ?? index}
                 className={`rounded-lg border p-3 ${getSeverityColor(log.severity)}`}

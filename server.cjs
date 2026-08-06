@@ -303,12 +303,12 @@ const SMS_CONFIG = {
     // Critical template: sent when a reading is dangerously outside the safe range
     critical: "🚨 {{SENSOR}} CRITICAL ALERT\nRecipient: {{NAME}}\nReading: {{VALUE}}{{UNIT}}\nThreshold: {{THRESHOLD}}{{UNIT}}\nTime: {{TIME}}\nStatus: CRITICAL",
     // Hourly update template: periodic summary of all sensor statuses
-    hourlyUpdate: "📊 CRAYVINGS HOURLY UPDATE\nTime: {{TIME}}\nTemperature: {{TEMP}}°C ({{TEMP_STATUS}})\nWater Level: {{WATER}}% ({{WATER_STATUS}})\n{{SUMMARY}}"
+    hourlyUpdate: "📊 CRAYVINGS HOURLY UPDATE\nTime: {{TIME}}\nTemperature: {{TEMP}}°C ({{TEMP_STATUS}})\nWater Level: {{WATER}}% ({{WATER_STATUS}})\nAmmonia: {{AMMONIA}} mg/L ({{AMMONIA_STATUS}})\n{{SUMMARY}}"
   },
   // Maps display names to SMS-friendly uppercase names
-  sensorNames: { "Temperature": "TEMPERATURE", "Water Level": "WATER LEVEL" },
+  sensorNames: { "Temperature": "TEMPERATURE", "Water Level": "WATER LEVEL", "Ammonia": "AMMONIA" },
   // Units for each sensor type in SMS messages
-  units: { "Temperature": "°C", "Water Level": "%" },
+  units: { "Temperature": "°C", "Water Level": "%", "Ammonia": " mg/L" },
   // Hourly SMS update settings
   hourly: {
     enabled: process.env.HOURLY_SMS_ENABLED !== "false",
@@ -451,6 +451,11 @@ let lastHourlyUpdateTs = null;
 // Create indexes on large tables for better query performance
 (async () => {
   try {
+    // Migrations: ensure ammonia columns exist (added after pH was removed).
+    await pool.query(`ALTER TABLE sensors ADD COLUMN IF NOT EXISTS ammonia DECIMAL(5,3) DEFAULT 0`);
+    await pool.query(`ALTER TABLE sensor_settings ADD COLUMN IF NOT EXISTS ammonia_min DECIMAL(5,2) DEFAULT 0`);
+    await pool.query(`ALTER TABLE sensor_settings ADD COLUMN IF NOT EXISTS ammonia_max DECIMAL(5,2) DEFAULT 1.00`);
+
     // Indexes for system_logs (faster pagination and counting)
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_system_logs_timestamp ON system_logs (timestamp DESC)`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_system_logs_action ON system_logs (action)`);
@@ -537,10 +542,11 @@ app.get("/", (req, res) => {
  *   - device_id (required): Identifier for the ESP32 device
  *   - temperature: Water temperature in Celsius (-1 if sensor failed)
  *   - water_level: Water level percentage (-1 if sensor failed)
+ *   - ammonia: Ammonia concentration in mg/L (-1 if sensor failed)
  *
  * Alert logic (runs in background via setImmediate):
  *   1. Fetches current threshold settings from sensor_settings table
- *   2. For each sensor (temp, water_level), skips negative values (-1 = sensor failed)
+ *   2. For each sensor (temp, water_level, ammonia), skips negative values (-1 = sensor failed)
  *   3. If value outside range, determines warning vs critical based on 15% deviation
  *   4. Checks cooldown period (2 minutes for both warning and critical)
  *   5. Checks if SMS alerts are muted (smsMuteUntil)
@@ -550,14 +556,14 @@ app.get("/", (req, res) => {
  */
 app.post("/sensor", async (req, res) => {
   try {
-    const { device_id, temperature, water_level } = req.body;
+    const { device_id, temperature, water_level, ammonia } = req.body;
     if (!device_id) return res.status(400).json({ message: "device_id is required" });
 
     // Store sensor reading in the database
     const ts = new Date();
     const result = await pool.query(
-      `INSERT INTO sensors (device_id, temperature, water_level, timestamp) VALUES ($1, $2, $3, $4) RETURNING *`,
-      [device_id, Number(temperature ?? 0), Number(water_level ?? 0), ts]
+      `INSERT INTO sensors (device_id, temperature, water_level, ammonia, timestamp) VALUES ($1, $2, $3, $4, $5) RETURNING *`,
+      [device_id, Number(temperature ?? 0), Number(water_level ?? 0), Number(ammonia ?? 0), ts]
     );
     console.log(`[${new Date().toISOString()}] Sensor data saved from ${device_id}`);
 
@@ -568,11 +574,12 @@ app.post("/sensor", async (req, res) => {
     setImmediate(async () => {
       try {
         const settingsResult = await pool.query("SELECT * FROM sensor_settings LIMIT 1");
-        const settings = settingsResult.rows[0] || { temp_min: 20, temp_max: 31, water_level_min: 10, water_level_max: 100 };
+        const settings = settingsResult.rows[0] || { temp_min: 20, temp_max: 31, water_level_min: 10, water_level_max: 100, ammonia_min: 0, ammonia_max: 1.0 };
 
         const sensorChecks = [
-          { key: "Temperature", val: Number(temperature), min: Number(settings.temp_min), max: Number(settings.temp_max) },
-          { key: "Water Level", val: Number(water_level), min: Number(settings.water_level_min), max: Number(settings.water_level_max) },
+          { key: "Temperature", val: Number(temperature), min: Number(settings.temp_min), max: Number(settings.temp_max), minValid: 0.0001 },
+          { key: "Water Level", val: Number(water_level), min: Number(settings.water_level_min), max: Number(settings.water_level_max), minValid: 0 },
+          { key: "Ammonia", val: Number(ammonia), min: Number(settings.ammonia_min), max: Number(settings.ammonia_max), minValid: 0 },
         ];
 
         const nowTs = ts.getTime();
@@ -581,8 +588,10 @@ app.post("/sensor", async (req, res) => {
 
         // Evaluate each sensor against its thresholds
         for (const sensor of sensorChecks) {
-          // Skip invalid sensor readings (-1 means sensor failed on ESP32)
-          if (sensor.val < 0) continue;
+          // Skip invalid sensor readings: the ESP32 sends -1 when a sensor fails,
+          // and 0 for temperature must also be treated as a failure (a 0°C reading
+          // is outside the valid range the firmware reports).
+          if (sensor.val < sensor.minValid) continue;
           const status = getThresholdStatus(sensor.val, sensor.min, sensor.max);
           const last = lastAlertedState[sensor.key] || {};
           const lastTs = last.timestamp ? new Date(last.timestamp).getTime() : 0;
@@ -678,7 +687,8 @@ app.post("/sensor", async (req, res) => {
               const hourlyMessage = buildMessage(SMS_CONFIG.messages.hourlyUpdate, {
                 TIME: ts.toLocaleString("en-PH", { timeZone: "Asia/Manila", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: true }),
                 TEMP: temperature ?? "N/A", TEMP_STATUS: "N/A",
-                WATER: water_level ?? "N/A", WATER_STATUS: "N/A", SUMMARY: "SMS muted"
+                WATER: water_level ?? "N/A", WATER_STATUS: "N/A",
+                AMMONIA: ammonia ?? "N/A", AMMONIA_STATUS: "N/A", SUMMARY: "SMS muted"
               });
               for (const r of hourlyRecipients.rows) {
                 await logSMS(r.phone_number, hourlyMessage, "muted", `SMS muted until ${smsMuteUntil}`, null);
@@ -689,13 +699,21 @@ app.post("/sensor", async (req, res) => {
           } else {
             const hourlyRecipients = await pool.query("SELECT phone_number, name FROM authorized_recipients WHERE is_active = true");
             if (hourlyRecipients.rows.length > 0) {
-              const tempStatus = getStatusText(getThresholdStatus(Number(temperature), Number(settings.temp_min), Number(settings.temp_max)));
-              const waterStatus = getStatusText(getThresholdStatus(Number(water_level), Number(settings.water_level_min), Number(settings.water_level_max)));
+              const tempVal = Number(temperature);
+              const waterVal = Number(water_level);
+              const ammoniaVal = Number(ammonia);
+              const tempOK = Number.isFinite(tempVal) && tempVal > 0;
+              const waterOK = Number.isFinite(waterVal) && waterVal >= 0;
+              const ammoniaOK = Number.isFinite(ammoniaVal) && ammoniaVal >= 0;
+              const tempStatus = tempOK ? getStatusText(getThresholdStatus(tempVal, Number(settings.temp_min), Number(settings.temp_max))) : "N/A (sensor offline)";
+              const waterStatus = waterOK ? getStatusText(getThresholdStatus(waterVal, Number(settings.water_level_min), Number(settings.water_level_max))) : "N/A (sensor offline)";
+              const ammoniaStatus = ammoniaOK ? getStatusText(getThresholdStatus(ammoniaVal, Number(settings.ammonia_min), Number(settings.ammonia_max))) : "N/A (sensor offline)";
               const hourlyTimestamp = ts.toLocaleString("en-PH", { timeZone: "Asia/Manila", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: true });
-              const summary = (tempStatus === "✅ Good" && waterStatus === "✅ Good") ? "All systems normal" : "Some parameters need attention";
+              const summary = (tempStatus === "✅ Good" && waterStatus === "✅ Good" && ammoniaStatus === "✅ Good") ? "All systems normal" : "Some parameters need attention";
               const hourlyMessage = buildMessage(SMS_CONFIG.messages.hourlyUpdate, {
-                TIME: hourlyTimestamp, TEMP: temperature ?? "N/A", TEMP_STATUS: tempStatus,
-                WATER: water_level ?? "N/A", WATER_STATUS: waterStatus, SUMMARY: summary
+                TIME: hourlyTimestamp, TEMP: tempOK ? temperature : "N/A", TEMP_STATUS: tempStatus,
+                WATER: waterOK ? water_level : "N/A", WATER_STATUS: waterStatus,
+                AMMONIA: ammoniaOK ? ammonia : "N/A", AMMONIA_STATUS: ammoniaStatus, SUMMARY: summary
               });
               const hourlyPromises = hourlyRecipients.rows.map(async (r) => sendSingleSMS(r.phone_number, hourlyMessage));
               await Promise.allSettled(hourlyPromises);
@@ -755,7 +773,7 @@ app.get("/sensor/latest", async (req, res) => {
  * Returns aggregated sensor data for the past 7 days for the weekly report.
  * Returns:
  *   - period: { start, end } ISO timestamps
- *   - summary: { temp_avg, temp_min, temp_max, water_avg, water_min, water_max, total_readings }
+ *   - summary: { temp_avg, temp_min, temp_max, water_avg, water_min, water_max, ammonia_avg, ammonia_min, ammonia_max, total_readings }
  *   - daily: array of per-day breakdown objects
  *   - alerts: { total, by_parameter, by_action }
  */
@@ -765,19 +783,22 @@ app.get("/report/weekly", async (req, res) => {
     try {
       summaryResult = await pool.query(`
         SELECT
-          COALESCE(AVG(temperature), 0)::float AS temp_avg,
-          COALESCE(MIN(temperature), 0)::float AS temp_min,
-          COALESCE(MAX(temperature), 0)::float AS temp_max,
-          COALESCE(AVG(water_level), 0)::float AS water_avg,
-          COALESCE(MIN(water_level), 0)::float AS water_min,
-          COALESCE(MAX(water_level), 0)::float AS water_max,
+          COALESCE(AVG(temperature) FILTER (WHERE temperature > 0), 0)::float AS temp_avg,
+          COALESCE(MIN(temperature) FILTER (WHERE temperature > 0), 0)::float AS temp_min,
+          COALESCE(MAX(temperature) FILTER (WHERE temperature > 0), 0)::float AS temp_max,
+          COALESCE(AVG(water_level) FILTER (WHERE water_level >= 0), 0)::float AS water_avg,
+          COALESCE(MIN(water_level) FILTER (WHERE water_level >= 0), 0)::float AS water_min,
+          COALESCE(MAX(water_level) FILTER (WHERE water_level >= 0), 0)::float AS water_max,
+          COALESCE(AVG(ammonia) FILTER (WHERE ammonia >= 0), 0)::float AS ammonia_avg,
+          COALESCE(MIN(ammonia) FILTER (WHERE ammonia >= 0), 0)::float AS ammonia_min,
+          COALESCE(MAX(ammonia) FILTER (WHERE ammonia >= 0), 0)::float AS ammonia_max,
           COUNT(*) AS total_readings
         FROM sensors
         WHERE timestamp >= NOW() - INTERVAL '7 days'
       `);
     } catch (err) {
       console.error(`[${new Date().toISOString()}] Weekly summary query failed:`, err.message);
-      summaryResult = { rows: [{ temp_avg: 0, temp_min: 0, temp_max: 0, water_avg: 0, water_min: 0, water_max: 0, total_readings: 0 }] };
+      summaryResult = { rows: [{ temp_avg: 0, temp_min: 0, temp_max: 0, water_avg: 0, water_min: 0, water_max: 0, ammonia_avg: 0, ammonia_min: 0, ammonia_max: 0, total_readings: 0 }] };
     }
 
     let dailyResult;
@@ -785,12 +806,15 @@ app.get("/report/weekly", async (req, res) => {
       dailyResult = await pool.query(`
         SELECT
           DATE(timestamp) AS date,
-          COALESCE(AVG(temperature), 0)::float AS temp_avg,
-          COALESCE(MIN(temperature), 0)::float AS temp_min,
-          COALESCE(MAX(temperature), 0)::float AS temp_max,
-          COALESCE(AVG(water_level), 0)::float AS water_avg,
-          COALESCE(MIN(water_level), 0)::float AS water_min,
-          COALESCE(MAX(water_level), 0)::float AS water_max,
+          COALESCE(AVG(temperature) FILTER (WHERE temperature > 0), 0)::float AS temp_avg,
+          COALESCE(MIN(temperature) FILTER (WHERE temperature > 0), 0)::float AS temp_min,
+          COALESCE(MAX(temperature) FILTER (WHERE temperature > 0), 0)::float AS temp_max,
+          COALESCE(AVG(water_level) FILTER (WHERE water_level >= 0), 0)::float AS water_avg,
+          COALESCE(MIN(water_level) FILTER (WHERE water_level >= 0), 0)::float AS water_min,
+          COALESCE(MAX(water_level) FILTER (WHERE water_level >= 0), 0)::float AS water_max,
+          COALESCE(AVG(ammonia) FILTER (WHERE ammonia >= 0), 0)::float AS ammonia_avg,
+          COALESCE(MIN(ammonia) FILTER (WHERE ammonia >= 0), 0)::float AS ammonia_min,
+          COALESCE(MAX(ammonia) FILTER (WHERE ammonia >= 0), 0)::float AS ammonia_max,
           COUNT(*) AS readings
         FROM sensors
         WHERE timestamp >= NOW() - INTERVAL '7 days'
@@ -863,6 +887,9 @@ app.get("/report/weekly", async (req, res) => {
         water_avg: Number(day.water_avg) || 0,
         water_min: Number(day.water_min) || 0,
         water_max: Number(day.water_max) || 0,
+        ammonia_avg: Number(day.ammonia_avg) || 0,
+        ammonia_min: Number(day.ammonia_min) || 0,
+        ammonia_max: Number(day.ammonia_max) || 0,
         readings: parseInt(day.readings) || 0,
         alerts: dailyAlertsMap[dateStr] || 0,
       };
@@ -883,6 +910,9 @@ app.get("/report/weekly", async (req, res) => {
         water_avg: Number(summary.water_avg) || 0,
         water_min: Number(summary.water_min) || 0,
         water_max: Number(summary.water_max) || 0,
+        ammonia_avg: Number(summary.ammonia_avg) || 0,
+        ammonia_min: Number(summary.ammonia_min) || 0,
+        ammonia_max: Number(summary.ammonia_max) || 0,
         total_readings: parseInt(summary.total_readings) || 0,
       },
       daily,
@@ -1019,7 +1049,7 @@ app.get("/settings", async (req, res) => {
   try {
     const result = await pool.query("SELECT * FROM sensor_settings LIMIT 1");
     if (result.rows.length === 0) {
-      return res.json({ temp_min: 20, temp_max: 31, water_level_min: 10, water_level_max: 100 });
+      return res.json({ temp_min: 20, temp_max: 31, water_level_min: 10, water_level_max: 100, ammonia_min: 0, ammonia_max: 1 });
     }
     const row = result.rows[0];
     res.json({
@@ -1028,6 +1058,8 @@ app.get("/settings", async (req, res) => {
       temp_max: Number(row.temp_max),
       water_level_min: Number(row.water_level_min),
       water_level_max: Number(row.water_level_max),
+      ammonia_min: Number(row.ammonia_min ?? 0),
+      ammonia_max: Number(row.ammonia_max ?? 1),
       updated_at: row.updated_at,
     });
   } catch (err) {
@@ -1043,11 +1075,11 @@ app.get("/settings", async (req, res) => {
  */
 app.post("/settings", requireAdmin, async (req, res) => {
   try {
-    const { temp_min, temp_max, water_level_min, water_level_max } = req.body;
+    const { temp_min, temp_max, water_level_min, water_level_max, ammonia_min, ammonia_max } = req.body;
     const existing = await pool.query("SELECT * FROM sensor_settings LIMIT 1");
     let savedSettings;
     if (existing.rows.length > 0) {
-      const changes = getChangedFields(existing.rows[0], { temp_min, temp_max, water_level_min, water_level_max });
+      const changes = getChangedFields(existing.rows[0], { temp_min, temp_max, water_level_min, water_level_max, ammonia_min, ammonia_max });
       if (Object.keys(changes).length === 0) return res.json({ message: "No change", changed: false, data: existing.rows[0] });
       const keys = Object.keys(changes);
       const values = Object.values(changes);
@@ -1056,8 +1088,8 @@ app.post("/settings", requireAdmin, async (req, res) => {
       savedSettings = result.rows[0];
     } else {
       const result = await pool.query(
-        `INSERT INTO sensor_settings (temp_min, temp_max, water_level_min, water_level_max) VALUES ($1, $2, $3, $4) RETURNING *`,
-        [temp_min, temp_max, water_level_min, water_level_max]
+        `INSERT INTO sensor_settings (temp_min, temp_max, water_level_min, water_level_max, ammonia_min, ammonia_max) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+        [temp_min, temp_max, water_level_min, water_level_max, ammonia_min, ammonia_max]
       );
       savedSettings = result.rows[0];
     }
@@ -1073,19 +1105,19 @@ app.post("/settings", requireAdmin, async (req, res) => {
  */
 app.post("/settings/reset", requireAdmin, async (req, res) => {
   try {
-    const defaults = { temp_min: 20, temp_max: 31, water_level_min: 10, water_level_max: 100 };
+    const defaults = { temp_min: 20, temp_max: 31, water_level_min: 10, water_level_max: 100, ammonia_min: 0, ammonia_max: 1 };
     const existing = await pool.query("SELECT * FROM sensor_settings LIMIT 1");
     let savedSettings;
     if (existing.rows.length > 0) {
       const result = await pool.query(
-        `UPDATE sensor_settings SET temp_min=$1, temp_max=$2, water_level_min=$3, water_level_max=$4, updated_at=NOW() WHERE id=$5 RETURNING *`,
-        [defaults.temp_min, defaults.temp_max, defaults.water_level_min, defaults.water_level_max, existing.rows[0].id]
+        `UPDATE sensor_settings SET temp_min=$1, temp_max=$2, water_level_min=$3, water_level_max=$4, ammonia_min=$5, ammonia_max=$6, updated_at=NOW() WHERE id=$7 RETURNING *`,
+        [defaults.temp_min, defaults.temp_max, defaults.water_level_min, defaults.water_level_max, defaults.ammonia_min, defaults.ammonia_max, existing.rows[0].id]
       );
       savedSettings = result.rows[0];
     } else {
       const result = await pool.query(
-        `INSERT INTO sensor_settings (temp_min, temp_max, water_level_min, water_level_max) VALUES ($1, $2, $3, $4) RETURNING *`,
-        [defaults.temp_min, defaults.temp_max, defaults.water_level_min, defaults.water_level_max]
+        `INSERT INTO sensor_settings (temp_min, temp_max, water_level_min, water_level_max, ammonia_min, ammonia_max) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+        [defaults.temp_min, defaults.temp_max, defaults.water_level_min, defaults.water_level_max, defaults.ammonia_min, defaults.ammonia_max]
       );
       savedSettings = result.rows[0];
     }
@@ -1178,17 +1210,25 @@ app.post("/settings/recipients/test/:id", requireAdmin, async (req, res) => {
 
     // Fetch current settings and latest sensor reading to build the test message
     const settingsResult = await pool.query("SELECT * FROM sensor_settings LIMIT 1");
-    const settings = settingsResult.rows[0] || { temp_min: 20, temp_max: 31, water_level_min: 10, water_level_max: 100 };
+    const settings = settingsResult.rows[0] || { temp_min: 20, temp_max: 31, water_level_min: 10, water_level_max: 100, ammonia_min: 0, ammonia_max: 1.0 };
     const sensorResult = await pool.query("SELECT * FROM sensors ORDER BY timestamp DESC LIMIT 1");
     const sensor = sensorResult.rows[0] || null;
 
     const temp = sensor?.temperature ?? "N/A";
     const water = sensor?.water_level ?? "N/A";
-    const tempStatus = sensor ? getStatusText(getThresholdStatus(Number(sensor.temperature), Number(settings.temp_min), Number(settings.temp_max))) : "N/A";
-    const waterStatus = sensor ? getStatusText(getThresholdStatus(Number(sensor.water_level), Number(settings.water_level_min), Number(settings.water_level_max))) : "N/A";
+    const ammonia = sensor?.ammonia ?? "N/A";
+    const tempVal = Number(sensor?.temperature);
+    const waterVal = Number(sensor?.water_level);
+    const ammoniaVal = Number(sensor?.ammonia);
+    const tempOK = sensor && Number.isFinite(tempVal) && tempVal > 0;
+    const waterOK = sensor && Number.isFinite(waterVal) && waterVal >= 0;
+    const ammoniaOK = sensor && Number.isFinite(ammoniaVal) && ammoniaVal >= 0;
+    const tempStatus = tempOK ? getStatusText(getThresholdStatus(tempVal, Number(settings.temp_min), Number(settings.temp_max))) : "N/A (sensor offline)";
+    const waterStatus = waterOK ? getStatusText(getThresholdStatus(waterVal, Number(settings.water_level_min), Number(settings.water_level_max))) : "N/A (sensor offline)";
+    const ammoniaStatus = ammoniaOK ? getStatusText(getThresholdStatus(ammoniaVal, Number(settings.ammonia_min), Number(settings.ammonia_max))) : "N/A (sensor offline)";
     const timestamp = new Date().toLocaleString("en-PH", { timeZone: "Asia/Manila", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: true });
-    const summary = (tempStatus === "✅ Good" && waterStatus === "✅ Good") ? "All systems normal" : "Some parameters need attention";
-    const testMessage = `📊 CRAYVINGS LIVE READINGS (TEST)\nTime: ${timestamp}\nTemperature: ${temp}°C (${tempStatus})\nWater Level: ${water}% (${waterStatus})\n${summary}\n(This is a test message)`;
+    const summary = (tempStatus === "✅ Good" && waterStatus === "✅ Good" && ammoniaStatus === "✅ Good") ? "All systems normal" : "Some parameters need attention";
+    const testMessage = `📊 CRAYVINGS LIVE READINGS (TEST)\nTime: ${timestamp}\nTemperature: ${tempOK ? temp : "N/A"}°C (${tempStatus})\nWater Level: ${waterOK ? water : "N/A"}% (${waterStatus})\nAmmonia: ${ammoniaOK ? ammonia : "N/A"} mg/L (${ammoniaStatus})\n${summary}\n(This is a test message)`;
 
     await sendSingleSMS(phone_number, testMessage);
     res.json({ success: true, message: "Test SMS sent" });
@@ -1224,7 +1264,8 @@ app.post("/logs", async (req, res) => {
 /**
  * GET /system-logs
  * Returns paginated system log entries with per-action counts.
- * Query parameters: page (default: 1), limit (default: 20, max: 100)
+ * Query parameters: page (default: 1), limit (default: 20, max: 100),
+ *   action (optional: filter by action, e.g. "Alert"), parameter (optional: filter by parameter)
  * Returns: { data: [], total: number, page: number, limit: number, counts: { action: count } }
  */
 app.get("/system-logs", async (req, res) => {
@@ -1232,8 +1273,22 @@ app.get("/system-logs", async (req, res) => {
     const page = Math.max(1, parseInt(req.query.page) || 1);
     const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 20));
     const offset = (page - 1) * limit;
-    const result = await pool.query("SELECT * FROM system_logs ORDER BY timestamp DESC LIMIT $1 OFFSET $2", [limit, offset]);
-    const countResult = await pool.query("SELECT COUNT(*) FROM system_logs");
+    const action = req.query.action || "";
+    const parameter = req.query.parameter || "";
+
+    // Build dynamic WHERE clause for action/parameter filters
+    let where = [];
+    let params = [];
+    let paramCount = 1;
+    if (action) { where.push(`action = $${paramCount}`); params.push(String(action)); paramCount++; }
+    if (parameter) { where.push(`parameter = $${paramCount}`); params.push(String(parameter)); paramCount++; }
+    const whereClause = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
+
+    const result = await pool.query(
+      `SELECT * FROM system_logs ${whereClause} ORDER BY timestamp DESC LIMIT $${paramCount} OFFSET $${paramCount + 1}`,
+      [...params, limit, offset]
+    );
+    const countResult = await pool.query(`SELECT COUNT(*) FROM system_logs ${whereClause}`, params);
     const countsResult = await pool.query("SELECT action, COUNT(*)::int AS count FROM system_logs GROUP BY action");
     const counts = {};
     countsResult.rows.forEach(row => { counts[row.action] = row.count; });

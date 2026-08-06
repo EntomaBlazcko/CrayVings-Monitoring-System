@@ -23,6 +23,7 @@ import { useMemo } from "react";
 import { 
   Thermometer, 
   Waves, 
+  FlaskConical,
   Radio,
   Activity,
   CheckCircle,
@@ -56,30 +57,28 @@ export default function SensorsPage() {
   const { data, connectionStatus, settings, settingsLoading, loading, error } = useSensors();
   
   const thresholds = useMemo(() => getSettingsThresholds(settings), [settings]);
-  
-  const isOnline = useMemo(() => {
-    if (connectionStatus === "online") return true;
-    if (connectionStatus === "connecting") return false;
-    if (!data?.timestamp) return false;
-    const dataTime = new Date(data.timestamp).getTime();
-    return !isNaN(dataTime) && Date.now() - dataTime < 10000;
-  }, [data?.timestamp, connectionStatus]);
+
+  // Use the provider's centrally-computed status so this page agrees with the
+  // rest of the app (15s threshold + consecutive-failure detection).
+  const isOnline = connectionStatus === "online";
 
   const isConnecting = connectionStatus === "connecting";
   const hasData = !!data;
   const isOfflineWithData = !isOnline && !isConnecting && hasData;
 
   const sensors = useMemo(() => {
-    const sensorKeys = ["temperature", "water_level"] as const;
+    const sensorKeys = ["temperature", "water_level", "ammonia"] as const;
     
     const icons: Record<string, React.ReactNode> = {
       temperature: <Thermometer size={20} />,
       water_level: <Waves size={20} />,
+      ammonia: <FlaskConical size={20} />,
     };
     
     const colors: Record<string, { color: string; bg: string; border: string }> = {
       temperature: { color: "text-orange-500", bg: "bg-orange-50", border: "border-orange-200" },
       water_level: { color: "text-blue-500", bg: "bg-blue-50", border: "border-blue-200" },
+      ammonia: { color: "text-emerald-500", bg: "bg-emerald-50", border: "border-emerald-200" },
     };
     
     return sensorKeys.map((key) => {
@@ -168,7 +167,7 @@ export default function SensorsPage() {
         </div>
       </div>
 
-      <div className={`grid grid-cols-1 sm:grid-cols-2 gap-3 md:gap-4 ${isOfflineWithData ? "opacity-60" : ""}`}>
+      <div className={`grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3 md:gap-4 ${isOfflineWithData ? "opacity-60" : ""}`}>
         {sensors.map((sensor) => (
           <div
             key={sensor.name}

@@ -91,6 +91,10 @@ export interface LogsContextValue {
   logsTotal: number;                   // Total number of log entries
   logsCounts: Record<string, number>;  // Per-action counts from API
   setLogsPage: (page: number) => void; // Navigate to a specific page
+  logsActionFilter: string;            // Current action filter (applied server-side)
+  setLogsActionFilter: (filter: string) => void;
+  logsParameterFilter: string;         // Current parameter filter (applied server-side)
+  setLogsParameterFilter: (filter: string) => void;
 }
 
 // ========================

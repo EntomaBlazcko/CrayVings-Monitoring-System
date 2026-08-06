@@ -2,6 +2,69 @@
 
 ## Change Log
 
+### 2026-08-06 - Ammonia as Third Monitored Parameter
+
+The previously removed pH parameter was replaced with **ammonia (mg/L)** as a full third parameter across the entire stack.
+
+#### ESP32 Firmware
+- Added a clearly-commented ammonia **simulation** (`readAmmonia()` in `esp32code/esp32code.ino`) — no physical sensor yet. Oscillates around a 0.12 mg/L baseline (amplitude 0.08) with a slow long-term drift, clamped to the 0–1.0 mg/L valid range
+- Payload is now `{"device_id","temperature","water_level","ammonia"}` (ammonia formatted `%.3f`); serial output prints "Ammonia: X mg/L"
+- `isAmmoniaValid()` and the `-1` failure sentinel match the water-level protocol
+
+#### Server
+- DB migration adds `sensors.ammonia DECIMAL(5,3)` and `sensor_settings.ammonia_min/max DECIMAL(5,2)` via `ADD COLUMN IF NOT EXISTS` (existing databases keep their data)
+- `POST /sensor` inserts ammonia and evaluates it in `sensorChecks` (minValid 0); hourly update, test SMS, and weekly report all include ammonia
+- `GET/POST/reset /settings` handle `ammonia_min`/`ammonia_max` (defaults 0 / 1)
+
+#### Frontend
+- Types: `SensorEntry.ammonia`, `ChartPoint.ammonia: number|null`, `SensorSettings.ammonia_min/max`, `DEFAULT_SETTINGS` (0–1.0), `getSettingsThresholds`, `SENSOR_KEY_TO_DISPLAY`/`DISPLAY_TO_SENSOR_KEY`, `WeeklyReport` daily/summary ammonia fields
+- API client: settings cast with `?? 0`/`?? 1` fallbacks; `fetchSensorHistory` maps failed readings to `null`
+- Pages: Home (3 stat cards/highlights/metrics), Dashboard (3 StatCards/TrendCards + ammonia in recent readings table), Sensors (third card, emerald theme), HistoricalData (stats, third TrendCard, weekly report table/PDF), Logs (Ammonia filter + PDF summary), Settings (ammonia thresholds)
+- `useThresholdAlert` now monitors `ammonia` for floating alerts
+
+#### Docs
+- `.env.example`, `README.md`, `HOW_IT_WORKS.md`, `SMS_HOWTO.md` updated for the ammonia parameter/placeholders; `CHANGES.md` gains this entry
+
+---
+
+### 2026-08-06 - Build Fix, Failed-Sensor Protocol, Offline History, and Polish
+
+#### Build Fixes
+- **`LogsResponse.counts`**: Added missing `counts: Record<string, number>` field in `src/api/client.ts` and pass-through in `fetchLogs` (fixes TypeScript build error)
+- **Removed unused `error` destructure** in DashboardPage and HomePage
+- **Fixed asset imports**: Logo renamed to `src/assets/crayvings.png`; updated `App.tsx`, `AuthPage.tsx`, `index.html` favicon, and docs to match (the old `craybitch without background.png` reference was broken)
+
+#### Failed-Sensor Protocol (minValid)
+- **Server threshold evaluation** now skips readings below per-sensor `minValid` (temperature `0.0001`, water level `0`) instead of `val < 0`; a dead sensor sending `-1` no longer triggers false critical alerts
+- **Hourly SMS / test SMS**: Sensors failing the validity check display "N/A (sensor offline)" instead of a bogus critical status
+- **Weekly report queries**: Use `FILTER (WHERE temperature > 0)` / `FILTER (WHERE water_level >= 0)` so sentinel values don't skew aggregates
+- **ESP32 firmware**: Sends `-1` on sensor failure (temperature, water level); WiFi-loss path now uses a finite 20s STA reconnect before falling back to a 180s WiFiManager portal (no more infinite block)
+
+#### Historical Data Available While Offline
+- **HistoricalDataPage fetches its own history** from `GET /sensor` on every range change, independent of the live device connection
+- Red "Failed to load" state only appears when the server is truly unreachable; an empty database shows a neutral message; otherwise charts render from the database while the device is offline
+- Offline banner shows "Device offline — showing recorded data up to {last recorded time}"
+- 1h/6h/24h range buttons are dimmed with a tooltip when the device has been offline longer than that window
+- **Sentinel normalization**: `fetchSensorHistory` converts failed readings (`-1`, and `0` for temperature) to `null`; `ChartPoint` values are now `number | null`; stats, TrendCard tooltips, and Dashboard recent-readings table handle nulls
+- Loading skeleton only shows on first load (no flash when switching ranges)
+
+#### SensorProvider / Connection Logic
+- `computeConnectionStatus` now includes `consecutiveFailures` in the memo (device properly marks offline after 5 failures)
+- All poll catch blocks return early on `ERR_CANCELED` so superseded/aborted polls don't count as failures
+- `refetch` refreshes the current logs page instead of resetting to page 1
+- Server-failure message clarified: "Unable to reach the server. Check your connection and try again." (was wrongly blaming the device)
+
+#### Server-Side Log Filters
+- `GET /system-logs` now accepts `action` and `parameter` query params and returns filtered pages + counts
+- LogsPage and AlertsPage filters are now server-backed (`logsActionFilter`/`logsParameterFilter` in `LogsContextValue`)
+
+#### Other Polish
+- **FloatingAlert**: Auto-dismiss timer no longer resets on every re-render (latest `onClose` held in a ref)
+- **LogsPage PDF**: Fixed always-true `didDrawPage` page-number bug; footers stamped in a loop over actual page count
+- **HomePage refresh / HistoricalDataPage PDF export**: Use `try/finally` so the busy state always clears
+- **ActivityLogsPage**: Pending debounce timer cleaned up on unmount
+- **SensorsPage**: Uses the shared provider connection status instead of a local stale window
+
 ### 2026-05-05 - Comprehensive Bug Fixes and Improvements
 
 #### ESP32 Firmware (`esp32code/esp32code.ino`)

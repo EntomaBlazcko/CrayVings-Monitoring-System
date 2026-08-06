@@ -5,7 +5,7 @@
 //
 // This is the default page shown after login. It provides:
 //   1. Hero banner with connection status badge and tank safety status
-//   2. Two gradient stat cards showing live temperature and water level
+//   2. Three gradient stat cards showing live temperature, water level, and ammonia
 //   3. System alerts sidebar showing active threshold breaches
 //   4. Quick controls panel (refresh data, dismiss alerts, go to settings)
 //   5. Key metrics summary section with optimal ranges
@@ -19,7 +19,7 @@
 // =============================================================================
 
 import { useState, useMemo } from "react";
-import { Thermometer, Waves, AlertTriangle, AlertCircle, CheckCircle, RefreshCw, BellOff, Settings } from "lucide-react";
+import { Thermometer, Waves, FlaskConical, AlertTriangle, AlertCircle, CheckCircle, RefreshCw, BellOff, Settings } from "lucide-react";
 import type { MenuKey } from "../types";
 import { useSensors } from "../hooks/useSensors";
 import { getSettingsThresholds, getThresholdStatus } from "../types";
@@ -50,7 +50,7 @@ function StatCard({ title, value, description, gradient, icon }: Stat) {
 }
 
 export default function HomePage({ onNavigate }: Props) {
-  const { data, refetch, settings, loading, error, connectionStatus, lastUpdate } = useSensors();
+  const { data, refetch, settings, loading, connectionStatus, lastUpdate } = useSensors();
   const [alertsDismissed, setAlertsDismissed] = useState(false);
   const [isRefreshing, setIsRefreshing] = useState(false);
   
@@ -63,10 +63,9 @@ export default function HomePage({ onNavigate }: Props) {
   
   const tankStatus = useMemo(() => {
     if (!hasData) return { safe: false, alerts: ["No sensor data"] };
-    if (!data) return { safe: false, alerts: ["No sensor data"] };
     
     const alerts: string[] = [];
-    const sensorKeys = ["temperature", "water_level"] as const;
+    const sensorKeys = ["temperature", "water_level", "ammonia"] as const;
     
     for (const key of sensorKeys) {
       const threshold = thresholds[key];
@@ -163,11 +162,19 @@ export default function HomePage({ onNavigate }: Props) {
       gradient: getCardGradient("from-indigo-500 to-blue-500"),
       icon: <Waves size={24} />,
     },
+    {
+      title: "Ammonia",
+      value: loading ? "Loading..." : data ? `${data.ammonia} mg/L` : "-- mg/L",
+      description: `Threshold: ${thresholds.ammonia.range.min}-${thresholds.ammonia.range.max} mg/L`,
+      gradient: getCardGradient("from-emerald-500 to-teal-500"),
+      icon: <FlaskConical size={24} />,
+    },
   ];
 
   const highlights = [
     { label: "Temperature", value: loading ? "..." : data ? `${data.temperature}°C` : "--", color: isOfflineWithData ? "bg-yellow-50 border-yellow-200 text-yellow-700" : data ? "bg-blue-50 border-blue-200 text-blue-700" : "bg-red-50 border-red-200 text-red-700" },
     { label: "Water Level", value: loading ? "..." : data ? `${data.water_level}%` : "--", color: isOfflineWithData ? "bg-yellow-50 border-yellow-200 text-yellow-700" : data ? "bg-indigo-50 border-indigo-200 text-indigo-700" : "bg-red-50 border-red-200 text-red-700" },
+    { label: "Ammonia", value: loading ? "..." : data ? `${data.ammonia} mg/L` : "--", color: isOfflineWithData ? "bg-yellow-50 border-yellow-200 text-yellow-700" : data ? "bg-emerald-50 border-emerald-200 text-emerald-700" : "bg-red-50 border-red-200 text-red-700" },
   ];
 
   const recentAlerts = tankStatus.alerts.filter(alert => alert !== "Tank is Safe").slice(0, 4);
@@ -278,7 +285,7 @@ export default function HomePage({ onNavigate }: Props) {
         </section>
       )}
 
-      <section className={`grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-2 ${isOfflineWithData ? "opacity-60" : ""}`}>
+      <section className={`grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3 ${isOfflineWithData ? "opacity-60" : ""}`}>
         {stats.map((stat) => (
           <StatCard key={stat.title} {...stat} />
         ))}
@@ -291,8 +298,11 @@ export default function HomePage({ onNavigate }: Props) {
             <button
               onClick={async () => {
                 setIsRefreshing(true);
-                await refetch();
-                setIsRefreshing(false);
+                try {
+                  await refetch();
+                } finally {
+                  setIsRefreshing(false);
+                }
               }}
               disabled={isRefreshing || loading}
               className="flex items-center gap-2 rounded-lg bg-blue-500 px-4 py-3 text-sm font-semibold text-white transition hover:bg-blue-600 disabled:opacity-50 disabled:cursor-not-allowed"
@@ -324,7 +334,7 @@ export default function HomePage({ onNavigate }: Props) {
               No sensor data available yet.
             </div>
           ) : (
-            <div className={`grid grid-cols-2 gap-4 md:grid-cols-2 ${isOfflineWithData ? "opacity-60" : ""}`}>
+            <div className={`grid grid-cols-1 gap-4 sm:grid-cols-3 ${isOfflineWithData ? "opacity-60" : ""}`}>
               <div className="rounded-xl bg-blue-50 p-4">
                 <p className="text-xs text-gray-500">Temperature</p>
                 <p className="mt-1 text-2xl font-bold text-blue-600">{data?.temperature ?? "--"}°C</p>
@@ -337,6 +347,13 @@ export default function HomePage({ onNavigate }: Props) {
                 <p className="mt-1 text-2xl font-bold text-indigo-600">{data?.water_level ?? "--"}%</p>
                 <p className="mt-1 text-xs text-gray-400">
                   Optimal: {thresholds.water_level.range.min}-{thresholds.water_level.range.max}%
+                </p>
+              </div>
+              <div className="rounded-xl bg-emerald-50 p-4">
+                <p className="text-xs text-gray-500">Ammonia</p>
+                <p className="mt-1 text-2xl font-bold text-emerald-600">{data?.ammonia ?? "--"} mg/L</p>
+                <p className="mt-1 text-xs text-gray-400">
+                  Optimal: {thresholds.ammonia.range.min}-{thresholds.ammonia.range.max} mg/L
                 </p>
               </div>
             </div>

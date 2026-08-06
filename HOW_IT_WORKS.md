@@ -41,7 +41,7 @@ The CRAYvings Monitoring System is an IoT-based aquaculture monitoring solution 
 │  Sensors:                                                         Pages:  │
 │  - DS18B20 (Temperature)                                     - Home      │
 │  - Ultrasonic (Water Level)                                  - Dashboard │
-│                                                               - Sensors   │
+│  - Ammonia (simulated)                                       - Sensors   │
 │                                                               - Alerts   │
 │                                                               - Historical│
 │                                                               - Settings  │
@@ -62,6 +62,7 @@ The system continuously monitors water parameters collected by the ESP32:
 |-----------|--------|-------|------|------------------|
 | Temperature | DS18B20 | 0 to 50 | °C | 20 - 31°C |
 | Water Level | Ultrasonic HC-SR04 | 0 to 100 | % | 10 - 100% |
+| Ammonia | Simulated (MQ-137 when available) | 0 to 1.0 | mg/L | 0 - 1.0 mg/L |
 
 **Features:**
 - Continuous data collection from ESP32 every 1000ms
@@ -69,6 +70,11 @@ The system continuously monitors water parameters collected by the ESP32:
 - Real-time display updates every 3 seconds via polling
 - Visual indicators for sensor status (online/offline)
 - Connection status detection based on actual sensor data timestamp (not poll time)
+
+> **Note:** No physical ammonia sensor is connected yet. The ESP32 firmware
+> (`readAmmonia()` in `esp32code/esp32code.ino`) returns a simulated reading so
+> the full stack can be tested end-to-end. Swap in a real sensor read when the
+> hardware is available.
 
 ### 2. Intelligent Alert System
 
@@ -100,11 +106,14 @@ The system actively monitors ESP32 connectivity:
 
 ### 4. Data-Driven Insights & Analytics
 
-- **Historical data analysis** with time range filtering (1h, 6h, 24h, all)
-- **Trend charts** for Temperature and Water Level using Recharts
+- **Historical data analysis** with time range filtering (1h, 6h, 24h, 1w, all time)
+- **Trend charts** for Temperature, Water Level, and Ammonia using Recharts
 - **Statistical summaries** on dashboard
-- **Export capability** via PDF (LogsPage exports system logs)
+- **Export capability** via PDF (LogsPage exports system logs, Historical Data exports weekly report)
+- **Weekly report** - 7-day summary (min/avg/max per sensor), daily breakdown, and alert counts
 - **Flexible history fetching** - Backend supports up to 1000 records (default: 300)
+- **Available while device is offline** - History is read from the database, so it stays viewable when the ESP32 disconnects (an amber banner shows the last recorded data time; short ranges that would be empty are dimmed)
+- **Failed-sensor sentinel filtering** - Readings the ESP32 marks as failed (-1, and 0 for temperature) are excluded from charts and statistics
 
 ### 5. Mobile-Responsive Dashboard
 
@@ -154,10 +163,11 @@ The system actively monitors ESP32 connectivity:
 ### 10. PDF Export
 
 - Export system logs to PDF using jsPDF + jspdf-autotable
-- Parameter filtering (Temperature, Water Level)
+- Parameter filtering (Temperature, Water Level, Ammonia)
 - Summary section with parameter counts
-- Auto-table formatting with pagination support
+- Auto-table formatting with pagination support (correct page numbers on multi-page exports)
 - Available in LogsPage
+- **Weekly report export** - Historical Data page (1 Week range) exports the summary, daily table, and alert breakdown to PDF
 
 ---
 
@@ -183,6 +193,7 @@ The ESP32 microcontroller reads sensor values at regular intervals:
 
 - **Temperature**: DS18B20 waterproof sensor (OneWire protocol)
 - **Water Level**: Ultrasonic HC-SR04 distance sensor with averaging (5 samples)
+- **Ammonia**: Simulated in firmware until a physical sensor (e.g., MQ-137) is installed
 
 ### 2. Data Transmission
 
@@ -195,7 +206,8 @@ Content-Type: application/json
 {
   "device_id": "ESP32_01",
   "temperature": 25.5,
-  "water_level": 80.0
+  "water_level": 80.0,
+  "ammonia": 0.12
 }
 ```
 
@@ -205,7 +217,7 @@ The Express server (`server.cjs`) performs these operations:
 
 1. **Validation**: Uses Zod schema to validate incoming data
 2. **Storage**: Inserts readings into PostgreSQL `sensors` table
-3. **Threshold Checking**: Compares values against configurable settings
+3. **Threshold Checking**: Compares values against configurable settings; readings below each sensor's `minValid` (temperature `0.0001`, water level `0`) are treated as failed sensors (`-1` from the ESP32) and skipped
 4. **Alert Generation**: Creates alerts for out-of-range values
 5. **Logging**: Records all alerts to `system_logs` table
 6. **History API**: Accepts `limit` parameter (1-1000, default: 300) for flexible data retrieval
@@ -267,6 +279,15 @@ const OFFLINE_THRESHOLD = 15000;     // 15 seconds before offline
 const MAX_CONSECUTIVE_FAILURES = 5;  // API failures before offline
 ```
 
+### Historical Data While Offline
+
+Historical data is served from the PostgreSQL database, not from the device, so it remains available when the ESP32 is offline:
+
+- The **Historical Data** page fetches its own history directly from `GET /sensor` on every range change — it does not depend on the live polling connection state
+- While offline, an amber banner shows "Device offline — showing recorded data up to {last recorded time}"
+- Range buttons that would contain no readings during a long outage (e.g. 1h/6h/24h) are dimmed with an explanatory tooltip; 1 Week and All Time stay enabled
+- A hard error is only shown if the server itself is unreachable (no DB access)
+
 ---
 
 ## Alert System
@@ -287,6 +308,7 @@ Users can configure thresholds in **Settings**:
 |------------|--------------|-------------|------|
 | Temperature | 20 | 31 | °C |
 | Water Level | 10 | 100 | % |
+| Ammonia | 0 | 1.0 | mg/L |
 
 ### Alert Severity
 
@@ -311,7 +333,7 @@ The system integrates with **SkySMS API** to send SMS notifications for:
 ```bash
 SKYSMS_API_KEY=your_skysms_api_key_here
 SKYSMS_API_URL=https://skysms.skyio.site/api/v1
-SMS_COOLDOWN_MS=300000
+SMS_COOLDOWN_MS=120000
 ```
 
 ### SMS Alert Flow
@@ -378,6 +400,7 @@ Manage SMS recipients through the **Settings** page:
 | `/sensor` | POST | Submit sensor data |
 | `/sensor` | GET | Get history (`limit`: 1-1000) |
 | `/sensor/latest` | GET | Get latest reading |
+| `/report/weekly` | GET | Weekly report (summary, daily breakdown, alert counts) |
 | `/settings` | GET | Get thresholds |
 | `/settings` | POST | Update thresholds |
 | `/settings/recipients` | GET | Get all recipients |
@@ -388,7 +411,7 @@ Manage SMS recipients through the **Settings** page:
 | `/alert/device-disconnect` | POST | Send disconnect SMS alert |
 | `/alert/mute` | POST | Mute SMS (`{ hours: number }`) |
 | `/alert/mute-status` | GET | Check mute status |
-| `/system-logs` | GET | Get system logs (`page`, `limit`) |
+| `/system-logs` | GET | Get system logs (`page`, `limit`, `action`, `parameter`) |
 | `/logs` | POST | Create log entry |
 | `/activity-logs` | GET | Get activity logs (`page`, `limit`, `search`, `sortBy`, `actionType`) |
 | `/activity-logs` | POST | Create activity log |
@@ -406,6 +429,7 @@ const sensorSchema = z.object({
   device_id: z.string().min(1).max(50),
   temperature: z.coerce.number().min(-10).max(50),
   water_level: z.coerce.number().min(0).max(100),
+  ammonia: z.coerce.number().min(0).max(1).optional(),
   timestamp: z.string().datetime().optional(),
 });
 ```
@@ -516,7 +540,7 @@ WiFi: WiFiManager captive portal (configurable on first boot)
 - Server on same local network
 - Port 3000 accessible
 - Static IP recommended for server
-- Auto-reconnect on WiFi drop
+- Auto-reconnect on WiFi drop: on disconnect the firmware retries STA connection for 20 seconds, then falls back to a 180-second WiFiManager portal before retrying
 
 ### Sensor Types & Measurement Ranges
 
@@ -524,11 +548,14 @@ WiFi: WiFiManager captive portal (configurable on first boot)
 |--------|------|-------|----------|-----|
 | DS18B20 | Digital | 0°C to 50°C | ±0.5°C | GPIO4 |
 | HC-SR04 | Ultrasonic | 0 - 100% | ±3mm | GPIO5, GPIO18 |
+| Ammonia | Simulated | 0 - 1.0 mg/L | - | (none yet) |
 
 ### ESP32 Sensor Validation
 
-- **Temperature**: Valid range 0-50°C, error detection (-127°C = sensor error)
-- **Water Level**: Valid range 0-100%, ultrasonic echo validation, 5-sample averaging
+- **Temperature**: Valid range 0-50°C, error detection (-127°C = sensor error); failed readings sent as `-1`
+- **Water Level**: Valid range 0-100%, ultrasonic echo validation, 5-sample averaging; failed readings sent as `-1`
+- **Ammonia**: Valid range 0-1.0 mg/L, simulated in firmware until a real sensor is connected; failed readings sent as `-1`
+- The backend skips these sentinel values during threshold evaluation so a failed sensor never triggers a false alert, and the dashboard excludes them from historical charts/stats
 
 ---
 
@@ -539,7 +566,7 @@ src/
 ├── api/
 │   └── client.ts           # Axios API client with all functions
 ├── assets/
-│   └── craybitch without background.png
+│   └── crayvings.png
 ├── components/
 │   ├── Header.tsx
 │   ├── Sidebar.tsx
@@ -613,8 +640,8 @@ PG_PASSWORD=your_password
 ALLOWED_ORIGINS=http://localhost:5173
 SKYSMS_API_KEY=your_skysms_api_key_here
 SKYSMS_API_URL=https://skysms.skyio.site/api/v1
-SMS_COOLDOWN_MS=300000
-WARNING_SMS_COOLDOWN_MS=3600000
+SMS_COOLDOWN_MS=120000
+WARNING_SMS_COOLDOWN_MS=120000
 HOURLY_SMS_ENABLED=true
 HOURLY_SMS_INTERVAL_MS=3600000
 ```
@@ -637,6 +664,7 @@ CREATE TABLE sensors (
   device_id VARCHAR(50) NOT NULL,
   temperature DECIMAL(5,2) DEFAULT 0,
   water_level DECIMAL(5,2) DEFAULT 0,
+  ammonia DECIMAL(5,3) DEFAULT 0,
   timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -668,6 +696,8 @@ CREATE TABLE sensor_settings (
   temp_max DECIMAL(5,2) DEFAULT 31.0,
   water_level_min DECIMAL(5,2) DEFAULT 10.0,
   water_level_max DECIMAL(5,2) DEFAULT 100.0,
+  ammonia_min DECIMAL(5,2) DEFAULT 0.0,
+  ammonia_max DECIMAL(5,2) DEFAULT 1.0,
   updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 ```
@@ -734,7 +764,7 @@ curl http://localhost:3000/health
 curl http://localhost:3000/sensor/latest
 curl -X POST http://localhost:3000/sensor \
   -H "Content-Type: application/json" \
-  -d '{"device_id":"TEST","temperature":25.0,"water_level":75.0}'
+  -d '{"device_id":"TEST","temperature":25.0,"water_level":75.0,"ammonia":0.12}'
 
 # Test mute
 curl -X POST http://localhost:3000/alert/mute \
@@ -770,8 +800,8 @@ curl http://localhost:3000/alert/mute-status
 | Connection pool | 20 max connections |
 | Page size | 20 items default |
 | Alert cooldown | 10 seconds |
-| SMS cooldown (critical) | 5 minutes |
-| SMS cooldown (warning) | 1 hour |
+| SMS cooldown (critical) | 2 minutes |
+| SMS cooldown (warning) | 2 minutes |
 | Offline threshold | 15 seconds |
 | Mute durations | 1, 2, 4, 6, 8, 12, 24 hours |
 

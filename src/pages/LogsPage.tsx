@@ -4,7 +4,7 @@
 // PURPOSE: System logs page with parameter filtering and PDF export.
 //
 // This page displays system log entries in a table format with:
-//   1. Parameter filter buttons: All / Temperature / Water Level
+//   1. Parameter filter buttons: All / Temperature / Water Level / Ammonia
 //   2. Paginated table showing timestamp, parameter, old value, new value, action
 //   3. PDF export functionality (via jsPDF + autoTable)
 //
@@ -19,39 +19,33 @@
 // =============================================================================
 
 import { useState, useMemo, useCallback } from "react";
-import { FileText, Download, Clock, Thermometer, Waves } from "lucide-react";
+import { FileText, Download, Clock, Thermometer, Waves, FlaskConical } from "lucide-react";
 import { useSensors } from "../hooks/useSensors";
 import { jsPDF } from "jspdf";
-import autoTable, { type HookData } from "jspdf-autotable";
+import autoTable from "jspdf-autotable";
 import { SENSOR_KEY_TO_DISPLAY } from "../types";
 
 const PARAMETER_ICONS: Record<string, React.ReactNode> = {
   Temperature: <Thermometer size={14} className="text-blue-500" />,
   "Water Level": <Waves size={14} className="text-indigo-500" />,
+  Ammonia: <FlaskConical size={14} className="text-emerald-500" />,
   temperature: <Thermometer size={14} className="text-blue-500" />,
   water_level: <Waves size={14} className="text-indigo-500" />,
+  ammonia: <FlaskConical size={14} className="text-emerald-500" />,
 };
 
-const PARAMETERS = ["all", "Temperature", "Water Level"] as const;
-type ParameterFilter = typeof PARAMETERS[number];
+const PARAMETERS = ["all", "Temperature", "Water Level", "Ammonia"] as const;
 
 export default function LogsPage() {
-  const { logs, logsLoading, logsError, refetchLogs, logsPage, logsTotal, setLogsPage } = useSensors();
-  const [filter, setFilter] = useState<ParameterFilter>("all");
+  const { logs, logsLoading, logsError, refetchLogs, logsPage, logsTotal, setLogsPage, logsParameterFilter, setLogsParameterFilter } = useSensors();
   const [isChangingPage, setIsChangingPage] = useState(false);
 
   const getDisplayParameter = (param: string): string => {
     return SENSOR_KEY_TO_DISPLAY[param] ?? param;
   };
 
-  const filteredLogs = useMemo(
-    () => logs.filter((log) => {
-      if (filter === "all") return true;
-      const displayParam = getDisplayParameter(log.parameter);
-      return displayParam === filter || log.parameter === filter;
-    }),
-    [logs, filter]
-  );
+  // Logs are already filtered server-side by the active parameter filter.
+  const filteredLogs = logs;
 
   const totalPages = useMemo(() => {
     const total = Number(logsTotal) || 0;
@@ -92,11 +86,11 @@ export default function LogsPage() {
 
   const parameterCounts = filteredLogs.reduce<Record<string, number>>((acc, log) => {
     const displayParam = getDisplayParameter(log.parameter);
-    if (["Temperature", "Water Level"].includes(displayParam)) {
+    if (["Temperature", "Water Level", "Ammonia"].includes(displayParam)) {
       acc[displayParam] = (acc[displayParam] || 0) + 1;
     }
     return acc;
-  }, { Temperature: 0, "Water Level":0 });
+  }, { Temperature: 0, "Water Level":0, Ammonia: 0 });
 
     const summaryY = 34;
     doc.setFontSize(11);
@@ -119,7 +113,7 @@ export default function LogsPage() {
   const tableData = filteredLogs
     .filter((log) => {
       const displayParam = getDisplayParameter(log.parameter);
-      return ["Temperature", "Water Level"].includes(displayParam);
+      return ["Temperature", "Water Level", "Ammonia"].includes(displayParam);
     })
     .map((log) => [
       log.timestamp ? new Date(log.timestamp).toLocaleString() : "-",
@@ -155,35 +149,37 @@ export default function LogsPage() {
         4: { cellWidth: 35, halign: "center" },
       },
       margin: { left: 14, right: 14 },
-      didDrawPage: (data: HookData) => {
-        const currentPage = data.doc.getNumberOfPages();
-        const totalPages = data.doc.getNumberOfPages();
-
-        data.doc.setFontSize(8);
-        data.doc.setFont("helvetica", "normal");
-        data.doc.setTextColor(128, 128, 128);
-        
-        data.doc.text(
-          `Page ${currentPage} of ${totalPages}`,
-          pageWidth / 2,
-          pageHeight - 10,
-          { align: "center" }
-        );
-        
-        data.doc.text(
-          "CRAYvings Monitoring System",
-          14,
-          pageHeight - 10
-        );
-        
-        data.doc.text(
-          `Exported: ${new Date().toLocaleDateString()}`,
-          pageWidth - 14,
-          pageHeight - 10,
-          { align: "right" }
-        );
-      },
     });
+
+    // Stamp footers after the table is drawn so the page total is accurate.
+    // (didDrawPage can't know the final count while earlier pages are rendered.)
+    const finalPageCount = doc.getNumberOfPages();
+    for (let i = 1; i <= finalPageCount; i++) {
+      doc.setPage(i);
+      doc.setFontSize(8);
+      doc.setFont("helvetica", "normal");
+      doc.setTextColor(128, 128, 128);
+
+      doc.text(
+        `Page ${i} of ${finalPageCount}`,
+        pageWidth / 2,
+        pageHeight - 10,
+        { align: "center" }
+      );
+
+      doc.text(
+        "CRAYvings Monitoring System",
+        14,
+        pageHeight - 10
+      );
+
+      doc.text(
+        `Exported: ${new Date().toLocaleDateString()}`,
+        pageWidth - 14,
+        pageHeight - 10,
+        { align: "right" }
+      );
+    }
 
     doc.save(`CRAYvings_System_Logs_${new Date().toISOString().split("T")[0]}.pdf`);
   }, [filteredLogs]);
@@ -219,9 +215,9 @@ export default function LogsPage() {
             {PARAMETERS.map((param) => (
               <button
                 key={param}
-                onClick={() => setFilter(param)}
+                onClick={() => setLogsParameterFilter(param === "all" ? "" : param)}
                 className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition ${
-                  filter === param
+                  (param === "all" && logsParameterFilter === "") || logsParameterFilter === param
                     ? "bg-[#c2410c] text-white"
                     : "bg-white text-gray-600 border border-gray-200 hover:bg-gray-50"
                 }`}
@@ -247,9 +243,9 @@ export default function LogsPage() {
           {PARAMETERS.map((param) => (
             <button
               key={param}
-              onClick={() => setFilter(param)}
+              onClick={() => setLogsParameterFilter(param === "all" ? "" : param)}
               className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition ${
-                filter === param
+                (param === "all" && logsParameterFilter === "") || logsParameterFilter === param
                   ? "bg-[#c2410c] text-white"
                   : "bg-white text-gray-600 border border-gray-200 hover:bg-gray-50"
               }`}

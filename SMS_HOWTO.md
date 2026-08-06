@@ -71,10 +71,10 @@ warning: "⚠️ {{SENSOR}} WARNING\n" +
 ```
 
 **Available placeholders:**
-- `{{SENSOR}}` - Sensor name (e.g., "TEMPERATURE", "WATER LEVEL")
+- `{{SENSOR}}` - Sensor name (e.g., "TEMPERATURE", "WATER LEVEL", "AMMONIA")
 - `{{NAME}}` - Recipient's name
 - `{{VALUE}}` - Current sensor reading
-- `{{UNIT}}` - Unit (°C, %)
+- `{{UNIT}}` - Unit (°C, %, mg/L)
 - `{{THRESHOLD}}` - Threshold value that was crossed
 - `{{TIME}}` - Timestamp in Philippines timezone
 
@@ -112,12 +112,14 @@ hourlyUpdate: "📊 CRAYVINGS HOURLY UPDATE\n" +
               "Time: {{TIME}}\n" +
               "Temperature: {{TEMP}}°C ({{TEMP_STATUS}})\n" +
               "Water Level: {{WATER}}% ({{WATER_STATUS}})\n" +
+              "Ammonia: {{AMMONIA}} mg/L ({{AMMONIA_STATUS}})\n" +
               "{{SUMMARY}}"
 ```
 
 **Additional placeholders for hourly update:**
 - `{{TEMP}}`, `{{TEMP_STATUS}}` - Temperature reading and status
 - `{{WATER}}`, `{{WATER_STATUS}}` - Water level reading and status
+- `{{AMMONIA}}`, `{{AMMONIA_STATUS}}` - Ammonia reading and status
 - `{{SUMMARY}}` - Summary text (e.g., "All systems normal ✅")
 
 ---
@@ -167,7 +169,8 @@ Edit `SMS_CONFIG.sensorNames` in `server.cjs`:
 ```javascript
 sensorNames: {
   "Temperature": "TEMPERATURE",
-  "Water Level": "WATER LEVEL"
+  "Water Level": "WATER LEVEL",
+  "Ammonia": "AMMONIA"
 }
 ```
 
@@ -242,11 +245,11 @@ from: "CRAYVINGS"  // Change this to your preferred sender name (max 11 characte
 Add or edit in your `.env` file:
 
 ```bash
-# Critical alert cooldown (default: 5 minutes = 300000)
-SMS_COOLDOWN_MS=300000
+# Critical alert cooldown (default: 2 minutes = 120000)
+SMS_COOLDOWN_MS=120000
 
-# Warning alert cooldown (default: 1 hour = 3600000)
-WARNING_SMS_COOLDOWN_MS=3600000
+# Warning alert cooldown (default: 2 minutes = 120000)
+WARNING_SMS_COOLDOWN_MS=120000
 ```
 
 This prevents spam if a sensor stays in warning/critical state.
@@ -468,8 +471,8 @@ SKYSMS_API_KEY=your_skysms_api_key_here
 SKYSMS_API_URL=https://skysms.skyio.site/api/v1
 
 # SMS Cooldowns
-SMS_COOLDOWN_MS=300000        # 5 min cooldown for critical
-WARNING_SMS_COOLDOWN_MS=3600000 # 1 hour cooldown for warning
+SMS_COOLDOWN_MS=120000        # 2 min cooldown for critical
+WARNING_SMS_COOLDOWN_MS=120000 # 2 min cooldown for warning
 
 # Hourly Updates
 HOURLY_SMS_ENABLED=true

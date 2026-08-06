@@ -67,6 +67,10 @@ export function useSensors() {
     logsTotal: logsContext.logsTotal,
     logsCounts: logsContext.logsCounts,
     setLogsPage: logsContext.setLogsPage,
+    logsActionFilter: logsContext.logsActionFilter,
+    setLogsActionFilter: logsContext.setLogsActionFilter,
+    logsParameterFilter: logsContext.logsParameterFilter,
+    setLogsParameterFilter: logsContext.setLogsParameterFilter,
     // Activity logs fields
     activityLogs: activityLogsContext.activityLogs,
     activityLogsLoading: activityLogsContext.activityLogsLoading,

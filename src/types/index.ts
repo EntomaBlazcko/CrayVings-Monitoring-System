@@ -32,6 +32,7 @@ export type SensorEntry = {
   device_id: string;       // ESP32 device identifier
   temperature: number;     // Water temperature in Celsius
   water_level: number;     // Water level as percentage
+  ammonia: number;         // Ammonia concentration in mg/L
   timestamp?: string;      // ISO 8601 timestamp of the reading
 };
 
@@ -43,8 +44,9 @@ export type SensorEntry = {
 export type ChartPoint = {
   name: string;            // Formatted time label (e.g., "02:30 PM")
   timestamp: string;       // ISO 8601 timestamp
-  temperature: number;     // Temperature value for charting
-  water_level: number;     // Water level value for charting
+  temperature: number | null;     // Temperature value for charting (null = sensor failure)
+  water_level: number | null;     // Water level value for charting (null = sensor failure)
+  ammonia: number | null;         // Ammonia value for charting (null = sensor failure)
 };
 
 // ========================
@@ -117,19 +119,23 @@ export type SensorSettings = {
   temp_max: number;
   water_level_min: number;
   water_level_max: number;
+  ammonia_min: number;
+  ammonia_max: number;
   updated_at?: string;
 };
 
 /**
  * Default threshold values used when no settings exist in the database.
  * These represent safe ranges for crayfish aquaculture.
- * Temperature: 20-31°C, Water Level: 10-100%
+ * Temperature: 20-31°C, Water Level: 10-100%, Ammonia: 0-1.0 mg/L
  */
 export const DEFAULT_SETTINGS: SensorSettings = {
   temp_min:20.0,
   temp_max:31.0,
   water_level_min:10.0,
   water_level_max:100.0,
+  ammonia_min:0.0,
+  ammonia_max:1.0,
 };
 
 // ========================
@@ -179,6 +185,13 @@ export function getSettingsThresholds(settings: SensorSettings | null): Record<s
       range: { min: defaults.water_level_min, max: defaults.water_level_max },
       isMinOnly: false,
       color: "text-blue-500",
+    },
+    ammonia: {
+      name: "Ammonia",
+      unit: "mg/L",
+      range: { min: defaults.ammonia_min, max: defaults.ammonia_max },
+      isMinOnly: false,
+      color: "text-emerald-500",
     },
   };
 }
@@ -295,6 +308,7 @@ export function getApiBase(): string {
 export const SENSOR_KEY_TO_DISPLAY: Record<string, string> = {
   temperature: "Temperature",
   water_level: "Water Level",
+  ammonia: "Ammonia",
 };
 
 /**
@@ -304,6 +318,7 @@ export const SENSOR_KEY_TO_DISPLAY: Record<string, string> = {
 export const DISPLAY_TO_SENSOR_KEY: Record<string, string> = {
   "Temperature": "temperature",
   "Water Level": "water_level",
+  "Ammonia": "ammonia",
 };
 
 /**
@@ -417,6 +432,9 @@ export type WeeklyReportDaily = {
   water_avg: number;
   water_min: number;
   water_max: number;
+  ammonia_avg: number;
+  ammonia_min: number;
+  ammonia_max: number;
   readings: number;
   alerts: number;
 };
@@ -430,6 +448,9 @@ export type WeeklyReport = {
     water_avg: number;
     water_min: number;
     water_max: number;
+    ammonia_avg: number;
+    ammonia_min: number;
+    ammonia_max: number;
     total_readings: number;
   };
   daily: WeeklyReportDaily[];

@@ -39,7 +39,7 @@ import {
   FileText,
   ClipboardList,
 } from "lucide-react";
-import logo from "./assets/craybitch without background.png";
+import logo from "./assets/crayvings.png";
 import type { MenuKey } from "./types";
 import { isValidMenuKey } from "./types";
 import Header from "./components/Header";

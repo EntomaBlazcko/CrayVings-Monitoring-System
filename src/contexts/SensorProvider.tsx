@@ -43,6 +43,7 @@ import {
   useMemo,
   type ReactNode,
 } from "react";
+import { isAxiosError } from "axios";
 import {
   SensorDataContext,
   SensorSettingsContext,
@@ -108,20 +109,25 @@ interface LogsState {
   logsPage: number;
   logsTotal: number;
   logsCounts: Record<string, number>;
+  logsActionFilter: string;
+  logsParameterFilter: string;
 }
 
 // ========================
 // CONNECTION STATUS HELPER
 // ========================
 /**
- * Computes the connection status based on loading state and last update time.
+ * Computes the connection status based on loading state, last update time,
+ * and consecutive polling failures.
  * This is a pure function used for consistent status calculation.
  */
 function computeConnectionStatus(
   loading: boolean,
-  lastUpdate: Date | null
+  lastUpdate: Date | null,
+  consecutiveFailures = 0
 ): "online" | "offline" | "connecting" | "unknown" {
   if (loading) return "connecting";
+  if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) return "offline";
   if (!lastUpdate) return "unknown";
   const gap = Date.now() - lastUpdate.getTime();
   if (gap > OFFLINE_THRESHOLD) return "offline";
@@ -202,14 +208,18 @@ function useSensorDataPolling(): SensorDataState & { refetch: () => void } {
           connectionStatus: "unknown",
         }));
       }
-    } catch {
+    } catch (error) {
+      // A canceled request just means the next poll superseded it (or the
+      // component unmounted) — that's not a failure, so don't count it.
+      if (isAxiosError(error) && error.code === "ERR_CANCELED") return;
+
       consecutiveFailuresRef.current += 1;
 
       // Only show error after multiple consecutive failures
       if (consecutiveFailuresRef.current >= MAX_CONSECUTIVE_FAILURES) {
         setState((prev) => ({
           ...prev,
-          error: "Unable to connect to device. Device may be offline.",
+          error: "Unable to reach the server. Check your connection and try again.",
           loading: false,
           connectionStatus: "offline",
           consecutiveFailures: consecutiveFailuresRef.current,
@@ -239,10 +249,10 @@ function useSensorDataPolling(): SensorDataState & { refetch: () => void } {
     };
   }, [fetchData]);
 
-  // Recompute connection status whenever loading or lastUpdate changes
+  // Recompute connection status whenever loading, lastUpdate, or failures change
   const computedConnectionStatus = useMemo(
-    () => computeConnectionStatus(state.loading, state.lastUpdate),
-    [state.loading, state.lastUpdate]
+    () => computeConnectionStatus(state.loading, state.lastUpdate, state.consecutiveFailures),
+    [state.loading, state.lastUpdate, state.consecutiveFailures]
   );
 
   return useMemo(
@@ -372,7 +382,7 @@ function useSettingsManager(): SensorSettingsState & { refetch: () => void; save
  * Custom hook that manages paginated system logs.
  * Auto-polls every 5 seconds for fresh log entries.
  */
-function useLogsManager(): LogsState & { refetch: () => void; setPage: (page: number) => void } {
+function useLogsManager(): LogsState & { refetch: () => void; setPage: (page: number) => void; setLogsActionFilter: (filter: string) => void; setLogsParameterFilter: (filter: string) => void } {
   const [state, setState] = useState<LogsState>({
     logs: [],
     logsLoading: true,
@@ -380,19 +390,29 @@ function useLogsManager(): LogsState & { refetch: () => void; setPage: (page: nu
     logsPage: 1,
     logsTotal: 0,
     logsCounts: {},
+    logsActionFilter: "",
+    logsParameterFilter: "",
   });
 
   const abortControllerRef = useRef<AbortController | null>(null);
 
-  /** Fetches a specific page of system logs. */
-  const fetchData = useCallback(async (page = 1) => {
+  /** Fetches a specific page of system logs with the active filters. */
+  const fetchData = useCallback(async (page = 1, actionFilter = "", parameterFilter = "") => {
     if (abortControllerRef.current) {
       abortControllerRef.current.abort();
     }
     abortControllerRef.current = new AbortController();
 
     try {
-      const response = await fetchLogs(page, LOGS_PAGE_SIZE, abortControllerRef.current.signal);
+      const response = await fetchLogs(
+        page,
+        LOGS_PAGE_SIZE,
+        abortControllerRef.current.signal,
+        {
+          action: actionFilter || undefined,
+          parameter: parameterFilter || undefined,
+        }
+      );
       setState((prev) => ({
         ...prev,
         logs: response.data,
@@ -402,7 +422,8 @@ function useLogsManager(): LogsState & { refetch: () => void; setPage: (page: nu
         logsTotal: response.total,
         logsCounts: response.counts || {},
       }));
-    } catch {
+    } catch (error) {
+      if (isAxiosError(error) && error.code === "ERR_CANCELED") return;
       setState((prev) => ({
         ...prev,
         logsLoading: false,
@@ -413,8 +434,11 @@ function useLogsManager(): LogsState & { refetch: () => void; setPage: (page: nu
 
   // Fetch logs on mount and set up auto-polling
   useEffect(() => {
-    fetchData(state.logsPage);
-    const interval = setInterval(() => fetchData(state.logsPage), LOGS_POLL_INTERVAL);
+    fetchData(state.logsPage, state.logsActionFilter, state.logsParameterFilter);
+    const interval = setInterval(
+      () => fetchData(state.logsPage, state.logsActionFilter, state.logsParameterFilter),
+      LOGS_POLL_INTERVAL
+    );
 
     return () => {
       clearInterval(interval);
@@ -422,24 +446,44 @@ function useLogsManager(): LogsState & { refetch: () => void; setPage: (page: nu
         abortControllerRef.current.abort();
       }
     };
-  }, [fetchData, state.logsPage]);
+  }, [fetchData, state.logsPage, state.logsActionFilter, state.logsParameterFilter]);
 
   const refetch = useCallback(() => {
     setState((prev) => ({ ...prev, logsLoading: true, logsError: null }));
-    fetchData();
-  }, [fetchData]);
+    fetchData(state.logsPage, state.logsActionFilter, state.logsParameterFilter);
+  }, [fetchData, state.logsPage, state.logsActionFilter, state.logsParameterFilter]);
 
   const setPage = useCallback((page: number) => {
     setState((prev) => ({ ...prev, logsPage: page }));
   }, []);
+
+  const setLogsActionFilter = useCallback((filter: string) => {
+    setState((prev) => ({
+      ...prev,
+      logsActionFilter: filter,
+      logsPage: 1,
+    }));
+    fetchData(1, filter, state.logsParameterFilter);
+  }, [fetchData, state.logsParameterFilter]);
+
+  const setLogsParameterFilter = useCallback((filter: string) => {
+    setState((prev) => ({
+      ...prev,
+      logsParameterFilter: filter,
+      logsPage: 1,
+    }));
+    fetchData(1, state.logsActionFilter, filter);
+  }, [fetchData, state.logsActionFilter]);
 
   return useMemo(
     () => ({
       ...state,
       refetch,
       setPage,
+      setLogsActionFilter,
+      setLogsParameterFilter,
     }),
-    [state, refetch, setPage]
+    [state, refetch, setPage, setLogsActionFilter, setLogsParameterFilter]
   );
 }
 
@@ -527,7 +571,8 @@ function useActivityLogsManager() {
           activityLogsTotalPages: response.totalPages ?? Math.ceil((response.total || 0) / 20),
         }));
       }
-    } catch {
+    } catch (error) {
+      if (isAxiosError(error) && error.code === "ERR_CANCELED") return;
       if (isMountedRef.current) {
         setState((prev) => ({
           ...prev,
@@ -655,6 +700,10 @@ export function SensorProvider({ children }: { children: ReactNode }) {
       logsTotal: logsState.logsTotal,
       logsCounts: logsState.logsCounts,
       setLogsPage: logsState.setPage,
+      logsActionFilter: logsState.logsActionFilter,
+      setLogsActionFilter: logsState.setLogsActionFilter,
+      logsParameterFilter: logsState.logsParameterFilter,
+      setLogsParameterFilter: logsState.setLogsParameterFilter,
     }),
     [logsState]
   );

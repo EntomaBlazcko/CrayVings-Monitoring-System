@@ -21,7 +21,7 @@
 // DATA: Activity logs from SensorProvider (fetched on mount, refreshed on demand)
 // =============================================================================
 
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { Search, RefreshCw, ChevronLeft, ChevronRight, ArrowUpDown, Activity } from "lucide-react";
 import { useActivityLogs } from "../hooks/useSensors";
 
@@ -75,6 +75,12 @@ export default function ActivityLogsPage() {
   const [searchInput, setSearchInput] = useState(activitySearch);
   const [debounceTimer, setDebounceTimer] = useState<ReturnType<typeof setTimeout> | null>(null);
   const [isChangingPage, setIsChangingPage] = useState(false);
+
+  useEffect(() => {
+    return () => {
+      if (debounceTimer) clearTimeout(debounceTimer);
+    };
+  }, [debounceTimer]);
 
   const handleSearchChange = useCallback((value: string) => {
     setSearchInput(value);

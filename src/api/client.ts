@@ -139,7 +139,8 @@ export async function fetchLatestSensor(signal?: AbortSignal): Promise<SensorEnt
  * Transforms raw SensorEntry[] into ChartPoint[] format:
  *   - Sorts by timestamp (oldest first for chronological charts)
  *   - Formats timestamps as human-readable time labels
- *   - Provides default 0 values for missing data
+ *   - Normalizes failed-sensor sentinels (temperature 0, water_level/ammonia -1) to null so
+ *     charts show gaps and stats exclude them
  * Called on initial load and when switching time ranges in HistoricalDataPage.
  */
 export async function fetchSensorHistory(limit = 1000, signal?: AbortSignal): Promise<ChartPoint[]> {
@@ -163,8 +164,12 @@ export async function fetchSensorHistory(limit = 1000, signal?: AbortSignal): Pr
           ? timestamp.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
           : "--:--",
         timestamp: timestamp ? timestamp.toISOString() : "",
-        temperature: item.temperature ?? 0,
-        water_level: item.water_level ?? 0,
+        // The ESP32 sends temperature 0 and water_level/ammonia -1 when a sensor fails.
+        // These match the server's minValid checks; anything below them is a
+        // failed sensor, not a real reading.
+        temperature: item.temperature !== undefined && item.temperature >= 0.0001 ? item.temperature : null,
+        water_level: item.water_level !== undefined && item.water_level >= 0 ? item.water_level : null,
+        ammonia: item.ammonia !== undefined && item.ammonia >= 0 ? item.ammonia : null,
       };
     });
   
@@ -195,6 +200,13 @@ export interface LogsResponse {
   total: number;
   page: number;
   limit: number;
+  counts: Record<string, number>;
+}
+
+/** Optional filters for paginated system logs (applied server-side). */
+export interface LogsFilter {
+  action?: string;
+  parameter?: string;
 }
 
 /**
@@ -205,10 +217,11 @@ export interface LogsResponse {
 export async function fetchLogs(
   page = 1,
   limit = 20,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  filter?: LogsFilter
 ): Promise<LogsResponse> {
-  const response = await client.get<{ data: LogEntry[]; total: number }>("/system-logs", {
-    params: { page, limit },
+  const response = await client.get<{ data: LogEntry[]; total: number; counts?: Record<string, number> }>("/system-logs", {
+    params: { page, limit, action: filter?.action, parameter: filter?.parameter },
     signal,
   });
   return {
@@ -216,6 +229,7 @@ export async function fetchLogs(
     total: response.data.total || 0,
     page,
     limit,
+    counts: response.data.counts || {},
   };
 }
 
@@ -238,6 +252,8 @@ export async function fetchSettings(signal?: AbortSignal): Promise<SensorSetting
     temp_max: Number(data.temp_max),
     water_level_min: Number(data.water_level_min),
     water_level_max: Number(data.water_level_max),
+    ammonia_min: Number(data.ammonia_min ?? 0),
+    ammonia_max: Number(data.ammonia_max ?? 1),
     updated_at: data.updated_at as string,
   };
 }

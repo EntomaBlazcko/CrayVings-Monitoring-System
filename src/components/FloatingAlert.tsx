@@ -19,7 +19,7 @@
 // MOUNTED IN: App.tsx (always visible, outside page routing)
 // =============================================================================
 
-import { useState, useEffect, useCallback, type ReactNode } from "react";
+import { useState, useEffect, useRef, useCallback, type ReactNode } from "react";
 import { X, AlertTriangle, AlertCircle, BellOff } from "lucide-react";
 import { playLowAlertSound, playHighAlertSound } from "../utils/playAlertSound";
 import { muteAlerts } from "../api/client";
@@ -148,15 +148,23 @@ function FloatingAlertItem({ notification, onClose }: FloatingAlertItemProps) {
   const [showMuteOptions, setShowMuteOptions] = useState(false);
   const [muting, setMuting] = useState(false);
 
+  // Keep the latest onClose in a ref so the auto-dismiss timer below is not
+  // torn down and restarted on every parent re-render (which would prevent
+  // notifications from ever auto-dismissing).
+  const onCloseRef = useRef(onClose);
+  useEffect(() => {
+    onCloseRef.current = onClose;
+  }, [onClose]);
+
   // Auto-dismiss after 5 seconds
   useEffect(() => {
     const timer = setTimeout(() => {
       setIsExiting(true);
-      setTimeout(onClose, 300);
+      setTimeout(() => onCloseRef.current(), 300);
     }, 5000);
 
     return () => clearTimeout(timer);
-  }, [onClose]);
+  }, [notification.id]);
 
   // Manual close with exit animation
   const handleClose = () => {

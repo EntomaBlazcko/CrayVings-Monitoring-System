@@ -29,7 +29,7 @@ import { getSettingsThresholds, getThresholdStatus, type ThresholdStatus } from 
 // 60-second cooldown between alerts for the same sensor+threshold
 const ALERT_COOLDOWN_MS = 60000;
 // Sensor keys to monitor (must match the keys in getSettingsThresholds)
-const SENSOR_KEYS = ["temperature", "water_level"] as const;
+const SENSOR_KEYS = ["temperature", "water_level", "ammonia"] as const;
 
 /**
  * Safely converts a value to a number.

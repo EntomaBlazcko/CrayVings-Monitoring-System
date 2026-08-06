@@ -44,7 +44,7 @@ type Props = {
  */
 function CustomTooltip(props: {
   active?: boolean;
-  payload?: Array<{ value: number }>;
+  payload?: Array<{ value: number | null }>;
   label?: string;
 }) {
   const { active, payload, label } = props;
@@ -53,7 +53,7 @@ function CustomTooltip(props: {
   return (
     <div className="bg-white border border-gray-200 rounded-lg p-2 shadow-sm text-xs">
       <p className="text-gray-500">{label}</p>
-      <p className="font-semibold text-gray-800">{typeof value === "number" ? value.toFixed(1) : value}</p>
+      <p className="font-semibold text-gray-800">{typeof value === "number" ? value.toFixed(1) : "—"}</p>
     </div>
   );
 }

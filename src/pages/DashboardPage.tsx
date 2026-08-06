@@ -4,7 +4,7 @@
 // PURPOSE: Main monitoring dashboard with live readings and trend charts.
 //
 // This page provides a comprehensive real-time view of the aquaculture system:
-//   1. Two StatCards showing current temperature and water level
+//   1. Three StatCards showing current temperature, water level, and ammonia
 //   2. Three TrendCards with line charts showing historical trends
 //   3. Sensor Hub Status panel showing ESP32 connection state
 //   4. Recent Readings table with the last 5 sensor entries
@@ -15,14 +15,14 @@
 // =============================================================================
 
 import { useMemo } from "react";
-import { Thermometer, Waves, AlertTriangle } from "lucide-react";
+import { Thermometer, Waves, FlaskConical, AlertTriangle } from "lucide-react";
 import StatCard from "../components/StatCard";
 import TrendCard from "../components/TrendCard";
 import { useSensors } from "../hooks/useSensors";
 import { getSettingsThresholds, getThresholdStatus } from "../types";
 
 export default function DashboardPage() {
-  const { data, history, connectionStatus, lastUpdate, settings, loading, error } = useSensors();
+  const { data, history, connectionStatus, lastUpdate, settings, loading } = useSensors();
   
   const thresholds = useMemo(() => getSettingsThresholds(settings), [settings]);
   
@@ -36,7 +36,7 @@ export default function DashboardPage() {
     if (!data) return { safe: false, messages: ["No sensor data"] };
     
     const messages: string[] = [];
-    const sensorKeys = ["temperature", "water_level"] as const;
+    const sensorKeys = ["temperature", "water_level", "ammonia"] as const;
     
     for (const key of sensorKeys) {
       const threshold = thresholds[key];
@@ -57,7 +57,7 @@ export default function DashboardPage() {
 
   return (
     <>
-      <div className="grid grid-cols-2 gap-2 md:gap-3 mb-4">
+      <div className="grid grid-cols-1 gap-2 sm:grid-cols-3 md:gap-3 mb-4">
         <div className={offlineClass}>
           <StatCard
             title="Temperature"
@@ -74,6 +74,14 @@ export default function DashboardPage() {
             icon={<Waves size={18} />}
           />
         </div>
+        <div className={offlineClass}>
+          <StatCard
+            title="Ammonia"
+            value={loading ? "Loading..." : data ? `${data.ammonia} mg/L` : "-- mg/L"}
+            color={loading ? "#9ca3af" : isOfflineWithData ? "#9ca3af" : data ? "#10b981" : "#ef4444"}
+            icon={<FlaskConical size={18} />}
+          />
+        </div>
       </div>
 
       {isOfflineWithData && (
@@ -88,7 +96,7 @@ export default function DashboardPage() {
       <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mb-4">
         {loading ? (
           <>
-            {["Temperature", "Water Level"].map((title) => (
+            {["Temperature", "Water Level", "Ammonia"].map((title) => (
               <div key={title} className="bg-white rounded-xl border border-gray-100 p-4 shadow-sm flex items-center justify-center">
                 <div className="text-xs text-gray-400">Loading chart...</div>
               </div>
@@ -107,6 +115,12 @@ export default function DashboardPage() {
               data={history}
               dataKey="water_level"
               stroke="#2563eb"
+            />
+            <TrendCard
+              title="Ammonia"
+              data={history}
+              dataKey="ammonia"
+              stroke="#10b981"
             />
           </>
         )}
@@ -153,14 +167,16 @@ export default function DashboardPage() {
                     <th className="text-left py-1">Time</th>
                     <th className="text-center py-1">Temp</th>
                     <th className="text-center py-1">Level</th>
+                    <th className="text-center py-1">Ammonia</th>
                   </tr>
                 </thead>
                 <tbody>
                   {history.slice(-5).reverse().map((h, i) => (
                     <tr key={i} className="border-t">
                       <td className="py-1">{new Date(h.timestamp).toLocaleTimeString()}</td>
-                      <td className="text-center py-1">{h.temperature}°C</td>
-                      <td className="text-center py-1">{h.water_level}%</td>
+                      <td className="text-center py-1">{h.temperature != null ? `${h.temperature}°C` : "--"}</td>
+                      <td className="text-center py-1">{h.water_level != null ? `${h.water_level}%` : "--"}</td>
+                      <td className="text-center py-1">{h.ammonia != null ? `${h.ammonia} mg/L` : "--"}</td>
                     </tr>
                   ))}
                 </tbody>

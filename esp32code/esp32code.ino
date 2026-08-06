@@ -9,7 +9,6 @@
 #define ONE_WIRE_BUS 4
 #define TRIG_PIN 5
 #define ECHO_PIN 18
-#define PH_PIN 34
 
 char serverName[64] = "http://192.168.1.20:3000/sensor";
 
@@ -20,28 +19,27 @@ const int LOOP_DELAY_MS = 1000;
 const int HTTP_TIMEOUT_MS = 5000;
 const int WIFI_CONNECT_TIMEOUT_MS = 20000;
 
-const float PH_CALIBRATION_OFFSET = 19.77f;
-const float VOLTAGE_REFERENCE = 3.3f;
-const int ADC_RESOLUTION = 4095;
-const float ADC_TO_VOLT = (VOLTAGE_REFERENCE / ADC_RESOLUTION);
-const float PH_PHASE_SHIFT = -5.70f;
-
 const float TEMP_VALID_MIN = 0.0f;
 const float TEMP_VALID_MAX = 50.0f;
 const float WATER_LEVEL_VALID_MIN = 0.0f;
 const float WATER_LEVEL_VALID_MAX = 100.0f;
-const float PH_VALID_MIN = 0.0f;
-const float PH_VALID_MAX = 14.0f;
 const float TEMP_SENSOR_ERROR = -127.0f;
 const float DISTANCE_SENSOR_ERROR = -1.0f;
+
+// ===== AMMONIA SENSOR (SIMULATION) =====
+// NOTE: No physical ammonia sensor is connected yet. readAmmonia() returns a
+// simulated reading so the whole stack can be tested end-to-end. Replace the
+// body of readAmmonia() with a real sensor read (e.g., MQ-137 on an analog
+// pin) once the hardware is available.
+const float AMMONIA_VALID_MIN = 0.0f;
+const float AMMONIA_VALID_MAX = 1.0f;      // mg/L
+const float AMMONIA_SIM_BASE = 0.12f;      // healthy baseline level (mg/L)
+const float AMMONIA_SIM_AMPLITUDE = 0.08f; // slow oscillation amplitude (mg/L)
 
 const char* DEVICE_ID = "ESP32_01";
 
 OneWire oneWire(ONE_WIRE_BUS);
 DallasTemperature sensors(&oneWire);
-
-int buffer_arr[10];
-float ph_act;
 
 WiFiManager wm;
 
@@ -71,13 +69,25 @@ bool isWaterLevelValid(float level) {
   return true;
 }
 
-bool isPHValid(float ph) {
-  if (ph < PH_VALID_MIN || ph > PH_VALID_MAX) {
-    Serial.print("Warning: pH out of range: ");
-    Serial.println(ph);
+bool isAmmoniaValid(float value) {
+  if (value < AMMONIA_VALID_MIN || value > AMMONIA_VALID_MAX) {
+    Serial.print("Warning: Ammonia out of range: ");
+    Serial.println(value);
     return false;
   }
   return true;
+}
+
+// SIMULATED ammonia reading in mg/L. Oscillates slowly around a healthy
+// baseline so charts show a realistic trend. See the note above readAmmonia().
+float readAmmonia() {
+  unsigned long t = millis();
+  float wave = sin(2.0f * PI * (t / 60000.0f)) + 0.5f * sin(2.0f * PI * (t / 14400000.0f));
+  float value = AMMONIA_SIM_BASE + AMMONIA_SIM_AMPLITUDE * wave;
+
+  if (value < AMMONIA_VALID_MIN) value = AMMONIA_VALID_MIN;
+  if (value > AMMONIA_VALID_MAX) value = AMMONIA_VALID_MAX;
+  return value;
 }
 
 float readDistanceCM() {
@@ -109,36 +119,6 @@ float getAverageDistance(int samples) {
   return (validReadings == 0) ? DISTANCE_SENSOR_ERROR : total / validReadings;
 }
 
-float readPH() {
-  for (int i = 0; i < 10; i++) {
-    buffer_arr[i] = analogRead(PH_PIN);
-    delay(30);
-  }
-
-  for (int i = 1; i < 10; i++) {
-    int key = buffer_arr[i];
-    int j = i - 1;
-    while (j >= 0 && buffer_arr[j] > key) {
-      buffer_arr[j + 1] = buffer_arr[j];
-      j--;
-    }
-    buffer_arr[j + 1] = key;
-  }
-
-  unsigned long avgval = 0;
-  for (int i = 2; i < 8; i++) {
-    avgval += buffer_arr[i];
-  }
-
-  float volt = ((float)avgval / 6.0f) * ADC_TO_VOLT;
-  ph_act = PH_PHASE_SHIFT * volt + PH_CALIBRATION_OFFSET;
-
-  if (ph_act < PH_VALID_MIN) ph_act = PH_VALID_MIN;
-  if (ph_act > PH_VALID_MAX) ph_act = PH_VALID_MAX;
-
-  return ph_act;
-}
-
 void setup() {
   Serial.begin(19200);
 
@@ -146,7 +126,6 @@ void setup() {
 
   pinMode(TRIG_PIN, OUTPUT);
   pinMode(ECHO_PIN, INPUT);
-  pinMode(PH_PIN, INPUT);
   sensors.begin();
 
   wm.setConfigPortalTimeout(180);
@@ -196,19 +175,28 @@ void loop() {
   sensors.requestTemperatures();
   float tempC = sensors.getTempCByIndex(0);
 
-  float phValue = readPH();
+  float ammoniaValue = readAmmonia();
 
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("WiFi lost, reconnecting...");
-    wm.setConfigPortalTimeout(0);
-    if (!wm.autoConnect("CRAYVings-ESP32")) {
-      Serial.println("Reconnection failed, will retry next loop.");
+    WiFi.mode(WIFI_STA);
+    WiFi.begin();
+    unsigned long start = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - start < WIFI_CONNECT_TIMEOUT_MS) {
+      delay(500);
+      Serial.print(".");
+    }
+    if (WiFi.status() != WL_CONNECTED) {
+      // Fall back to the config portal for reconfiguration, but time it out
+      // so the loop keeps monitoring sensors instead of blocking forever.
+      wm.setConfigPortalTimeout(180);
+      wm.autoConnect("CRAYVings-ESP32");
     }
   }
 
   bool tempOK  = isTemperatureValid(tempC);
   bool levelOK = isWaterLevelValid(waterLevel);
-  bool phOK    = isPHValid(phValue);
+  bool ammoniaOK = isAmmoniaValid(ammoniaValue);
 
   if (WiFi.status() == WL_CONNECTED) {
     HTTPClient http;
@@ -216,14 +204,14 @@ void loop() {
     http.begin(serverName);
     http.addHeader("Content-Type", "application/json");
 
-    float sendTemp = (tempOK) ? tempC : 0.0f;
-    float sendLevel = (levelOK) ? waterLevel : 0.0f;
-    float sendPH = (phOK) ? phValue : 0.0f;
+    float sendTemp = (tempOK) ? tempC : -1.0f;
+    float sendLevel = (levelOK) ? waterLevel : -1.0f;
+    float sendAmmonia = (ammoniaOK) ? ammoniaValue : -1.0f;
 
     char json[128];
     snprintf(json, sizeof(json),
-             "{\"device_id\":\"%s\",\"temperature\":%.2f,\"water_level\":%.2f,\"ph\":%.2f}",
-             DEVICE_ID, sendTemp, sendLevel, sendPH);
+             "{\"device_id\":\"%s\",\"temperature\":%.2f,\"water_level\":%.2f,\"ammonia\":%.3f}",
+             DEVICE_ID, sendTemp, sendLevel, sendAmmonia);
 
     int code = http.POST(json);
 
@@ -250,9 +238,9 @@ void loop() {
   Serial.print(waterLevel, 2);
   Serial.print(" % | Water Temp: ");
   Serial.print(tempC, 2);
-  Serial.print(" C | pH: ");
-  Serial.print(phValue, 2);
-  Serial.println();
+  Serial.print(" C | Ammonia: ");
+  Serial.print(ammoniaValue, 3);
+  Serial.println(" mg/L");
   Serial.println("------------------------");
 
   delay(LOOP_DELAY_MS);
