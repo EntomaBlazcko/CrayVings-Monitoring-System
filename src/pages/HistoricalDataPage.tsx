@@ -29,13 +29,18 @@ import {
   TrendingUp,
   TrendingDown,
   Activity,
+  Calendar,
+  Download,
+  AlertTriangle,
 } from "lucide-react";
 import TrendCard from "../components/TrendCard";
 import { useSensors } from "../hooks/useSensors";
-import { fetchSensorHistory } from "../api/client";
-import type { ChartPoint } from "../types";
+import { fetchSensorHistory, fetchWeeklyReport } from "../api/client";
+import type { ChartPoint, WeeklyReport } from "../types";
+import { jsPDF } from "jspdf";
+import autoTable, { type HookData } from "jspdf-autotable";
 
-type TimeRange = "1h" | "6h" | "24h" | "all";
+type TimeRange = "1h" | "6h" | "24h" | "1w" | "all";
 
 /**
  * Calculates min, max, and average statistics for each sensor parameter.
@@ -67,11 +72,17 @@ export default function HistoricalDataPage() {
   const [timeRange, setTimeRange] = useState<TimeRange>("all");
   const [dynamicHistory, setDynamicHistory] = useState<ChartPoint[]>([]);
   const [dynamicLoading, setDynamicLoading] = useState(false);
+  const [weeklyReport, setWeeklyReport] = useState<WeeklyReport | null>(null);
+  const [weeklyReportLoading, setWeeklyReportLoading] = useState(false);
+  const [weeklyReportError, setWeeklyReportError] = useState<string | null>(null);
+  const [weeklyRetry, setWeeklyRetry] = useState(0);
+  const [exportingPdf, setExportingPdf] = useState(false);
 
   const timeRanges: { value: TimeRange; label: string }[] = [
     { value: "1h", label: "1 Hour" },
     { value: "6h", label: "6 Hours" },
     { value: "24h", label: "24 Hours" },
+    { value: "1w", label: "1 Week" },
     { value: "all", label: "All Time" },
   ];
 
@@ -80,6 +91,7 @@ export default function HistoricalDataPage() {
       case "1h": return 60;
       case "6h": return 360;
       case "24h": return 1440;
+      case "1w": return 2000;
       case "all": return 1000;
     }
   };
@@ -126,6 +138,34 @@ export default function HistoricalDataPage() {
     };
   }, [timeRange, history.length, fetchDynamicData]);
 
+  useEffect(() => {
+    if (timeRange !== "1w") {
+      setWeeklyReport(null);
+      setWeeklyReportError(null);
+      return;
+    }
+
+    const controller = new AbortController();
+    setWeeklyReportLoading(true);
+    setWeeklyReportError(null);
+
+    fetchWeeklyReport(controller.signal)
+      .then(data => {
+        setWeeklyReport(data);
+        setWeeklyReportLoading(false);
+      })
+      .catch((err: Error) => {
+        if (err.name !== 'AbortError') {
+          setWeeklyReportError(err?.message || 'Failed to load weekly report');
+        }
+        setWeeklyReportLoading(false);
+      });
+
+    return () => {
+      controller.abort();
+    };
+  }, [timeRange, weeklyRetry]);
+
   const activeHistory = dynamicHistory.length > 0 ? dynamicHistory : history;
   const activeLoading = dynamicLoading || loading;
 
@@ -140,7 +180,7 @@ export default function HistoricalDataPage() {
 
     if (timeRange === "all") return sorted;
 
-    const hours = timeRange === "1h" ? 1 : timeRange === "6h" ? 6 : 24;
+    const hours = timeRange === "1h" ? 1 : timeRange === "6h" ? 6 : timeRange === "1w" ? 168 : 24;
     const cutoff = Date.now() - hours * 60 * 60 * 1000;
 
     return sorted.filter((item) => {
@@ -163,6 +203,137 @@ export default function HistoricalDataPage() {
     }
     return null;
   }, [filteredHistory, activeHistory]);
+
+  const handleExportPdf = useCallback(async () => {
+    if (exportingPdf) return;
+
+    let report = weeklyReport;
+    if (!report) {
+      setExportingPdf(true);
+      try {
+        report = await fetchWeeklyReport();
+      } catch {
+        alert("Failed to fetch weekly report data.");
+        setExportingPdf(false);
+        return;
+      }
+    }
+
+    const doc = new jsPDF();
+    const pageWidth = doc.internal.pageSize.getWidth();
+    const pageHeight = doc.internal.pageSize.getHeight();
+
+    doc.setFontSize(20);
+    doc.setFont("helvetica", "bold");
+    doc.text("CRAYvings Weekly Report", pageWidth / 2, 20, { align: "center" });
+
+    doc.setFontSize(9);
+    doc.setFont("helvetica", "normal");
+    const startDate = new Date(report.period.start).toLocaleDateString();
+    const endDate = new Date(report.period.end).toLocaleDateString();
+    doc.text(`Period: ${startDate} - ${endDate}`, pageWidth / 2, 28, { align: "center" });
+    doc.text(`Generated on ${new Date().toLocaleString()}`, pageWidth / 2, 34, { align: "center" });
+
+    const summary = report.summary;
+    const summaryY = 40;
+    doc.setFontSize(12);
+    doc.setFont("helvetica", "bold");
+    doc.text("Summary", 14, summaryY);
+
+    doc.setFontSize(9);
+    doc.setFont("helvetica", "normal");
+    const s = [
+      `Temperature: Avg ${(summary.temp_avg ?? 0).toFixed(1)}°C, Min ${(summary.temp_min ?? 0).toFixed(1)}°C, Max ${(summary.temp_max ?? 0).toFixed(1)}°C`,
+      `Water Level: Avg ${(summary.water_avg ?? 0).toFixed(0)}%, Min ${(summary.water_min ?? 0).toFixed(0)}%, Max ${(summary.water_max ?? 0).toFixed(0)}%`,
+      `Total Readings: ${(summary.total_readings ?? 0).toLocaleString()}`,
+      `Total Alerts: ${report.alerts.total ?? 0}`,
+    ];
+    let sy = summaryY + 7;
+    s.forEach(line => { doc.text(line, 14, sy); sy += 5; });
+
+    const tableStartY = sy + 6;
+    autoTable(doc, {
+      startY: tableStartY,
+      head: [["Date", "Temp Avg", "Temp Range", "Water Avg", "Water Range", "Readings", "Alerts"]],
+      body: report.daily.map(d => [
+        new Date(d.date).toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" }),
+        `${(d.temp_avg ?? 0).toFixed(1)}°C`,
+        `${(d.temp_min ?? 0).toFixed(1)} - ${(d.temp_max ?? 0).toFixed(1)}°C`,
+        `${(d.water_avg ?? 0).toFixed(0)}%`,
+        `${(d.water_min ?? 0).toFixed(0)} - ${(d.water_max ?? 0).toFixed(0)}%`,
+        (d.readings ?? 0).toLocaleString(),
+        String(d.alerts ?? 0),
+      ]),
+      styles: { fontSize: 8, cellPadding: 2.5, valign: "middle" },
+      headStyles: { fillColor: [241, 245, 249], textColor: [30, 41, 59], fontStyle: "bold", halign: "center" },
+      alternateRowStyles: { fillColor: [248, 250, 252] },
+      columnStyles: {
+        0: { cellWidth: 38 },
+        1: { cellWidth: 22, halign: "center" },
+        2: { cellWidth: 38, halign: "center" },
+        3: { cellWidth: 22, halign: "center" },
+        4: { cellWidth: 38, halign: "center" },
+        5: { cellWidth: 20, halign: "center" },
+        6: { cellWidth: 16, halign: "center" },
+      },
+      margin: { left: 14, right: 14 },
+      didDrawPage: (data: HookData) => {
+        data.doc.setFontSize(8);
+        data.doc.setFont("helvetica", "normal");
+        data.doc.setTextColor(128, 128, 128);
+        data.doc.text(`Page ${data.pageNumber}`, pageWidth / 2, pageHeight - 10, { align: "center" });
+        data.doc.text("CRAYvings Monitoring System", 14, pageHeight - 10);
+        data.doc.text(`Exported: ${new Date().toLocaleDateString()}`, pageWidth - 14, pageHeight - 10, { align: "right" });
+      },
+    });
+
+    // Alert summary on a new page
+    if (Object.keys(report.alerts.by_parameter).length > 0 || Object.keys(report.alerts.by_action).length > 0) {
+      doc.addPage();
+      doc.setFontSize(14);
+      doc.setFont("helvetica", "bold");
+      doc.text("Alert Summary", 14, 20);
+
+      doc.setFontSize(9);
+      doc.setFont("helvetica", "normal");
+      let ay = 30;
+      doc.text(`Total Alerts: ${report.alerts.total}`, 14, ay);
+      ay += 7;
+
+      if (Object.keys(report.alerts.by_parameter).length > 0) {
+        doc.setFont("helvetica", "bold");
+        doc.text("By Parameter:", 14, ay);
+        ay += 5;
+        doc.setFont("helvetica", "normal");
+        Object.entries(report.alerts.by_parameter).forEach(([param, count]) => {
+          doc.text(`  ${param}: ${count}`, 14, ay);
+          ay += 5;
+        });
+        ay += 3;
+      }
+
+      if (Object.keys(report.alerts.by_action).length > 0) {
+        doc.setFont("helvetica", "bold");
+        doc.text("By Action:", 14, ay);
+        ay += 5;
+        doc.setFont("helvetica", "normal");
+        Object.entries(report.alerts.by_action).forEach(([action, count]) => {
+          doc.text(`  ${action}: ${count}`, 14, ay);
+          ay += 5;
+        });
+      }
+
+      // Footer on alert page
+      doc.setFontSize(8);
+      doc.setFont("helvetica", "normal");
+      doc.setTextColor(128, 128, 128);
+      doc.text("CRAYvings Monitoring System", 14, pageHeight - 10);
+      doc.text(`Exported: ${new Date().toLocaleDateString()}`, pageWidth - 14, pageHeight - 10, { align: "right" });
+    }
+
+    doc.save(`CRAYvings_Weekly_Report_${new Date().toISOString().split("T")[0]}.pdf`);
+    setExportingPdf(false);
+  }, [weeklyReport, exportingPdf]);
 
   if (activeLoading) {
     return (
@@ -188,7 +359,7 @@ export default function HistoricalDataPage() {
     );
   }
 
-  if (error) {
+  if (error && (!activeHistory || activeHistory.length === 0)) {
     return (
       <div className="bg-red-50 border border-red-200 text-red-700 rounded-xl p-6 text-center">
         <History size={40} className="mx-auto mb-3 text-red-400" />
@@ -198,7 +369,7 @@ export default function HistoricalDataPage() {
     );
   }
 
-  if (!history || history.length === 0) {
+  if (!activeHistory || activeHistory.length === 0) {
     return (
       <div className="bg-white rounded-xl border border-gray-100 p-8 text-center">
         <History size={40} className="mx-auto mb-3 text-gray-300" />
@@ -211,6 +382,14 @@ export default function HistoricalDataPage() {
 
   return (
     <div className="space-y-4">
+      {/* Offline warning banner */}
+      {error && activeHistory && activeHistory.length > 0 && (
+        <div className="bg-amber-50 border border-amber-200 text-amber-800 rounded-xl p-3 text-sm flex items-center gap-2">
+          <AlertTriangle size={16} className="shrink-0" />
+          <span>{error}</span>
+        </div>
+      )}
+
       {/* Header */}
       <div className="bg-white rounded-xl border border-gray-100 p-5">
         <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
@@ -238,12 +417,36 @@ export default function HistoricalDataPage() {
                 {range.label}
               </button>
             ))}
+            {timeRange === "1w" && (
+              <button
+                onClick={handleExportPdf}
+                disabled={exportingPdf || weeklyReportLoading}
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-semibold bg-[#c2410c] text-white hover:bg-[#a13a0a] disabled:opacity-50 disabled:cursor-not-allowed transition"
+              >
+                <Download size={14} />
+                {exportingPdf ? "Exporting..." : "Export PDF"}
+              </button>
+            )}
           </div>
         </div>
         <div className="mt-3 text-sm text-gray-400">
           Showing {filteredHistory.length} of {history.length} readings
         </div>
       </div>
+
+      {/* Weekly report error banner */}
+      {timeRange === "1w" && weeklyReportError && (
+        <div className="bg-red-50 border border-red-200 text-red-700 rounded-xl p-4 text-sm flex items-center gap-2">
+          <AlertTriangle size={16} className="shrink-0" />
+          <span>{weeklyReportError}</span>
+          <button
+            onClick={() => setWeeklyRetry(n => n + 1)}
+            className="ml-auto text-red-600 font-medium underline hover:text-red-800"
+          >
+            Retry
+          </button>
+        </div>
+      )}
 
       {/* Summary Cards */}
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
@@ -253,7 +456,19 @@ export default function HistoricalDataPage() {
               <Thermometer size={16} className="text-orange-500" />
               <span className="text-xs font-semibold uppercase tracking-wide">Temperature</span>
             </div>
-            {stats?.temperature && (
+            {timeRange === "1w" && weeklyReport ? (
+              <div className="flex gap-3 text-xs">
+                <span className="text-blue-600" title="Min">
+                  <TrendingDown size={12} className="inline" /> {(weeklyReport.summary.temp_min ?? 0).toFixed(1)}°
+                </span>
+                <span className="text-green-600" title="Average">
+                  <Activity size={12} className="inline" /> {(weeklyReport.summary.temp_avg ?? 0).toFixed(1)}°
+                </span>
+                <span className="text-red-600" title="Max">
+                  <TrendingUp size={12} className="inline" /> {(weeklyReport.summary.temp_max ?? 0).toFixed(1)}°
+                </span>
+              </div>
+            ) : stats?.temperature && (
               <div className="flex gap-3 text-xs">
                 <span className="text-blue-600" title="Min">
                   <TrendingDown size={12} className="inline" /> {stats.temperature.min.toFixed(1)}°
@@ -278,7 +493,19 @@ export default function HistoricalDataPage() {
               <Waves size={16} className="text-blue-500" />
               <span className="text-xs font-semibold uppercase tracking-wide">Water Level</span>
             </div>
-            {stats?.water_level && (
+            {timeRange === "1w" && weeklyReport ? (
+              <div className="flex gap-3 text-xs">
+                <span className="text-blue-600" title="Min">
+                  <TrendingDown size={12} className="inline" /> {(weeklyReport.summary.water_min ?? 0).toFixed(0)}%
+                </span>
+                <span className="text-green-600" title="Average">
+                  <Activity size={12} className="inline" /> {(weeklyReport.summary.water_avg ?? 0).toFixed(0)}%
+                </span>
+                <span className="text-red-600" title="Max">
+                  <TrendingUp size={12} className="inline" /> {(weeklyReport.summary.water_max ?? 0).toFixed(0)}%
+                </span>
+              </div>
+            ) : stats?.water_level && (
               <div className="flex gap-3 text-xs">
                 <span className="text-blue-600" title="Min">
                   <TrendingDown size={12} className="inline" /> {stats.water_level.min.toFixed(0)}%
@@ -319,6 +546,89 @@ export default function HistoricalDataPage() {
           <History size={40} className="mx-auto mb-3 text-gray-300" />
           <p className="text-gray-600 font-medium">No data for selected time range</p>
           <p className="text-sm text-gray-400 mt-1">Try selecting a different time range.</p>
+        </div>
+      )}
+
+      {/* Weekly Report Breakdown */}
+      {timeRange === "1w" && weeklyReportLoading && (
+        <div className="bg-white rounded-xl border border-gray-100 p-5 animate-pulse">
+          <div className="h-6 bg-gray-200 rounded w-48 mb-4"></div>
+          <div className="h-4 bg-gray-100 rounded w-full mb-2"></div>
+          <div className="h-4 bg-gray-100 rounded w-full mb-2"></div>
+          <div className="h-4 bg-gray-100 rounded w-3/4"></div>
+        </div>
+      )}
+
+      {timeRange === "1w" && weeklyReport && !weeklyReportLoading && (
+        <div className="space-y-4">
+          <div className="bg-white rounded-xl border border-gray-100 p-5">
+            <h2 className="text-lg font-bold text-gray-800 flex items-center gap-2 mb-4">
+              <Calendar size={20} className="text-orange-500" />
+              Weekly Breakdown
+            </h2>
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="bg-gray-50 border-b border-gray-200">
+                    <th className="px-3 py-2.5 text-left text-xs font-bold text-gray-500 uppercase">Date</th>
+                    <th className="px-3 py-2.5 text-center text-xs font-bold text-gray-500 uppercase">Avg Temp</th>
+                    <th className="px-3 py-2.5 text-center text-xs font-bold text-gray-500 uppercase">Temp Range</th>
+                    <th className="px-3 py-2.5 text-center text-xs font-bold text-gray-500 uppercase">Avg Water</th>
+                    <th className="px-3 py-2.5 text-center text-xs font-bold text-gray-500 uppercase">Water Range</th>
+                    <th className="px-3 py-2.5 text-center text-xs font-bold text-gray-500 uppercase">Readings</th>
+                    <th className="px-3 py-2.5 text-center text-xs font-bold text-gray-500 uppercase">Alerts</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {weeklyReport.daily.map((day) => (
+                    <tr key={day.date} className="border-b border-gray-100 last:border-0 hover:bg-gray-50">
+                      <td className="px-3 py-2.5 font-medium text-gray-800 whitespace-nowrap">
+                        {new Date(day.date).toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" })}
+                      </td>
+                      <td className="px-3 py-2.5 text-center text-gray-600">{(day.temp_avg ?? 0).toFixed(1)}°C</td>
+                      <td className="px-3 py-2.5 text-center text-gray-500 text-xs">
+                        {(day.temp_min ?? 0).toFixed(1)} - {(day.temp_max ?? 0).toFixed(1)}°C
+                      </td>
+                      <td className="px-3 py-2.5 text-center text-gray-600">{(day.water_avg ?? 0).toFixed(0)}%</td>
+                      <td className="px-3 py-2.5 text-center text-gray-500 text-xs">
+                        {(day.water_min ?? 0).toFixed(0)} - {(day.water_max ?? 0).toFixed(0)}%
+                      </td>
+                      <td className="px-3 py-2.5 text-center text-gray-600">{(day.readings ?? 0).toLocaleString()}</td>
+                      <td className="px-3 py-2.5 text-center">
+                        <span className={`inline-flex items-center px-2 py-0.5 rounded text-xs font-medium ${
+                          day.alerts > 0
+                            ? "bg-red-100 text-red-700"
+                            : "bg-green-100 text-green-700"
+                        }`}>
+                          {day.alerts}
+                        </span>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          {/* Alert Summary */}
+          <div className="bg-white rounded-xl border border-gray-100 p-5">
+            <h2 className="text-lg font-bold text-gray-800 flex items-center gap-2 mb-4">
+              <AlertTriangle size={20} className="text-amber-500" />
+              Alert Summary
+            </h2>
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+              <div className="bg-gray-50 rounded-lg p-4 text-center">
+                <div className="text-2xl font-bold text-gray-800">{weeklyReport.alerts.total}</div>
+                <div className="text-xs text-gray-500 mt-1">Total Alerts</div>
+              </div>
+              {Object.entries(weeklyReport.alerts.by_parameter).map(([param, count]) => (
+                <div key={param} className="bg-gray-50 rounded-lg p-4 text-center">
+                  <div className="text-2xl font-bold text-gray-800">{count}</div>
+                  <div className="text-xs text-gray-500 mt-1">{param}</div>
+                </div>
+              ))}
+            </div>
+          </div>
         </div>
       )}
     </div>

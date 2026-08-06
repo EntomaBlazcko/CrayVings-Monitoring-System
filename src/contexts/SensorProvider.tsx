@@ -192,12 +192,12 @@ function useSensorDataPolling(): SensorDataState & { refetch: () => void } {
           consecutiveFailures: 0,
         });
       } else {
-        // No data available from the server
+        // No latest reading, but preserve any historical data we already have
         setState((prev) => ({
           ...prev,
           data: null,
-          history: [],
-          error: "No sensor data available",
+          history: historyData.length > 0 ? historyData : prev.history,
+          error: historyData.length > 0 ? "ESP32 device is offline. No new data received." : "No sensor data available",
           loading: false,
           connectionStatus: "unknown",
         }));

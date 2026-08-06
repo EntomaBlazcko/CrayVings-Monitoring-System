@@ -71,10 +71,10 @@ warning: "⚠️ {{SENSOR}} WARNING\n" +
 ```
 
 **Available placeholders:**
-- `{{SENSOR}}` - Sensor name (e.g., "TEMPERATURE", "PH LEVEL")
+- `{{SENSOR}}` - Sensor name (e.g., "TEMPERATURE", "WATER LEVEL")
 - `{{NAME}}` - Recipient's name
 - `{{VALUE}}` - Current sensor reading
-- `{{UNIT}}` - Unit (°C, %, or empty for pH)
+- `{{UNIT}}` - Unit (°C, %)
 - `{{THRESHOLD}}` - Threshold value that was crossed
 - `{{TIME}}` - Timestamp in Philippines timezone
 
@@ -111,14 +111,12 @@ Edit `SMS_CONFIG.messages.hourlyUpdate` in `server.cjs`:
 hourlyUpdate: "📊 CRAYVINGS HOURLY UPDATE\n" +
               "Time: {{TIME}}\n" +
               "Temperature: {{TEMP}}°C ({{TEMP_STATUS}})\n" +
-              "pH Level: {{PH}} ({{PH_STATUS}})\n" +
               "Water Level: {{WATER}}% ({{WATER_STATUS}})\n" +
               "{{SUMMARY}}"
 ```
 
 **Additional placeholders for hourly update:**
 - `{{TEMP}}`, `{{TEMP_STATUS}}` - Temperature reading and status
-- `{{PH}}`, `{{PH_STATUS}}` - pH reading and status
 - `{{WATER}}`, `{{WATER_STATUS}}` - Water level reading and status
 - `{{SUMMARY}}` - Summary text (e.g., "All systems normal ✅")
 
@@ -169,7 +167,6 @@ Edit `SMS_CONFIG.sensorNames` in `server.cjs`:
 ```javascript
 sensorNames: {
   "Temperature": "TEMPERATURE",
-  "pH Level": "PH LEVEL",
   "Water Level": "WATER LEVEL"
 }
 ```

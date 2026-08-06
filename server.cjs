@@ -747,6 +747,158 @@ app.get("/sensor/latest", async (req, res) => {
 });
 
 // ========================
+// WEEKLY REPORT ENDPOINT
+// ========================
+
+/**
+ * GET /report/weekly
+ * Returns aggregated sensor data for the past 7 days for the weekly report.
+ * Returns:
+ *   - period: { start, end } ISO timestamps
+ *   - summary: { temp_avg, temp_min, temp_max, water_avg, water_min, water_max, total_readings }
+ *   - daily: array of per-day breakdown objects
+ *   - alerts: { total, by_parameter, by_action }
+ */
+app.get("/report/weekly", async (req, res) => {
+  try {
+    let summaryResult;
+    try {
+      summaryResult = await pool.query(`
+        SELECT
+          COALESCE(AVG(temperature), 0)::float AS temp_avg,
+          COALESCE(MIN(temperature), 0)::float AS temp_min,
+          COALESCE(MAX(temperature), 0)::float AS temp_max,
+          COALESCE(AVG(water_level), 0)::float AS water_avg,
+          COALESCE(MIN(water_level), 0)::float AS water_min,
+          COALESCE(MAX(water_level), 0)::float AS water_max,
+          COUNT(*) AS total_readings
+        FROM sensors
+        WHERE timestamp >= NOW() - INTERVAL '7 days'
+      `);
+    } catch (err) {
+      console.error(`[${new Date().toISOString()}] Weekly summary query failed:`, err.message);
+      summaryResult = { rows: [{ temp_avg: 0, temp_min: 0, temp_max: 0, water_avg: 0, water_min: 0, water_max: 0, total_readings: 0 }] };
+    }
+
+    let dailyResult;
+    try {
+      dailyResult = await pool.query(`
+        SELECT
+          DATE(timestamp) AS date,
+          COALESCE(AVG(temperature), 0)::float AS temp_avg,
+          COALESCE(MIN(temperature), 0)::float AS temp_min,
+          COALESCE(MAX(temperature), 0)::float AS temp_max,
+          COALESCE(AVG(water_level), 0)::float AS water_avg,
+          COALESCE(MIN(water_level), 0)::float AS water_min,
+          COALESCE(MAX(water_level), 0)::float AS water_max,
+          COUNT(*) AS readings
+        FROM sensors
+        WHERE timestamp >= NOW() - INTERVAL '7 days'
+        GROUP BY DATE(timestamp)
+        ORDER BY date
+      `);
+    } catch (err) {
+      console.error(`[${new Date().toISOString()}] Weekly daily query failed:`, err.message);
+      dailyResult = { rows: [] };
+    }
+
+    let dailyAlertsMap = {};
+    try {
+      const dailyAlertsResult = await pool.query(`
+        SELECT DATE(timestamp) AS date, COUNT(*) AS count
+        FROM system_logs
+        WHERE timestamp >= NOW() - INTERVAL '7 days' AND action = 'Alert'
+        GROUP BY DATE(timestamp)
+      `);
+      dailyAlertsResult.rows.forEach(row => {
+        const d = typeof row.date === 'string' ? row.date.split('T')[0] : String(row.date);
+        dailyAlertsMap[d] = parseInt(row.count) || 0;
+      });
+    } catch (err) {
+      console.error(`[${new Date().toISOString()}] Weekly daily alerts query failed:`, err.message);
+      dailyAlertsMap = {};
+    }
+
+    let byParameter = {};
+    try {
+      const alertsByParamResult = await pool.query(`
+        SELECT parameter, COUNT(*) AS count
+        FROM system_logs
+        WHERE timestamp >= NOW() - INTERVAL '7 days' AND action = 'Alert'
+        GROUP BY parameter
+      `);
+      alertsByParamResult.rows.forEach(row => { byParameter[row.parameter] = parseInt(row.count) || 0; });
+    } catch (err) {
+      console.error(`[${new Date().toISOString()}] Weekly alerts by param query failed:`, err.message);
+      byParameter = {};
+    }
+
+    let byAction = {};
+    try {
+      const logActionsResult = await pool.query(`
+        SELECT action, COUNT(*)::int AS count
+        FROM system_logs
+        WHERE timestamp >= NOW() - INTERVAL '7 days'
+        GROUP BY action
+      `);
+      logActionsResult.rows.forEach(row => { byAction[row.action] = row.count; });
+    } catch (err) {
+      console.error(`[${new Date().toISOString()}] Weekly log actions query failed:`, err.message);
+      byAction = {};
+    }
+
+    const now = new Date();
+    const weekAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+
+    const summary = summaryResult.rows[0] || {};
+
+    // Build daily array with alert counts merged
+    const daily = (dailyResult.rows || []).map(day => {
+      const dateStr = typeof day.date === 'string' ? day.date.split('T')[0] : String(day.date);
+      return {
+        date: dateStr,
+        temp_avg: Number(day.temp_avg) || 0,
+        temp_min: Number(day.temp_min) || 0,
+        temp_max: Number(day.temp_max) || 0,
+        water_avg: Number(day.water_avg) || 0,
+        water_min: Number(day.water_min) || 0,
+        water_max: Number(day.water_max) || 0,
+        readings: parseInt(day.readings) || 0,
+        alerts: dailyAlertsMap[dateStr] || 0,
+      };
+    });
+
+    // Total alerts
+    const totalAlerts = Object.values(byParameter).reduce((sum, c) => sum + c, 0);
+
+    res.json({
+      period: {
+        start: weekAgo.toISOString(),
+        end: now.toISOString(),
+      },
+      summary: {
+        temp_avg: Number(summary.temp_avg) || 0,
+        temp_min: Number(summary.temp_min) || 0,
+        temp_max: Number(summary.temp_max) || 0,
+        water_avg: Number(summary.water_avg) || 0,
+        water_min: Number(summary.water_min) || 0,
+        water_max: Number(summary.water_max) || 0,
+        total_readings: parseInt(summary.total_readings) || 0,
+      },
+      daily,
+      alerts: {
+        total: totalAlerts,
+        by_parameter: byParameter,
+        by_action: byAction,
+      },
+    });
+  } catch (err) {
+    console.error(`[${new Date().toISOString()}] Error fetching weekly report:`, err.message);
+    res.status(500).json({ message: "Error fetching weekly report", error: err.message });
+  }
+});
+
+// ========================
 // AUTHENTICATION ENDPOINTS
 // ========================
 

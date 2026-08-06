@@ -62,3 +62,30 @@
 - SkySMS API queues messages (`status: pending`), causing inherent delivery delays
 - PostgreSQL `NUMERIC` columns return as strings; must be explicitly cast to `Number` in API responses
 - Hardware watchdog timer: 120 seconds (ESP32 firmware)
+
+### 2026-07-30 - pH Removal + Cleanup
+
+#### pH Threshold Removal
+- **Removed pH threshold evaluation** from entire stack: types, API client, pages, hooks, and server
+- **Removed pH from `SensorSettings`** type, `DEFAULT_SETTINGS`, `getSettingsThresholds()`
+- **Removed pH from `getSettingsThresholds`** - only returns temperature and water_level
+- **Removed pH from all pages**: HomePage, DashboardPage, SensorsPage, HistoricalDataPage, LogsPage
+- **Removed pH from SMS templates**: hourly update, test SMS, sensor names, units
+- **Removed pH from `parseAlertSeverity`** function
+- **Removed pH from `SENSOR_KEY_TO_DISPLAY` and `DISPLAY_TO_SENSOR_KEY`** mappings
+- **Grid layouts adjusted**: 3-column grids changed to 2-column for all affected pages
+- **pH data still stored** in database sensors table (column kept for existing data)
+
+#### Offline Display Enhancement
+- **Pages show last known data** with yellow offline banner instead of "Error" state when ESP32 disconnects
+- **HomePage, DashboardPage, SensorsPage**: Added `isOfflineWithData` state, overlay colors, cached value display
+- **All sensor cards** show reduced opacity during offline state
+
+#### ESP32 Firmware
+- **Replaced WiFiMulti with WiFiManager**: ESP32 firmware now uses captive portal for WiFi configuration
+- **No hardcoded credentials**: Connect to "CRAYvings-Config" AP on first boot
+
+#### Cleanup
+- **Removed unused `Sidebar.tsx`** component (sidebar is defined inline in App.tsx)
+- **Removed unused `App.css`** file (not imported anywhere)
+- **Removed unused `AlertEntry`** type from types/index.ts

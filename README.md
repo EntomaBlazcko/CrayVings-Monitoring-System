@@ -29,12 +29,12 @@ This can help reduce risks caused by poor water conditions and improve overall m
 ## Features
 
 ### Core Features
-- **Real-time sensor monitoring** - Temperature, pH, water level (3 sensors via ESP32)
-- **ESP32-based data collection** - Wireless sensor data transmission with WiFiMulti + validation
+- **Real-time sensor monitoring** - Temperature and water level (2 sensors via ESP32)
+- **ESP32-based data collection** - Wireless sensor data transmission with WiFiManager captive portal
 - **Web dashboard** - Responsive React UI with icon-based navigation
 - **Database storage** - PostgreSQL for historical data
 - **Smart connection detection** - Connection status based on actual sensor data timestamp, not API poll time
-- **Offline error display** - When ESP32 disconnects, all pages show error state (same as when server is down)
+- **Offline data display** - When ESP32 disconnects, pages show last known readings with yellow offline banner
 - **Smart alerts** - Floating popup notifications with threshold-based alerts and cooldown
 - **SMS notifications** - Critical threshold alerts and device disconnect alerts via SkySMS API
 - **SMS mute/sleep** - Pause SMS alerts for 1, 2, 4, 6, 8, 12, or 24 hours
@@ -43,15 +43,13 @@ This can help reduce risks caused by poor water conditions and improve overall m
 - **Custom alert sounds** - Audio alerts via Web Audio API
 - **PDF export** - Export system logs to PDF (LogsPage)
 - **Activity logging** - Track user interactions including device connect/disconnect events
-- **Smart save logic** - Only writes to database when data actually changes
-- **Token expiration** - Auth tokens expire after 24 hours
+- **WiFiManager** - ESP32 firmware uses captive portal for WiFi config (no hardcoded credentials)
 
 ### Monitoring Parameters
 | Parameter | Sensor | Safe Range |
 |-----------|--------|------------|
 | Temperature | DS18B20 | 20 - 31°C |
 | Water Level | Ultrasonic HC-SR04 | 10 - 100% |
-| pH Level | pH Probe | 6.5 - 8.5 |
 
 ### Dashboard Pages
 - **Home** - Overview, quick stats, connection status, system alerts
@@ -68,10 +66,9 @@ This can help reduce risks caused by poor water conditions and improve overall m
 ## Technologies Used
 
 ### Hardware
-- **ESP32 DevKit V1** with WiFiMulti support
+- **ESP32 DevKit V1** with WiFiManager support
 - **DS18B20** - Temperature sensor (GPIO4, OneWire)
 - **HC-SR04** - Ultrasonic distance sensor (GPIO5, GPIO18)
-- **pH Probe** - pH measurement (GPIO34)
 
 ### Software
 | Component | Technology | Version |
@@ -118,7 +115,6 @@ Sensors → ESP32 → Wi-Fi → Express API → PostgreSQL → React Dashboard
 - ESP32 DevKit V1
 - DS18B20 temperature sensor
 - HC-SR04 water level sensor
-- pH probe/sensor
 
 ### Software
 - Node.js 18+
@@ -167,17 +163,14 @@ Dashboard opens at http://localhost:5173
 
 ### 5. Connect ESP32
 
-Configure server URL in `esp32code.ino`:
-```cpp
-const char* serverName = "http://<your-server-ip>:3000/sensor";
-```
+Flash the ESP32 with `esp32code/esp32code.ino`. On first boot, connect to the "CRAYvings-Config" WiFi access point to configure your WiFi credentials via the captive portal.
 
 ---
 
 ## Configuration
 
 ### Setting Thresholds
-Navigate to **Settings** to configure temperature, pH, and water level min/max values.
+Navigate to **Settings** to configure temperature and water level min/max values.
 
 ### SMS Mute / Sleep
 Two ways to pause SMS alerts:
@@ -190,9 +183,6 @@ While muted, disconnect alerts still show as popups and are logged, but SMS is n
 - SkySMS integration for critical alerts and device disconnect alerts
 - Recipient management in Settings page
 - Test SMS feature to verify configuration
-
-### Smart Save Logic
-Only writes to database when values actually change. Handles null/undefined, numeric strings, dates, and JSON objects.
 
 ---
 
@@ -232,7 +222,7 @@ src/
 │   ├── useThresholdAlert.ts
 │   └── useFloatingAlerts.ts
 ├── pages/
-│   ├── HomePage.tsx           # Error state when ESP32 offline
+│   ├── HomePage.tsx           # Shows last data with offline banner when ESP32 offline
 │   ├── DashboardPage.tsx
 │   ├── SensorsPage.tsx
 │   ├── AlertsPage.tsx
@@ -246,7 +236,7 @@ src/
 ├── main.tsx
 └── index.css
 server.cjs                     # Express backend
-esp32code/esp32code.ino        # ESP32 firmware
+esp32code/esp32code.ino        # ESP32 firmware (WiFiManager)
 ```
 
 ---
@@ -261,17 +251,16 @@ esp32code/esp32code.ino        # ESP32 firmware
 
 ### When ESP32 Disconnects
 1. Sensor data becomes stale (older than 15s)
-2. `error` state set → all pages show error UI
+2. Pages show last known readings with yellow offline banner and "ESP32 is offline" message
 3. Floating popup: "ESP32 device disconnected — no data received"
 4. Critical alert sound plays
 5. Activity log: `device_disconnect`
 6. SMS sent to active recipients (unless muted)
 
 ### When ESP32 Reconnects
-1. Fresh data arrives → `error` cleared, status = **online**
-2. Pages show live readings automatically
-3. Floating popup: "ESP32 device reconnected — data restored"
-4. Activity log: `device_connect`
+1. Fresh data arrives → status = **online**, pages show live readings
+2. Floating popup: "ESP32 device reconnected — data restored"
+3. Activity log: `device_connect`
 
 ---
 
@@ -280,9 +269,9 @@ esp32code/esp32code.ino        # ESP32 firmware
 | Issue | Solution |
 |-------|----------|
 | Backend won't start | Check PostgreSQL connection |
-| No data showing | Verify ESP32 IP address |
+| No data showing | Verify ESP32 is connected to same WiFi network |
 | CORS error | Add frontend port to ALLOWED_ORIGINS |
-| "Device offline" | Check ESP32 WiFi connection |
+| "Device offline" | Check ESP32 WiFi connection (use WiFiManager portal) |
 | SMS not sending | Verify SKYSMS_API_KEY in .env |
 | AudioContext warning | Click anywhere on the page to unlock audio |
 
@@ -290,7 +279,7 @@ esp32code/esp32code.ino        # ESP32 firmware
 ```bash
 curl http://localhost:3000/health
 curl http://localhost:3000/sensor/latest
-curl -X POST http://localhost:3000/sensor -H "Content-Type: application/json" -d '{"device_id":"TEST","temperature":25,"water_level":75,"ph":7}'
+curl -X POST http://localhost:3000/sensor -H "Content-Type: application/json" -d '{"device_id":"TEST","temperature":25,"water_level":75}'
 curl -X POST http://localhost:3000/alert/mute -H "Content-Type: application/json" -d '{"hours": 4}'
 ```
 

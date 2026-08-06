@@ -65,7 +65,7 @@ export const VALID_MENU_KEYS = [
   "Historical Data",
   "Activity Logs",
   "Settings",
-  "Logs",
+  "Sensor Logs",
 ] as const;
 
 /**
@@ -242,14 +242,6 @@ export function getThresholdStatus(
 export type AlertSeverity = "info" | "warning" | "critical";
 
 /**
- * A log entry enriched with severity classification.
- * Extends LogEntry to include the severity field for UI styling.
- */
-export interface AlertEntry extends LogEntry {
-  severity: AlertSeverity;
-}
-
-/**
  * Determines the severity of an alert based on sensor parameter and value.
  * Uses hardcoded critical thresholds for classification:
  *   - Temperature: critical if >35°C or <15°C
@@ -412,3 +404,38 @@ export interface AuthResponse {
   user: AuthUser;
   token: string;
 }
+
+// ========================
+// WEEKLY REPORT TYPES
+// ========================
+
+export type WeeklyReportDaily = {
+  date: string;
+  temp_avg: number;
+  temp_min: number;
+  temp_max: number;
+  water_avg: number;
+  water_min: number;
+  water_max: number;
+  readings: number;
+  alerts: number;
+};
+
+export type WeeklyReport = {
+  period: { start: string; end: string };
+  summary: {
+    temp_avg: number;
+    temp_min: number;
+    temp_max: number;
+    water_avg: number;
+    water_min: number;
+    water_max: number;
+    total_readings: number;
+  };
+  daily: WeeklyReportDaily[];
+  alerts: {
+    total: number;
+    by_parameter: Record<string, number>;
+    by_action: Record<string, number>;
+  };
+};

@@ -24,7 +24,7 @@
 // =============================================================================
 
 import axios, { isAxiosError, type AxiosError } from "axios";
-import type { SensorEntry, ChartPoint, LogEntry, SensorSettings, ActivityLog, ActivityLogEntry, AuthResponse } from "../types";
+import type { SensorEntry, ChartPoint, LogEntry, SensorSettings, ActivityLog, ActivityLogEntry, AuthResponse, WeeklyReport } from "../types";
 import { API_BASE } from "../types";
 
 // ========================
@@ -169,6 +169,20 @@ export async function fetchSensorHistory(limit = 1000, signal?: AbortSignal): Pr
     });
   
   return data;
+}
+
+// ========================
+// WEEKLY REPORT ENDPOINT
+// ========================
+
+/**
+ * GET /report/weekly
+ * Fetches aggregated weekly report data from the backend.
+ * Returns summary stats, daily breakdown, and alert counts for the past 7 days.
+ */
+export async function fetchWeeklyReport(signal?: AbortSignal): Promise<WeeklyReport> {
+  const response = await client.get<WeeklyReport>("/report/weekly", { signal });
+  return response.data;
 }
 
 // ========================

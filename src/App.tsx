@@ -72,7 +72,7 @@ const baseMenuItems: { label: MenuKey; icon: React.ReactNode }[] = [
   { label: "Alerts", icon: <Bell size={18} /> },
   { label: "Historical Data", icon: <History size={18} /> },
   { label: "Activity Logs", icon: <ClipboardList size={18} /> },
-  { label: "Logs", icon: <FileText size={18} /> },
+  { label: "Sensor Logs", icon: <FileText size={18} /> },
   { label: "Settings", icon: <Settings size={18} /> },
 ];
 
@@ -158,7 +158,7 @@ function DashboardLayout() {
         return <HistoricalDataPage />;
       case "Activity Logs":
         return <ActivityLogsPage />;
-      case "Logs":
+      case "Sensor Logs":
         return <LogsPage />;
        case "Settings":
          return <SettingsPage />;

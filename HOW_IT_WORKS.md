@@ -30,7 +30,7 @@ The CRAYvings Monitoring System is an IoT-based aquaculture monitoring solution 
 ├─────────────────────────────────────────────────────────────────────────┤
 │                                                                          │
 │  ┌──────────┐     ┌──────────────┐     ┌─────────────┐     ┌────────┐   │
-│  │  ESP32   │────▶│  Express API  │────▶│ PostgreSQL  │────▶│ React  │   │
+│  │  ESP32   │────▶│  Express API  │────▶│  PostgreSQL  │────▶│ React  │   │
 │  │ Hardware │     │  Backend      │     │ Database    │     │ Dashboard│   │
 │  └──────────┘     └──────────────┘     └─────────────┘     └────────┘   │
 │       │                   │                   │                  │        │
@@ -41,7 +41,7 @@ The CRAYvings Monitoring System is an IoT-based aquaculture monitoring solution 
 │  Sensors:                                                         Pages:  │
 │  - DS18B20 (Temperature)                                     - Home      │
 │  - Ultrasonic (Water Level)                                  - Dashboard │
-│  - pH Probe                                                  - Sensors   │
+│                                                               - Sensors   │
 │                                                               - Alerts   │
 │                                                               - Historical│
 │                                                               - Settings  │
@@ -56,21 +56,19 @@ The CRAYvings Monitoring System is an IoT-based aquaculture monitoring solution 
 
 ### 1. Real-Time Water Quality Monitoring
 
-The system continuously monitors three critical water parameters collected by the ESP32:
+The system continuously monitors water parameters collected by the ESP32:
 
 | Parameter | Sensor | Range | Unit | Default Threshold |
 |-----------|--------|-------|------|------------------|
 | Temperature | DS18B20 | 0 to 50 | °C | 20 - 31°C |
 | Water Level | Ultrasonic HC-SR04 | 0 to 100 | % | 10 - 100% |
-| pH Level | pH Probe | 0 to 14 | - | 6.5 - 8.5 |
 
 **Features:**
 - Continuous data collection from ESP32 every 1000ms
-- Sensor validation before sending data (invalid readings skipped)
+- Sensor validation before sending data (invalid readings sent as -1)
 - Real-time display updates every 3 seconds via polling
 - Visual indicators for sensor status (online/offline)
 - Connection status detection based on actual sensor data timestamp (not poll time)
-- Only 3 sensors actively monitored (matches ESP32 hardware)
 
 ### 2. Intelligent Alert System
 
@@ -96,14 +94,14 @@ The system actively monitors ESP32 connectivity:
 
 - **Stale data detection**: Connection status uses sensor data timestamp, not API response time
 - **15-second offline threshold**: If data is older than 15s, device is marked offline
-- **Error state display**: When disconnected, all pages show error UI (same as server down)
+- **Last known data display**: When disconnected, pages show cached readings with yellow offline banner
 - **Auto-recovery**: When fresh data arrives, all pages automatically recover
 - **Activity logging**: `device_disconnect` and `device_connect` events logged
 
 ### 4. Data-Driven Insights & Analytics
 
 - **Historical data analysis** with time range filtering (1h, 6h, 24h, all)
-- **Trend charts** for Temperature, pH, and Water Level using Recharts
+- **Trend charts** for Temperature and Water Level using Recharts
 - **Statistical summaries** on dashboard
 - **Export capability** via PDF (LogsPage exports system logs)
 - **Flexible history fetching** - Backend supports up to 1000 records (default: 300)
@@ -121,7 +119,6 @@ The system actively monitors ESP32 connectivity:
 - Persistent storage in database
 - Real-time validation with range checking
 - Activity logging for all changes
-- **Smart save logic** - Only writes to DB when values actually change
 - **SMS recipient management** - Add, edit, delete recipients
 - **SMS mute/sleep** - Pause SMS alerts for 1/2/4/6/8/12/24 hours
 - **Test SMS** - Verify SMS configuration
@@ -157,7 +154,7 @@ The system actively monitors ESP32 connectivity:
 ### 10. PDF Export
 
 - Export system logs to PDF using jsPDF + jspdf-autotable
-- Parameter filtering (Temperature, pH Level, Water Level)
+- Parameter filtering (Temperature, Water Level)
 - Summary section with parameter counts
 - Auto-table formatting with pagination support
 - Available in LogsPage
@@ -186,11 +183,10 @@ The ESP32 microcontroller reads sensor values at regular intervals:
 
 - **Temperature**: DS18B20 waterproof sensor (OneWire protocol)
 - **Water Level**: Ultrasonic HC-SR04 distance sensor with averaging (5 samples)
-- **pH Level**: Analog pH probe with calibration and median filtering (10 samples)
 
 ### 2. Data Transmission
 
-The ESP32 sends a POST request to the backend server via Wi-Fi (only when all sensor readings are valid):
+The ESP32 sends a POST request to the backend server via Wi-Fi:
 
 ```http
 POST http://192.168.1.20:3000/sensor
@@ -199,8 +195,7 @@ Content-Type: application/json
 {
   "device_id": "ESP32_01",
   "temperature": 25.5,
-  "water_level": 80.0,
-  "ph": 7.2
+  "water_level": 80.0
 }
 ```
 
@@ -222,10 +217,11 @@ The React dashboard:
 1. **Polling**: Fetches data every 3 seconds
 2. **Display**: Shows real-time readings in cards and charts
 3. **Connection check**: Uses sensor data timestamp to determine online/offline
-4. **Alerts**: Warns users when parameters exceed thresholds
-5. **Disconnect alerts**: Floating popup + sound + activity log when ESP32 offline
-6. **SMS**: Sends SMS for critical alerts and device disconnects (unless muted)
-7. **Audio**: Plays alert sounds for threshold violations and disconnects
+4. **Offline display**: Shows last known readings with yellow banner when ESP32 disconnected
+5. **Alerts**: Warns users when parameters exceed thresholds
+6. **Disconnect alerts**: Floating popup + sound + activity log when ESP32 offline
+7. **SMS**: Sends SMS for critical alerts and device disconnects (unless muted)
+8. **Audio**: Plays alert sounds for threshold violations and disconnects
 
 ---
 
@@ -243,14 +239,14 @@ if gap > 15000 → OFFLINE
 
 This means:
 - If the ESP32 stops sending data, the dashboard correctly shows "offline" after 15 seconds
-- If the backend is running but ESP32 is disconnected, stale data is detected and error state is shown
+- If the backend is running but ESP32 is disconnected, stale data is detected
 - When fresh data arrives, the system automatically recovers
 
 ### When ESP32 Disconnects
 
 1. Sensor data in database becomes stale (older than 15 seconds)
-2. `error` state set to "ESP32 device is offline. Last data received is stale."
-3. All pages show their error UI (red error state, same as when server is down)
+2. Pages show last known readings with yellow "ESP32 is offline" banner
+3. Cards show last cached values with reduced opacity
 4. **FloatingAlert**: "ESP32 device disconnected — no data received" (red popup, top-right)
 5. **Sound**: Critical alert sound (double beep) plays
 6. **Activity log**: `device_disconnect` event recorded
@@ -259,11 +255,9 @@ This means:
 ### When ESP32 Reconnects
 
 1. Fresh data arrives with current timestamp
-2. `error` state cleared, `connectionStatus` = "online"
-3. All pages automatically re-render with live readings
-4. **FloatingAlert**: "ESP32 device reconnected — data restored" (amber popup)
-5. **Activity log**: `device_connect` event recorded
-6. Disconnect popup automatically removed
+2. `connectionStatus` = "online", pages automatically re-render with live readings
+3. **FloatingAlert**: "ESP32 device reconnected — data restored" (amber popup)
+4. **Activity log**: `device_connect` event recorded
 
 ### Offline Threshold Configuration
 
@@ -292,7 +286,6 @@ Users can configure thresholds in **Settings**:
 | Parameter | Default Min | Default Max | Unit |
 |------------|--------------|-------------|------|
 | Temperature | 20 | 31 | °C |
-| pH Level | 6.5 | 8.5 | - |
 | Water Level | 10 | 100 | % |
 
 ### Alert Severity
@@ -413,7 +406,6 @@ const sensorSchema = z.object({
   device_id: z.string().min(1).max(50),
   temperature: z.coerce.number().min(-10).max(50),
   water_level: z.coerce.number().min(0).max(100),
-  ph: z.coerce.number().min(0).max(14),
   timestamp: z.string().datetime().optional(),
 });
 ```
@@ -514,13 +506,13 @@ Method: POST
 Content-Type: application/json
 URL: http://<server>:3000/sensor
 Baud Rate: 19200
-WiFi: WiFiMulti for multiple network support
+WiFi: WiFiManager captive portal (configurable on first boot)
 ```
 
 ### Network Requirements
 
 - WiFi network (2.4GHz recommended for ESP32)
-- Multiple WiFi networks supported via WiFiMulti
+- WiFiManager captive portal for easy credential configuration
 - Server on same local network
 - Port 3000 accessible
 - Static IP recommended for server
@@ -532,13 +524,11 @@ WiFi: WiFiMulti for multiple network support
 |--------|------|-------|----------|-----|
 | DS18B20 | Digital | 0°C to 50°C | ±0.5°C | GPIO4 |
 | HC-SR04 | Ultrasonic | 0 - 100% | ±3mm | GPIO5, GPIO18 |
-| pH Probe | Analog | 0 - 14 | ±0.1 | GPIO34 |
 
 ### ESP32 Sensor Validation
 
 - **Temperature**: Valid range 0-50°C, error detection (-127°C = sensor error)
 - **Water Level**: Valid range 0-100%, ultrasonic echo validation, 5-sample averaging
-- **pH**: Valid range 0-14, median filter (10 samples, discard highest/lowest 2)
 
 ---
 
@@ -565,7 +555,7 @@ src/
 │   ├── useThresholdAlert.ts     # Alert threshold monitoring
 │   └── useFloatingAlerts.ts     # Alert context
 ├── pages/
-│   ├── HomePage.tsx             # Error state when ESP32 offline
+│   ├── HomePage.tsx             # Shows last data when ESP32 offline
 │   ├── DashboardPage.tsx
 │   ├── SensorsPage.tsx
 │   ├── AlertsPage.tsx
@@ -582,7 +572,7 @@ src/
 └── index.css
 server.cjs                       # Express backend
 esp32code/
-└── esp32code.ino                # ESP32 firmware
+└── esp32code.ino                # ESP32 firmware (WiFiManager)
 ```
 
 ---
@@ -605,13 +595,7 @@ Dashboard available at http://localhost:5173
 
 ### 3. ESP32
 
-Configure the ESP32 with your server IP in `esp32code.ino`:
-
-```cpp
-const char* serverName = "http://192.168.1.20:3000/sensor";
-```
-
-Upload using Arduino IDE and monitor at 19200 baud.
+Flash the ESP32 with `esp32code/esp32code.ino`. On first boot, connect to the "CRAYvings-Config" WiFi access point and configure your network via the captive portal.
 
 ---
 
@@ -653,7 +637,6 @@ CREATE TABLE sensors (
   device_id VARCHAR(50) NOT NULL,
   temperature DECIMAL(5,2) DEFAULT 0,
   water_level DECIMAL(5,2) DEFAULT 0,
-  ph DECIMAL(5,2) DEFAULT 0,
   timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -683,8 +666,6 @@ CREATE TABLE sensor_settings (
   id SERIAL PRIMARY KEY,
   temp_min DECIMAL(5,2) DEFAULT 20.0,
   temp_max DECIMAL(5,2) DEFAULT 31.0,
-  ph_min DECIMAL(5,2) DEFAULT 6.5,
-  ph_max DECIMAL(5,2) DEFAULT 8.5,
   water_level_min DECIMAL(5,2) DEFAULT 10.0,
   water_level_max DECIMAL(5,2) DEFAULT 100.0,
   updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -753,7 +734,7 @@ curl http://localhost:3000/health
 curl http://localhost:3000/sensor/latest
 curl -X POST http://localhost:3000/sensor \
   -H "Content-Type: application/json" \
-  -d '{"device_id":"TEST","temperature":25.0,"water_level":75.0,"ph":7.0}'
+  -d '{"device_id":"TEST","temperature":25.0,"water_level":75.0}'
 
 # Test mute
 curl -X POST http://localhost:3000/alert/mute \
@@ -772,7 +753,7 @@ curl http://localhost:3000/alert/mute-status
 | "Invalid URL" | Empty API URL | Set `VITE_API_BASE` |
 | CORS error | Wrong port | Add port to `ALLOWED_ORIGINS` |
 | Data not showing | Wrong IP | Check server config in frontend |
-| "Device offline" | ESP32 not connected | Check WiFi, restart ESP32 |
+| "Device offline" | ESP32 not connected | Check WiFi, restart ESP32 (use WiFiManager portal) |
 | Alert spam | Frequent threshold breaches | Adjust threshold settings |
 | AudioContext warning | Browser security | Click anywhere on page to unlock audio |
 | SMS not sending | Missing API key | Set `SKYSMS_API_KEY` in .env |
