@@ -81,7 +81,6 @@ This can help reduce risks caused by poor water conditions and improve overall m
 | Charts | Recharts | 3.8 |
 | Icons | lucide-react | 1.8 |
 | PDF Export | jsPDF + autoTable | 4.2 + 5.0 |
-| Routing | react-router-dom | 7.14 |
 | HTTP Client | Axios | 1.15 |
 | Backend | Express.js | 5.2 |
 | Database | PostgreSQL | 15+ |

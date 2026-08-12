@@ -256,20 +256,22 @@ export type AlertSeverity = "info" | "warning" | "critical";
 
 /**
  * Determines the severity of an alert based on sensor parameter and value.
- * Uses hardcoded critical thresholds for classification:
- *   - Temperature: critical if >35°C or <15°C
- *   - Water Level: always "warning" (no critical threshold defined)
+ * Uses the user-configured threshold ranges from SensorSettings:
+ *   - Critical when the value deviates from the configured range by 15% or more
+ *   - Warning when it is only slightly outside
+ *   - Falls back to DEFAULT_SETTINGS when no settings are available
  */
-export function parseAlertSeverity(log: LogEntry): AlertSeverity {
+export function parseAlertSeverity(log: LogEntry, settings?: SensorSettings | null): AlertSeverity {
   if (log.action !== "Alert") return "info";
-  
-  const param = log.parameter;
+
+  const key = DISPLAY_TO_SENSOR_KEY[log.parameter];
   const val = Number(log.new_value);
-  
-  if (param === "Temperature") {
-    return val > 35 || val < 15 ? "critical" : "warning";
-  }
-  return "warning";
+  if (!key || !Number.isFinite(val)) return "warning";
+
+  const config = getSettingsThresholds(settings ?? null)[key];
+  if (!config) return "warning";
+
+  return getThresholdStatus(val, config.range, config.isMinOnly) === "critical" ? "critical" : "warning";
 }
 
 // ========================

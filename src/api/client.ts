@@ -77,12 +77,18 @@ client.interceptors.request.use((config) => {
 // Handles network errors silently to prevent UI crashes from transient failures.
 // Connection timeouts and canceled requests are not treated as errors here
 // (they are handled at the call site).
+// A 401 on a protected route means the token is invalid or expired — clear the
+// stored session so the app returns to the login page on next load.
 
 client.interceptors.response.use(
   (response) => response,
   (error: AxiosError) => {
     if (error.code !== "ECONNABORTED" && error.code !== "ERR_CANCELED") {
       // Silent fail for network errors - handled by calling code
+    }
+    if (error.response?.status === 401 && localStorage.getItem("crayvings_token")) {
+      localStorage.removeItem("crayvings_token");
+      localStorage.removeItem("crayvings_user");
     }
     return Promise.reject(error);
   }
@@ -491,6 +497,20 @@ export async function loginUser(
     { signal }
   );
   return response.data;
+}
+
+/**
+ * POST /auth/logout (Authenticated)
+ * Revokes the current session token server-side.
+ * Called by AuthContext.logout; failures are silent since local
+ * session state is cleared regardless.
+ */
+export async function logoutUser(signal?: AbortSignal): Promise<void> {
+  try {
+    await client.post("/auth/logout", {}, { signal });
+  } catch {
+    // Non-critical — local session is cleared by the caller anyway.
+  }
 }
 
 /** GET /auth/users (Admin only) - Fetches all user accounts. */

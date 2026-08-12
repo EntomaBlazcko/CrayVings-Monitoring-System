@@ -74,8 +74,25 @@ const pool = new Pool({
   password: process.env.PG_PASSWORD,
 });
 
-// Enable CORS so the Vite/React frontend (dev server) can call this API
-app.use(cors());
+// Enable CORS so the Vite/React frontend (dev server) can call this API.
+// Origins are restricted to the allowlist in ALLOWED_ORIGINS (comma-separated).
+// Requests without an Origin header (e.g. the ESP32's HTTP client, curl) are allowed.
+const allowedOrigins = (process.env.ALLOWED_ORIGINS || "http://localhost:5173")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+app.use(
+  cors({
+    origin(origin, callback) {
+      if (!origin || allowedOrigins.includes(origin)) {
+        callback(null, true);
+      } else {
+        callback(new Error(`Origin ${origin} not allowed by CORS`));
+      }
+    },
+  })
+);
 // Parse incoming JSON request bodies
 app.use(express.json());
 
@@ -106,7 +123,10 @@ function hashPassword(password) {
 function verifyPassword(password, stored) {
   const [salt, hash] = stored.split(":");
   const verifyHash = crypto.pbkdf2Sync(password, salt, 10000, 64, "sha512").toString("hex");
-  return hash === verifyHash;
+  const expected = Buffer.from(hash, "hex");
+  const actual = Buffer.from(verifyHash, "hex");
+  if (expected.length !== actual.length) return false;
+  return crypto.timingSafeEqual(expected, actual);
 }
 
 /**
@@ -139,10 +159,14 @@ function requireAdmin(req, res, next) {
   if (!token) return res.status(401).json({ message: "Authentication required" });
 
   pool.query("SELECT * FROM users WHERE token = $1", [token])
-    .then(result => {
+    .then(async result => {
       if (result.rows.length === 0) return res.status(403).json({ message: "Invalid token" });
       const user = result.rows[0];
       if (user.role !== "admin") return res.status(403).json({ message: "Admin access required" });
+      if (user.token_expires_at && new Date(user.token_expires_at) <= new Date()) {
+        await pool.query("UPDATE users SET token = NULL, token_expires_at = NULL WHERE id = $1", [user.id]);
+        return res.status(401).json({ message: "Session expired, please log in again" });
+      }
       req.adminUser = user;
       next();
     })
@@ -159,9 +183,14 @@ function requireAuth(req, res, next) {
   if (!token) return res.status(401).json({ message: "Authentication required" });
 
   pool.query("SELECT * FROM users WHERE token = $1", [token])
-    .then(result => {
+    .then(async result => {
       if (result.rows.length === 0) return res.status(403).json({ message: "Invalid token" });
-      req.user = result.rows[0];
+      const user = result.rows[0];
+      if (user.token_expires_at && new Date(user.token_expires_at) <= new Date()) {
+        await pool.query("UPDATE users SET token = NULL, token_expires_at = NULL WHERE id = $1", [user.id]);
+        return res.status(401).json({ message: "Session expired, please log in again" });
+      }
+      req.user = user;
       next();
     })
     .catch(err => res.status(500).json({ message: "Auth error", error: err.message }));
@@ -226,6 +255,66 @@ async function updateOnlyIfChanged(client, { table, keyColumn, keyValue, current
     [...values, keyValue]
   );
   return { changed: true, row: result.rows[0] };
+}
+
+// =============================================================================
+// INPUT VALIDATION SCHEMAS (Zod)
+// =============================================================================
+// Server-side validation for incoming request bodies. The ESP32 sends -1 (and
+// 0 for temperature) to mark a failed sensor, so the sensor schema's lower
+// bounds must accept those sentinel values.
+
+/**
+ * Schema for POST /sensor (ESP32 ingestion).
+ * Failed-sensor sentinels (-1, 0 for temperature) are allowed and filtered
+ * out later during threshold evaluation.
+ */
+const sensorSchema = z.object({
+  device_id: z.string().min(1).max(50),
+  temperature: z.coerce.number().min(-10).max(50),
+  water_level: z.coerce.number().min(-1).max(100),
+  ammonia: z.coerce.number().min(-1).max(1).optional(),
+});
+
+/**
+ * Schema for POST /settings (threshold configuration).
+ * Accepts partial updates; each pair is validated so min < max.
+ */
+const settingsFieldSchema = z.object({
+  temp_min: z.coerce.number().min(-10).max(50),
+  temp_max: z.coerce.number().min(-10).max(50),
+  water_level_min: z.coerce.number().min(0).max(100),
+  water_level_max: z.coerce.number().min(0).max(100),
+  ammonia_min: z.coerce.number().min(0).max(10),
+  ammonia_max: z.coerce.number().min(0).max(10),
+}).partial();
+
+/**
+ * Validates a settings payload and returns parsed values.
+ * Throws a ZodError for field/range violations or an Error with
+ * statusCode 400 for min >= max pairs.
+ */
+function parseSettingsInput(body) {
+  const parsed = settingsFieldSchema.parse(body);
+  const pairChecks = [
+    { label: "Temperature", min: parsed.temp_min, max: parsed.temp_max },
+    { label: "Water Level", min: parsed.water_level_min, max: parsed.water_level_max },
+    { label: "Ammonia", min: parsed.ammonia_min, max: parsed.ammonia_max },
+  ];
+  for (const pair of pairChecks) {
+    if (pair.min !== undefined && pair.max !== undefined && pair.min >= pair.max) {
+      const err = new Error(`${pair.label} min must be less than max`);
+      err.statusCode = 400;
+      throw err;
+    }
+  }
+  return parsed;
+}
+
+/** Converts a ZodError into a readable field-errors object. */
+function zodFieldErrors(err) {
+  const flat = err.flatten();
+  return flat.fieldErrors || {};
 }
 
 // =============================================================================
@@ -421,6 +510,8 @@ async function logSMS(phone, message, status, error, smsId = null) {
 // smsMuteUntil: ISO timestamp until which all SMS alerts are suppressed
 let lastAlertedState = {};
 let smsMuteUntil = null;
+// Tracks the last device-disconnect SMS to prevent spam when the connection flaps
+let lastDisconnectSmsTs = 0;
 
 // Hourly SMS timestamp - loaded from DB on startup, persisted on each send
 let lastHourlyUpdateTs = null;
@@ -440,6 +531,19 @@ let lastHourlyUpdateTs = null;
       lastHourlyUpdateTs = new Date(result.rows[0].value).getTime();
       console.log(`[${new Date().toISOString()}] Loaded lastHourlyUpdateTs from DB: ${new Date(lastHourlyUpdateTs).toISOString()}`);
     }
+
+    // Restore SMS mute state from the database (survives server restarts)
+    const muteResult = await pool.query("SELECT value FROM system_state WHERE key = 'sms_mute_until'");
+    if (muteResult.rows.length > 0 && muteResult.rows[0].value) {
+      const storedMute = new Date(muteResult.rows[0].value);
+      if (storedMute > new Date()) {
+        smsMuteUntil = storedMute.toISOString();
+        console.log(`[${new Date().toISOString()}] Restored SMS mute until ${smsMuteUntil}`);
+      } else {
+        await pool.query("DELETE FROM system_state WHERE key = 'sms_mute_until'");
+        console.log(`[${new Date().toISOString()}] Cleared expired SMS mute from DB`);
+      }
+    }
   } catch (err) {
     console.error(`[${new Date().toISOString()}] Error initializing system_state:`, err.message);
   }
@@ -455,6 +559,9 @@ let lastHourlyUpdateTs = null;
     await pool.query(`ALTER TABLE sensors ADD COLUMN IF NOT EXISTS ammonia DECIMAL(5,3) DEFAULT 0`);
     await pool.query(`ALTER TABLE sensor_settings ADD COLUMN IF NOT EXISTS ammonia_min DECIMAL(5,2) DEFAULT 0`);
     await pool.query(`ALTER TABLE sensor_settings ADD COLUMN IF NOT EXISTS ammonia_max DECIMAL(5,2) DEFAULT 1.00`);
+
+    // Migrations: session token expiry (24-hour expiration).
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS token_expires_at TIMESTAMP`);
 
     // Indexes for system_logs (faster pagination and counting)
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_system_logs_timestamp ON system_logs (timestamp DESC)`);
@@ -473,9 +580,9 @@ let lastHourlyUpdateTs = null;
   }
 })();
 
-// Auto-cleanup: keep only last 30 days of logs (run on startup and daily)
+// Auto-cleanup: keep only last 30 days of logs and sensor readings (run on startup and daily)
 const LOGS_RETENTION_DAYS = 30;
-async function cleanupOldLogs() {
+async function cleanupOldData() {
   try {
     const result = await pool.query(
       `DELETE FROM system_logs WHERE timestamp < NOW() - INTERVAL '${LOGS_RETENTION_DAYS} days' RETURNING id`
@@ -490,14 +597,23 @@ async function cleanupOldLogs() {
     if (smsResult.rowCount > 0) {
       console.log(`[${new Date().toISOString()}] Cleaned up ${smsResult.rowCount} old sms_logs entries`);
     }
+
+    // The ESP32 posts ~1 reading/second, so the sensors table grows fast.
+    // Prune readings older than the retention window to keep queries fast.
+    const sensorResult = await pool.query(
+      `DELETE FROM sensors WHERE timestamp < NOW() - INTERVAL '${LOGS_RETENTION_DAYS} days' RETURNING id`
+    );
+    if (sensorResult.rowCount > 0) {
+      console.log(`[${new Date().toISOString()}] Cleaned up ${sensorResult.rowCount} old sensor readings`);
+    }
   } catch (err) {
     console.error(`[${new Date().toISOString()}] Error cleaning up logs:`, err.message);
   }
 }
 
 // Run cleanup on startup, then daily
-cleanupOldLogs();
-setInterval(cleanupOldLogs, 24 * 60 * 60 * 1000);
+cleanupOldData();
+setInterval(cleanupOldData, 24 * 60 * 60 * 1000);
 
 // =============================================================================
 // API ROUTES
@@ -556,7 +672,11 @@ app.get("/", (req, res) => {
  */
 app.post("/sensor", async (req, res) => {
   try {
-    const { device_id, temperature, water_level, ammonia } = req.body;
+    const parsed = sensorSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({ message: "Invalid sensor data", errors: zodFieldErrors(parsed.error) });
+    }
+    const { device_id, temperature, water_level, ammonia } = parsed.data;
     if (!device_id) return res.status(400).json({ message: "device_id is required" });
 
     // Store sensor reading in the database
@@ -950,18 +1070,35 @@ app.post("/auth/login", async (req, res) => {
     const user = result.rows[0];
     if (!verifyPassword(password, user.password_hash)) return res.status(401).json({ message: "Invalid credentials" });
 
-    // Generate a new session token and store it in the database
+    // Generate a new session token (24-hour expiry) and store it in the database
     const token = generateToken();
-    await pool.query("UPDATE users SET token = $1 WHERE id = $2", [token, user.id]);
+    const TOKEN_TTL_MS = 24 * 60 * 60 * 1000;
+    const tokenExpiresAt = new Date(Date.now() + TOKEN_TTL_MS);
+    await pool.query("UPDATE users SET token = $1, token_expires_at = $2 WHERE id = $3", [token, tokenExpiresAt, user.id]);
 
     res.json({
       message: "Login successful",
       user: { id: user.id, username: user.username, email: user.email, role: user.role, name: user.name },
-      token
+      token,
+      tokenExpiresAt: tokenExpiresAt.toISOString(),
     });
   } catch (err) {
     console.error(`[${new Date().toISOString()}] Login error:`, err.message);
     res.status(500).json({ message: "Login failed", error: err.message });
+  }
+});
+
+/**
+ * POST /auth/logout (Authenticated)
+ * Revokes the current session token so it can no longer be used.
+ * Called by the frontend when the user logs out.
+ */
+app.post("/auth/logout", requireAuth, async (req, res) => {
+  try {
+    await pool.query("UPDATE users SET token = NULL, token_expires_at = NULL WHERE id = $1", [req.user.id]);
+    res.json({ message: "Logged out" });
+  } catch (err) {
+    res.status(500).json({ message: "Error logging out", error: err.message });
   }
 });
 
@@ -1075,7 +1212,17 @@ app.get("/settings", async (req, res) => {
  */
 app.post("/settings", requireAdmin, async (req, res) => {
   try {
-    const { temp_min, temp_max, water_level_min, water_level_max, ammonia_min, ammonia_max } = req.body;
+    let parsed;
+    try {
+      parsed = parseSettingsInput(req.body);
+    } catch (err) {
+      if (err instanceof z.ZodError) {
+        return res.status(400).json({ message: "Invalid settings", errors: zodFieldErrors(err) });
+      }
+      if (err.statusCode === 400) return res.status(400).json({ message: err.message });
+      throw err;
+    }
+    const { temp_min, temp_max, water_level_min, water_level_max, ammonia_min, ammonia_max } = parsed;
     const existing = await pool.query("SELECT * FROM sensor_settings LIMIT 1");
     let savedSettings;
     if (existing.rows.length > 0) {
@@ -1331,6 +1478,15 @@ app.post('/alert/device-disconnect', async (req, res) => {
     const timestamp = new Date().toLocaleString('en-PH', { timeZone: 'Asia/Manila', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: true });
     const message = 'CRAYVINGS DEVICE ALERT\nESP32 device disconnected\n' + (description || 'No data received for 15+ seconds') + '\nFailed polls: ' + (consecutive_failures || 0) + '\nTime: ' + timestamp;
 
+    // Cooldown prevents SMS spam when the connection flaps on/off rapidly
+    const now = Date.now();
+    const cooldownMs = SMS_CONFIG.cooldown.critical;
+    if (now - lastDisconnectSmsTs < cooldownMs) {
+      await pool.query('INSERT INTO system_logs (action, parameter, old_value, new_value) VALUES ($1, $2, $3, $4)', ['Device Disconnect (cooldown)', 'ESP32', String(consecutive_failures || 0), 'SMS suppressed by cooldown']);
+      return res.json({ message: 'Disconnect alert suppressed (cooldown)', sent: 0, total: recipients.rows.length, cooldown: true });
+    }
+    lastDisconnectSmsTs = now;
+
     // Send all SMS in parallel instead of sequentially
     const smsPromises = recipients.rows.map(async (r) => sendSingleSMS(r.phone_number, message));
     const results = await Promise.allSettled(smsPromises);
@@ -1356,11 +1512,14 @@ app.post('/alert/mute', async (req, res) => {
     const { hours } = req.body;
     if (!hours || typeof hours !== 'number' || hours <= 0) {
       smsMuteUntil = null;
+      await pool.query("DELETE FROM system_state WHERE key = 'sms_mute_until'");
       console.log('[' + new Date().toISOString() + '] SMS alerts unmuted');
       return res.json({ message: 'SMS alerts unmuted', muted: false, muteExpires: null });
     }
 
     smsMuteUntil = new Date(Date.now() + hours * 60 * 60 * 1000).toISOString();
+    // Persist the mute so it survives server restarts
+    await pool.query(`INSERT INTO system_state (key, value) VALUES ('sms_mute_until', $1) ON CONFLICT (key) DO UPDATE SET value = $1`, [smsMuteUntil]);
     console.log('[' + new Date().toISOString() + '] SMS alerts muted for ' + hours + ' hours until ' + smsMuteUntil);
 
     await pool.query('INSERT INTO system_logs (action, parameter, old_value, new_value) VALUES ($1, $2, $3, $4)', ['SMS Muted', 'Alerts', String(hours) + 'h', 'Until ' + smsMuteUntil]);
@@ -1381,9 +1540,10 @@ app.get('/alert/mute-status', async (req, res) => {
     if (smsMuteUntil && new Date() < new Date(smsMuteUntil)) {
       return res.json({ muted: true, muteExpires: smsMuteUntil });
     }
-    // Clear expired mute state
+    // Clear expired mute state (memory + database)
     if (smsMuteUntil && new Date() >= new Date(smsMuteUntil)) {
       smsMuteUntil = null;
+      await pool.query("DELETE FROM system_state WHERE key = 'sms_mute_until'");
     }
     res.json({ muted: false, muteExpires: null });
   } catch (err) {
@@ -1479,16 +1639,17 @@ async function startServer() {
 
       // Create default admin account if it doesn't exist
       const adminExists = await client.query("SELECT id, password_hash FROM users WHERE username = $1", ["admin"]);
+      const initialAdminPassword = process.env.ADMIN_INITIAL_PASSWORD || "Admin@123";
       if (adminExists.rows.length === 0) {
-        const adminPassword = hashPassword("Admin@123");
+        const adminPassword = hashPassword(initialAdminPassword);
         await client.query(
           `INSERT INTO users (name, username, email, password_hash, role) VALUES ('Administrator', 'admin', 'admin@crayvings.com', $1, 'admin')`,
           [adminPassword]
         );
-        console.log(`[${new Date().toISOString()}] Default admin account created (admin / Admin@123)`);
+        console.log(`[${new Date().toISOString()}] Default admin account created (admin / ${initialAdminPassword})`);
       } else {
         const storedHash = adminExists.rows[0].password_hash;
-        if (verifyPassword("Admin@123", storedHash)) {
+        if (verifyPassword(initialAdminPassword, storedHash)) {
           console.log(`[${new Date().toISOString()}] Admin account verified`);
         } else {
           console.log(`[${new Date().toISOString()}] Admin account exists with custom password`);

@@ -14,7 +14,6 @@ The CRAYvings Monitoring System is an IoT-based aquaculture monitoring solution 
 | Charts | Recharts | 3.8 |
 | Icons | lucide-react | 1.8 |
 | PDF Export | jsPDF + autoTable | 4.2 + 5.0 |
-| Routing | react-router-dom | 7.14 |
 | Backend | Express.js | 5.2 |
 | Database | PostgreSQL | 15+ |
 | ORM | pg (connection pool) | 8.20 |
@@ -364,6 +363,7 @@ While muted:
 - Floating popups still appear
 - Activity logs still recorded
 - SMS messages are NOT sent
+- Mute state is persisted in the database and survives server restarts
 
 ### Device Disconnect SMS Message
 
@@ -397,6 +397,12 @@ Manage SMS recipients through the **Settings** page:
 |----------|--------|-------------|
 | `/` | GET | Server info |
 | `/health` | GET | Health check |
+| `/auth/login` | POST | Log in (returns session token) |
+| `/auth/logout` | POST | Log out (revokes session token) |
+| `/auth/users` | GET | List users (admin) |
+| `/auth/users` | POST | Create user (admin) |
+| `/auth/users/:id` | DELETE | Delete user (admin) |
+| `/auth/users/:id/password` | PUT | Reset user password (admin) |
 | `/sensor` | POST | Submit sensor data |
 | `/sensor` | GET | Get history (`limit`: 1-1000) |
 | `/sensor/latest` | GET | Get latest reading |
@@ -811,10 +817,13 @@ curl http://localhost:3000/alert/mute-status
 
 ### Current Implementation
 
-- CORS origin validation
-- Input validation with Zod
+- CORS origin validation (enforced allowlist via `ALLOWED_ORIGINS`)
+- Input validation with Zod (settings and sensor data)
 - SQL parameterized queries (pg)
-- Auth tokens with 24-hour expiration
+- Auth tokens with 24-hour expiration and server-side logout (token revoked)
+- Timing-safe password comparison (PBKDF2)
+- SMS cooldown and mute state persisted in the database
+- Old sensor readings pruned after 30 days
 
 ### Production Recommendations
 

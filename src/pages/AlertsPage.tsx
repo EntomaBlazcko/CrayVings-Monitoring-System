@@ -24,14 +24,14 @@ import { useSensors } from "../hooks/useSensors";
 import { parseAlertSeverity, type AlertSeverity } from "../types";
 
 export default function AlertsPage() {
-  const { logs, logsLoading, logsError, logsPage, logsTotal, logsCounts, setLogsPage, logsActionFilter, setLogsActionFilter } = useSensors();
+  const { logs, settings, logsLoading, logsError, logsPage, logsTotal, logsCounts, setLogsPage, logsActionFilter, setLogsActionFilter } = useSensors();
 
   const processedLogs = useMemo(() => {
     return logs.map((log) => ({
       ...log,
-      severity: parseAlertSeverity(log),
+      severity: parseAlertSeverity(log, settings),
     }));
-  }, [logs]);
+  }, [logs, settings]);
 
   const getSeverityColor = (severity?: AlertSeverity) => {
     switch (severity) {

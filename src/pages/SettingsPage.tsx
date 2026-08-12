@@ -281,7 +281,7 @@ export default function SettingsPage() {
     } catch {
       setLocalSaveError("Failed to save settings");
     }
-  }, [localSettings, settings, saveSettings, validationErrors, logActivity]);
+  }, [localSettings, settings, saveSettings, validationErrors, logActivity, refetchSettings]);
 
   const handleResetSettings = useCallback(async () => {
     setIsResetting(true);

@@ -73,6 +73,7 @@ import {
 // ========================
 // How often to poll the backend for fresh data.
 const POLL_INTERVAL = 3000;              // 3 seconds for sensor data
+const HISTORY_POLL_INTERVAL = 30000;     // 30 seconds for chart history (heavy query)
 const OFFLINE_THRESHOLD = 15000;         // 15 seconds without data = offline
 const MAX_CONSECUTIVE_FAILURES = 5;      // After 5 failures, mark as offline
 const LOGS_POLL_INTERVAL = 5000;         // 5 seconds for system logs
@@ -160,51 +161,47 @@ function useSensorDataPolling(): SensorDataState & { refetch: () => void } {
   });
 
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const abortControllerRef = useRef<AbortController | null>(null);
+  const historyIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const latestAbortRef = useRef<AbortController | null>(null);
+  const historyAbortRef = useRef<AbortController | null>(null);
   const consecutiveFailuresRef = useRef(0);
 
   /**
-   * Fetches latest sensor data and history from the backend.
-   * Uses Promise.all to fetch both in parallel for efficiency.
-   * Handles success, no-data, and error cases.
+   * Fetches the latest sensor reading from the backend (lightweight, every 3s).
+   * Determines connection status from the sensor data's own timestamp.
    */
-  const fetchData = useCallback(async () => {
+  const fetchLatest = useCallback(async () => {
     // Cancel any in-flight request before starting a new one
-    if (abortControllerRef.current) {
-      abortControllerRef.current.abort();
+    if (latestAbortRef.current) {
+      latestAbortRef.current.abort();
     }
-    abortControllerRef.current = new AbortController();
+    latestAbortRef.current = new AbortController();
 
     try {
-      // Fetch latest reading and chart history simultaneously
-      const [latest, historyData] = await Promise.all([
-        fetchLatestSensor(abortControllerRef.current.signal),
-        fetchSensorHistory(1000, abortControllerRef.current.signal),
-      ]);
+      const latest = await fetchLatestSensor(latestAbortRef.current.signal);
 
       if (latest && latest.timestamp) {
-        consecutiveFailuresRef.current = 0
+        consecutiveFailuresRef.current = 0;
         const sensorTime = new Date(latest.timestamp);
         const gap = Date.now() - sensorTime.getTime();
         const isStale = gap > OFFLINE_THRESHOLD;
 
-        setState({
+        setState((prev) => ({
+          ...prev,
           data: latest,
-          history: historyData,
           loading: false,
           error: isStale ? "ESP32 device is offline. Last data received is stale." : null,
           connectionStatus: computeConnectionStatus(false, sensorTime),
           lastUpdate: sensorTime,
           consecutiveFailures: 0,
-        });
+        }));
       } else {
-        // No latest reading, but preserve any historical data we already have
+        // No latest reading; keep any historical data we already have
         setState((prev) => ({
           ...prev,
           data: null,
-          history: historyData.length > 0 ? historyData : prev.history,
-          error: historyData.length > 0 ? "ESP32 device is offline. No new data received." : "No sensor data available",
           loading: false,
+          error: prev.history.length > 0 ? "ESP32 device is offline. No new data received." : "No sensor data available",
           connectionStatus: "unknown",
         }));
       }
@@ -234,20 +231,55 @@ function useSensorDataPolling(): SensorDataState & { refetch: () => void } {
     }
   }, []);
 
-  // Start polling on mount, clean up on unmount
+  /**
+   * Fetches chart history from the backend (heavier query, every 30s).
+   * Errors are swallowed — the last good history stays on screen.
+   */
+  const fetchHistory = useCallback(async () => {
+    if (historyAbortRef.current) {
+      historyAbortRef.current.abort();
+    }
+    historyAbortRef.current = new AbortController();
+
+    try {
+      const historyData = await fetchSensorHistory(1000, historyAbortRef.current.signal);
+      setState((prev) => ({ ...prev, history: historyData }));
+    } catch (error) {
+      if (isAxiosError(error) && error.code === "ERR_CANCELED") return;
+    }
+  }, []);
+
+  const refetch = useCallback(() => {
+    fetchLatest();
+    fetchHistory();
+  }, [fetchLatest, fetchHistory]);
+
+  // Start polling on mount, clean up on unmount.
+  // Both polls pause while the tab is hidden to reduce background load.
   useEffect(() => {
-    fetchData();
-    intervalRef.current = setInterval(fetchData, POLL_INTERVAL);
+    refetch();
+    intervalRef.current = setInterval(() => {
+      if (!document.hidden) fetchLatest();
+    }, POLL_INTERVAL);
+    historyIntervalRef.current = setInterval(() => {
+      if (!document.hidden) fetchHistory();
+    }, HISTORY_POLL_INTERVAL);
 
     return () => {
       if (intervalRef.current) {
         clearInterval(intervalRef.current);
       }
-      if (abortControllerRef.current) {
-        abortControllerRef.current.abort();
+      if (historyIntervalRef.current) {
+        clearInterval(historyIntervalRef.current);
+      }
+      if (latestAbortRef.current) {
+        latestAbortRef.current.abort();
+      }
+      if (historyAbortRef.current) {
+        historyAbortRef.current.abort();
       }
     };
-  }, [fetchData]);
+  }, [refetch, fetchLatest, fetchHistory]);
 
   // Recompute connection status whenever loading, lastUpdate, or failures change
   const computedConnectionStatus = useMemo(
@@ -259,9 +291,9 @@ function useSensorDataPolling(): SensorDataState & { refetch: () => void } {
     () => ({
       ...state,
       connectionStatus: computedConnectionStatus,
-      refetch: fetchData,
+      refetch,
     }),
-    [state, computedConnectionStatus, fetchData]
+    [state, computedConnectionStatus, refetch]
   );
 }
 
@@ -432,11 +464,13 @@ function useLogsManager(): LogsState & { refetch: () => void; setPage: (page: nu
     }
   }, []);
 
-  // Fetch logs on mount and set up auto-polling
+  // Fetch logs on mount and set up auto-polling (pauses while the tab is hidden)
   useEffect(() => {
     fetchData(state.logsPage, state.logsActionFilter, state.logsParameterFilter);
     const interval = setInterval(
-      () => fetchData(state.logsPage, state.logsActionFilter, state.logsParameterFilter),
+      () => {
+        if (!document.hidden) fetchData(state.logsPage, state.logsActionFilter, state.logsParameterFilter);
+      },
       LOGS_POLL_INTERVAL
     );
 
@@ -603,22 +637,22 @@ function useActivityLogsManager() {
   const setPage = useCallback((page: number) => {
     setState((prev) => ({ ...prev, activityLogsPage: page }));
     fetchData(page);
-  }, []);
+  }, [fetchData]);
 
   const setSearch = useCallback((search: string) => {
     setState((prev) => ({ ...prev, activitySearch: search, activityLogsPage: 1 }));
     fetchData(1, search);
-  }, []);
+  }, [fetchData]);
 
   const setSortBy = useCallback((sort: "newest" | "oldest") => {
     setState((prev) => ({ ...prev, activitySortBy: sort, activityLogsPage: 1 }));
     fetchData(1, undefined, sort);
-  }, []);
+  }, [fetchData]);
 
   const setActionFilter = useCallback((filter: string) => {
     setState((prev) => ({ ...prev, activityActionFilter: filter, activityLogsPage: 1 }));
     fetchData(1, undefined, undefined, filter);
-  }, []);
+  }, [fetchData]);
 
   /**
    * Logs a user activity event to the backend.

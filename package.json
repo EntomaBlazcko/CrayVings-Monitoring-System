@@ -1,4 +1,3 @@
-
 {
   "name": "aquaculture-dashboard",
   "private": true,
@@ -7,8 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
-    "lint": "eslint ."
-    ,
+    "lint": "eslint .",
     "preview": "vite preview",
     "server": "node server.cjs",
     "start": "node server.cjs",
@@ -17,18 +15,14 @@
   "dependencies": {
     "axios": "^1.15.2",
     "cors": "^2.8.6",
-    "dom": "^0.0.3",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
     "jspdf": "^4.2.1",
     "jspdf-autotable": "^5.0.7",
     "lucide-react": "^1.8.0",
-    "mongoose": "^9.3.1",
     "pg": "^8.20.0",
     "react": "^19.2.4",
     "react-dom": "^19.2.4",
-    "react-router": "^7.14.1",
-    "react-router-dom": "^7.14.1",
     "recharts": "^3.8.1",
     "zod": "^4.3.6"
   },
@@ -49,7 +43,7 @@
     "vite": "^8.0.0"
   },
   "description": "This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.",
-  "main": "eslint.config.js",
+  "main": "server.cjs",
   "keywords": [],
   "author": "",
   "license": "ISC"

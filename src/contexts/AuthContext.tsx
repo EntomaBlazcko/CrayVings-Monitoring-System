@@ -24,7 +24,7 @@
 
 import { createContext, useState, useCallback, type ReactNode } from "react";
 import type { AuthUser } from "../types";
-import { loginUser } from "../api/client";
+import { loginUser, logoutUser } from "../api/client";
 
 // ========================
 // LOCAL STORAGE KEYS
@@ -51,6 +51,7 @@ export interface AuthContextType {
 
 // Create the context with null as default value.
 // The useAuth hook throws if accessed outside AuthProvider.
+// eslint-disable-next-line react-refresh/only-export-components
 export const AuthContext = createContext<AuthContextType | null>(null);
 
 interface AuthProviderProps {
@@ -146,10 +147,12 @@ export function AuthProvider({ children }: AuthProviderProps) {
 
   /**
    * Logs out the current user.
-   * Clears all authentication state from React and localStorage.
+   * Revokes the token server-side (fire-and-forget), clears all authentication
+   * state from React and localStorage.
    * The app will redirect to the login page (handled by AppContent in App.tsx).
    */
   const logout = useCallback(() => {
+    void logoutUser();
     setUser(null);
     setStoredUser(null);
     setStoredToken(null);

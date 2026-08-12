@@ -38,7 +38,6 @@ export function DeviceConnectionMonitor() {
   const prevStatusRef = useRef<ConnectionStatus>("connecting");
   const prevFailuresRef = useRef(0);
   const disconnectAlertIdRef = useRef<string | null>(null);
-  const smsSentRef = useRef(false);
 
   // Monitor connection status changes
   useEffect(() => {
@@ -57,8 +56,6 @@ export function DeviceConnectionMonitor() {
       (consecutiveFailures === 0 && prevFailures > 0 && connectionStatus === "online");
 
     if (wentOffline) {
-      // Reset SMS sent flag for this disconnect event
-      smsSentRef.current = false;
       const id = `device-disconnect-${Date.now()}`;
       disconnectAlertIdRef.current = id;
 

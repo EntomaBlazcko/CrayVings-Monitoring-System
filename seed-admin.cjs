@@ -18,27 +18,25 @@ async function seedAdmin() {
   });
 
   try {
+    const password = process.env.ADMIN_INITIAL_PASSWORD || "Admin@123";
     console.log("Checking admin account...");
     const result = await pool.query("SELECT id FROM users WHERE username = $1", ["admin"]);
 
     if (result.rows.length === 0) {
-      const hash = hashPassword("Admin@123");
+      const hash = hashPassword(password);
       await pool.query(
         `INSERT INTO users (name, username, email, password_hash, role)
          VALUES ('Administrator', 'admin', 'admin@crayvings.com', $1, 'admin')`,
         [hash]
       );
       console.log("✅ Admin account created!");
+      console.log("\n🔑 Login credentials:");
+      console.log("   Username: admin");
+      console.log("   Password: " + password + "\n");
     } else {
-      console.log("🔄 Updating admin password...");
-      const hash = hashPassword("Admin@123");
-      await pool.query("UPDATE users SET password_hash = $1 WHERE username = 'admin'", [hash]);
-      console.log("✅ Admin password updated!");
+      console.log("ℹ️ Admin account already exists — password not changed.");
+      console.log("   Run the server and reset the password via the Settings page if needed.");
     }
-
-    console.log("\n🔑 Login credentials:");
-    console.log("   Username: admin");
-    console.log("   Password: Admin@123\n");
   } catch (err) {
     console.error("❌ Error:", err.message);
   } finally {
