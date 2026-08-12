@@ -10,7 +10,7 @@
 #define TRIG_PIN 5
 #define ECHO_PIN 18
 
-char serverName[64] = "http://192.168.1.20:3000/sensor";
+char serverName[64] = "http://192.168.100.16:3000/sensor";
 
 const float TANK_HEIGHT_CM = 36.0f;
 const int ULTRASONIC_SAMPLES = 5;

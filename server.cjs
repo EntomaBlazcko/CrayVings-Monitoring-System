@@ -713,17 +713,17 @@ app.post("/sensor", async (req, res) => {
           // is outside the valid range the firmware reports).
           if (sensor.val < sensor.minValid) continue;
           const status = getThresholdStatus(sensor.val, sensor.min, sensor.max);
-          const last = lastAlertedState[sensor.key] || {};
+          const last = lastAlertedState[`${device_id}:${sensor.key}`] || {};
           const lastTs = last.timestamp ? new Date(last.timestamp).getTime() : 0;
 
           // If reading is back to normal, update state, log resolution, and skip alerting
           if (status === "good") {
             if (last.status && last.status !== "good") {
               await pool.query(
-                `INSERT INTO last_alerts (sensor_key, status, value, timestamp) VALUES ($1, $2, $3, $4) ON CONFLICT (sensor_key) DO UPDATE SET status = $2, value = $3, timestamp = $4`,
-                [sensor.key, "good", sensor.val, ts.toISOString()]
+                `INSERT INTO last_alerts (device_id, sensor_key, status, value, timestamp) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (device_id, sensor_key) DO UPDATE SET status = $3, value = $4, timestamp = $5`,
+                [device_id, sensor.key, "good", sensor.val, ts.toISOString()]
               );
-              lastAlertedState[sensor.key] = { status: "good", value: sensor.val, timestamp: ts.toISOString() };
+              lastAlertedState[`${device_id}:${sensor.key}`] = { status: "good", value: sensor.val, timestamp: ts.toISOString() };
               // Log "Alert Resolved" to system_logs
               await pool.query(`INSERT INTO system_logs (action, parameter, old_value, new_value) VALUES ($1, $2, $3, $4)`,
                 ["Alert Resolved", sensor.key, last.status, "good"]);
@@ -744,10 +744,10 @@ app.post("/sensor", async (req, res) => {
 
           // Update last_alerts table (upsert: insert or update on conflict)
           await pool.query(
-            `INSERT INTO last_alerts (sensor_key, status, value, timestamp) VALUES ($1, $2, $3, $4) ON CONFLICT (sensor_key) DO UPDATE SET status = $2, value = $3, timestamp = $4`,
-            [sensor.key, status, sensor.val, ts.toISOString()]
+            `INSERT INTO last_alerts (device_id, sensor_key, status, value, timestamp) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (device_id, sensor_key) DO UPDATE SET status = $3, value = $4, timestamp = $5`,
+            [device_id, sensor.key, status, sensor.val, ts.toISOString()]
           );
-          lastAlertedState[sensor.key] = { status, value: sensor.val, timestamp: ts.toISOString() };
+          lastAlertedState[`${device_id}:${sensor.key}`] = { status, value: sensor.val, timestamp: ts.toISOString() };
 
           // Check if SMS alerts are currently muted
           if (smsMuteUntil && new Date() < new Date(smsMuteUntil)) {
@@ -1563,11 +1563,24 @@ app.get('/alert/mute-status', async (req, res) => {
  */
 app.post("/activity-logs", async (req, res) => {
   try {
-    const { user_name, action_type, description, module } = req.body;
+    const { action_type, description, module } = req.body;
     if (!action_type) return res.status(400).json({ message: "action_type required" });
+
+    // Derive the acting user from the session token (accurate audit trail).
+    // Falls back to the built-in "admin" account when no valid token is present
+    // (must match a real users.username so the FK constraint is satisfied).
+    const token = req.headers.authorization?.replace("Bearer ", "");
+    let userName = "admin";
+    if (token) {
+      const tokenResult = await pool.query("SELECT username FROM users WHERE token = $1", [token]);
+      if (tokenResult.rows.length > 0) {
+        userName = tokenResult.rows[0].username;
+      }
+    }
+
     const result = await pool.query(
       "INSERT INTO activity_logs (user_name, action_type, description, module) VALUES ($1, $2, $3, $4) RETURNING *",
-      [user_name || "Admin", action_type, description || "", module || ""]
+      [userName, action_type, description || "", module || ""]
     );
     res.status(201).json({ message: "Logged", data: result.rows[0] });
   } catch (err) {
@@ -1660,7 +1673,7 @@ async function startServer() {
       const lastAlertsResult = await client.query("SELECT * FROM last_alerts");
       lastAlertedState = {};
       for (const row of lastAlertsResult.rows) {
-        lastAlertedState[row.sensor_key] = { status: row.status, value: parseFloat(row.value), timestamp: row.timestamp?.toISOString() };
+        lastAlertedState[`${row.device_id}:${row.sensor_key}`] = { status: row.status, value: parseFloat(row.value), timestamp: row.timestamp?.toISOString() };
       }
       console.log(`[${new Date().toISOString()}] Loaded ${lastAlertsResult.rows.length} alert states from DB`);
 
