@@ -18,13 +18,15 @@
 // DATA: System logs from SensorProvider (auto-polled every 5 seconds)
 // =============================================================================
 
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
 import { AlertTriangle, AlertCircle, ChevronLeft, ChevronRight } from "lucide-react";
 import { useSensors } from "../hooks/useSensors";
+import { Spinner, LoadingCard, ErrorCard } from "../components/Loading";
 import { parseAlertSeverity, type AlertSeverity } from "../types";
 
 export default function AlertsPage() {
-  const { logs, settings, logsLoading, logsError, logsPage, logsTotal, logsCounts, setLogsPage, logsActionFilter, setLogsActionFilter } = useSensors();
+  const { logs, settings, logsLoading, logsError, refetchLogs, logsPage, logsTotal, logsCounts, setLogsPage, logsActionFilter, setLogsActionFilter } = useSensors();
+  const [isChangingPage, setIsChangingPage] = useState(false);
 
   const processedLogs = useMemo(() => {
     return logs.map((log) => ({
@@ -62,22 +64,26 @@ export default function AlertsPage() {
   const startItem = (logsPage - 1) * 20 + 1;
   const endItem = Math.min(logsPage * 20, logsTotal ?? logs.length);
 
+  const handlePageChange = (newPage: number) => {
+    if (newPage < 1 || newPage > logsTotalPages || newPage === logsPage || isChangingPage) return;
+    setIsChangingPage(true);
+    setLogsPage(newPage);
+    // Brief pending window so the buttons stay disabled while the new page loads
+    setTimeout(() => setIsChangingPage(false), 200);
+  };
+
   if (logsLoading) {
-    return (
-      <div className="bg-white rounded-xl border border-gray-100 p-8 text-center">
-        <AlertCircle size={40} className="mx-auto mb-3 text-gray-400 animate-spin" />
-        <p className="text-gray-600">Loading alerts...</p>
-      </div>
-    );
+    return <LoadingCard title="Alerts & Logs" message="Loading alerts..." />;
   }
 
   if (logsError) {
     return (
-      <div className="bg-white rounded-xl border border-gray-100 p-8 text-center">
-        <AlertCircle size={40} className="mx-auto mb-3 text-red-400" />
-        <p className="text-red-600 font-semibold">Failed to load alerts</p>
-        <p className="text-sm text-gray-500 mt-2">{logsError}</p>
-      </div>
+      <ErrorCard
+        title="Failed to load alerts"
+        message="We couldn't load the alerts from the server. Please check your connection and try again."
+        detail={logsError}
+        onRetry={refetchLogs}
+      />
     );
   }
 
@@ -181,21 +187,22 @@ export default function AlertsPage() {
               <p className="text-xs text-gray-400">
                 Showing {startItem}-{endItem} of {logsTotal} logs
               </p>
-              <div className="flex gap-1">
+              <div className="flex gap-1 items-center">
                 <button
-                  onClick={() => setLogsPage(Math.max(1, logsPage - 1))}
-                  disabled={logsPage <= 1}
+                  onClick={() => handlePageChange(logsPage - 1)}
+                  disabled={logsPage <= 1 || isChangingPage}
                   className="flex items-center gap-1 px-3 py-1 text-sm border border-gray-200 rounded disabled:opacity-50 disabled:cursor-not-allowed hover:bg-gray-50"
                 >
                   <ChevronLeft size={14} />
                   Previous
                 </button>
-                <span className="px-3 py-1 text-sm text-gray-600">
+                <span className="px-3 py-1 text-sm text-gray-600 flex items-center gap-1.5">
+                  {isChangingPage && <Spinner size={12} />}
                   Page {logsPage} of {logsTotalPages}
                 </span>
                 <button
-                  onClick={() => setLogsPage(Math.min(logsTotalPages, logsPage + 1))}
-                  disabled={logsPage >= logsTotalPages}
+                  onClick={() => handlePageChange(logsPage + 1)}
+                  disabled={logsPage >= logsTotalPages || isChangingPage}
                   className="flex items-center gap-1 px-3 py-1 text-sm border border-gray-200 rounded disabled:opacity-50 disabled:cursor-not-allowed hover:bg-gray-50"
                 >
                   Next

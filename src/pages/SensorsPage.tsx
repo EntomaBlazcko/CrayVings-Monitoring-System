@@ -32,6 +32,7 @@ import {
   AlertTriangle,
 } from "lucide-react";
 import { useSensors } from "../hooks/useSensors";
+import { LoadingCard, ErrorCard } from "../components/Loading";
 import { getSettingsThresholds, getThresholdStatus } from "../types";
 
 /**
@@ -54,7 +55,7 @@ function formatTimeAgo(timestamp: string): string {
 }
 
 export default function SensorsPage() {
-  const { data, connectionStatus, settings, settingsLoading, loading, error } = useSensors();
+  const { data, connectionStatus, settings, settingsLoading, loading, error, refetch } = useSensors();
   
   const thresholds = useMemo(() => getSettingsThresholds(settings), [settings]);
 
@@ -104,31 +105,29 @@ export default function SensorsPage() {
   }, [data, thresholds]);
 
   if (loading && !hasData) {
-    return (
-      <div className="bg-white rounded-xl border border-gray-100 p-8 text-center">
-        <Activity size={40} className="mx-auto mb-3 text-gray-400 animate-spin" />
-        <h2 className="mt-0 text-gray-800">Sensors</h2>
-        <p className="text-gray-600">Loading sensor data...</p>
-      </div>
-    );
+    return <LoadingCard title="Sensors" message="Loading sensor data..." />;
   }
 
   if (settingsLoading && !hasData) {
-    return (
-      <div className="bg-white rounded-xl border border-gray-100 p-8 text-center">
-        <Activity size={40} className="mx-auto mb-3 text-gray-400 animate-spin" />
-        <h2 className="mt-0 text-gray-800">Sensors</h2>
-        <p className="text-gray-600">Loading settings...</p>
-      </div>
-    );
+    return <LoadingCard title="Sensors" message="Loading settings..." />;
   }
 
   if (!hasData && !loading) {
+    if (error) {
+      return (
+        <ErrorCard
+          title="Sensors unavailable"
+          message="No sensor data could be loaded at this time."
+          detail={error}
+          onRetry={refetch}
+        />
+      );
+    }
     return (
-      <div className="bg-white rounded-xl border border-gray-100 p-8 text-center">
+      <div className="bg-white rounded-xl border border-gray-100 p-8 text-center shadow-sm">
         <Activity size={40} className="mx-auto mb-3 text-gray-400" />
         <h2 className="mt-0 text-gray-800">Sensors</h2>
-        <p className="text-gray-600">{error || "No sensor data available yet."}</p>
+        <p className="text-gray-600">No sensor data available yet.</p>
         <p className="text-sm text-gray-500 mt-2">
           Waiting for ESP32 to send data...
         </p>

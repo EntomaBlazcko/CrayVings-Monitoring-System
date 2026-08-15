@@ -35,11 +35,10 @@ import {
   AlertTriangle,
 } from "lucide-react";
 import TrendCard from "../components/TrendCard";
+import { ErrorCard } from "../components/Loading";
 import { useSensors } from "../hooks/useSensors";
 import { fetchSensorHistory, fetchWeeklyReport } from "../api/client";
 import type { ChartPoint, WeeklyReport } from "../types";
-import { jsPDF } from "jspdf";
-import autoTable, { type HookData } from "jspdf-autotable";
 
 type TimeRange = "1h" | "6h" | "24h" | "1w" | "all";
 
@@ -79,6 +78,7 @@ export default function HistoricalDataPage() {
   const [weeklyReportLoading, setWeeklyReportLoading] = useState(false);
   const [weeklyReportError, setWeeklyReportError] = useState<string | null>(null);
   const [weeklyRetry, setWeeklyRetry] = useState(0);
+  const [historyRetry, setHistoryRetry] = useState(0);
   const [exportingPdf, setExportingPdf] = useState(false);
 
   const timeRanges: { value: TimeRange; label: string }[] = [
@@ -129,7 +129,7 @@ export default function HistoricalDataPage() {
     return () => {
       controller.abort();
     };
-  }, [timeRange, fetchDynamicData]);
+  }, [timeRange, fetchDynamicData, historyRetry]);
 
   useEffect(() => {
     if (timeRange !== "1w") {
@@ -234,7 +234,14 @@ export default function HistoricalDataPage() {
     }
 
     try {
-    const doc = new jsPDF();
+      // jspdf is heavy (~150kB+), so it's only loaded when the user actually
+      // exports a PDF rather than when this page opens.
+      const [{ jsPDF }, { default: autoTable }] = await Promise.all([
+        import("jspdf"),
+        import("jspdf-autotable"),
+      ]);
+
+      const doc = new jsPDF();
     const pageWidth = doc.internal.pageSize.getWidth();
     const pageHeight = doc.internal.pageSize.getHeight();
 
@@ -297,7 +304,7 @@ export default function HistoricalDataPage() {
         8: { halign: "center" },
       },
       margin: { left: 14, right: 14 },
-      didDrawPage: (data: HookData) => {
+      didDrawPage: (data) => {
         data.doc.setFontSize(8);
         data.doc.setFont("helvetica", "normal");
         data.doc.setTextColor(128, 128, 128);
@@ -352,6 +359,8 @@ export default function HistoricalDataPage() {
     }
 
     doc.save(`CRAYvings_Weekly_Report_${new Date().toISOString().split("T")[0]}.pdf`);
+    } catch {
+      alert("Failed to export the PDF. Please try again.");
     } finally {
       setExportingPdf(false);
     }
@@ -385,11 +394,12 @@ export default function HistoricalDataPage() {
 
   if (historyFetchError && (!activeHistory || activeHistory.length === 0)) {
     return (
-      <div className="bg-red-50 border border-red-200 text-red-700 rounded-xl p-6 text-center">
-        <History size={40} className="mx-auto mb-3 text-red-400" />
-        <p className="font-semibold">Failed to load historical data</p>
-        <p className="text-sm mt-1">Unable to reach the server. Check your connection and try again.</p>
-      </div>
+      <ErrorCard
+        title="Failed to load historical data"
+        message="We couldn't reach the server. Please check your connection and try again."
+        detail={historyFetchError}
+        onRetry={() => setHistoryRetry((n) => n + 1)}
+      />
     );
   }
 

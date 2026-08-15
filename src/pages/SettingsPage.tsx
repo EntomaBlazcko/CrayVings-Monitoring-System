@@ -66,6 +66,7 @@ import {
 } from "lucide-react";
 import type { SensorSettings } from "../types";
 import { DEFAULT_SETTINGS, getSettingsThresholds } from "../types";
+import { LoadingCard } from "../components/Loading";
 import { z } from "zod";
 import { fetchUsers, createUser, deleteUser, resetUserPassword, resetSettings as apiResetSettings, fetchRecipients, addRecipient, deleteRecipient, sendTestSms, updateRecipient, muteAlerts, getMuteStatus } from "../api/client";
 import type { UserEntry, SmsRecipient } from "../api/client";
@@ -506,12 +507,11 @@ export default function SettingsPage() {
     }
   }, [resetModal, showToast]);
 
-  if (settingsLoading) {
-    return (
-      <div className="flex items-center justify-center p-8">
-        <div className="text-gray-500">Loading settings...</div>
-      </div>
-    );
+  // Only block the page on the very first load — once settings exist, keep the
+  // page rendered while a background refetch (e.g. after save/reset) happens,
+  // so the form doesn't flash away on every save.
+  if (settingsLoading && !settings) {
+    return <LoadingCard title="Settings" message="Loading settings..." />;
   }
 
   return (

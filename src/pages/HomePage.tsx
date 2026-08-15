@@ -34,16 +34,17 @@ type Stat = {
   description: string;
   gradient: string;
   icon: React.ReactNode;
+  loading?: boolean;
 };
 
-function StatCard({ title, value, description, gradient, icon }: Stat) {
+function StatCard({ title, value, description, gradient, icon, loading = false }: Stat) {
   return (
     <div className={`rounded-2xl bg-gradient-to-r ${gradient} p-5 text-white shadow-sm`}>
       <div className="flex items-center justify-between">
         <p className="text-sm text-white/90">{title}</p>
         <div className="text-white/80">{icon}</div>
       </div>
-      <h3 className="mt-2 text-3xl font-bold">{value}</h3>
+      <h3 className={`mt-2 text-3xl font-bold ${loading ? "animate-pulse" : ""}`}>{value}</h3>
       <p className="mt-2 text-sm text-white/90">{description}</p>
     </div>
   );
@@ -287,7 +288,7 @@ export default function HomePage({ onNavigate }: Props) {
 
       <section className={`grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3 ${isOfflineWithData ? "opacity-60" : ""}`}>
         {stats.map((stat) => (
-          <StatCard key={stat.title} {...stat} />
+          <StatCard key={stat.title} {...stat} loading={loading} />
         ))}
       </section>
 

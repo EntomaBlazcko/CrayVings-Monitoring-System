@@ -18,13 +18,15 @@ type Props = {
   value: string;
   color: string;
   icon: React.ReactNode;
+  loading?: boolean;
 };
 
 /**
  * Compact statistic card showing a title, value, and icon.
  * The icon circle background color is derived from the color prop (with 18% opacity).
+ * When loading, a pulsing skeleton placeholder is shown instead of the value.
  */
-export default function StatCard({ title, value, color, icon }: Props) {
+export default function StatCard({ title, value, color, icon, loading = false }: Props) {
   return (
     <div className="bg-white rounded-xl border border-gray-100 p-3 flex items-center gap-3 min-h-[88px] shadow-sm">
       {/* Icon circle with tinted background */}
@@ -38,7 +40,11 @@ export default function StatCard({ title, value, color, icon }: Props) {
       {/* Title and value */}
       <div>
         <div className="text-xs font-semibold text-gray-500 mb-1">{title}</div>
-        <div className="text-2xl font-bold text-gray-800 leading-none">{value}</div>
+        {loading ? (
+          <div className="h-6 w-20 rounded bg-gray-200 animate-pulse" />
+        ) : (
+          <div className="text-2xl font-bold text-gray-800 leading-none">{value}</div>
+        )}
       </div>
     </div>
   );

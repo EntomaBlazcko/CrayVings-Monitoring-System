@@ -24,6 +24,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { Search, RefreshCw, ChevronLeft, ChevronRight, ArrowUpDown, Activity } from "lucide-react";
 import { useActivityLogs } from "../hooks/useSensors";
+import { Spinner, LoadingCard, ErrorCard } from "../components/Loading";
 
 const FILTER_ACTION_TYPES = [
   "navigation",
@@ -117,24 +118,17 @@ export default function ActivityLogsPage() {
   const endItem = Math.min(activityLogsPage * 20, activityLogsTotal);
 
   if (activityLogsLoading && activityLogs.length === 0) {
-    return (
-      <div className="flex items-center justify-center p-8">
-        <div className="text-gray-500">Loading activity logs...</div>
-      </div>
-    );
+    return <LoadingCard title="Activity Logs" message="Loading activity logs..." />;
   }
 
   if (activityLogsError) {
     return (
-      <div className="bg-red-50 border border-red-200 text-red-700 rounded-lg p-4">
-        <p>{activityLogsError}</p>
-        <button
-          onClick={refetchActivityLogs}
-          className="mt-2 px-3 py-1 bg-red-100 hover:bg-red-200 rounded text-sm"
-        >
-          Retry
-        </button>
-      </div>
+      <ErrorCard
+        title="Failed to load activity logs"
+        message="We couldn't load the activity logs from the server. Please check your connection and try again."
+        detail={activityLogsError}
+        onRetry={refetchActivityLogs}
+      />
     );
   }
 
@@ -261,7 +255,8 @@ export default function ActivityLogsPage() {
                  <ChevronLeft size={14} />
                  Previous
                </button>
-               <span className="px-3 py-1 text-sm text-gray-600">
+               <span className="px-3 py-1 text-sm text-gray-600 flex items-center gap-1.5">
+                 {isChangingPage && <Spinner size={12} />}
                  Page {activityLogsPage} of {activityLogsTotalPages || 1}
                </span>
                <button

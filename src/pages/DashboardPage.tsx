@@ -18,6 +18,7 @@ import { useMemo } from "react";
 import { Thermometer, Waves, FlaskConical, AlertTriangle } from "lucide-react";
 import StatCard from "../components/StatCard";
 import TrendCard from "../components/TrendCard";
+import { Skeleton } from "../components/Loading";
 import { useSensors } from "../hooks/useSensors";
 import { getSettingsThresholds, getThresholdStatus } from "../types";
 
@@ -61,7 +62,8 @@ export default function DashboardPage() {
         <div className={offlineClass}>
           <StatCard
             title="Temperature"
-            value={loading ? "Loading..." : data ? `${data.temperature}°C` : "--°C"}
+            value={data ? `${data.temperature}°C` : "--°C"}
+            loading={loading}
             color={loading ? "#9ca3af" : isOfflineWithData ? "#9ca3af" : data ? "#f97316" : "#ef4444"}
             icon={<Thermometer size={18} />}
           />
@@ -69,7 +71,8 @@ export default function DashboardPage() {
         <div className={offlineClass}>
           <StatCard
             title="Water Level"
-            value={loading ? "Loading..." : data ? `${data.water_level}%` : "--%"}
+            value={data ? `${data.water_level}%` : "--%"}
+            loading={loading}
             color={loading ? "#9ca3af" : isOfflineWithData ? "#9ca3af" : data ? "#2563eb" : "#ef4444"}
             icon={<Waves size={18} />}
           />
@@ -77,7 +80,8 @@ export default function DashboardPage() {
         <div className={offlineClass}>
           <StatCard
             title="Ammonia"
-            value={loading ? "Loading..." : data ? `${data.ammonia} mg/L` : "-- mg/L"}
+            value={data ? `${data.ammonia} mg/L` : "-- mg/L"}
+            loading={loading}
             color={loading ? "#9ca3af" : isOfflineWithData ? "#9ca3af" : data ? "#10b981" : "#ef4444"}
             icon={<FlaskConical size={18} />}
           />
@@ -97,8 +101,12 @@ export default function DashboardPage() {
         {loading ? (
           <>
             {["Temperature", "Water Level", "Ammonia"].map((title) => (
-              <div key={title} className="bg-white rounded-xl border border-gray-100 p-4 shadow-sm flex items-center justify-center">
-                <div className="text-xs text-gray-400">Loading chart...</div>
+              <div key={title} className="bg-white rounded-xl border border-gray-100 p-4 shadow-sm" aria-busy="true">
+                <div className="flex items-center justify-between mb-3">
+                  <Skeleton className="h-4 w-28" />
+                  <Skeleton className="h-3 w-10" />
+                </div>
+                <Skeleton className="h-[180px] w-full" />
               </div>
             ))}
           </>
@@ -156,7 +164,16 @@ export default function DashboardPage() {
             Recent Readings
           </div>
           {loading ? (
-            <div className="text-xs text-gray-400 py-4 text-center">Loading readings...</div>
+            <div className="space-y-2" aria-busy="true">
+              {[1, 2, 3, 4, 5].map((i) => (
+                <div key={i} className="flex gap-3">
+                  <Skeleton className="h-3 flex-1" />
+                  <Skeleton className="h-3 w-16" />
+                  <Skeleton className="h-3 w-16" />
+                  <Skeleton className="h-3 w-16" />
+                </div>
+              ))}
+            </div>
           ) : history.length === 0 ? (
             <div className="text-xs text-gray-400 py-4 text-center">No readings available</div>
           ) : (
@@ -191,9 +208,7 @@ export default function DashboardPage() {
               Tank Status
             </div>
             {loading ? (
-              <div className="rounded-lg p-2 text-xs font-bold text-center bg-blue-100 text-blue-700">
-                Loading...
-              </div>
+              <Skeleton className="h-7 w-full" />
             ) : !data ? (
               <div className="rounded-lg p-2 text-xs font-bold text-center bg-red-100 text-red-700">
                 Connection Error

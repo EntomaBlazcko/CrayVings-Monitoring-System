@@ -21,8 +21,7 @@
 import { useState, useMemo, useCallback } from "react";
 import { FileText, Download, Clock, Thermometer, Waves, FlaskConical } from "lucide-react";
 import { useSensors } from "../hooks/useSensors";
-import { jsPDF } from "jspdf";
-import autoTable from "jspdf-autotable";
+import { Spinner, LoadingCard, ErrorCard } from "../components/Loading";
 import { SENSOR_KEY_TO_DISPLAY } from "../types";
 
 const PARAMETER_ICONS: Record<string, React.ReactNode> = {
@@ -66,12 +65,28 @@ export default function LogsPage() {
     }
   }, [logsPage, totalPages, isChangingPage, setLogsPage]);
 
-  const handleExport = useCallback(() => {
+  const handleExport = useCallback(async () => {
     if (filteredLogs.length === 0) {
       alert("No logs to export.");
       return;
     }
 
+    // jspdf is heavy (~150kB+), so it's only loaded when the user actually
+    // exports a PDF rather than when the Logs page opens.
+    let jsPDFModule: typeof import("jspdf");
+    let autoTableModule: typeof import("jspdf-autotable");
+    try {
+      [jsPDFModule, autoTableModule] = await Promise.all([
+        import("jspdf"),
+        import("jspdf-autotable"),
+      ]);
+    } catch {
+      alert("Failed to load the PDF library. Please try again.");
+      return;
+    }
+
+    const { jsPDF } = jsPDFModule;
+    const autoTable = autoTableModule.default;
     const doc = new jsPDF();
     const pageWidth = doc.internal.pageSize.getWidth();
     const pageHeight = doc.internal.pageSize.getHeight();
@@ -185,25 +200,17 @@ export default function LogsPage() {
   }, [filteredLogs]);
 
   if (logsLoading) {
-    return (
-      <div className="bg-blue-50 border border-blue-200 text-blue-700 rounded-lg p-3 text-sm">
-        Loading logs...
-      </div>
-    );
+    return <LoadingCard title="Sensor Logs" message="Loading logs..." />;
   }
 
   if (logsError) {
     return (
-      <div className="bg-red-50 border border-red-200 text-red-700 rounded-lg p-3 text-sm">
-        <p>Failed to load logs</p>
-        <p className="text-sm mt-1">{logsError}</p>
-        <button
-          onClick={refetchLogs}
-          className="mt-2 px-3 py-1 bg-red-100 hover:bg-red-200 rounded text-sm"
-        >
-          Retry
-        </button>
-      </div>
+      <ErrorCard
+        title="Failed to load logs"
+        message="We couldn't load the sensor logs from the server. Please check your connection and try again."
+        detail={logsError}
+        onRetry={refetchLogs}
+      />
     );
   }
 
@@ -338,7 +345,8 @@ export default function LogsPage() {
           >
             Previous
           </button>
-          <span className="px-3 py-1 text-sm text-gray-600">
+          <span className="px-3 py-1 text-sm text-gray-600 flex items-center gap-1.5">
+            {isChangingPage && <Spinner size={12} />}
             Page {logsPage} of {totalPages}
           </span>
           <button

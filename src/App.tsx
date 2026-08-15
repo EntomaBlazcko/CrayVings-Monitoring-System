@@ -26,7 +26,7 @@
 //   Menu items are defined in baseMenuItems array.
 // =============================================================================
 
-import { useState, useCallback, useRef, useMemo } from "react";
+import { useState, useCallback, useRef, useMemo, lazy, Suspense } from "react";
 import {
   Menu,
   X,
@@ -43,15 +43,8 @@ import logo from "./assets/crayvings.png";
 import type { MenuKey } from "./types";
 import { isValidMenuKey } from "./types";
 import Header from "./components/Header";
-import HomePage from "./pages/HomePage";
-import DashboardPage from "./pages/DashboardPage";
-import SensorsPage from "./pages/SensorsPage";
-import AlertsPage from "./pages/AlertsPage";
-import HistoricalDataPage from "./pages/HistoricalDataPage";
-import SettingsPage from "./pages/SettingsPage";
-import LogsPage from "./pages/LogsPage";
-import ActivityLogsPage from "./pages/ActivityLogsPage";
 import AuthPage from "./pages/AuthPage";
+import { LoadingCard } from "./components/Loading";
 import { SensorProvider } from "./contexts/SensorProvider";
 import { useActivityLogs } from "./contexts/SensorContext";
 import { AuthProvider } from "./contexts/AuthContext";
@@ -59,6 +52,17 @@ import { useAuth } from "./contexts/useAuth";
 import { DeviceConnectionMonitor } from "./components/DeviceConnectionMonitor";
 import { FloatingAlertProvider, FloatingAlertContainer } from "./components/FloatingAlert";
 import { useThresholdAlert } from "./hooks/useThresholdAlert";
+
+// Pages are lazy-loaded so heavy dependencies (recharts, jspdf) only download
+// when the user actually visits those pages instead of on login.
+const HomePage = lazy(() => import("./pages/HomePage"));
+const DashboardPage = lazy(() => import("./pages/DashboardPage"));
+const SensorsPage = lazy(() => import("./pages/SensorsPage"));
+const AlertsPage = lazy(() => import("./pages/AlertsPage"));
+const HistoricalDataPage = lazy(() => import("./pages/HistoricalDataPage"));
+const SettingsPage = lazy(() => import("./pages/SettingsPage"));
+const LogsPage = lazy(() => import("./pages/LogsPage"));
+const ActivityLogsPage = lazy(() => import("./pages/ActivityLogsPage"));
 
 // ========================
 // NAVIGATION MENU DEFINITION
@@ -145,26 +149,49 @@ function DashboardLayout() {
    * Each case renders a different page component.
    */
   const renderPage = useCallback(() => {
+    let page: React.ReactNode;
+
     switch (activeMenu) {
       case "Home":
-        return <HomePage onNavigate={handleNavigate} />;
+        page = <HomePage onNavigate={handleNavigate} />;
+        break;
       case "Dashboard":
-        return <DashboardPage />;
+        page = <DashboardPage />;
+        break;
       case "Sensors":
-        return <SensorsPage />;
+        page = <SensorsPage />;
+        break;
       case "Alerts":
-        return <AlertsPage />;
+        page = <AlertsPage />;
+        break;
       case "Historical Data":
-        return <HistoricalDataPage />;
+        page = <HistoricalDataPage />;
+        break;
       case "Activity Logs":
-        return <ActivityLogsPage />;
+        page = <ActivityLogsPage />;
+        break;
       case "Sensor Logs":
-        return <LogsPage />;
-       case "Settings":
-         return <SettingsPage />;
-       default:
-        return <HomePage onNavigate={handleNavigate} />;
+        page = <LogsPage />;
+        break;
+      case "Settings":
+        page = <SettingsPage />;
+        break;
+      default:
+        page = <HomePage onNavigate={handleNavigate} />;
+        break;
     }
+
+    // Suspense keeps a consistent loading state while a lazy page chunk
+    // (and its dependencies like recharts/jspdf) finishes downloading.
+    return (
+      <Suspense
+        fallback={
+          <LoadingCard title={activeMenu} message="Loading page..." />
+        }
+      >
+        {page}
+      </Suspense>
+    );
   }, [activeMenu, handleNavigate]);
 
   // Don't render anything if no user is authenticated
