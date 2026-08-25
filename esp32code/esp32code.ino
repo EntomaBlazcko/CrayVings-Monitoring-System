@@ -3,7 +3,7 @@
 // =============================================================================
 // PURPOSE: ESP32 firmware for the CRAYvings aquaculture monitoring system.
 //
-//   - Reads DS18B20 temperature, HC-SR04 water level, and simulated ammonia
+//   - Reads DS18B20 temperature, HC-SR04 water level, and MQ-137 ammonia
 //   - Posts readings as JSON to the backend server every second
 //   - WiFi configuration via WiFiManager captive portal
 //   - 3.5" ILI9488 touchscreen (480x320) with:
@@ -11,11 +11,8 @@
 //       * Individual pages for temperature, water level, and ammonia
 //       * Left/right swipe (or tap) to switch between the four pages
 //
-// DISPLAY PIN WARNING:
-//   The TFT pins are configured in the TFT_eSPI library (User_Setup.h) and
-//   MUST NOT collide with the sensor pins below. If your TFT uses GPIO4,
-//   GPIO5, or GPIO18, move the sensors to free pins instead
-//   (e.g. ONE_WIRE_BUS 15, TRIG_PIN 25, ECHO_PIN 26) and rewire accordingly.
+// PIN MAP (kept clear of TFT/touch pins: 15, 2, 4, 23, 18, 19, 21):
+//   ONE_WIRE_BUS = 25   TRIG_PIN = 26   ECHO_PIN = 27   MQ137_PIN = 34
 // =============================================================================
 
 #include <Arduino.h>
@@ -28,9 +25,10 @@
 #include <TFT_eSPI.h>
 #include <Preferences.h>
 
-#define ONE_WIRE_BUS 4
-#define TRIG_PIN 5
-#define ECHO_PIN 18
+#define ONE_WIRE_BUS 25
+#define TRIG_PIN 26
+#define ECHO_PIN 27
+#define MQ137_PIN 34
 
 char serverName[64] = "http://192.168.100.16:3000/sensor";
 
@@ -48,15 +46,8 @@ const float WATER_LEVEL_VALID_MAX = 100.0f;
 const float TEMP_SENSOR_ERROR = -127.0f;
 const float DISTANCE_SENSOR_ERROR = -1.0f;
 
-// ===== AMMONIA SENSOR (SIMULATION) =====
-// NOTE: No physical ammonia sensor is connected yet. readAmmonia() returns a
-// simulated reading so the whole stack can be tested end-to-end. Replace the
-// body of readAmmonia() with a real sensor read (e.g., MQ-137 on an analog
-// pin) once the hardware is available.
 const float AMMONIA_VALID_MIN = 0.0f;
-const float AMMONIA_VALID_MAX = 1.0f;      // mg/L
-const float AMMONIA_SIM_BASE = 0.12f;      // healthy baseline level (mg/L)
-const float AMMONIA_SIM_AMPLITUDE = 0.08f; // slow oscillation amplitude (mg/L)
+const float AMMONIA_VALID_MAX = 3.3f;      // raw volts from ADC
 
 const char* DEVICE_ID = "ESP32_01";
 
@@ -65,47 +56,37 @@ DallasTemperature sensors(&oneWire);
 
 WiFiManager wm;
 
-// =============================================================================
-// DISPLAY CONFIGURATION
-// =============================================================================
-// 3.5" ILI9488 (480x320) with resistive touch; pins are set in TFT_eSPI's
-// User_Setup.h (including TOUCH_CS).
-
 TFT_eSPI tft = TFT_eSPI();
 Preferences gPrefs;
 
-// Page ordering shown on screen
 enum {
-  PAGE_OVERVIEW = 0,  // all three sensors at once
-  PAGE_TEMP     = 1,  // temperature
-  PAGE_WATER    = 2,  // water level
-  PAGE_AMMONIA  = 3,  // ammonia
+  PAGE_OVERVIEW = 0,
+  PAGE_TEMP     = 1,
+  PAGE_WATER    = 2,
+  PAGE_AMMONIA  = 3,
   PAGE_COUNT    = 4
 };
 
-// Timing / interaction tuning
-#define TOUCH_POLL_MS      40     // touch read rate
-#define DISPLAY_REFRESH_MS 150    // display refresh rate
-#define SWIPE_DIST_X       60     // horizontal px to register a swipe
-#define TAP_DIST_X         25     // max px treated as a tap
+#define TOUCH_POLL_MS      40
+#define DISPLAY_REFRESH_MS 150
+#define SWIPE_DIST_X       60
+#define TAP_DIST_X         25
 #define TAP_DIST_Y         40
-#define TOUCH_COOLDOWN_MS  250    // debounce after a page change
+#define TOUCH_COOLDOWN_MS  250
 
-// RGB565 palette (mirrors the web dashboard's accent colors)
 #define COL_BG       0x0000
 #define COL_HEADER   0x10A2
 #define COL_PANEL    0x0841
-#define COL_ACCENT   0xFD20   // orange
-#define COL_TEMP     0xFD20   // orange
-#define COL_WATER    0x295F   // blue
-#define COL_AMMONIA  0x07E0   // green
+#define COL_ACCENT   0xFD20
+#define COL_TEMP     0xFD20
+#define COL_WATER    0x295F
+#define COL_AMMONIA  0x07E0
 #define COL_OK       0x07E0
 #define COL_BAD      0xF800
 #define COL_TEXT     0xFFFF
 #define COL_MUTED    0x7BEF
 #define COL_DOT_IDLE 0x3186
 
-// Latest readings cached for the display
 float gTemp = NAN;
 float gLevel = NAN;
 float gAmmonia = NAN;
@@ -113,7 +94,6 @@ bool  gTempOK = false;
 bool  gLevelOK = false;
 bool  gAmmoniaOK = false;
 
-// Display redraw tracking
 int  gPage = PAGE_OVERVIEW;
 int  gDrawnPage = -1;
 float gLastTemp = NAN;
@@ -124,20 +104,15 @@ bool  gLastLevelOK = false;
 bool  gLastAmmoniaOK = false;
 bool  gWifiWasConnected = false;
 
-// Touch / swipe state
 bool  gWasTouching = false;
 int16_t gPressX = 0, gPressY = 0;
 int16_t gCurX = 0, gCurY = 0;
 unsigned long gTouchCooldownUntil = 0;
 
-// Loop scheduling
 unsigned long gLastTouchPoll = 0;
 unsigned long gLastDisplayRefresh = 0;
 unsigned long gLastSensorRead = 0;
 
-// =============================================================================
-// SENSOR VALIDATION
-// =============================================================================
 bool isTemperatureValid(float temp) {
   if (temp <= TEMP_SENSOR_ERROR) {
     Serial.println("Warning: Temperature sensor disconnected or not found!");
@@ -166,23 +141,17 @@ bool isWaterLevelValid(float level) {
 
 bool isAmmoniaValid(float value) {
   if (value < AMMONIA_VALID_MIN || value > AMMONIA_VALID_MAX) {
-    Serial.print("Warning: Ammonia out of range: ");
+    Serial.print("Warning: Ammonia reading out of range: ");
     Serial.println(value);
     return false;
   }
   return true;
 }
 
-// SIMULATED ammonia reading in mg/L. Oscillates slowly around a healthy
-// baseline so charts show a realistic trend. See the note above readAmmonia().
 float readAmmonia() {
-  unsigned long t = millis();
-  float wave = sin(2.0f * PI * (t / 60000.0f)) + 0.5f * sin(2.0f * PI * (t / 14400000.0f));
-  float value = AMMONIA_SIM_BASE + AMMONIA_SIM_AMPLITUDE * wave;
-
-  if (value < AMMONIA_VALID_MIN) value = AMMONIA_VALID_MIN;
-  if (value > AMMONIA_VALID_MAX) value = AMMONIA_VALID_MAX;
-  return value;
+  int raw = analogRead(MQ137_PIN);
+  float voltage = raw * (3.3f / 4095.0f);
+  return voltage;
 }
 
 float readDistanceCM() {
@@ -214,11 +183,8 @@ float getAverageDistance(int samples) {
   return (validReadings == 0) ? DISTANCE_SENSOR_ERROR : total / validReadings;
 }
 
-// =============================================================================
-// TOUCH CALIBRATION (persisted in NVS so it runs only once)
-// =============================================================================
 bool loadCalibration(uint16_t* calData) {
-  gPrefs.begin("display", true);   // read-only
+  gPrefs.begin("display", true);
   size_t n = gPrefs.getBytes("cal", calData, 5 * sizeof(uint16_t));
   gPrefs.end();
   return n == 5 * sizeof(uint16_t);
@@ -232,14 +198,13 @@ void saveCalibration(const uint16_t* calData) {
 
 void initDisplay() {
   tft.init();
-  tft.setRotation(1);   // landscape: 480x320
+  tft.setRotation(1);
   tft.fillScreen(COL_BG);
 
   uint16_t calData[5];
   if (loadCalibration(calData)) {
     tft.setTouch(calData);
   } else {
-    // First boot: run the interactive 5-point calibration, then store it.
     tft.setTextColor(TFT_WHITE, TFT_BLACK);
     tft.setTextDatum(MC_DATUM);
     tft.drawString("Touch calibration", tft.width() / 2, tft.height() / 2 - 20, 4);
@@ -252,9 +217,6 @@ void initDisplay() {
   redrawFull();
 }
 
-// =============================================================================
-// SCREEN RENDERING
-// =============================================================================
 void showCenterMessage(const char* line1, const char* line2) {
   tft.fillScreen(COL_BG);
   tft.setTextDatum(MC_DATUM);
@@ -267,25 +229,21 @@ void showCenterMessage(const char* line1, const char* line2) {
 void drawChrome() {
   tft.fillRect(0, 0, tft.width(), 28, COL_HEADER);
 
-  // Title
   tft.setTextDatum(TL_DATUM);
   tft.setTextColor(COL_TEXT, COL_HEADER);
   tft.drawString("CRAYvings Monitor", 10, 6, 2);
 
-  // Local IP when connected
   if (WiFi.status() == WL_CONNECTED) {
     tft.setTextDatum(MC_DATUM);
     tft.setTextColor(COL_MUTED, COL_HEADER);
     tft.drawString(WiFi.localIP().toString(), tft.width() / 2, 6, 1);
   }
 
-  // WiFi status
   bool online = (WiFi.status() == WL_CONNECTED);
   tft.setTextDatum(TR_DATUM);
   tft.setTextColor(online ? COL_OK : COL_BAD, COL_HEADER);
   tft.drawString(online ? "WiFi: OK" : "WiFi: ---", tft.width() - 10, 6, 2);
 
-  // Page indicator dots
   int cx = tft.width() / 2;
   int dotY = tft.height() - 12;
   for (int i = 0; i < PAGE_COUNT; i++) {
@@ -298,10 +256,6 @@ void clearContent() {
   tft.fillRect(0, 30, tft.width(), tft.height() - 30 - 24, COL_BG);
 }
 
-// Draws a big value with a small unit label next to it. When degCircle is true
-// the unit is drawn as a small degree circle + "C" (TFT_eSPI's built-in fonts
-// have no degree glyph). bg must match whatever the value sits on so the text
-// eraser doesn't paint a contrasting box behind the glyphs.
 void drawValueBlock(int cx, int cy, const String& value, const char* unit,
                     uint16_t color, uint8_t valFont, bool degCircle, int degR,
                     uint16_t bg) {
@@ -326,7 +280,7 @@ void drawOverviewRow(int idx, const String& label, const String& value,
                      const char* unit, uint16_t color, bool deg, bool valid) {
   int y0 = 34 + idx * 88;
   tft.fillRect(6, y0, tft.width() - 12, 82, COL_PANEL);
-  tft.fillRect(12, y0 + 12, 6, 58, color);   // accent bar
+  tft.fillRect(12, y0 + 12, 6, 58, color);
 
   tft.setTextDatum(TL_DATUM);
   tft.setTextColor(COL_MUTED, COL_PANEL);
@@ -343,7 +297,7 @@ void drawOverviewRow(int idx, const String& label, const String& value,
 void drawOverview() {
   drawOverviewRow(0, "TEMPERATURE", String(gTemp, 1), "C", COL_TEMP, true, gTempOK);
   drawOverviewRow(1, "WATER LEVEL", String(gLevel, 1), "%", COL_WATER, false, gLevelOK);
-  drawOverviewRow(2, "AMMONIA", String(gAmmonia, 2), "mg/L", COL_AMMONIA, false, gAmmoniaOK);
+  drawOverviewRow(2, "AMMONIA", String(gAmmonia, 2), "V", COL_AMMONIA, false, gAmmoniaOK);
 }
 
 void drawTempPage() {
@@ -375,12 +329,12 @@ void drawWaterPage() {
 
 void drawAmmoniaPage() {
   drawValueBlock(tft.width() / 2 - 10, 150,
-                 gAmmoniaOK ? String(gAmmonia, 2) : "--", "mg/L",
+                 gAmmoniaOK ? String(gAmmonia, 2) : "--", "V",
                  gAmmoniaOK ? COL_AMMONIA : COL_BAD, 6, false, 0, TFT_BLACK);
 
   tft.setTextDatum(MC_DATUM);
   tft.setTextColor(gAmmoniaOK ? COL_OK : COL_BAD, TFT_BLACK);
-  tft.drawString(gAmmoniaOK ? "SENSOR OK" : "SENSOR FAILED",
+  tft.drawString(gAmmoniaOK ? "SENSOR OK (raw V)" : "SENSOR FAILED",
                  tft.width() / 2, 235, 2);
 }
 
@@ -402,9 +356,6 @@ void redrawFull() {
   gDrawnPage = gPage;
 }
 
-// =============================================================================
-// DISPLAY UPDATE (value-diff based, keeps the screen responsive)
-// =============================================================================
 bool valuesChanged() {
   if (gTempOK != gLastTempOK || gLevelOK != gLastLevelOK) return true;
   if (isnan(gTemp) != isnan(gLastTemp)) return true;
@@ -412,7 +363,7 @@ bool valuesChanged() {
   if (isnan(gAmmonia) != isnan(gLastAmmonia)) return true;
   if (gTempOK && fabsf(gTemp - gLastTemp) > 0.05f) return true;
   if (gLevelOK && fabsf(gLevel - gLastLevel) > 0.05f) return true;
-  if (gAmmoniaOK && fabsf(gAmmonia - gLastAmmonia) > 0.005f) return true;
+  if (gAmmoniaOK && fabsf(gAmmonia - gLastAmmonia) > 0.01f) return true;
   return false;
 }
 
@@ -436,9 +387,6 @@ void updateDisplay() {
   gLastAmmoniaOK = gAmmoniaOK;
 }
 
-// =============================================================================
-// TOUCH / SWIPE HANDLING
-// =============================================================================
 void nextPage() {
   gPage = (gPage + 1) % PAGE_COUNT;
   gTouchCooldownUntil = millis() + TOUCH_COOLDOWN_MS;
@@ -452,7 +400,7 @@ void prevPage() {
 void pollTouch() {
   if ((long)(millis() - gTouchCooldownUntil) < 0) return;
 
-  int16_t x = 0, y = 0;
+  uint16_t x = 0, y = 0;
   if (tft.getTouch(&x, &y)) {
     gCurX = x;
     gCurY = y;
@@ -469,15 +417,12 @@ void pollTouch() {
     } else if (dx >= SWIPE_DIST_X) {
       prevPage();
     } else if (abs(dx) <= TAP_DIST_X && abs(dy) <= TAP_DIST_Y) {
-      nextPage();   // a simple tap also advances
+      nextPage();
     }
     gWasTouching = false;
   }
 }
 
-// =============================================================================
-// SENSOR READING + SERVER UPLOAD (runs on the LOOP_DELAY_MS schedule)
-// =============================================================================
 void takeSensorReading() {
   float distanceCm = getAverageDistance(ULTRASONIC_SAMPLES);
   float waterLevel = DISTANCE_SENSOR_ERROR;
@@ -494,7 +439,6 @@ void takeSensorReading() {
 
   float ammoniaValue = readAmmonia();
 
-  // Cache latest readings + validity for the touchscreen display
   gTempOK = isTemperatureValid(tempC);
   gLevelOK = isWaterLevelValid(waterLevel);
   gAmmoniaOK = isAmmoniaValid(ammoniaValue);
@@ -512,8 +456,6 @@ void takeSensorReading() {
       Serial.print(".");
     }
     if (WiFi.status() != WL_CONNECTED) {
-      // Fall back to the config portal for reconfiguration, but time it out
-      // so the loop keeps monitoring sensors instead of blocking forever.
       showCenterMessage("WiFi setup", "Connect to CRAYVings-ESP32");
       wm.setConfigPortalTimeout(180);
       wm.autoConnect("CRAYVings-ESP32");
@@ -565,29 +507,23 @@ void takeSensorReading() {
   Serial.print(waterLevel, 2);
   Serial.print(" % | Water Temp: ");
   Serial.print(tempC, 2);
-  Serial.print(" C | Ammonia: ");
+  Serial.print(" C | Ammonia (raw V): ");
   Serial.print(ammoniaValue, 3);
-  Serial.println(" mg/L");
+  Serial.println(" V");
   Serial.println("------------------------");
 }
 
-// =============================================================================
-// SETUP
-// =============================================================================
 void setup() {
-  Serial.begin(19200);
+  Serial.begin(115200);
 
   esp_task_wdt_deinit();
 
-  // --- Touchscreen (initializes and calibrates once) ---
   initDisplay();
 
-  // --- Sensors ---
   pinMode(TRIG_PIN, OUTPUT);
   pinMode(ECHO_PIN, INPUT);
   sensors.begin();
 
-  // --- WiFi ---
   wm.setConfigPortalTimeout(180);
   wm.setConnectTimeout(15);
   wm.setDarkMode(true);
@@ -623,9 +559,6 @@ void setup() {
   esp_task_wdt_add(NULL);
 }
 
-// =============================================================================
-// MAIN LOOP (non-blocking millis() scheduler)
-// =============================================================================
 void loop() {
   esp_task_wdt_reset();
   unsigned long now = millis();
@@ -645,6 +578,5 @@ void loop() {
     takeSensorReading();
   }
 
-  // Let the scheduler keep a steady pace without hogging the CPU.
   delay(5);
 }
