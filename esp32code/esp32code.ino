@@ -1,582 +1,1308 @@
-// =============================================================================
-// FILE: esp32code/esp32code.ino
-// =============================================================================
-// PURPOSE: ESP32 firmware for the CRAYvings aquaculture monitoring system.
-//
-//   - Reads DS18B20 temperature, HC-SR04 water level, and MQ-137 ammonia
-//   - Posts readings as JSON to the backend server every second
-//   - WiFi configuration via WiFiManager captive portal
-//   - 3.5" ILI9488 touchscreen (480x320) with:
-//       * Overview page showing all three sensors at once
-//       * Individual pages for temperature, water level, and ammonia
-//       * Left/right swipe (or tap) to switch between the four pages
-//
-// PIN MAP (kept clear of TFT/touch pins: 15, 2, 4, 23, 18, 19, 21):
-//   ONE_WIRE_BUS = 25   TRIG_PIN = 26   ECHO_PIN = 27   MQ137_PIN = 34
-// =============================================================================
-
 #include <Arduino.h>
+#include <FS.h>
+#include <TFT_eSPI.h>
+#include <SPI.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
 #include <WiFi.h>
 #include <WiFiManager.h>
 #include <HTTPClient.h>
-#include <OneWire.h>
-#include <DallasTemperature.h>
-#include <esp_task_wdt.h>
-#include <TFT_eSPI.h>
-#include <Preferences.h>
 
-#define ONE_WIRE_BUS 25
-#define TRIG_PIN 26
-#define ECHO_PIN 27
-#define MQ137_PIN 34
+// =============================================================================
+// DISPLAY
+// =============================================================================
 
-char serverName[64] = "http://192.168.100.16:3000/sensor";
+TFT_eSPI tft = TFT_eSPI();
 
-const float TANK_HEIGHT_CM = 36.0f;
-const int ULTRASONIC_SAMPLES = 5;
-const int SAMPLE_DELAY_MS = 50;
-const int LOOP_DELAY_MS = 1000;
-const int HTTP_TIMEOUT_MS = 5000;
-const int WIFI_CONNECT_TIMEOUT_MS = 20000;
+// =============================================================================
+// TOUCH
+// =============================================================================
 
-const float TEMP_VALID_MIN = 0.0f;
-const float TEMP_VALID_MAX = 50.0f;
-const float WATER_LEVEL_VALID_MIN = 0.0f;
-const float WATER_LEVEL_VALID_MAX = 100.0f;
-const float TEMP_SENSOR_ERROR = -127.0f;
-const float DISTANCE_SENSOR_ERROR = -1.0f;
+#define TOUCH_CLK   32
+#define TOUCH_CS    33
+#define TOUCH_MOSI  22
+#define TOUCH_MISO  19
 
-const float AMMONIA_VALID_MIN = 0.0f;
-const float AMMONIA_VALID_MAX = 3.3f;      // raw volts from ADC
+SPIClass touchSPI(HSPI);
 
-const char* DEVICE_ID = "ESP32_01";
+// XPT2046 commands
+#define XPT2046_X   0xD0
+#define XPT2046_Y   0x90
+#define XPT2046_Z1  0xB1
+#define XPT2046_Z2  0xC1
+
+// =============================================================================
+// TOUCH CALIBRATION
+// =============================================================================
+
+#define RAW_X_MIN 200
+#define RAW_X_MAX 3900
+
+#define RAW_Y_MIN 200
+#define RAW_Y_MAX 3900
+
+#define MIN_PRESSURE 100
+
+// =============================================================================
+// DS18B20
+// =============================================================================
+
+#define ONE_WIRE_BUS 13
 
 OneWire oneWire(ONE_WIRE_BUS);
 DallasTemperature sensors(&oneWire);
 
-WiFiManager wm;
+// =============================================================================
+// HC-SR04
+// =============================================================================
 
-TFT_eSPI tft = TFT_eSPI();
-Preferences gPrefs;
+#define TRIG_PIN 26
+#define ECHO_PIN 27
 
-enum {
-  PAGE_OVERVIEW = 0,
-  PAGE_TEMP     = 1,
-  PAGE_WATER    = 2,
-  PAGE_AMMONIA  = 3,
-  PAGE_COUNT    = 4
-};
+#define TANK_HEIGHT_CM 36.0
 
-#define TOUCH_POLL_MS      40
-#define DISPLAY_REFRESH_MS 150
-#define SWIPE_DIST_X       60
-#define TAP_DIST_X         25
-#define TAP_DIST_Y         40
-#define TOUCH_COOLDOWN_MS  250
+// =============================================================================
+// MQ-137
+// =============================================================================
 
-#define COL_BG       0x0000
-#define COL_HEADER   0x10A2
-#define COL_PANEL    0x0841
-#define COL_ACCENT   0xFD20
-#define COL_TEMP     0xFD20
-#define COL_WATER    0x295F
-#define COL_AMMONIA  0x07E0
-#define COL_OK       0x07E0
-#define COL_BAD      0xF800
-#define COL_TEXT     0xFFFF
-#define COL_MUTED    0x7BEF
-#define COL_DOT_IDLE 0x3186
+#define MQ137_PIN 34
 
-float gTemp = NAN;
-float gLevel = NAN;
-float gAmmonia = NAN;
-bool  gTempOK = false;
-bool  gLevelOK = false;
-bool  gAmmoniaOK = false;
+// =============================================================================
+// SENSOR VALUES
+// =============================================================================
 
-int  gPage = PAGE_OVERVIEW;
-int  gDrawnPage = -1;
-float gLastTemp = NAN;
-float gLastLevel = NAN;
-float gLastAmmonia = NAN;
-bool  gLastTempOK = false;
-bool  gLastLevelOK = false;
-bool  gLastAmmoniaOK = false;
-bool  gWifiWasConnected = false;
+float temperature = -127.0;
+float distance = -1.0;
+float waterLevel = 0.0;
+int mq137Raw = 0;
+float mq137Voltage = 0.0;
 
-bool  gWasTouching = false;
-int16_t gPressX = 0, gPressY = 0;
-int16_t gCurX = 0, gCurY = 0;
-unsigned long gTouchCooldownUntil = 0;
+// =============================================================================
+// PAGES
+// =============================================================================
 
-unsigned long gLastTouchPoll = 0;
-unsigned long gLastDisplayRefresh = 0;
-unsigned long gLastSensorRead = 0;
+#define PAGE_OVERVIEW     0
+#define PAGE_TEMPERATURE  1
+#define PAGE_WATER_LEVEL  2
+#define PAGE_AMMONIA      3
 
-bool isTemperatureValid(float temp) {
-  if (temp <= TEMP_SENSOR_ERROR) {
-    Serial.println("Warning: Temperature sensor disconnected or not found!");
-    return false;
-  }
-  if (temp < TEMP_VALID_MIN || temp > TEMP_VALID_MAX) {
-    Serial.print("Warning: Temperature out of range: ");
-    Serial.println(temp);
-    return false;
-  }
-  return true;
+#define PAGE_COUNT 4
+
+int currentPage = PAGE_OVERVIEW;
+
+// =============================================================================
+// TIMING
+// =============================================================================
+
+unsigned long lastSensorRead = 0;
+#define SENSOR_INTERVAL 1000
+
+// =============================================================================
+// TOUCH STATE
+// =============================================================================
+
+bool touching = false;
+uint16_t touchStartX = 0;
+uint16_t touchStartY = 0;
+uint16_t lastTouchX = 0;
+uint16_t lastTouchY = 0;
+unsigned long lastSwipeTime = 0;
+#define SWIPE_DISTANCE 70
+#define SWIPE_COOLDOWN 500
+
+// =============================================================================
+// WIFI & BACKEND CONFIG
+// =============================================================================
+
+#define DEVICE_ID_DEFAULT "ESP32_01"
+#define SERVER_IP_DEFAULT "192.168.100.20"
+#define SERVER_PORT_DEFAULT "3000"
+#define SEND_INTERVAL 5000
+
+char serverIP[50] = SERVER_IP_DEFAULT;
+char serverPort[10] = SERVER_PORT_DEFAULT;
+char deviceId[50] = DEVICE_ID_DEFAULT;
+
+unsigned long lastSendTime = 0;
+bool wifiConnected = false;
+
+// Flag to trigger WiFi configuration
+bool wifiConfigRequested = false;
+
+// =============================================================================
+// DISPLAY
+// =============================================================================
+
+#define SCREEN_W 480
+#define SCREEN_H 320
+
+// =============================================================================
+// TOUCH RAW READING
+// =============================================================================
+
+uint16_t readTouchRaw(uint8_t command)
+{
+    uint16_t value;
+
+    digitalWrite(TOUCH_CS, LOW);
+
+    touchSPI.beginTransaction(
+        SPISettings(
+            2000000,
+            MSBFIRST,
+            SPI_MODE0
+        )
+    );
+
+    touchSPI.transfer(command);
+    value = touchSPI.transfer16(0x0000);
+    touchSPI.endTransaction();
+    digitalWrite(TOUCH_CS, HIGH);
+    value >>= 3;
+    return value;
 }
 
-bool isWaterLevelValid(float level) {
-  if (level < 0) {
-    Serial.println("Warning: Ultrasonic sensor failed, no valid echo received!");
-    return false;
-  }
-  if (level < WATER_LEVEL_VALID_MIN || level > WATER_LEVEL_VALID_MAX) {
-    Serial.print("Warning: Water level out of range: ");
-    Serial.println(level);
-    return false;
-  }
-  return true;
-}
-
-bool isAmmoniaValid(float value) {
-  if (value < AMMONIA_VALID_MIN || value > AMMONIA_VALID_MAX) {
-    Serial.print("Warning: Ammonia reading out of range: ");
-    Serial.println(value);
-    return false;
-  }
-  return true;
-}
-
-float readAmmonia() {
-  int raw = analogRead(MQ137_PIN);
-  float voltage = raw * (3.3f / 4095.0f);
-  return voltage;
-}
-
-float readDistanceCM() {
-  digitalWrite(TRIG_PIN, LOW);
-  delayMicroseconds(2);
-  digitalWrite(TRIG_PIN, HIGH);
-  delayMicroseconds(10);
-  digitalWrite(TRIG_PIN, LOW);
-
-  long duration = pulseIn(ECHO_PIN, HIGH, 30000);
-  if (duration == 0) return DISTANCE_SENSOR_ERROR;
-
-  return (duration * 0.0343f) / 2.0f;
-}
-
-float getAverageDistance(int samples) {
-  float total = 0.0f;
-  int validReadings = 0;
-
-  for (int i = 0; i < samples; i++) {
-    float distance = readDistanceCM();
-    if (distance > 0) {
-      total += distance;
-      validReadings++;
+// Sample a touch axis repeatedly and return the average (reduces noise)
+uint16_t readTouchSample(uint8_t command, int samples)
+{
+    uint32_t total = 0;
+    for (int i = 0; i < samples; i++)
+    {
+        total += readTouchRaw(command);
     }
-    delay(SAMPLE_DELAY_MS);
-  }
-
-  return (validReadings == 0) ? DISTANCE_SENSOR_ERROR : total / validReadings;
+    return (uint16_t)(total / samples);
 }
 
-bool loadCalibration(uint16_t* calData) {
-  gPrefs.begin("display", true);
-  size_t n = gPrefs.getBytes("cal", calData, 5 * sizeof(uint16_t));
-  gPrefs.end();
-  return n == 5 * sizeof(uint16_t);
+// =============================================================================
+// TOUCH PRESSURE
+// =============================================================================
+
+bool isTouchPressed()
+{
+    uint16_t z1;
+    uint16_t z2;
+
+    digitalWrite(TOUCH_CS, LOW);
+    touchSPI.beginTransaction(
+        SPISettings(
+            2000000,
+            MSBFIRST,
+            SPI_MODE0
+        )
+    );
+
+    touchSPI.transfer(XPT2046_Z1);
+    z1 = touchSPI.transfer16(0x0000);
+    z1 >>= 3;
+
+    touchSPI.transfer(XPT2046_Z2);
+    z2 = touchSPI.transfer16(0x0000);
+    z2 >>= 3;
+
+    touchSPI.endTransaction();
+    digitalWrite(TOUCH_CS, HIGH);
+
+    if (
+        z1 > MIN_PRESSURE &&
+        z1 < 4000 &&
+        z2 > MIN_PRESSURE &&
+        z2 < 4000
+    )
+    {
+        return true;
+    }
+
+    return false;
 }
 
-void saveCalibration(const uint16_t* calData) {
-  gPrefs.begin("display", false);
-  gPrefs.putBytes("cal", calData, 5 * sizeof(uint16_t));
-  gPrefs.end();
+// =============================================================================
+// GET TOUCH POSITION
+// =============================================================================
+
+bool getTouchPosition(
+    uint16_t &screenX,
+    uint16_t &screenY
+)
+{
+    if (!isTouchPressed())
+    {
+        return false;
+    }
+
+    uint16_t rawX = readTouchSample(XPT2046_X, 4);
+    uint16_t rawY = readTouchSample(XPT2046_Y, 4);
+
+    // Rotation 1:
+    //
+    // RAW Y -> SCREEN X
+    // RAW X -> SCREEN Y
+    //
+    // Reversed according to your working calibration.
+
+    screenX = map(
+        rawY,
+        RAW_Y_MIN,
+        RAW_Y_MAX,
+        tft.width() - 1,
+        0
+    );
+
+    screenY = map(
+        rawX,
+        RAW_X_MIN,
+        RAW_X_MAX,
+        tft.height() - 1,
+        0
+    );
+
+    screenX = constrain(
+        screenX,
+        0,
+        tft.width() - 1
+    );
+
+    screenY = constrain(
+        screenY,
+        0,
+        tft.height() - 1
+    );
+
+    return true;
 }
 
-void initDisplay() {
-  tft.init();
-  tft.setRotation(1);
-  tft.fillScreen(COL_BG);
+// =============================================================================
+// READ TEMPERATURE
+// =============================================================================
 
-  uint16_t calData[5];
-  if (loadCalibration(calData)) {
-    tft.setTouch(calData);
-  } else {
-    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+void readTemperature()
+{
+    sensors.requestTemperatures();
+    float value = sensors.getTempCByIndex(0);
+
+    if (
+        value != DEVICE_DISCONNECTED_C &&
+        value >= -10.0 &&
+        value <= 50.0
+    )
+    {
+        temperature = value;
+    }
+    else
+    {
+        temperature = -127.0;
+    }
+}
+
+// =============================================================================
+// READ WATER LEVEL
+// =============================================================================
+
+void readWaterLevel()
+{
+    digitalWrite(TRIG_PIN, LOW);
+    delayMicroseconds(2);
+    digitalWrite(TRIG_PIN, HIGH);
+    delayMicroseconds(10);
+    digitalWrite(TRIG_PIN, LOW);
+
+    long duration = pulseIn(ECHO_PIN, HIGH, 30000);
+
+    if (duration == 0)
+    {
+        distance = -1.0;
+        waterLevel = 0.0;
+        return;
+    }
+
+    distance = duration * 0.0343 / 2.0;
+    float waterHeight = TANK_HEIGHT_CM - distance;
+
+    if (waterHeight < 0)
+    {
+        waterHeight = 0;
+    }
+
+    if (waterHeight > TANK_HEIGHT_CM)
+    {
+        waterHeight = TANK_HEIGHT_CM;
+    }
+
+    waterLevel = (waterHeight / TANK_HEIGHT_CM) * 100.0;
+    waterLevel = constrain(waterLevel, 0.0, 100.0);
+}
+
+// =============================================================================
+// READ MQ-137
+// =============================================================================
+
+void readAmmonia()
+{
+    mq137Raw = analogRead(MQ137_PIN);
+    mq137Voltage = mq137Raw * (3.3 / 4095.0);
+}
+
+// =============================================================================
+// READ ALL SENSORS
+// =============================================================================
+
+void readAllSensors()
+{
+    readTemperature();
+    readWaterLevel();
+    readAmmonia();
+
+    Serial.println();
+    Serial.println("========================================");
+
+    Serial.print("Water Temperature: ");
+    if (temperature == -127.0)
+    {
+        Serial.println("ERROR");
+    }
+    else
+    {
+        Serial.print(temperature, 2);
+        Serial.println(" C");
+    }
+
+    Serial.print("Water Level: ");
+    Serial.print(waterLevel, 1);
+    Serial.println(" %");
+
+    Serial.print("MQ-137 Raw ADC: ");
+    Serial.print(mq137Raw);
+    Serial.print(" | ADC Voltage: ");
+    Serial.print(mq137Voltage, 3);
+    Serial.println(" V");
+
+    Serial.println("========================================");
+}
+
+// =============================================================================
+// HEADER
+// =============================================================================
+
+void drawHeader(const char *title)
+{
+    tft.fillRect(0, 0, 480, 55, TFT_BLUE);
     tft.setTextDatum(MC_DATUM);
-    tft.drawString("Touch calibration", tft.width() / 2, tft.height() / 2 - 20, 4);
-    tft.drawString("Follow the crosses", tft.width() / 2, tft.height() / 2 + 10, 2);
-    tft.calibrateTouch(calData, TFT_WHITE, TFT_BLACK, 15);
-    tft.setTouch(calData);
-    saveCalibration(calData);
-  }
+    tft.setTextColor(TFT_WHITE, TFT_BLUE);
+    tft.drawString(title, 240, 27, 4);
 
-  redrawFull();
+    if (wifiConnected)
+    {
+        tft.fillCircle(465, 27, 5, TFT_GREEN);
+    }
+    else
+    {
+        tft.fillCircle(465, 27, 5, TFT_RED);
+    }
 }
 
-void showCenterMessage(const char* line1, const char* line2) {
-  tft.fillScreen(COL_BG);
-  tft.setTextDatum(MC_DATUM);
-  tft.setTextColor(COL_TEXT, TFT_BLACK);
-  tft.drawString(line1, tft.width() / 2, tft.height() / 2 - 15, 2);
-  tft.setTextColor(COL_ACCENT, TFT_BLACK);
-  tft.drawString(line2, tft.width() / 2, tft.height() / 2 + 15, 2);
+// =============================================================================
+// PAGE INDICATORS
+// =============================================================================
+
+void drawPageDots()
+{
+    int dotY = 305;
+    for (int i = 0; i < PAGE_COUNT; i++)
+    {
+        int x = 180 + (i * 40);
+        if (i == currentPage)
+        {
+            tft.fillCircle(x, dotY, 6, TFT_BLUE);
+        }
+        else
+        {
+            tft.fillCircle(x, dotY, 5, TFT_LIGHTGREY);
+        }
+    }
 }
 
-void drawChrome() {
-  tft.fillRect(0, 0, tft.width(), 28, COL_HEADER);
+// =============================================================================
+// NAVIGATION
+// =============================================================================
 
-  tft.setTextDatum(TL_DATUM);
-  tft.setTextColor(COL_TEXT, COL_HEADER);
-  tft.drawString("CRAYvings Monitor", 10, 6, 2);
-
-  if (WiFi.status() == WL_CONNECTED) {
+void drawNavigation()
+{
     tft.setTextDatum(MC_DATUM);
-    tft.setTextColor(COL_MUTED, COL_HEADER);
-    tft.drawString(WiFi.localIP().toString(), tft.width() / 2, 6, 1);
-  }
-
-  bool online = (WiFi.status() == WL_CONNECTED);
-  tft.setTextDatum(TR_DATUM);
-  tft.setTextColor(online ? COL_OK : COL_BAD, COL_HEADER);
-  tft.drawString(online ? "WiFi: OK" : "WiFi: ---", tft.width() - 10, 6, 2);
-
-  int cx = tft.width() / 2;
-  int dotY = tft.height() - 12;
-  for (int i = 0; i < PAGE_COUNT; i++) {
-    int x = cx + (int)((i - (PAGE_COUNT - 1) / 2.0f) * 28);
-    tft.fillCircle(x, dotY, 5, (i == gPage) ? COL_ACCENT : COL_DOT_IDLE);
-  }
+    tft.setTextColor(TFT_DARKGREY, TFT_WHITE);
+    tft.drawString("Swipe LEFT or RIGHT", 240, 280, 2);
 }
 
-void clearContent() {
-  tft.fillRect(0, 30, tft.width(), tft.height() - 30 - 24, COL_BG);
+// =============================================================================
+// OVERVIEW PAGE
+// =============================================================================
+
+void drawOverview()
+{
+    tft.fillScreen(TFT_WHITE);
+    drawHeader("CRAYVINGS MONITOR");
+
+    // -------------------------------------------------------------------------
+    // TEMPERATURE BOX
+    // -------------------------------------------------------------------------
+
+    tft.drawRect(15, 70, 215, 75, TFT_RED);
+    tft.setTextDatum(TL_DATUM);
+    tft.setTextColor(TFT_RED, TFT_WHITE);
+    tft.drawString("TEMPERATURE", 30, 80, 2);
+
+    // -------------------------------------------------------------------------
+    // WATER LEVEL BOX
+    // -------------------------------------------------------------------------
+
+    tft.drawRect(250, 70, 215, 75, TFT_BLUE);
+    tft.setTextColor(TFT_BLUE, TFT_WHITE);
+    tft.drawString("WATER LEVEL", 265, 80, 2);
+
+    // -------------------------------------------------------------------------
+    // AMMONIA BOX
+    // -------------------------------------------------------------------------
+
+    tft.drawRect(15, 160, 215, 75, TFT_ORANGE);
+    tft.setTextColor(TFT_ORANGE, TFT_WHITE);
+    tft.drawString("MQ-137", 30, 170, 2);
+
+    // -------------------------------------------------------------------------
+    // DISTANCE BOX
+    // -------------------------------------------------------------------------
+    // The distance VALUE is intentionally not displayed.
+    // -------------------------------------------------------------------------
+
+    tft.drawRect(250, 160, 215, 75, TFT_GREEN);
+    tft.setTextColor(TFT_GREEN, TFT_WHITE);
+    tft.drawString("WATER STATUS", 265, 170, 2);
+
+    tft.setTextColor(TFT_BLACK, TFT_WHITE);
+    tft.setTextDatum(TL_DATUM);
+    tft.drawString("HC-SR04", 265, 195, 2);
+
+    // -------------------------------------------------------------------------
+    // NAVIGATION
+    // -------------------------------------------------------------------------
+
+    drawNavigation();
+    drawPageDots();
 }
 
-void drawValueBlock(int cx, int cy, const String& value, const char* unit,
-                    uint16_t color, uint8_t valFont, bool degCircle, int degR,
-                    uint16_t bg) {
-  tft.setTextDatum(MC_DATUM);
-  tft.setTextColor(color, bg);
-  tft.drawString(value, cx, cy, valFont);
+// =============================================================================
+// UPDATE OVERVIEW VALUES
+// =============================================================================
+//
+// IMPORTANT:
+// Only the value areas are cleared.
+// The entire screen is NOT redrawn.
+// =============================================================================
 
-  int half = tft.textWidth(value, valFont) / 2;
-  int ux = cx + half + 10;
-  int uy = cy - tft.fontHeight(valFont) / 2;
-  tft.setTextDatum(ML_DATUM);
-  tft.setTextColor(COL_ACCENT, bg);
-  if (degCircle) {
-    tft.fillCircle(ux, uy + 6, degR, COL_ACCENT);
-    tft.drawString("C", ux + degR + 4, uy, 2);
-  } else {
-    tft.drawString(unit, ux, uy, 2);
-  }
-}
+void updateOverview()
+{
+    // -------------------------------------------------------------------------
+    // TEMPERATURE VALUE
+    // -------------------------------------------------------------------------
 
-void drawOverviewRow(int idx, const String& label, const String& value,
-                     const char* unit, uint16_t color, bool deg, bool valid) {
-  int y0 = 34 + idx * 88;
-  tft.fillRect(6, y0, tft.width() - 12, 82, COL_PANEL);
-  tft.fillRect(12, y0 + 12, 6, 58, color);
+    tft.fillRect(25, 102, 195, 35, TFT_WHITE);
+    tft.setTextDatum(TL_DATUM);
+    tft.setTextColor(TFT_BLACK, TFT_WHITE);
+    char tempText[30];
 
-  tft.setTextDatum(TL_DATUM);
-  tft.setTextColor(COL_MUTED, COL_PANEL);
-  tft.drawString(label, 28, y0 + 10, 2);
-
-  drawValueBlock(tft.width() / 2 + 20, y0 + 44, valid ? value : "--",
-                 unit, valid ? color : COL_BAD, 4, deg, 3, COL_PANEL);
-
-  tft.setTextDatum(TR_DATUM);
-  tft.setTextColor(valid ? COL_OK : COL_BAD, COL_PANEL);
-  tft.drawString(valid ? "OK" : "FAIL", tft.width() - 16, y0 + 10, 2);
-}
-
-void drawOverview() {
-  drawOverviewRow(0, "TEMPERATURE", String(gTemp, 1), "C", COL_TEMP, true, gTempOK);
-  drawOverviewRow(1, "WATER LEVEL", String(gLevel, 1), "%", COL_WATER, false, gLevelOK);
-  drawOverviewRow(2, "AMMONIA", String(gAmmonia, 2), "V", COL_AMMONIA, false, gAmmoniaOK);
-}
-
-void drawTempPage() {
-  drawValueBlock(tft.width() / 2 - 10, 150,
-                 gTempOK ? String(gTemp, 1) : "--", "C",
-                 gTempOK ? COL_TEMP : COL_BAD, 6, true, 5, TFT_BLACK);
-
-  tft.setTextDatum(MC_DATUM);
-  tft.setTextColor(gTempOK ? COL_OK : COL_BAD, TFT_BLACK);
-  tft.drawString(gTempOK ? "SENSOR OK" : "SENSOR DISCONNECTED",
-                 tft.width() / 2, 235, 2);
-}
-
-void drawWaterPage() {
-  drawValueBlock(tft.width() / 2 - 10, 130,
-                 gLevelOK ? String(gLevel, 1) : "--", "%",
-                 gLevelOK ? COL_WATER : COL_BAD, 6, false, 0, TFT_BLACK);
-
-  float pct = gLevelOK ? constrain(gLevel, 0.0f, 100.0f) : 0.0f;
-  int bx = 40, by = 215, bw = tft.width() - 80, bh = 26;
-  tft.drawRect(bx, by, bw, bh, COL_MUTED);
-  tft.fillRect(bx, by, (int)(bw * pct / 100.0f), bh, COL_WATER);
-
-  tft.setTextDatum(MC_DATUM);
-  tft.setTextColor(gLevelOK ? COL_OK : COL_BAD, TFT_BLACK);
-  tft.drawString(gLevelOK ? "SENSOR OK" : "SENSOR FAILED",
-                 tft.width() / 2, 260, 2);
-}
-
-void drawAmmoniaPage() {
-  drawValueBlock(tft.width() / 2 - 10, 150,
-                 gAmmoniaOK ? String(gAmmonia, 2) : "--", "V",
-                 gAmmoniaOK ? COL_AMMONIA : COL_BAD, 6, false, 0, TFT_BLACK);
-
-  tft.setTextDatum(MC_DATUM);
-  tft.setTextColor(gAmmoniaOK ? COL_OK : COL_BAD, TFT_BLACK);
-  tft.drawString(gAmmoniaOK ? "SENSOR OK (raw V)" : "SENSOR FAILED",
-                 tft.width() / 2, 235, 2);
-}
-
-void drawCurrentPageContent() {
-  clearContent();
-  switch (gPage) {
-    case PAGE_TEMP:    drawTempPage(); break;
-    case PAGE_WATER:   drawWaterPage(); break;
-    case PAGE_AMMONIA: drawAmmoniaPage(); break;
-    case PAGE_OVERVIEW:
-    default:           drawOverview(); break;
-  }
-}
-
-void redrawFull() {
-  tft.fillScreen(COL_BG);
-  drawChrome();
-  drawCurrentPageContent();
-  gDrawnPage = gPage;
-}
-
-bool valuesChanged() {
-  if (gTempOK != gLastTempOK || gLevelOK != gLastLevelOK) return true;
-  if (isnan(gTemp) != isnan(gLastTemp)) return true;
-  if (isnan(gLevel) != isnan(gLastLevel)) return true;
-  if (isnan(gAmmonia) != isnan(gLastAmmonia)) return true;
-  if (gTempOK && fabsf(gTemp - gLastTemp) > 0.05f) return true;
-  if (gLevelOK && fabsf(gLevel - gLastLevel) > 0.05f) return true;
-  if (gAmmoniaOK && fabsf(gAmmonia - gLastAmmonia) > 0.01f) return true;
-  return false;
-}
-
-void updateDisplay() {
-  bool wifiNow = (WiFi.status() == WL_CONNECTED);
-  bool wifiChanged = (wifiNow != gWifiWasConnected);
-  gWifiWasConnected = wifiNow;
-
-  if (gPage != gDrawnPage) {
-    redrawFull();
-  } else {
-    if (valuesChanged()) drawCurrentPageContent();
-    if (wifiChanged) drawChrome();
-  }
-
-  gLastTemp = gTemp;
-  gLastLevel = gLevel;
-  gLastAmmonia = gAmmonia;
-  gLastTempOK = gTempOK;
-  gLastLevelOK = gLevelOK;
-  gLastAmmoniaOK = gAmmoniaOK;
-}
-
-void nextPage() {
-  gPage = (gPage + 1) % PAGE_COUNT;
-  gTouchCooldownUntil = millis() + TOUCH_COOLDOWN_MS;
-}
-
-void prevPage() {
-  gPage = (gPage + PAGE_COUNT - 1) % PAGE_COUNT;
-  gTouchCooldownUntil = millis() + TOUCH_COOLDOWN_MS;
-}
-
-void pollTouch() {
-  if ((long)(millis() - gTouchCooldownUntil) < 0) return;
-
-  uint16_t x = 0, y = 0;
-  if (tft.getTouch(&x, &y)) {
-    gCurX = x;
-    gCurY = y;
-    if (!gWasTouching) {
-      gPressX = x;
-      gPressY = y;
+    if (temperature == -127.0)
+    {
+        strcpy(tempText, "ERROR");
     }
-    gWasTouching = true;
-  } else if (gWasTouching) {
-    int dx = (int)gCurX - (int)gPressX;
-    int dy = (int)gCurY - (int)gPressY;
-    if (dx <= -SWIPE_DIST_X) {
-      nextPage();
-    } else if (dx >= SWIPE_DIST_X) {
-      prevPage();
-    } else if (abs(dx) <= TAP_DIST_X && abs(dy) <= TAP_DIST_Y) {
-      nextPage();
+    else
+    {
+        snprintf(tempText, sizeof(tempText), "%.1f C", temperature);
     }
-    gWasTouching = false;
-  }
+
+    tft.drawString(tempText, 30, 105, 4);
+
+    // -------------------------------------------------------------------------
+    // WATER LEVEL VALUE
+    // -------------------------------------------------------------------------
+
+    tft.fillRect(260, 102, 195, 35, TFT_WHITE);
+    char levelText[30];
+    snprintf(levelText, sizeof(levelText), "%.1f %%", waterLevel);
+    tft.drawString(levelText, 265, 105, 4);
+
+    // -------------------------------------------------------------------------
+    // AMMONIA VALUE
+    // -------------------------------------------------------------------------
+
+    tft.fillRect(25, 192, 195, 35, TFT_WHITE);
+    char ammoniaText[30];
+    snprintf(ammoniaText, sizeof(ammoniaText), "%.3f V", mq137Voltage);
+    tft.drawString(ammoniaText, 30, 195, 4);
+
+    // -------------------------------------------------------------------------
+    // WATER STATUS
+    // -------------------------------------------------------------------------
+
+    tft.fillRect(260, 192, 195, 35, TFT_WHITE);
+    const char *status;
+
+    if (waterLevel < 20.0)
+    {
+        status = "LOW";
+    }
+    else if (waterLevel < 80.0)
+    {
+        status = "NORMAL";
+    }
+    else
+    {
+        status = "HIGH";
+    }
+
+    tft.setTextDatum(TL_DATUM);
+    tft.setTextColor(TFT_BLACK, TFT_WHITE);
+    tft.drawString(status, 265, 195, 4);
 }
 
-void takeSensorReading() {
-  float distanceCm = getAverageDistance(ULTRASONIC_SAMPLES);
-  float waterLevel = DISTANCE_SENSOR_ERROR;
+// =============================================================================
+// TEMPERATURE PAGE
+// =============================================================================
 
-  if (distanceCm > 0) {
-    float levelCm = TANK_HEIGHT_CM - distanceCm;
-    if (levelCm < 0) levelCm = 0;
-    if (levelCm > TANK_HEIGHT_CM) levelCm = TANK_HEIGHT_CM;
-    waterLevel = (levelCm / TANK_HEIGHT_CM) * 100.0f;
-  }
+void drawTemperaturePage()
+{
+    tft.fillScreen(TFT_WHITE);
+    drawHeader("WATER TEMPERATURE");
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextColor(TFT_RED, TFT_WHITE);
 
-  sensors.requestTemperatures();
-  float tempC = sensors.getTempCByIndex(0);
-
-  float ammoniaValue = readAmmonia();
-
-  gTempOK = isTemperatureValid(tempC);
-  gLevelOK = isWaterLevelValid(waterLevel);
-  gAmmoniaOK = isAmmoniaValid(ammoniaValue);
-  gTemp = gTempOK ? tempC : NAN;
-  gLevel = gLevelOK ? waterLevel : NAN;
-  gAmmonia = gAmmoniaOK ? ammoniaValue : NAN;
-
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("WiFi lost, reconnecting...");
-    WiFi.mode(WIFI_STA);
-    WiFi.begin();
-    unsigned long start = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - start < WIFI_CONNECT_TIMEOUT_MS) {
-      delay(500);
-      Serial.print(".");
+    if (temperature == -127.0)
+    {
+        tft.drawString("SENSOR ERROR", 240, 140, 4);
     }
-    if (WiFi.status() != WL_CONNECTED) {
-      showCenterMessage("WiFi setup", "Connect to CRAYVings-ESP32");
-      wm.setConfigPortalTimeout(180);
-      wm.autoConnect("CRAYVings-ESP32");
-      redrawFull();
+    else
+    {
+        char text[30];
+        snprintf(text, sizeof(text), "%.2f C", temperature);
+        tft.drawString(text, 240, 140, 7);
     }
-  }
 
-  bool tempOK = gTempOK;
-  bool levelOK = gLevelOK;
-  bool ammoniaOK = gAmmoniaOK;
+    tft.setTextColor(TFT_BLACK, TFT_WHITE);
+    tft.drawString("DS18B20", 240, 210, 2);
+    drawNavigation();
+    drawPageDots();
+}
 
-  if (WiFi.status() == WL_CONNECTED) {
+// =============================================================================
+// UPDATE TEMPERATURE PAGE
+// =============================================================================
+
+void updateTemperaturePage()
+{
+    tft.fillRect(60, 95, 360, 90, TFT_WHITE);
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextColor(TFT_RED, TFT_WHITE);
+
+    if (temperature == -127.0)
+    {
+        tft.drawString("SENSOR ERROR", 240, 140, 4);
+    }
+    else
+    {
+        char text[30];
+        snprintf(text, sizeof(text), "%.2f C", temperature);
+        tft.drawString(text, 240, 140, 7);
+    }
+}
+
+// =============================================================================
+// WATER LEVEL PAGE
+// =============================================================================
+
+void drawWaterLevelPage()
+{
+    tft.fillScreen(TFT_WHITE);
+    drawHeader("WATER LEVEL");
+
+    // -------------------------------------------------------------------------
+    // BAR OUTLINE
+    // -------------------------------------------------------------------------
+
+    tft.drawRect(70, 80, 340, 80, TFT_BLUE);
+
+    // -------------------------------------------------------------------------
+    // PERCENTAGE
+    // -------------------------------------------------------------------------
+
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextColor(TFT_BLUE, TFT_WHITE);
+    char levelText[30];
+    snprintf(levelText, sizeof(levelText), "%.1f %%", waterLevel);
+    tft.drawString(levelText, 240, 205, 6);
+
+    // -------------------------------------------------------------------------
+    // SENSOR LABEL
+    // -------------------------------------------------------------------------
+
+    tft.setTextColor(TFT_BLACK, TFT_WHITE);
+    tft.drawString("HC-SR04 WATER LEVEL", 240, 245, 2);
+
+    drawNavigation();
+    drawPageDots();
+    updateWaterLevelPage();
+}
+
+// =============================================================================
+// UPDATE WATER LEVEL
+// =============================================================================
+
+void updateWaterLevelPage()
+{
+    // -------------------------------------------------------------------------
+    // CLEAR INSIDE OF BAR
+    // -------------------------------------------------------------------------
+
+    tft.fillRect(72, 82, 336, 76, TFT_WHITE);
+
+    // -------------------------------------------------------------------------
+    // WATER LEVEL BAR
+    // -------------------------------------------------------------------------
+
+    int fillWidth = (int)(336.0 * waterLevel / 100.0);
+    fillWidth = constrain(fillWidth, 0, 336);
+
+    if (fillWidth > 0)
+    {
+        tft.fillRect(72, 82, fillWidth, 76, TFT_BLUE);
+    }
+
+    // -------------------------------------------------------------------------
+    // REDRAW BORDER
+    // -------------------------------------------------------------------------
+
+    tft.drawRect(70, 80, 340, 80, TFT_BLUE);
+
+    // -------------------------------------------------------------------------
+    // UPDATE PERCENTAGE
+    // -------------------------------------------------------------------------
+
+    tft.fillRect(90, 175, 300, 60, TFT_WHITE);
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextColor(TFT_BLUE, TFT_WHITE);
+    char levelText[30];
+    snprintf(levelText, sizeof(levelText), "%.1f %%", waterLevel);
+    tft.drawString(levelText, 240, 205, 6);
+}
+
+// =============================================================================
+// AMMONIA PAGE
+// =============================================================================
+
+void drawAmmoniaPage()
+{
+    tft.fillScreen(TFT_WHITE);
+    drawHeader("MQ-137 AMMONIA");
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextColor(TFT_ORANGE, TFT_WHITE);
+
+    char voltageText[30];
+    snprintf(voltageText, sizeof(voltageText), "%.3f V", mq137Voltage);
+    tft.drawString(voltageText, 240, 125, 7);
+
+    tft.setTextColor(TFT_BLACK, TFT_WHITE);
+    char rawText[30];
+    snprintf(rawText, sizeof(rawText), "RAW ADC: %d", mq137Raw);
+    tft.drawString(rawText, 240, 200, 3);
+
+    tft.drawString("MQ-137 AOUT", 240, 235, 2);
+    tft.setTextColor(TFT_DARKGREY, TFT_WHITE);
+    tft.drawString("Voltage test only", 240, 280, 2);
+    drawPageDots();
+}
+
+// =============================================================================
+// UPDATE AMMONIA PAGE
+// =============================================================================
+
+void updateAmmoniaPage()
+{
+    // -------------------------------------------------------------------------
+    // VOLTAGE
+    // -------------------------------------------------------------------------
+
+    tft.fillRect(70, 85, 340, 80, TFT_WHITE);
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextColor(TFT_ORANGE, TFT_WHITE);
+    char voltageText[30];
+    snprintf(voltageText, sizeof(voltageText), "%.3f V", mq137Voltage);
+    tft.drawString(voltageText, 240, 125, 7);
+
+    // -------------------------------------------------------------------------
+    // RAW ADC
+    // -------------------------------------------------------------------------
+
+    tft.fillRect(120, 180, 240, 35, TFT_WHITE);
+    tft.setTextColor(TFT_BLACK, TFT_WHITE);
+    char rawText[30];
+    snprintf(rawText, sizeof(rawText), "RAW ADC: %d", mq137Raw);
+    tft.drawString(rawText, 240, 200, 3);
+}
+
+// =============================================================================
+// DRAW CURRENT PAGE
+// =============================================================================
+//
+// Called ONLY when changing pages.
+// =============================================================================
+
+void drawCurrentPage()
+{
+    switch (currentPage)
+    {
+        case PAGE_OVERVIEW:
+            drawOverview();
+            updateOverview();
+            break;
+
+        case PAGE_TEMPERATURE:
+            drawTemperaturePage();
+            break;
+
+        case PAGE_WATER_LEVEL:
+            drawWaterLevelPage();
+            break;
+
+        case PAGE_AMMONIA:
+            drawAmmoniaPage();
+            break;
+    }
+}
+
+// =============================================================================
+// UPDATE CURRENT PAGE
+// =============================================================================
+//
+// This does NOT call fillScreen().
+// This is the important anti-blinking section.
+// =============================================================================
+
+void updateCurrentPage()
+{
+    switch (currentPage)
+    {
+        case PAGE_OVERVIEW:
+            updateOverview();
+            break;
+
+        case PAGE_TEMPERATURE:
+            updateTemperaturePage();
+            break;
+
+        case PAGE_WATER_LEVEL:
+            updateWaterLevelPage();
+            break;
+
+        case PAGE_AMMONIA:
+            updateAmmoniaPage();
+            break;
+    }
+}
+
+// =============================================================================
+// NEXT PAGE
+// =============================================================================
+
+void nextPage()
+{
+    currentPage++;
+    if (currentPage >= PAGE_COUNT)
+    {
+        currentPage = PAGE_OVERVIEW;
+    }
+    drawCurrentPage();
+    lastSwipeTime = millis();
+}
+
+// =============================================================================
+// PREVIOUS PAGE
+// =============================================================================
+
+void previousPage()
+{
+    currentPage--;
+    if (currentPage < 0)
+    {
+        currentPage = PAGE_COUNT - 1;
+    }
+    drawCurrentPage();
+    lastSwipeTime = millis();
+}
+
+// =============================================================================
+// TOUCH / SWIPE
+// =============================================================================
+
+void handleTouch()
+{
+    uint16_t x = lastTouchX;
+    uint16_t y = lastTouchY;
+    bool pressed = getTouchPosition(x, y);
+
+    // -------------------------------------------------------------------------
+    // FINGER IS DOWN
+    // -------------------------------------------------------------------------
+
+    if (pressed)
+    {
+        lastTouchX = x;
+        lastTouchY = y;
+
+        if (!touching)
+        {
+            touching = true;
+            touchStartX = x;
+            touchStartY = y;
+            Serial.print("[TOUCH START] X=");
+            Serial.print(x);
+            Serial.print(" Y=");
+            Serial.println(y);
+        }
+        return;
+    }
+
+    // -------------------------------------------------------------------------
+    // NO TOUCH
+    // -------------------------------------------------------------------------
+
+    if (!touching)
+    {
+        return;
+    }
+
+    // -------------------------------------------------------------------------
+    // FINGER RELEASED
+    // -------------------------------------------------------------------------
+
+    touching = false;
+    uint16_t endX = lastTouchX;
+    uint16_t endY = lastTouchY;
+    int dx = (int)endX - (int)touchStartX;
+    int dy = (int)endY - (int)touchStartY;
+
+    Serial.print("[SWIPE] DX=");
+    Serial.print(dx);
+    Serial.print(" DY=");
+    Serial.println(dy);
+
+    // -------------------------------------------------------------------------
+    // COOLDOWN
+    // -------------------------------------------------------------------------
+
+    if (millis() - lastSwipeTime < SWIPE_COOLDOWN)
+    {
+        return;
+    }
+
+    // -------------------------------------------------------------------------
+    // HORIZONTAL SWIPE ONLY
+    // -------------------------------------------------------------------------
+
+    if (abs(dx) >= SWIPE_DISTANCE && abs(dx) > abs(dy))
+    {
+        // ---------------------------------------------------------------------
+        // SWIPE LEFT
+        // ---------------------------------------------------------------------
+
+        if (dx < 0)
+        {
+            Serial.println("[SWIPE] LEFT -> NEXT PAGE");
+            nextPage();
+        }
+        // ---------------------------------------------------------------------
+        // SWIPE RIGHT
+        // ---------------------------------------------------------------------
+
+        else
+        {
+            Serial.println("[SWIPE] RIGHT -> PREVIOUS PAGE");
+            previousPage();
+        }
+    }
+    // -------------------------------------------------------------------------
+    // SPECIAL GESTURE: Tap top corner 3 times quickly to enter WiFi config
+    // -------------------------------------------------------------------------
+    else if (abs(dx) < 30 && abs(dy) < 30)  // Tap (not swipe)
+    {
+        static uint8_t tapCount = 0;
+        static unsigned long lastTapTime = 0;
+        unsigned long now = millis();
+
+        // Reset tap counter if too much time has passed
+        if (now - lastTapTime > 1000)
+        {
+            tapCount = 0;
+        }
+
+        // Check if tap is in top-left corner (configuration trigger zone)
+        if (x < 60 && y < 60)
+        {
+            tapCount++;
+            lastTapTime = now;
+            Serial.printf("[CONFIG] Tap %d/3 detected\n", tapCount);
+
+            if (tapCount >= 3)
+            {
+                Serial.println("[CONFIG] Triple tap detected! Starting WiFi configuration...");
+                wifiConfigRequested = true;
+                tapCount = 0;  // Reset after triggering
+            }
+        }
+        else
+        {
+            tapCount = 0;  // Reset if tap is not in the zone
+        }
+    }
+}
+
+// =============================================================================
+// START WIFI CONFIGURATION PORTAL
+// =============================================================================
+
+void startWifiConfigPortal()
+{
+    Serial.println("[WIFI] Starting configuration portal...");
+
+    // Show configuration message on screen
+    tft.fillScreen(TFT_WHITE);
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextColor(TFT_BLACK, TFT_WHITE);
+    tft.drawString("WiFi Setup", 240, 80, 4);
+    tft.drawString("Connect to AP:", 240, 130, 2);
+    tft.drawString("Aquaculture-Setup", 240, 160, 4);
+    tft.drawString("to configure WiFi", 240, 200, 2);
+    tft.drawString("Timeout: 3 minutes", 240, 240, 2);
+
+    WiFi.mode(WIFI_AP_STA);
+    WiFiManager wm;
+
+    // Create parameters for configuration
+    WiFiManagerParameter serverIPParam(
+        "server_ip",
+        "Backend Server IP (e.g. 192.168.1.100)",
+        SERVER_IP_DEFAULT,
+        50
+    );
+
+    WiFiManagerParameter serverPortParam(
+        "server_port",
+        "Backend Server Port",
+        SERVER_PORT_DEFAULT,
+        6
+    );
+
+    WiFiManagerParameter deviceIdParam(
+        "device_id",
+        "Device ID (e.g. ESP32_01)",
+        DEVICE_ID_DEFAULT,
+        50
+    );
+
+    wm.addParameter(&serverIPParam);
+    wm.addParameter(&serverPortParam);
+    wm.addParameter(&deviceIdParam);
+
+    wm.setConfigPortalTimeout(180);  // 3 minutes timeout
+    wm.setConnectTimeout(10);
+
+    bool wifiResult = wm.autoConnect("Aquaculture-Setup");
+
+    if (wifiResult)
+    {
+        wifiConnected = true;
+        Serial.println("[WIFI] Connected!");
+        Serial.print("[WIFI] IP: ");
+        Serial.println(WiFi.localIP());
+
+        // Save the configured values
+        strncpy(serverIP, serverIPParam.getValue(), sizeof(serverIP) - 1);
+        strncpy(serverPort, serverPortParam.getValue(), sizeof(serverPort) - 1);
+        strncpy(deviceId, deviceIdParam.getValue(), sizeof(deviceId) - 1);
+
+        // Ensure null termination
+        serverIP[sizeof(serverIP) - 1] = '\0';
+        serverPort[sizeof(serverPort) - 1] = '\0';
+        deviceId[sizeof(deviceId) - 1] = '\0';
+
+        Serial.print("[WIFI] Backend: ");
+        Serial.print(serverIP);
+        Serial.print(":");
+        Serial.println(serverPort);
+        Serial.print("[WIFI] Device ID: ");
+        Serial.println(deviceId);
+
+        // Update the display to show connected status
+        tft.fillScreen(TFT_WHITE);
+        tft.setTextDatum(MC_DATUM);
+        tft.setTextColor(TFT_BLACK, TFT_WHITE);
+        tft.drawString("WiFi Connected!", 240, 100, 4);
+        tft.drawString("IP: " + String(WiFi.localIP().toString()), 240, 150, 2);
+        delay(2000);
+    }
+    else
+    {
+        wifiConnected = false;
+        Serial.println("[WIFI] Timeout or failed. Running offline.");
+
+        tft.fillScreen(TFT_WHITE);
+        tft.setTextDatum(MC_DATUM);
+        tft.setTextColor(TFT_BLACK, TFT_WHITE);
+        tft.drawString("WiFi Setup Failed", 240, 100, 4);
+        tft.drawString("Running in offline mode", 240, 150, 2);
+        delay(2000);
+    }
+
+    wifiConfigRequested = false;
+    tft.fillScreen(TFT_WHITE);
+    drawCurrentPage();  // Redraw the current page after configuration
+}
+
+// =============================================================================
+// SEND SENSOR DATA TO BACKEND
+// =============================================================================
+
+void sendSensorData()
+{
+    if (WiFi.status() != WL_CONNECTED)
+    {
+        wifiConnected = false;
+        return;
+    }
+
+    wifiConnected = true;
+
     HTTPClient http;
-    http.setTimeout(HTTP_TIMEOUT_MS);
-    http.begin(serverName);
+    String url = "http://";
+    url += serverIP;
+    url += ":";
+    url += serverPort;
+    url += "/sensor";
+
+    http.begin(url);
     http.addHeader("Content-Type", "application/json");
 
-    float sendTemp = (tempOK) ? tempC : -1.0f;
-    float sendLevel = (levelOK) ? waterLevel : -1.0f;
-    float sendAmmonia = (ammoniaOK) ? ammoniaValue : -1.0f;
+    float tempToSend = (temperature == -127.0) ? -1.0 : temperature;
+    float ammoniaValue = (mq137Voltage / 3.3);
 
-    char json[128];
-    snprintf(json, sizeof(json),
-             "{\"device_id\":\"%s\",\"temperature\":%.2f,\"water_level\":%.2f,\"ammonia\":%.3f}",
-             DEVICE_ID, sendTemp, sendLevel, sendAmmonia);
+    String payload = "{";
+    payload += "\"device_id\":\"" + String(deviceId) + "\",";
+    payload += "\"temperature\":" + String(tempToSend, 2) + ",";
+    payload += "\"water_level\":" + String(waterLevel, 1) + ",";
+    payload += "\"ammonia\":" + String(ammoniaValue, 4);
+    payload += "}";
 
-    int code = http.POST(json);
+    Serial.print("[HTTP] POST ");
+    Serial.println(url);
+    Serial.print("[HTTP] Payload: ");
+    Serial.println(payload);
 
-    if (code > 0) {
-      if (code == 200 || code == 201) {
-        Serial.println("Data successfully saved to database!");
-      } else {
-        Serial.print("Server responded with code: ");
-        Serial.println(code);
-      }
-    } else {
-      Serial.print("POST failed, error: ");
-      Serial.println(http.errorToString(code));
+    int httpResponseCode = http.POST(payload);
+
+    if (httpResponseCode > 0)
+    {
+        Serial.print("[HTTP] Response code: ");
+        Serial.println(httpResponseCode);
+    }
+    else
+    {
+        Serial.print("[HTTP] Error: ");
+        Serial.println(http.errorToString(httpResponseCode));
+
+        // Mark as disconnected so we can retry
+        wifiConnected = false;
     }
 
     http.end();
-  } else {
-    Serial.println("WiFi not connected, cannot send data.");
-  }
-
-  Serial.print("Distance: ");
-  Serial.print(distanceCm, 2);
-  Serial.print(" cm | Water Level: ");
-  Serial.print(waterLevel, 2);
-  Serial.print(" % | Water Temp: ");
-  Serial.print(tempC, 2);
-  Serial.print(" C | Ammonia (raw V): ");
-  Serial.print(ammoniaValue, 3);
-  Serial.println(" V");
-  Serial.println("------------------------");
 }
 
-void setup() {
-  Serial.begin(115200);
+// =============================================================================
+// SETUP
+// =============================================================================
 
-  esp_task_wdt_deinit();
+void setup()
+{
+    Serial.begin(115200);
+    delay(1000);
 
-  initDisplay();
+    Serial.println();
+    Serial.println("================================================");
+    Serial.println("IoT-Based Smart Aquaculture Monitoring System");
+    Serial.println("for Crayfish Production");
+    Serial.println("================================================");
 
-  pinMode(TRIG_PIN, OUTPUT);
-  pinMode(ECHO_PIN, INPUT);
-  sensors.begin();
+    // =========================================================================
+    // DS18B20
+    // =========================================================================
 
-  wm.setConfigPortalTimeout(180);
-  wm.setConnectTimeout(15);
-  wm.setDarkMode(true);
-  wm.setTitle("CRAYVings ESP32");
+    sensors.begin();
+    Serial.println("[OK] DS18B20 -> GPIO13");
 
-  WiFiManagerParameter serverParam("server", "Server URL", serverName, 64);
-  wm.addParameter(&serverParam);
+    // =========================================================================
+    // HC-SR04
+    // =========================================================================
 
-  showCenterMessage("WiFi setup", "Connect to CRAYVings-ESP32");
-  bool connected = wm.autoConnect("CRAYVings-ESP32");
+    pinMode(TRIG_PIN, OUTPUT);
+    pinMode(ECHO_PIN, INPUT);
+    digitalWrite(TRIG_PIN, LOW);
+    Serial.println("[OK] HC-SR04 -> GPIO26 / GPIO27");
 
-  if (!connected) {
-    Serial.println("WiFi connection failed! Rebooting...");
-    ESP.restart();
-  }
+    // =========================================================================
+    // MQ-137
+    // =========================================================================
 
-  strlcpy(serverName, serverParam.getValue(), sizeof(serverName));
-  Serial.println("Connected to: " + WiFi.SSID());
-  Serial.print("Server: ");
-  Serial.println(serverName);
-  Serial.print("IP: ");
-  Serial.println(WiFi.localIP());
+    pinMode(MQ137_PIN, INPUT);
+    analogReadResolution(12);
+    Serial.println("[OK] MQ-137 -> GPIO34");
 
-  gWifiWasConnected = (WiFi.status() == WL_CONNECTED);
-  redrawFull();
+    // =========================================================================
+    // TOUCH
+    // =========================================================================
 
-  esp_task_wdt_config_t wdt_config = {
-    .timeout_ms = 120000,
-    .idle_core_mask = 0,
-    .trigger_panic = true
-  };
-  esp_task_wdt_init(&wdt_config);
-  esp_task_wdt_add(NULL);
+    pinMode(TOUCH_CS, OUTPUT);
+    digitalWrite(TOUCH_CS, HIGH);
+    touchSPI.begin(TOUCH_CLK, TOUCH_MISO, TOUCH_MOSI, TOUCH_CS);
+    Serial.println("[OK] XPT2046 Touch initialized");
+
+    // =========================================================================
+    // ILI9488
+    // =========================================================================
+
+    tft.init();
+    tft.setRotation(1);
+    tft.fillScreen(TFT_WHITE);
+    Serial.print("[DISPLAY] Width = ");
+    Serial.println(tft.width());
+    Serial.print("[DISPLAY] Height = ");
+    Serial.println(tft.height());
+
+    // =========================================================================
+    // WIFI - Initial Connection Attempt
+    // =========================================================================
+
+    Serial.println("[WIFI] Attempting to connect to saved network...");
+    tft.fillScreen(TFT_WHITE);
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextColor(TFT_BLACK, TFT_WHITE);
+    tft.drawString("WiFi Setup", 240, 80, 4);
+    tft.drawString("Connecting to saved network...", 240, 130, 2);
+    tft.drawString("Tap top-left corner 3x to config", 240, 200, 2);
+
+    WiFi.mode(WIFI_STA);  // Start in station mode only
+
+    // Try to connect to saved network first
+    WiFi.begin();
+
+    unsigned long startAttemptTime = millis();
+    bool connected = false;
+
+    // Wait for connection with timeout
+    while (millis() - startAttemptTime < 15000)  // 15 second timeout
+    {
+        if (WiFi.status() == WL_CONNECTED)
+        {
+            connected = true;
+            break;
+        }
+        delay(100);
+    }
+
+    if (connected)
+    {
+        wifiConnected = true;
+        Serial.println("[WIFI] Connected to saved network!");
+        Serial.print("[WIFI] IP: ");
+        Serial.println(WiFi.localIP());
+        tft.fillScreen(TFT_WHITE);
+        tft.setTextDatum(MC_DATUM);
+        tft.setTextColor(TFT_BLACK, TFT_WHITE);
+        tft.drawString("WiFi Connected!", 240, 100, 4);
+        tft.drawString("IP: " + String(WiFi.localIP().toString()), 240, 150, 2);
+        delay(1500);
+    }
+    else
+    {
+        Serial.println("[WIFI] No saved network or connection failed.");
+        Serial.println("[WIFI] Starting configuration portal...");
+
+        // Start configuration portal since we couldn't connect
+        startWifiConfigPortal();
+    }
+
+    // =========================================================================
+    // INITIAL SENSOR READING
+    // =========================================================================
+
+    readAllSensors();
+
+    // =========================================================================
+    // INITIAL SCREEN
+    // =========================================================================
+
+    currentPage = PAGE_OVERVIEW;
+    drawCurrentPage();
+
+    Serial.println();
+    Serial.println("[SYSTEM] READY");
+    Serial.println("[SYSTEM] Swipe LEFT  = Next Page");
+    Serial.println("[SYSTEM] Swipe RIGHT = Previous Page");
+    Serial.println("[SYSTEM] Tap top-left corner 3x = WiFi Config");
+    Serial.println();
 }
 
-void loop() {
-  esp_task_wdt_reset();
-  unsigned long now = millis();
+// =============================================================================
+// LOOP
+// =============================================================================
 
-  if (now - gLastTouchPoll >= TOUCH_POLL_MS) {
-    gLastTouchPoll = now;
-    pollTouch();
-  }
+void loop()
+{
+    unsigned long now = millis();
 
-  if (now - gLastDisplayRefresh >= DISPLAY_REFRESH_MS) {
-    gLastDisplayRefresh = now;
-    updateDisplay();
-  }
+    // =========================================================================
+    // SENSOR READING
+    // =========================================================================
 
-  if (now - gLastSensorRead >= LOOP_DELAY_MS) {
-    gLastSensorRead = now;
-    takeSensorReading();
-  }
+    if (now - lastSensorRead >= SENSOR_INTERVAL)
+    {
+        lastSensorRead = now;
+        readAllSensors();
 
-  delay(5);
+        // IMPORTANT:
+        // Update values only.
+        // Do NOT redraw the complete screen.
+        updateCurrentPage();
+    }
+
+    // =========================================================================
+    // SEND DATA TO BACKEND
+    // =========================================================================
+
+    if (now - lastSendTime >= SEND_INTERVAL)
+    {
+        lastSendTime = now;
+        sendSensorData();
+    }
+
+    // =========================================================================
+    // HANDLE WIFI CONFIGURATION REQUEST
+    // =========================================================================
+
+    if (wifiConfigRequested)
+    {
+        startWifiConfigPortal();
+    }
+
+    // =========================================================================
+    // TOUCH
+    // =========================================================================
+
+    handleTouch();
+
+    // Small delay prevents excessive touch polling
+    // while keeping the interface responsive.
+    delay(20);
 }
