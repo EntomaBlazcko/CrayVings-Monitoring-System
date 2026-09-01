@@ -72,7 +72,7 @@ import {
 // POLLING CONFIGURATION
 // ========================
 // How often to poll the backend for fresh data.
-const POLL_INTERVAL = 3000;              // 3 seconds for sensor data
+const POLL_INTERVAL = 1000;             // 1 second for sensor data (matches ESP32 send rate)
 const HISTORY_POLL_INTERVAL = 30000;     // 30 seconds for chart history (heavy query)
 const OFFLINE_THRESHOLD = 15000;         // 15 seconds without data = offline
 const MAX_CONSECUTIVE_FAILURES = 5;      // After 5 failures, mark as offline
@@ -164,21 +164,32 @@ function useSensorDataPolling(): SensorDataState & { refetch: () => void } {
   const historyIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const latestAbortRef = useRef<AbortController | null>(null);
   const historyAbortRef = useRef<AbortController | null>(null);
+  // Monotonically increasing request ids let slow responses from a superseded
+  // poll be dropped WITHOUT aborting the previous request. Aborting was the
+  // bug: every 1s poll aborted the previous in-flight request, which surfaced
+  // as ERR_CANCELED and returned early without counting a failure — so when the
+  // ESP32/server went offline, the counter never advanced and the status could
+  // freeze at "online" forever (slow requests never got a chance to time out
+  // before being aborted). Letting requests finish and then dropping stale ones
+  // lets genuine timeouts/errors advance the failure counter. The AbortController
+  // is kept only so unmount can cancel any request still pending.
+  const latestReqIdRef = useRef(0);
+  const historyReqIdRef = useRef(0);
   const consecutiveFailuresRef = useRef(0);
 
   /**
-   * Fetches the latest sensor reading from the backend (lightweight, every 3s).
+   * Fetches the latest sensor reading from the backend (lightweight, every 1s).
    * Determines connection status from the sensor data's own timestamp.
    */
   const fetchLatest = useCallback(async () => {
-    // Cancel any in-flight request before starting a new one
-    if (latestAbortRef.current) {
-      latestAbortRef.current.abort();
-    }
+    // Let the previous in-flight request run to completion instead of aborting
+    // it (see comment above). Bump the id so its (now stale) result is ignored.
+    const reqId = ++latestReqIdRef.current;
     latestAbortRef.current = new AbortController();
 
     try {
       const latest = await fetchLatestSensor(latestAbortRef.current.signal);
+      if (reqId !== latestReqIdRef.current) return; // superseded by a newer poll
 
       if (latest && latest.timestamp) {
         consecutiveFailuresRef.current = 0;
@@ -206,9 +217,11 @@ function useSensorDataPolling(): SensorDataState & { refetch: () => void } {
         }));
       }
     } catch (error) {
-      // A canceled request just means the next poll superseded it (or the
-      // component unmounted) — that's not a failure, so don't count it.
+      // A request aborted because a newer poll started (or unmount) just means
+      // it was superseded — not a real failure.
       if (isAxiosError(error) && error.code === "ERR_CANCELED") return;
+      // Ignore the result if a newer poll has already superseded this one.
+      if (reqId !== latestReqIdRef.current) return;
 
       consecutiveFailuresRef.current += 1;
 
@@ -236,13 +249,12 @@ function useSensorDataPolling(): SensorDataState & { refetch: () => void } {
    * Errors are swallowed — the last good history stays on screen.
    */
   const fetchHistory = useCallback(async () => {
-    if (historyAbortRef.current) {
-      historyAbortRef.current.abort();
-    }
+    const reqId = ++historyReqIdRef.current;
     historyAbortRef.current = new AbortController();
 
     try {
       const historyData = await fetchSensorHistory(1000, historyAbortRef.current.signal);
+      if (reqId !== historyReqIdRef.current) return;
       setState((prev) => ({ ...prev, history: historyData }));
     } catch (error) {
       if (isAxiosError(error) && error.code === "ERR_CANCELED") return;

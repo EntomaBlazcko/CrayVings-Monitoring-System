@@ -34,13 +34,13 @@ The CRAYvings Monitoring System is an IoT-based aquaculture monitoring solution 
 │  └──────────┘     └──────────────┘     └─────────────┘     └────────┘   │
 │       │                   │                   │                  │        │
 │       │     ┌──────────────┘                   └──────────────┐   │        │
-│       │     │  Alert Generation │     Data Polling (3s)    │   │        │
+│       │     │  Alert Generation │     Data Polling (1s)    │   │        │
 │       │     └────────────────────┘───────────────────────────┘   │        │
 │       │                                                           │        │
 │  Sensors:                                                         Pages:  │
 │  - DS18B20 (Temperature)                                     - Home      │
 │  - Ultrasonic (Water Level)                                  - Dashboard │
-│  - Ammonia (simulated)                                       - Sensors   │
+│  - Ammonia (MQ-137 NH3 ppm)                                 - Sensors   │
 │                                                               - Alerts   │
 │                                                               - Historical│
 │                                                               - Settings  │
@@ -61,19 +61,21 @@ The system continuously monitors water parameters collected by the ESP32:
 |-----------|--------|-------|------|------------------|
 | Temperature | DS18B20 | 0 to 50 | °C | 20 - 31°C |
 | Water Level | Ultrasonic HC-SR04 | 0 to 100 | % | 10 - 100% |
-| Ammonia | Simulated (MQ-137 when available) | 0 to 1.0 | mg/L | 0 - 1.0 mg/L |
+| Ammonia | MQ-137 (NH3 gas) | 0 to 500 | ppm | 0 - 25 ppm |
 
 **Features:**
 - Continuous data collection from ESP32 every 1000ms
 - Sensor validation before sending data (invalid readings sent as -1)
-- Real-time display updates every 3 seconds via polling
+- Real-time display updates every 1 second via polling
 - Visual indicators for sensor status (online/offline)
 - Connection status detection based on actual sensor data timestamp (not poll time)
 
-> **Note:** No physical ammonia sensor is connected yet. The ESP32 firmware
-> (`readAmmonia()` in `esp32code/esp32code.ino`) returns a simulated reading so
-> the full stack can be tested end-to-end. Swap in a real sensor read when the
-> hardware is available.
+> **Note:** Ammonia is measured as **real NH3 gas concentration in ppm** using
+> the MQ-137 chemiresistor (`readAmmonia()` in `esp32code/esp32code.ino`). The
+> firmware computes `Rs/R0` from the module's analog output and converts it to
+> ppm with the datasheet NH3 curve. R0 is calibrated in clean air on first boot
+> (and persisted to NVS); triple-tap the top-right corner of the display to
+> recalibrate. Failed readings are sent as `-1`.
 
 ### 2. Intelligent Alert System
 
@@ -183,7 +185,7 @@ ESP32 ──POST──▶ /sensor ──Validate──▶ PostgreSQL ──Query
     │                       (Alerts)                         │
     │                                                     ▼
     │                                              Real-time Display
-    │                                              (every 3 seconds)
+    │                                              (every 1 second)
 ```
 
 ### 1. Data Collection (ESP32)
@@ -192,7 +194,7 @@ The ESP32 microcontroller reads sensor values at regular intervals:
 
 - **Temperature**: DS18B20 waterproof sensor (OneWire protocol)
 - **Water Level**: Ultrasonic HC-SR04 distance sensor with averaging (5 samples)
-- **Ammonia**: Simulated in firmware until a physical sensor (e.g., MQ-137) is installed
+- **Ammonia**: MQ-137 chemiresistor measuring real NH3 gas concentration (ppm)
 
 ### 2. Data Transmission
 
@@ -201,12 +203,13 @@ The ESP32 sends a POST request to the backend server via Wi-Fi:
 ```http
 POST http://192.168.1.20:3000/sensor
 Content-Type: application/json
+X-Device-Secret: your_shared_secret   # required only if DEVICE_SECRET is set on the server
 
 {
   "device_id": "ESP32_01",
   "temperature": 25.5,
   "water_level": 80.0,
-  "ammonia": 0.12
+  "ammonia": 4.5
 }
 ```
 
@@ -225,7 +228,7 @@ The Express server (`server.cjs`) performs these operations:
 
 The React dashboard:
 
-1. **Polling**: Fetches data every 3 seconds
+1. **Polling**: Fetches data every 1 second
 2. **Display**: Shows real-time readings in cards and charts
 3. **Connection check**: Uses sensor data timestamp to determine online/offline
 4. **Offline display**: Shows last known readings with yellow banner when ESP32 disconnected
@@ -240,7 +243,7 @@ The React dashboard:
 
 ### How Connection Status Works
 
-The frontend polls `GET /sensor/latest` every 3 seconds. Unlike before, the connection status is determined by the **actual timestamp of the sensor data** stored in the database, not the time the API responded.
+The frontend polls `GET /sensor/latest` every 1 second. Unlike before, the connection status is determined by the **actual timestamp of the sensor data** stored in the database, not the time the API responded.
 
 ```
 lastUpdate = new Date(latest.timestamp)  // Sensor's actual send time
@@ -252,6 +255,7 @@ This means:
 - If the ESP32 stops sending data, the dashboard correctly shows "offline" after 15 seconds
 - If the backend is running but ESP32 is disconnected, stale data is detected
 - When fresh data arrives, the system automatically recovers
+- Slow requests from a superseded poll are dropped by a request-id guard (not aborted), so a slow or failed network still advances the failure counter — the status can never freeze at "online" during an outage
 
 ### When ESP32 Disconnects
 
@@ -273,7 +277,7 @@ This means:
 ### Offline Threshold Configuration
 
 ```typescript
-const POLL_INTERVAL = 3000;          // Poll every 3 seconds
+const POLL_INTERVAL = 1000;          // Poll every 1 second (matches ESP32 send rate)
 const OFFLINE_THRESHOLD = 15000;     // 15 seconds before offline
 const MAX_CONSECUTIVE_FAILURES = 5;  // API failures before offline
 ```
@@ -307,7 +311,7 @@ Users can configure thresholds in **Settings**:
 |------------|--------------|-------------|------|
 | Temperature | 20 | 31 | °C |
 | Water Level | 10 | 100 | % |
-| Ammonia | 0 | 1.0 | mg/L |
+| Ammonia | 0 | 25 | ppm |
 
 ### Alert Severity
 
@@ -346,7 +350,7 @@ SMS_COOLDOWN_MS=120000
 
 ### SMS Mute / Sleep
 
-SMS alerts can be temporarily paused:
+SMS alerts can be temporarily paused (**admin role required** — the `/alert/mute` endpoint is admin-only):
 
 **From floating alert popup:**
 - Click the bell icon on a disconnect alert
@@ -397,13 +401,13 @@ Manage SMS recipients through the **Settings** page:
 |----------|--------|-------------|
 | `/` | GET | Server info |
 | `/health` | GET | Health check |
-| `/auth/login` | POST | Log in (returns session token) |
+| `/auth/login` | POST | Log in (rate-limited: 10 attempts / 10 min / IP) |
 | `/auth/logout` | POST | Log out (revokes session token) |
 | `/auth/users` | GET | List users (admin) |
 | `/auth/users` | POST | Create user (admin) |
 | `/auth/users/:id` | DELETE | Delete user (admin) |
 | `/auth/users/:id/password` | PUT | Reset user password (admin) |
-| `/sensor` | POST | Submit sensor data |
+| `/sensor` | POST | Submit sensor data (requires `X-Device-Secret` when `DEVICE_SECRET` is set) |
 | `/sensor` | GET | Get history (`limit`: 1-1000) |
 | `/sensor/latest` | GET | Get latest reading |
 | `/report/weekly` | GET | Weekly report (summary, daily breakdown, alert counts) |
@@ -414,8 +418,8 @@ Manage SMS recipients through the **Settings** page:
 | `/settings/recipients/:id` | PUT | Update recipient |
 | `/settings/recipients/:id` | DELETE | Delete recipient |
 | `/settings/recipients/test/:id` | POST | Send test SMS |
-| `/alert/device-disconnect` | POST | Send disconnect SMS alert |
-| `/alert/mute` | POST | Mute SMS (`{ hours: number }`) |
+| `/alert/device-disconnect` | POST | Send disconnect SMS alert (authenticated) |
+| `/alert/mute` | POST | Mute SMS (`{ hours: number }`) — **admin only** |
 | `/alert/mute-status` | GET | Check mute status |
 | `/system-logs` | GET | Get system logs (`page`, `limit`, `action`, `parameter`) |
 | `/logs` | POST | Create log entry |
@@ -435,7 +439,7 @@ const sensorSchema = z.object({
   device_id: z.string().min(1).max(50),
   temperature: z.coerce.number().min(-10).max(50),
   water_level: z.coerce.number().min(0).max(100),
-  ammonia: z.coerce.number().min(0).max(1).optional(),
+  ammonia: z.coerce.number().min(-1).max(500).optional(),
   timestamp: z.string().datetime().optional(),
 });
 ```
@@ -470,7 +474,7 @@ function normalizeComparableValue(value) {
 ```
 App
 ├── SensorProvider
-│   ├── useSensorDataPolling (3s interval)
+│   ├── useSensorDataPolling (1s interval)
 │   ├── useSettingsManager
 │   ├── useLogsManager (5s interval)
 │   └── useActivityLogsManager
@@ -534,6 +538,7 @@ const ALERT_COOLDOWN_MS = 10000; // 10 seconds
 Protocol: HTTP/1.1
 Method: POST
 Content-Type: application/json
+Device auth: X-Device-Secret header (when a device secret is configured)
 URL: http://<server>:3000/sensor
 Baud Rate: 19200
 WiFi: WiFiManager captive portal (configurable on first boot)
@@ -554,13 +559,13 @@ WiFi: WiFiManager captive portal (configurable on first boot)
 |--------|------|-------|----------|-----|
 | DS18B20 | Digital | 0°C to 50°C | ±0.5°C | GPIO4 |
 | HC-SR04 | Ultrasonic | 0 - 100% | ±3mm | GPIO5, GPIO18 |
-| Ammonia | Simulated | 0 - 1.0 mg/L | - | (none yet) |
+| Ammonia | MQ-137 (NH3 gas) | 0 - 500 ppm | 0.1 ppm (approx.) | GPIO34 |
 
 ### ESP32 Sensor Validation
 
 - **Temperature**: Valid range 0-50°C, error detection (-127°C = sensor error); failed readings sent as `-1`
 - **Water Level**: Valid range 0-100%, ultrasonic echo validation, 5-sample averaging; failed readings sent as `-1`
-- **Ammonia**: Valid range 0-1.0 mg/L, simulated in firmware until a real sensor is connected; failed readings sent as `-1`
+- **Ammonia**: Valid range 0-500 ppm (NH3 gas), MQ-137 chemiresistor with clean-air R0 calibration (persisted in NVS); failed readings sent as `-1`
 - The backend skips these sentinel values during threshold evaluation so a failed sensor never triggers a false alert, and the dashboard excludes them from historical charts/stats
 
 ---
@@ -650,6 +655,10 @@ SMS_COOLDOWN_MS=120000
 WARNING_SMS_COOLDOWN_MS=120000
 HOURLY_SMS_ENABLED=true
 HOURLY_SMS_INTERVAL_MS=3600000
+
+# Security
+ADMIN_INITIAL_PASSWORD=change_me_strong_password   # REQUIRED on first-time setup (no default credential)
+DEVICE_SECRET=your_shared_secret                  # ESP32 must send this in the X-Device-Secret header
 ```
 
 ### Frontend
@@ -703,7 +712,7 @@ CREATE TABLE sensor_settings (
   water_level_min DECIMAL(5,2) DEFAULT 10.0,
   water_level_max DECIMAL(5,2) DEFAULT 100.0,
   ammonia_min DECIMAL(5,2) DEFAULT 0.0,
-  ammonia_max DECIMAL(5,2) DEFAULT 1.0,
+  ammonia_max DECIMAL(5,2) DEFAULT 25.0,
   updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 ```
@@ -770,11 +779,13 @@ curl http://localhost:3000/health
 curl http://localhost:3000/sensor/latest
 curl -X POST http://localhost:3000/sensor \
   -H "Content-Type: application/json" \
+  -H "X-Device-Secret: your_shared_secret" \
   -d '{"device_id":"TEST","temperature":25.0,"water_level":75.0,"ammonia":0.12}'
 
-# Test mute
+# Test mute (admin token required; the /alert/mute endpoint is admin-only)
 curl -X POST http://localhost:3000/alert/mute \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer <your-token>" \
   -d '{"hours": 4}'
 
 # Check mute status
@@ -800,8 +811,9 @@ curl http://localhost:3000/alert/mute-status
 
 | Metric | Value |
 |--------|-------|
-| Polling interval | 3 seconds |
+| Polling interval | 1 second |
 | Logs polling interval | 5 seconds |
+| History polling interval | 30 seconds |
 | Request timeout | 10 seconds |
 | Connection pool | 20 max connections |
 | Page size | 20 items default |
@@ -809,6 +821,9 @@ curl http://localhost:3000/alert/mute-status
 | SMS cooldown (critical) | 2 minutes |
 | SMS cooldown (warning) | 2 minutes |
 | Offline threshold | 15 seconds |
+| Rate limit (global) | 300 requests / minute / IP (device `/sensor` POST exempt) |
+| Rate limit (login) | 10 attempts / 10 minutes / IP |
+| JSON body limit | 10 KB |
 | Mute durations | 1, 2, 4, 6, 8, 12, 24 hours |
 
 ---
@@ -821,17 +836,20 @@ curl http://localhost:3000/alert/mute-status
 - Input validation with Zod (settings and sensor data)
 - SQL parameterized queries (pg)
 - Auth tokens with 24-hour expiration and server-side logout (token revoked)
-- Timing-safe password comparison (PBKDF2)
+- Timing-safe password comparison (PBKDF2-SHA512, **600,000 iterations**; legacy `salt:hash` hashes are transparently re-hashed on the next successful login)
+- **No known default credential** — first-time setup requires `ADMIN_INITIAL_PASSWORD`; the plaintext password is never logged or shown in the UI
+- **Device authentication** — `POST /sensor` requires an `X-Device-Secret` header matching `DEVICE_SECRET` (when set); `POST /alert/device-disconnect` requires a valid login
+- **Rate limiting** — global per-IP limiter (300 req/min, `/sensor` POST exempt) and a login limiter (10 attempts / 10 min / IP)
+- **JSON body-size limit** — `express.json({ limit: "10kb" })`
+- **Admin-only actions** — muting SMS alerts requires the admin role
 - SMS cooldown and mute state persisted in the database
 - Old sensor readings pruned after 30 days
 
 ### Production Recommendations
 
-1. Add authentication to all endpoints
-2. Use HTTPS
-3. Implement rate limiting
-4. Add API keys/session tokens
-5. Enable database encryption
+1. Use HTTPS behind a reverse proxy
+2. Enable database encryption
+3. **Still open (audit, deferred):** public read-only GET endpoints are not yet authenticated (token still held in localStorage) — scheduled as a separate refactor
 
 ---
 

@@ -52,6 +52,7 @@ const axios = require("axios");
 const { Pool } = require("pg");
 const { z } = require("zod");
 const crypto = require("crypto");
+const rateLimit = require("express-rate-limit");
 require("dotenv").config();
 
 // ========================
@@ -93,40 +94,94 @@ app.use(
     },
   })
 );
-// Parse incoming JSON request bodies
-app.use(express.json());
+// Parse incoming JSON request bodies. A small body-size limit prevents
+// oversized-payload memory abuse (the ESP32 payloads are a few hundred bytes).
+app.use(express.json({ limit: "10kb" }));
+
+// =============================================================================
+// RATE LIMITING
+// =============================================================================
+// A global per-IP limiter curbs endpoint abuse (brute force, scraping, DoS).
+// The ESP32's fast 1s sensor polling is exempted — that path is separately
+// guarded by DEVICE_SECRET, and any device can legitimately burst bursts.
+const globalLimiter = rateLimit({
+  windowMs: 60 * 1000,        // 1 minute window
+  limit: 300,                 // 300 requests / minute / IP
+  standardHeaders: "draft-7",
+  legacyHeaders: false,
+  skip: (req) => req.path === "/sensor" && req.method === "POST",
+  validate: { xForwardedForHeader: false }, // only trust req.ip (no proxy deps)
+});
+
+const loginLimiter = rateLimit({
+  windowMs: 10 * 60 * 1000,   // 10 minutes
+  limit: 10,                  // 10 login attempts / 10 min / IP
+  standardHeaders: "draft-7",
+  legacyHeaders: false,
+  message: { message: "Too many login attempts. Please try again later." },
+  validate: { xForwardedForHeader: false },
+});
+
+app.use(globalLimiter);
 
 // =============================================================================
 // PASSWORD HASHING UTILITIES
 // =============================================================================
 // Uses PBKDF2 with SHA-512 and a random 16-byte salt for secure password storage.
-// The stored format is: "salt:hash" (both as hex strings).
-// This is a synchronous hashing approach suitable for this application scale.
+// The stored format for new hashes is: "iterations:salt:hash" (iterations int,
+// the rest hex). Legacy hashes stored as "salt:hash" (no iteration prefix) are
+// verified at the old 10000-iteration count and transparently re-hashed with the
+// stronger PBKDF2_ITERATIONS on the next successful login, so raising the cost
+// never locks existing users out.
+const PBKDF2_ITERATIONS = 600000;
+const PBKDF2_KEYLEN = 64;
+const PBKDF2_DIGEST = "sha512";
 
-/**
- * Hashes a plaintext password with a random salt.
- * @param {string} password - The plaintext password to hash
- * @returns {string} Combined salt and hash in "salt:hash" format
- */
-function hashPassword(password) {
-  const salt = crypto.randomBytes(16).toString("hex");
-  const hash = crypto.pbkdf2Sync(password, salt, 10000, 64, "sha512").toString("hex");
-  return `${salt}:${hash}`;
+function parseStoredHash(stored) {
+  const parts = stored.split(":");
+  if (parts.length === 3) {
+    return { iterations: parseInt(parts[0], 10), salt: parts[1], hash: parts[2] };
+  }
+  // Legacy "salt:hash" — verify against the old default iteration count.
+  return { iterations: 10000, salt: parts[0], hash: parts[1] };
 }
 
 /**
- * Verifies a plaintext password against a stored "salt:hash" string.
+ * Hashes a plaintext password with a fresh random salt at PBKDF2_ITERATIONS.
+ * @param {string} password - The plaintext password to hash
+ * @returns {string} Combined "iterations:salt:hash" string
+ */
+function hashPassword(password) {
+  const salt = crypto.randomBytes(16).toString("hex");
+  const hash = crypto.pbkdf2Sync(password, salt, PBKDF2_ITERATIONS, PBKDF2_KEYLEN, PBKDF2_DIGEST).toString("hex");
+  return `${PBKDF2_ITERATIONS}:${salt}:${hash}`;
+}
+
+/**
+ * Verifies a plaintext password against a stored hash (new or legacy format).
  * @param {string} password - The plaintext password to verify
- * @param {string} stored - The stored "salt:hash" string from the database
+ * @param {string} stored - The stored hash string
  * @returns {boolean} True if the password matches
  */
 function verifyPassword(password, stored) {
-  const [salt, hash] = stored.split(":");
-  const verifyHash = crypto.pbkdf2Sync(password, salt, 10000, 64, "sha512").toString("hex");
+  const { iterations, salt, hash } = parseStoredHash(stored);
+  const verifyHash = crypto.pbkdf2Sync(password, salt, iterations, PBKDF2_KEYLEN, PBKDF2_DIGEST).toString("hex");
   const expected = Buffer.from(hash, "hex");
   const actual = Buffer.from(verifyHash, "hex");
   if (expected.length !== actual.length) return false;
   return crypto.timingSafeEqual(expected, actual);
+}
+
+/**
+ * Returns true if a stored hash uses the legacy format or an iteration count
+ * lower than the current PBKDF2_ITERATIONS (i.e. it should be re-hashed).
+ * @param {string} stored - The stored hash string
+ * @returns {boolean} True if the hash needs upgrading
+ */
+function needsRehash(stored) {
+  const parts = stored.split(":");
+  if (parts.length !== 3) return true;
+  return parseInt(parts[0], 10) !== PBKDF2_ITERATIONS;
 }
 
 /**
@@ -273,7 +328,9 @@ const sensorSchema = z.object({
   device_id: z.string().min(1).max(50),
   temperature: z.coerce.number().min(-10).max(50),
   water_level: z.coerce.number().min(-1).max(100),
-  ammonia: z.coerce.number().min(-1).max(1).optional(),
+  // ammonia is now a real NH3 gas reading in ppm (MQ-137). Upper bound covers
+  // the full datasheet range (5-500 ppm); -1 is the failed-sensor sentinel.
+  ammonia: z.coerce.number().min(-1).max(500).optional(),
 });
 
 /**
@@ -285,8 +342,8 @@ const settingsFieldSchema = z.object({
   temp_max: z.coerce.number().min(-10).max(50),
   water_level_min: z.coerce.number().min(0).max(100),
   water_level_max: z.coerce.number().min(0).max(100),
-  ammonia_min: z.coerce.number().min(0).max(10),
-  ammonia_max: z.coerce.number().min(0).max(10),
+  ammonia_min: z.coerce.number().min(0).max(500),
+  ammonia_max: z.coerce.number().min(0).max(500),
 }).partial();
 
 /**
@@ -383,6 +440,12 @@ function getThresholdStatus(value, min, max) {
 
 const SKYSMS_API_KEY = process.env.SKYSMS_API_KEY;
 const SKYSMS_API_URL = process.env.SKYSMS_API_URL || "https://skysms.skyio.site/api/v1";
+// Optional shared secret that the ESP32 must present (X-Device-Secret header)
+// when ingesting sensor data. When set, POST /sensor rejects requests without a
+// matching secret. When unset (local dev), ingestion is allowed but a warning is
+// logged. Set DEVICE_SECRET in production to prevent forged readings.
+const DEVICE_SECRET = process.env.DEVICE_SECRET;
+let deviceSecretWarned = false;
 
 // SMS configuration object: templates, sensor name mappings, units, cooldowns
 const SMS_CONFIG = {
@@ -392,12 +455,12 @@ const SMS_CONFIG = {
     // Critical template: sent when a reading is dangerously outside the safe range
     critical: "🚨 {{SENSOR}} CRITICAL ALERT\nRecipient: {{NAME}}\nReading: {{VALUE}}{{UNIT}}\nThreshold: {{THRESHOLD}}{{UNIT}}\nTime: {{TIME}}\nStatus: CRITICAL",
     // Hourly update template: periodic summary of all sensor statuses
-    hourlyUpdate: "📊 CRAYVINGS HOURLY UPDATE\nTime: {{TIME}}\nTemperature: {{TEMP}}°C ({{TEMP_STATUS}})\nWater Level: {{WATER}}% ({{WATER_STATUS}})\nAmmonia: {{AMMONIA}} mg/L ({{AMMONIA_STATUS}})\n{{SUMMARY}}"
+    hourlyUpdate: "📊 CRAYVINGS HOURLY UPDATE\nTime: {{TIME}}\nTemperature: {{TEMP}}°C ({{TEMP_STATUS}})\nWater Level: {{WATER}}% ({{WATER_STATUS}})\nAmmonia: {{AMMONIA}} ppm ({{AMMONIA_STATUS}})\n{{SUMMARY}}"
   },
   // Maps display names to SMS-friendly uppercase names
   sensorNames: { "Temperature": "TEMPERATURE", "Water Level": "WATER LEVEL", "Ammonia": "AMMONIA" },
   // Units for each sensor type in SMS messages
-  units: { "Temperature": "°C", "Water Level": "%", "Ammonia": " mg/L" },
+  units: { "Temperature": "°C", "Water Level": "%", "Ammonia": " ppm" },
   // Hourly SMS update settings
   hourly: {
     enabled: process.env.HOURLY_SMS_ENABLED !== "false",
@@ -556,9 +619,15 @@ let lastHourlyUpdateTs = null;
 (async () => {
   try {
     // Migrations: ensure ammonia columns exist (added after pH was removed).
+    // Ammonia is a real NH3 gas reading in ppm (MQ-137): default threshold range
+    // is 0-25 ppm (ACGIH 8h TWA for ammonia).
     await pool.query(`ALTER TABLE sensors ADD COLUMN IF NOT EXISTS ammonia DECIMAL(5,3) DEFAULT 0`);
     await pool.query(`ALTER TABLE sensor_settings ADD COLUMN IF NOT EXISTS ammonia_min DECIMAL(5,2) DEFAULT 0`);
-    await pool.query(`ALTER TABLE sensor_settings ADD COLUMN IF NOT EXISTS ammonia_max DECIMAL(5,2) DEFAULT 1.00`);
+    await pool.query(`ALTER TABLE sensor_settings ADD COLUMN IF NOT EXISTS ammonia_max DECIMAL(5,2) DEFAULT 25.00`);
+    // Rebase pre-existing threshold rows that still carry the old 0-1.0 value
+    // default so they match the new ppm scale. Custom values (not 1.0) are left
+    // untouched.
+    await pool.query(`UPDATE sensor_settings SET ammonia_max = 25.00 WHERE ammonia_max = 1.00`);
 
     // Migrations: session token expiry (24-hour expiration).
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS token_expires_at TIMESTAMP`);
@@ -658,7 +727,7 @@ app.get("/", (req, res) => {
  *   - device_id (required): Identifier for the ESP32 device
  *   - temperature: Water temperature in Celsius (-1 if sensor failed)
  *   - water_level: Water level percentage (-1 if sensor failed)
- *   - ammonia: Ammonia concentration in mg/L (-1 if sensor failed)
+ *   - ammonia: Ammonia gas concentration in ppm (-1 if sensor failed)
  *
  * Alert logic (runs in background via setImmediate):
  *   1. Fetches current threshold settings from sensor_settings table
@@ -672,6 +741,17 @@ app.get("/", (req, res) => {
  */
 app.post("/sensor", async (req, res) => {
   try {
+    // Device authentication: if DEVICE_SECRET is configured, require a matching
+    // X-Device-Secret header so only the real ESP32 can ingest readings.
+    if (DEVICE_SECRET) {
+      const presented = req.headers["x-device-secret"];
+      if (!presented || presented !== DEVICE_SECRET) {
+        return res.status(401).json({ message: "Invalid device secret" });
+      }
+    } else if (!deviceSecretWarned) {
+      deviceSecretWarned = true;
+      console.warn(`[${new Date().toISOString()}] DEVICE_SECRET not set - sensor ingestion is unauthenticated. Set DEVICE_SECRET in production.`);
+    }
     const parsed = sensorSchema.safeParse(req.body);
     if (!parsed.success) {
       return res.status(400).json({ message: "Invalid sensor data", errors: zodFieldErrors(parsed.error) });
@@ -694,7 +774,7 @@ app.post("/sensor", async (req, res) => {
     setImmediate(async () => {
       try {
         const settingsResult = await pool.query("SELECT * FROM sensor_settings LIMIT 1");
-        const settings = settingsResult.rows[0] || { temp_min: 20, temp_max: 31, water_level_min: 10, water_level_max: 100, ammonia_min: 0, ammonia_max: 1.0 };
+const settings = settingsResult.rows[0] || { temp_min: 20, temp_max: 31, water_level_min: 10, water_level_max: 100, ammonia_min: 0, ammonia_max: 25 };
 
         const sensorChecks = [
           { key: "Temperature", val: Number(temperature), min: Number(settings.temp_min), max: Number(settings.temp_max), minValid: 0.0001 },
@@ -1059,7 +1139,7 @@ app.get("/report/weekly", async (req, res) => {
  * and returns the user info + token to the client.
  * The client stores the token in localStorage for subsequent API requests.
  */
-app.post("/auth/login", async (req, res) => {
+app.post("/auth/login", loginLimiter, async (req, res) => {
   try {
     const { username, password } = req.body;
     if (!username || !password) return res.status(400).json({ message: "Username and password required" });
@@ -1074,7 +1154,18 @@ app.post("/auth/login", async (req, res) => {
     const token = generateToken();
     const TOKEN_TTL_MS = 24 * 60 * 60 * 1000;
     const tokenExpiresAt = new Date(Date.now() + TOKEN_TTL_MS);
-    await pool.query("UPDATE users SET token = $1, token_expires_at = $2 WHERE id = $3", [token, tokenExpiresAt, user.id]);
+
+    // Transparently upgrade legacy / weaker password hashes to the current
+    // PBKDF2 iteration count on a successful login (never on a failed one).
+    if (needsRehash(user.password_hash)) {
+      const upgradedHash = hashPassword(password);
+      await pool.query(
+        "UPDATE users SET token = $1, token_expires_at = $2, password_hash = $3 WHERE id = $4",
+        [token, tokenExpiresAt, upgradedHash, user.id]
+      );
+    } else {
+      await pool.query("UPDATE users SET token = $1, token_expires_at = $2 WHERE id = $3", [token, tokenExpiresAt, user.id]);
+    }
 
     res.json({
       message: "Login successful",
@@ -1186,7 +1277,7 @@ app.get("/settings", async (req, res) => {
   try {
     const result = await pool.query("SELECT * FROM sensor_settings LIMIT 1");
     if (result.rows.length === 0) {
-      return res.json({ temp_min: 20, temp_max: 31, water_level_min: 10, water_level_max: 100, ammonia_min: 0, ammonia_max: 1 });
+      return res.json({ temp_min: 20, temp_max: 31, water_level_min: 10, water_level_max: 100, ammonia_min: 0, ammonia_max: 25 });
     }
     const row = result.rows[0];
     res.json({
@@ -1196,7 +1287,7 @@ app.get("/settings", async (req, res) => {
       water_level_min: Number(row.water_level_min),
       water_level_max: Number(row.water_level_max),
       ammonia_min: Number(row.ammonia_min ?? 0),
-      ammonia_max: Number(row.ammonia_max ?? 1),
+      ammonia_max: Number(row.ammonia_max ?? 25),
       updated_at: row.updated_at,
     });
   } catch (err) {
@@ -1252,7 +1343,7 @@ app.post("/settings", requireAdmin, async (req, res) => {
  */
 app.post("/settings/reset", requireAdmin, async (req, res) => {
   try {
-    const defaults = { temp_min: 20, temp_max: 31, water_level_min: 10, water_level_max: 100, ammonia_min: 0, ammonia_max: 1 };
+    const defaults = { temp_min: 20, temp_max: 31, water_level_min: 10, water_level_max: 100, ammonia_min: 0, ammonia_max: 25 };
     const existing = await pool.query("SELECT * FROM sensor_settings LIMIT 1");
     let savedSettings;
     if (existing.rows.length > 0) {
@@ -1357,7 +1448,7 @@ app.post("/settings/recipients/test/:id", requireAdmin, async (req, res) => {
 
     // Fetch current settings and latest sensor reading to build the test message
     const settingsResult = await pool.query("SELECT * FROM sensor_settings LIMIT 1");
-    const settings = settingsResult.rows[0] || { temp_min: 20, temp_max: 31, water_level_min: 10, water_level_max: 100, ammonia_min: 0, ammonia_max: 1.0 };
+    const settings = settingsResult.rows[0] || { temp_min: 20, temp_max: 31, water_level_min: 10, water_level_max: 100, ammonia_min: 0, ammonia_max: 25 };
     const sensorResult = await pool.query("SELECT * FROM sensors ORDER BY timestamp DESC LIMIT 1");
     const sensor = sensorResult.rows[0] || null;
 
@@ -1375,7 +1466,7 @@ app.post("/settings/recipients/test/:id", requireAdmin, async (req, res) => {
     const ammoniaStatus = ammoniaOK ? getStatusText(getThresholdStatus(ammoniaVal, Number(settings.ammonia_min), Number(settings.ammonia_max))) : "N/A (sensor offline)";
     const timestamp = new Date().toLocaleString("en-PH", { timeZone: "Asia/Manila", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: true });
     const summary = (tempStatus === "✅ Good" && waterStatus === "✅ Good" && ammoniaStatus === "✅ Good") ? "All systems normal" : "Some parameters need attention";
-    const testMessage = `📊 CRAYVINGS LIVE READINGS (TEST)\nTime: ${timestamp}\nTemperature: ${tempOK ? temp : "N/A"}°C (${tempStatus})\nWater Level: ${waterOK ? water : "N/A"}% (${waterStatus})\nAmmonia: ${ammoniaOK ? ammonia : "N/A"} mg/L (${ammoniaStatus})\n${summary}\n(This is a test message)`;
+    const testMessage = `📊 CRAYVINGS LIVE READINGS (TEST)\nTime: ${timestamp}\nTemperature: ${tempOK ? temp : "N/A"}°C (${tempStatus})\nWater Level: ${waterOK ? water : "N/A"}% (${waterStatus})\nAmmonia: ${ammoniaOK ? ammonia : "N/A"} ppm (${ammoniaStatus})\n${summary}\n(This is a test message)`;
 
     await sendSingleSMS(phone_number, testMessage);
     res.json({ success: true, message: "Test SMS sent" });
@@ -1456,7 +1547,7 @@ app.get("/system-logs", async (req, res) => {
  * Respects the SMS mute setting (smsMuteUntil).
  * Logs the event to system_logs.
  */
-app.post('/alert/device-disconnect', async (req, res) => {
+app.post('/alert/device-disconnect', requireAuth, async (req, res) => {
   try {
     const { event_type, description, consecutive_failures } = req.body;
     const recipients = await pool.query('SELECT phone_number, name FROM authorized_recipients WHERE is_active = true');
@@ -1507,7 +1598,7 @@ app.post('/alert/device-disconnect', async (req, res) => {
  * The mute state is stored in memory (smsMuteUntil variable).
  * NOTE: Mute state is lost on server restart (not persisted to database).
  */
-app.post('/alert/mute', async (req, res) => {
+app.post('/alert/mute', requireAdmin, async (req, res) => {
   try {
     const { hours } = req.body;
     if (!hours || typeof hours !== 'number' || hours <= 0) {
@@ -1633,7 +1724,7 @@ app.get("/activity-logs", async (req, res) => {
 // This function runs when the server starts and performs initialization:
 //   1. Tests the PostgreSQL connection
 //   2. Creates a default admin account if one doesn't exist
-//      (username: "admin", password: "Admin@123")
+//      (requires ADMIN_INITIAL_PASSWORD env var for first-time setup)
 //   3. Loads the last alert states from the database to restore
 //      alert deduplication state after server restart
 //   4. Checks if SkySMS API key is configured
@@ -1650,23 +1741,26 @@ async function startServer() {
     try {
       console.log(`[${new Date().toISOString()}] PostgreSQL connected`);
 
-      // Create default admin account if it doesn't exist
-      const adminExists = await client.query("SELECT id, password_hash FROM users WHERE username = $1", ["admin"]);
-      const initialAdminPassword = process.env.ADMIN_INITIAL_PASSWORD || "Admin@123";
+      // Create default admin account if it doesn't exist.
+      // ADMIN_INITIAL_PASSWORD is REQUIRED for first-time setup so a known
+      // default credential is never used in production. The plaintext password
+      // is never logged.
+      const adminExists = await client.query("SELECT id FROM users WHERE username = $1", ["admin"]);
       if (adminExists.rows.length === 0) {
+        const initialAdminPassword = process.env.ADMIN_INITIAL_PASSWORD;
+        if (!initialAdminPassword) {
+          const msg = `[${new Date().toISOString()}] No admin account exists and ADMIN_INITIAL_PASSWORD is not set. Set ADMIN_INITIAL_PASSWORD in .env to create the initial admin, then restart.`;
+          console.error(msg);
+          process.exit(1);
+        }
         const adminPassword = hashPassword(initialAdminPassword);
         await client.query(
           `INSERT INTO users (name, username, email, password_hash, role) VALUES ('Administrator', 'admin', 'admin@crayvings.com', $1, 'admin')`,
           [adminPassword]
         );
-        console.log(`[${new Date().toISOString()}] Default admin account created (admin / ${initialAdminPassword})`);
+        console.log(`[${new Date().toISOString()}] Default admin account created. Change its password after first login.`);
       } else {
-        const storedHash = adminExists.rows[0].password_hash;
-        if (verifyPassword(initialAdminPassword, storedHash)) {
-          console.log(`[${new Date().toISOString()}] Admin account verified`);
-        } else {
-          console.log(`[${new Date().toISOString()}] Admin account exists with custom password`);
-        }
+        console.log(`[${new Date().toISOString()}] Admin account exists`);
       }
 
       // Restore alert state from database (persists across server restarts)

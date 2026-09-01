@@ -74,7 +74,7 @@ warning: "⚠️ {{SENSOR}} WARNING\n" +
 - `{{SENSOR}}` - Sensor name (e.g., "TEMPERATURE", "WATER LEVEL", "AMMONIA")
 - `{{NAME}}` - Recipient's name
 - `{{VALUE}}` - Current sensor reading
-- `{{UNIT}}` - Unit (°C, %, mg/L)
+- `{{UNIT}}` - Unit (°C, %, ppm)
 - `{{THRESHOLD}}` - Threshold value that was crossed
 - `{{TIME}}` - Timestamp in Philippines timezone
 
@@ -112,7 +112,7 @@ hourlyUpdate: "📊 CRAYVINGS HOURLY UPDATE\n" +
               "Time: {{TIME}}\n" +
               "Temperature: {{TEMP}}°C ({{TEMP_STATUS}})\n" +
               "Water Level: {{WATER}}% ({{WATER_STATUS}})\n" +
-              "Ammonia: {{AMMONIA}} mg/L ({{AMMONIA_STATUS}})\n" +
+              "Ammonia: {{AMMONIA}} ppm ({{AMMONIA_STATUS}})\n" +
               "{{SUMMARY}}"
 ```
 

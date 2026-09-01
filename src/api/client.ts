@@ -259,7 +259,7 @@ export async function fetchSettings(signal?: AbortSignal): Promise<SensorSetting
     water_level_min: Number(data.water_level_min),
     water_level_max: Number(data.water_level_max),
     ammonia_min: Number(data.ammonia_min ?? 0),
-    ammonia_max: Number(data.ammonia_max ?? 1),
+    ammonia_max: Number(data.ammonia_max ?? 25),
     updated_at: data.updated_at as string,
   };
 }

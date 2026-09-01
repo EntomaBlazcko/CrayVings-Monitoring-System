@@ -165,8 +165,8 @@ export default function HomePage({ onNavigate }: Props) {
     },
     {
       title: "Ammonia",
-      value: loading ? "Loading..." : data ? `${data.ammonia} mg/L` : "-- mg/L",
-      description: `Threshold: ${thresholds.ammonia.range.min}-${thresholds.ammonia.range.max} mg/L`,
+      value: loading ? "Loading..." : data ? `${data.ammonia} ppm` : "-- ppm",
+      description: `Threshold: ${thresholds.ammonia.range.min}-${thresholds.ammonia.range.max} ppm`,
       gradient: getCardGradient("from-emerald-500 to-teal-500"),
       icon: <FlaskConical size={24} />,
     },
@@ -175,7 +175,7 @@ export default function HomePage({ onNavigate }: Props) {
   const highlights = [
     { label: "Temperature", value: loading ? "..." : data ? `${data.temperature}°C` : "--", color: isOfflineWithData ? "bg-yellow-50 border-yellow-200 text-yellow-700" : data ? "bg-blue-50 border-blue-200 text-blue-700" : "bg-red-50 border-red-200 text-red-700" },
     { label: "Water Level", value: loading ? "..." : data ? `${data.water_level}%` : "--", color: isOfflineWithData ? "bg-yellow-50 border-yellow-200 text-yellow-700" : data ? "bg-indigo-50 border-indigo-200 text-indigo-700" : "bg-red-50 border-red-200 text-red-700" },
-    { label: "Ammonia", value: loading ? "..." : data ? `${data.ammonia} mg/L` : "--", color: isOfflineWithData ? "bg-yellow-50 border-yellow-200 text-yellow-700" : data ? "bg-emerald-50 border-emerald-200 text-emerald-700" : "bg-red-50 border-red-200 text-red-700" },
+    { label: "Ammonia", value: loading ? "..." : data ? `${data.ammonia} ppm` : "--", color: isOfflineWithData ? "bg-yellow-50 border-yellow-200 text-yellow-700" : data ? "bg-emerald-50 border-emerald-200 text-emerald-700" : "bg-red-50 border-red-200 text-red-700" },
   ];
 
   const recentAlerts = tankStatus.alerts.filter(alert => alert !== "Tank is Safe").slice(0, 4);
@@ -352,9 +352,9 @@ export default function HomePage({ onNavigate }: Props) {
               </div>
               <div className="rounded-xl bg-emerald-50 p-4">
                 <p className="text-xs text-gray-500">Ammonia</p>
-                <p className="mt-1 text-2xl font-bold text-emerald-600">{data?.ammonia ?? "--"} mg/L</p>
+                <p className="mt-1 text-2xl font-bold text-emerald-600">{data?.ammonia ?? "--"} ppm</p>
                 <p className="mt-1 text-xs text-gray-400">
-                  Optimal: {thresholds.ammonia.range.min}-{thresholds.ammonia.range.max} mg/L
+                  Optimal: {thresholds.ammonia.range.min}-{thresholds.ammonia.range.max} ppm
                 </p>
               </div>
             </div>

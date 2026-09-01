@@ -7,6 +7,8 @@
 #include <WiFi.h>
 #include <WiFiManager.h>
 #include <HTTPClient.h>
+#include <math.h>
+#include <Preferences.h>
 
 // =============================================================================
 // DISPLAY
@@ -35,11 +37,11 @@ SPIClass touchSPI(HSPI);
 // TOUCH CALIBRATION
 // =============================================================================
 
-#define RAW_X_MIN 200
-#define RAW_X_MAX 3900
+#define RAW_X_MIN 627
+#define RAW_X_MAX 3589
 
-#define RAW_Y_MIN 200
-#define RAW_Y_MAX 3900
+#define RAW_Y_MIN 479
+#define RAW_Y_MAX 3762
 
 #define MIN_PRESSURE 100
 
@@ -61,11 +63,58 @@ DallasTemperature sensors(&oneWire);
 
 #define TANK_HEIGHT_CM 36.0
 
-// =============================================================================
-// MQ-137
-// =============================================================================
+// HC-SR04 filtering: the module needs ~60ms between pings, so we do NOT sample
+// back-to-back (that causes echo crosstalk / false readings). Instead we fire one
+// ping per read (every 1s) and smooth across successive reads, with spike
+// rejection and a display deadband so the shown value stays rock-solid.
+#define DISTANCE_JUMP_CM 5.0
+#define DISTANCE_EMA_ALPHA 0.3
+#define WATER_LEVEL_DEADBAND 1.0
 
+float filteredDistance = -1.0;
+float lastShownLevel = -1.0;
+
+// =============================================================================
+// MQ-137 AMMONIA (NH3) GAS SENSOR
+// =============================================================================
+//
+// Measures real ammonia gas concentration (ppm in AIR) from the module's analog
+// output using the standard MQ-series chemiresistor model:
+//
+//   Vout = Vc * RL / (Rs + RL)            ->   Rs = RL * (Vc/Vout - 1)
+//   ppm  = 10^((log10(Rs/R0) - b) / m)
+//
+// R0 is the sensor resistance in clean air. Rs and R0 both come from the same
+// divider formula, so their RATIO is largely insensitive to the exact RL/Vc you
+// assume -- but keep them close to reality (serial prints Rs; clean air should
+// read tens of kOhm). Calibration curve (NH3) fitted from the MQ-137 datasheet
+// (widely published): m = -0.263, b = 0.42, clean-air ratio Rs/R0 = 3.6.
+//
+// 3.3V ADC WARNING: GPIO34 is clamped at ~3.3V while the module AO is a 0-5V
+// divider. With the most common module RL (1kOhm SMD) the whole 5-500ppm NH3
+// range stays below 3.3V. If your module uses RL=47kOhm the output saturates at
+// moderate ppm -- readings are then clamped and flagged on serial. Measure your
+// RL (multimeter between module VCC and AOUT) and fix MQ137_RL_KOHM below.
 #define MQ137_PIN 34
+
+#define MQ137_RL_KOHM   1.0    // Load resistor on your module (kOhm). Default 1.0 (common SMD)
+#define MQ137_VC_VOLTS  5.0    // Sensor circuit supply (module VCC; usually 5V)
+
+#define MQ137_CURVE_M   -0.263 // NH3 log-log slope:      log(Rs/R0) = m*log(ppm) + b
+#define MQ137_CURVE_B   0.42   // NH3 log-log intercept b
+#define MQ137_CLEAN_AIR_RATIO 3.6  // Rs/R0 expected in clean air (datasheet)
+#define MQ137_PPM_MAX   500.0  // Datasheet NH3 range upper bound (5-500 ppm)
+#define MQ137_SAT_VOLTS 3.24   // ADC saturation threshold (11dB attenuation ~3.3V)
+#define MQ137_EMA_ALPHA 0.2    // Smoothing factor for the displayed ppm
+#define MQ137_PPM_DEADBAND 0.1 // Don't repaint unless ppm changes by this much
+
+float mq137R0 = 0.0;        // Sensor resistance in clean air (kOhm), persisted in NVS
+float mq137RsKohm = 0.0;    // Latest computed sensor resistance (kOhm, diagnostics)
+float mq137Ratio = 0.0;     // Latest Rs/R0 (diagnostics)
+float ammoniaPpm = -1.0;    // Computed NH3 concentration (ppm); -1 = sensor failed
+float mq137PpmEma = -1.0;   // Smoothed ppm
+float lastShownPpm = -1.0;  // Last ppm painted to the screen (deadbanded)
+bool ammoniaReady = false;  // True once a valid reading has been produced
 
 // =============================================================================
 // SENSOR VALUES
@@ -91,6 +140,14 @@ float mq137Voltage = 0.0;
 int currentPage = PAGE_OVERVIEW;
 
 // =============================================================================
+// DISPLAY CACHING (water level page)
+// Tracks what is on screen so updates only repaint changed pixels
+// =============================================================================
+
+char lastLevelText[30] = "";
+int lastBarWidth = -1;
+
+// =============================================================================
 // TIMING
 // =============================================================================
 
@@ -102,22 +159,19 @@ unsigned long lastSensorRead = 0;
 // =============================================================================
 
 bool touching = false;
-uint16_t touchStartX = 0;
-uint16_t touchStartY = 0;
 uint16_t lastTouchX = 0;
 uint16_t lastTouchY = 0;
-unsigned long lastSwipeTime = 0;
-#define SWIPE_DISTANCE 70
-#define SWIPE_COOLDOWN 500
+unsigned long lastPageChange = 0;
+#define PAGE_CHANGE_COOLDOWN 500
 
 // =============================================================================
 // WIFI & BACKEND CONFIG
 // =============================================================================
 
 #define DEVICE_ID_DEFAULT "ESP32_01"
-#define SERVER_IP_DEFAULT "192.168.100.20"
+#define SERVER_IP_DEFAULT "192.168.1.16"
 #define SERVER_PORT_DEFAULT "3000"
-#define SEND_INTERVAL 5000
+#define SEND_INTERVAL 1000
 
 char serverIP[50] = SERVER_IP_DEFAULT;
 char serverPort[10] = SERVER_PORT_DEFAULT;
@@ -309,12 +363,38 @@ void readWaterLevel()
 
     if (duration == 0)
     {
+        filteredDistance = -1.0;
         distance = -1.0;
         waterLevel = 0.0;
         return;
     }
 
-    distance = duration * 0.0343 / 2.0;
+    float rawDistance = duration * 0.0343 / 2.0;
+    static int spikeStreak = 0;
+
+    if (filteredDistance < 0.0)
+    {
+        filteredDistance = rawDistance;
+    }
+    else if (fabsf(rawDistance - filteredDistance) <= DISTANCE_JUMP_CM)
+    {
+        // Normal reading: ease the filtered distance toward it (smooths jitter).
+        spikeStreak = 0;
+        filteredDistance += (rawDistance - filteredDistance) * DISTANCE_EMA_ALPHA;
+    }
+    else
+    {
+        // Big jump: likely a spurious echo. Only accept if it repeats next read.
+        spikeStreak++;
+        if (spikeStreak >= 2)
+        {
+            filteredDistance = rawDistance;
+            spikeStreak = 0;
+        }
+    }
+
+    distance = filteredDistance;
+
     float waterHeight = TANK_HEIGHT_CM - distance;
 
     if (waterHeight < 0)
@@ -327,18 +407,190 @@ void readWaterLevel()
         waterHeight = TANK_HEIGHT_CM;
     }
 
-    waterLevel = (waterHeight / TANK_HEIGHT_CM) * 100.0;
-    waterLevel = constrain(waterLevel, 0.0, 100.0);
+    float level = (waterHeight / TANK_HEIGHT_CM) * 100.0;
+    level = constrain(level, 0.0, 100.0);
+
+    // Deadband: keep showing the last level until a real change of at least
+    // WATER_LEVEL_DEADBAND% happens, so the screen never jitters over noise.
+    if (lastShownLevel < 0.0 || fabsf(level - lastShownLevel) >= WATER_LEVEL_DEADBAND)
+    {
+        lastShownLevel = level;
+    }
+
+    waterLevel = lastShownLevel;
 }
 
 // =============================================================================
-// READ MQ-137
+// MQ-137: R0 CALIBRATION (in clean air)
+// =============================================================================
+
+void saveMq137R0()
+{
+    Preferences prefs;
+    prefs.begin("mq137", false);
+    prefs.putFloat("r0_kohm", mq137R0);
+    prefs.end();
+    Serial.printf("[MQ-137] Saved R0 = %.2f kOhm to NVS\n", mq137R0);
+}
+
+bool loadMq137R0()
+{
+    Preferences prefs;
+    prefs.begin("mq137", true);
+    mq137R0 = prefs.getFloat("r0_kohm", 0.0);
+    prefs.end();
+    return mq137R0 > 5.0 && mq137R0 < 200.0;
+}
+
+// Instantaneous sensor resistance (kOhm) from the current analog voltage,
+// using the module's assumed Vc / RL. Returns -1 on invalid readings.
+float mq137RsFromVoltage()
+{
+    if (mq137Voltage < 0.005f)
+    {
+        return -1.0f;
+    }
+    return MQ137_RL_KOHM * (MQ137_VC_VOLTS / mq137Voltage - 1.0f);
+}
+
+// Average several readings in clean air and derive R0 = Rs_clean / 3.6, then
+// persist to NVS so a reboot doesn't throw the calibration away. The MQ-137
+// needs minutes to thermally stabilize after power-up, so readings taken too
+// early will drift -- let the device run a while before calibrating.
+void calibrateMq137R0()
+{
+    tft.fillScreen(TFT_WHITE);
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextColor(TFT_ORANGE, TFT_WHITE);
+    tft.drawString("MQ-137 CALIBRATION", 240, 80, 4);
+    tft.setTextColor(TFT_BLACK, TFT_WHITE);
+    tft.drawString("Keep sensor in clean air...", 240, 130, 2);
+
+    const int samples = 10;
+    float sum = 0.0;
+    int good = 0;
+
+    for (int i = 0; i < samples; i++)
+    {
+        mq137Raw = analogRead(MQ137_PIN);
+        mq137Voltage = analogReadMilliVolts(MQ137_PIN) / 1000.0f;
+
+        char buf[40];
+        snprintf(buf, sizeof(buf), "Sample %d/%d: %.3f V", i + 1, samples, mq137Voltage);
+        tft.drawString(buf, 240, 170, 2);
+
+        float rs = mq137RsFromVoltage();
+        if (rs > 0.0)
+        {
+            sum += rs;
+            good++;
+        }
+
+        delay(500);
+    }
+
+    if (good == 0)
+    {
+        Serial.println("[MQ-137] Calibration failed: no valid readings!");
+        tft.fillScreen(TFT_WHITE);
+        tft.setTextDatum(MC_DATUM);
+        tft.setTextColor(TFT_BLACK, TFT_WHITE);
+        tft.drawString("CALIBRATION FAILED", 240, 100, 4);
+        tft.drawString("Check MQ-137 wiring/power", 240, 150, 2);
+        delay(2000);
+        return;
+    }
+
+    float rsAvg = sum / good;
+    mq137R0 = rsAvg / MQ137_CLEAN_AIR_RATIO;
+    saveMq137R0();
+
+    Serial.printf("[MQ-137] Clean-air Rs avg = %.2f kOhm -> R0 = %.2f kOhm\n", rsAvg, mq137R0);
+
+    tft.fillScreen(TFT_WHITE);
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextColor(TFT_ORANGE, TFT_WHITE);
+    tft.drawString("CALIBRATION DONE", 240, 100, 4);
+    tft.setTextColor(TFT_BLACK, TFT_WHITE);
+    char calText[40];
+    snprintf(calText, sizeof(calText), "R0 = %.2f kOhm", mq137R0);
+    tft.drawString(calText, 240, 150, 2);
+    delay(1500);
+}
+
+// =============================================================================
+// READ MQ-137 (REAL AMMONIA GAS, ppm)
 // =============================================================================
 
 void readAmmonia()
 {
     mq137Raw = analogRead(MQ137_PIN);
-    mq137Voltage = mq137Raw * (3.3 / 4095.0);
+    mq137Voltage = analogReadMilliVolts(MQ137_PIN) / 1000.0f;
+
+    // ~0V output: module unpowered/disconnected -> mark the sensor as failed
+    if (mq137Raw < 8)
+    {
+        ammoniaReady = false;
+        ammoniaPpm = -1.0f;
+        return;
+    }
+
+    float rs = mq137RsFromVoltage();
+    if (rs <= 0.0f)
+    {
+        ammoniaReady = false;
+        ammoniaPpm = -1.0f;
+        return;
+    }
+
+    mq137RsKohm = rs;
+
+    if (mq137R0 <= 0.0f)
+    {
+        // No calibration data yet -> can't compute a ratio, flag the error.
+        ammoniaReady = false;
+        ammoniaPpm = -1.0f;
+        return;
+    }
+
+    mq137Ratio = rs / mq137R0;
+
+    float ppm = 0.0f;
+    if (mq137Ratio > 0.00001f)
+    {
+        ppm = powf(10.0f, (log10f(mq137Ratio) - MQ137_CURVE_B) / MQ137_CURVE_M);
+    }
+
+    if (mq137Voltage >= MQ137_SAT_VOLTS)
+    {
+        // ADC at/near full scale: the true concentration is higher than we can
+        // resolve. Clamp and keep reporting (so web alerts still fire).
+        ppm = MQ137_PPM_MAX;
+        Serial.printf("[MQ-137] ADC SATURATION (%.3f V) - reading clamped to %.0f ppm\n",
+                      mq137Voltage, MQ137_PPM_MAX);
+    }
+
+    ppm = constrain(ppm, 0.0f, MQ137_PPM_MAX);
+
+    // EMA smoothing to tame MQ-series drift/noise
+    if (mq137PpmEma < 0.0f)
+    {
+        mq137PpmEma = ppm;
+    }
+    else
+    {
+        mq137PpmEma += (ppm - mq137PpmEma) * MQ137_EMA_ALPHA;
+    }
+
+    ammoniaPpm = mq137PpmEma;
+    ammoniaReady = true;
+
+    // Deadband: screen only repaints when ppm really moved.
+    if (lastShownPpm < 0.0f || fabsf(ammoniaPpm - lastShownPpm) >= MQ137_PPM_DEADBAND)
+    {
+        lastShownPpm = ammoniaPpm;
+    }
+    ammoniaPpm = lastShownPpm;
 }
 
 // =============================================================================
@@ -371,9 +623,31 @@ void readAllSensors()
 
     Serial.print("MQ-137 Raw ADC: ");
     Serial.print(mq137Raw);
-    Serial.print(" | ADC Voltage: ");
+    Serial.print(" | Vout: ");
     Serial.print(mq137Voltage, 3);
-    Serial.println(" V");
+    Serial.print(" V | Rs: ");
+
+    if (mq137RsKohm > 0.0)
+    {
+        Serial.print(mq137RsKohm, 2);
+        Serial.print(" kOhm | R0: ");
+        Serial.print(mq137R0, 2);
+        Serial.print(" kOhm | NH3: ");
+
+        if (ammoniaReady)
+        {
+            Serial.print(ammoniaPpm, 2);
+            Serial.println(" ppm");
+        }
+        else
+        {
+            Serial.println("ERROR");
+        }
+    }
+    else
+    {
+        Serial.println("N/A");
+    }
 
     Serial.println("========================================");
 }
@@ -424,11 +698,32 @@ void drawPageDots()
 // NAVIGATION
 // =============================================================================
 
-void drawNavigation()
+void drawArrowButton(bool isLeft, bool pressed)
 {
-    tft.setTextDatum(MC_DATUM);
-    tft.setTextColor(TFT_DARKGREY, TFT_WHITE);
-    tft.drawString("Swipe LEFT or RIGHT", 240, 280, 2);
+    int x0 = isLeft ? 20 : 422;
+    int y0 = 248;
+    int w = 38;
+    int h = 52;
+
+    uint16_t fill = pressed ? TFT_YELLOW : TFT_BLUE;
+    uint16_t arrow = pressed ? TFT_NAVY : TFT_WHITE;
+
+    tft.fillRoundRect(x0, y0, w, h, 12, fill);
+
+    if (isLeft)
+    {
+        tft.fillTriangle(x0 + 10, y0 + h / 2, x0 + w - 6, y0 + 12, x0 + w - 6, y0 + h - 12, arrow);
+    }
+    else
+    {
+        tft.fillTriangle(x0 + w - 10, y0 + h / 2, x0 + 6, y0 + 12, x0 + 6, y0 + h - 12, arrow);
+    }
+}
+
+void drawNavigation(bool pressed = false)
+{
+    drawArrowButton(true, pressed);
+    drawArrowButton(false, pressed);
 }
 
 // =============================================================================
@@ -440,36 +735,18 @@ void drawOverview()
     tft.fillScreen(TFT_WHITE);
     drawHeader("CRAYVINGS MONITOR");
 
-    // -------------------------------------------------------------------------
-    // TEMPERATURE BOX
-    // -------------------------------------------------------------------------
-
     tft.drawRect(15, 70, 215, 75, TFT_RED);
     tft.setTextDatum(TL_DATUM);
     tft.setTextColor(TFT_RED, TFT_WHITE);
     tft.drawString("TEMPERATURE", 30, 80, 2);
 
-    // -------------------------------------------------------------------------
-    // WATER LEVEL BOX
-    // -------------------------------------------------------------------------
-
     tft.drawRect(250, 70, 215, 75, TFT_BLUE);
     tft.setTextColor(TFT_BLUE, TFT_WHITE);
     tft.drawString("WATER LEVEL", 265, 80, 2);
 
-    // -------------------------------------------------------------------------
-    // AMMONIA BOX
-    // -------------------------------------------------------------------------
-
     tft.drawRect(15, 160, 215, 75, TFT_ORANGE);
     tft.setTextColor(TFT_ORANGE, TFT_WHITE);
     tft.drawString("MQ-137", 30, 170, 2);
-
-    // -------------------------------------------------------------------------
-    // DISTANCE BOX
-    // -------------------------------------------------------------------------
-    // The distance VALUE is intentionally not displayed.
-    // -------------------------------------------------------------------------
 
     tft.drawRect(250, 160, 215, 75, TFT_GREEN);
     tft.setTextColor(TFT_GREEN, TFT_WHITE);
@@ -479,29 +756,12 @@ void drawOverview()
     tft.setTextDatum(TL_DATUM);
     tft.drawString("HC-SR04", 265, 195, 2);
 
-    // -------------------------------------------------------------------------
-    // NAVIGATION
-    // -------------------------------------------------------------------------
-
     drawNavigation();
     drawPageDots();
 }
 
-// =============================================================================
-// UPDATE OVERVIEW VALUES
-// =============================================================================
-//
-// IMPORTANT:
-// Only the value areas are cleared.
-// The entire screen is NOT redrawn.
-// =============================================================================
-
 void updateOverview()
 {
-    // -------------------------------------------------------------------------
-    // TEMPERATURE VALUE
-    // -------------------------------------------------------------------------
-
     tft.fillRect(25, 102, 195, 35, TFT_WHITE);
     tft.setTextDatum(TL_DATUM);
     tft.setTextColor(TFT_BLACK, TFT_WHITE);
@@ -518,27 +778,24 @@ void updateOverview()
 
     tft.drawString(tempText, 30, 105, 4);
 
-    // -------------------------------------------------------------------------
-    // WATER LEVEL VALUE
-    // -------------------------------------------------------------------------
-
     tft.fillRect(260, 102, 195, 35, TFT_WHITE);
     char levelText[30];
     snprintf(levelText, sizeof(levelText), "%.1f %%", waterLevel);
     tft.drawString(levelText, 265, 105, 4);
 
-    // -------------------------------------------------------------------------
-    // AMMONIA VALUE
-    // -------------------------------------------------------------------------
-
     tft.fillRect(25, 192, 195, 35, TFT_WHITE);
     char ammoniaText[30];
-    snprintf(ammoniaText, sizeof(ammoniaText), "%.3f V", mq137Voltage);
-    tft.drawString(ammoniaText, 30, 195, 4);
 
-    // -------------------------------------------------------------------------
-    // WATER STATUS
-    // -------------------------------------------------------------------------
+    if (ammoniaReady)
+    {
+        snprintf(ammoniaText, sizeof(ammoniaText), "%.1f ppm", ammoniaPpm);
+    }
+    else
+    {
+        strcpy(ammoniaText, "ERROR");
+    }
+
+    tft.drawString(ammoniaText, 30, 195, 4);
 
     tft.fillRect(260, 192, 195, 35, TFT_WHITE);
     const char *status;
@@ -560,10 +817,6 @@ void updateOverview()
     tft.setTextColor(TFT_BLACK, TFT_WHITE);
     tft.drawString(status, 265, 195, 4);
 }
-
-// =============================================================================
-// TEMPERATURE PAGE
-// =============================================================================
 
 void drawTemperaturePage()
 {
@@ -589,10 +842,6 @@ void drawTemperaturePage()
     drawPageDots();
 }
 
-// =============================================================================
-// UPDATE TEMPERATURE PAGE
-// =============================================================================
-
 void updateTemperaturePage()
 {
     tft.fillRect(60, 95, 360, 90, TFT_WHITE);
@@ -611,34 +860,21 @@ void updateTemperaturePage()
     }
 }
 
-// =============================================================================
-// WATER LEVEL PAGE
-// =============================================================================
-
 void drawWaterLevelPage()
 {
     tft.fillScreen(TFT_WHITE);
     drawHeader("WATER LEVEL");
 
-    // -------------------------------------------------------------------------
-    // BAR OUTLINE
-    // -------------------------------------------------------------------------
+    lastLevelText[0] = '\0';
+    lastBarWidth = -1;
 
     tft.drawRect(70, 80, 340, 80, TFT_BLUE);
-
-    // -------------------------------------------------------------------------
-    // PERCENTAGE
-    // -------------------------------------------------------------------------
 
     tft.setTextDatum(MC_DATUM);
     tft.setTextColor(TFT_BLUE, TFT_WHITE);
     char levelText[30];
     snprintf(levelText, sizeof(levelText), "%.1f %%", waterLevel);
     tft.drawString(levelText, 240, 205, 6);
-
-    // -------------------------------------------------------------------------
-    // SENSOR LABEL
-    // -------------------------------------------------------------------------
 
     tft.setTextColor(TFT_BLACK, TFT_WHITE);
     tft.drawString("HC-SR04 WATER LEVEL", 240, 245, 2);
@@ -648,108 +884,114 @@ void drawWaterLevelPage()
     updateWaterLevelPage();
 }
 
-// =============================================================================
-// UPDATE WATER LEVEL
-// =============================================================================
-
 void updateWaterLevelPage()
 {
-    // -------------------------------------------------------------------------
-    // CLEAR INSIDE OF BAR
-    // -------------------------------------------------------------------------
+    char levelText[30];
+    snprintf(levelText, sizeof(levelText), "%.1f %%", waterLevel);
 
-    tft.fillRect(72, 82, 336, 76, TFT_WHITE);
-
-    // -------------------------------------------------------------------------
-    // WATER LEVEL BAR
-    // -------------------------------------------------------------------------
+    if (strcmp(lastLevelText, levelText) != 0)
+    {
+        strcpy(lastLevelText, levelText);
+        tft.fillRect(90, 175, 300, 60, TFT_WHITE);
+        tft.setTextDatum(MC_DATUM);
+        tft.setTextColor(TFT_BLUE, TFT_WHITE);
+        tft.drawString(levelText, 240, 205, 6);
+    }
 
     int fillWidth = (int)(336.0 * waterLevel / 100.0);
     fillWidth = constrain(fillWidth, 0, 336);
 
-    if (fillWidth > 0)
+    if (lastBarWidth < 0)
     {
-        tft.fillRect(72, 82, fillWidth, 76, TFT_BLUE);
+        tft.fillRect(72, 82, 336, 76, TFT_WHITE);
+
+        if (fillWidth > 0)
+        {
+            tft.fillRect(72, 82, fillWidth, 76, TFT_BLUE);
+        }
+    }
+    else if (fillWidth > lastBarWidth)
+    {
+        tft.fillRect(72 + lastBarWidth, 82, fillWidth - lastBarWidth, 76, TFT_BLUE);
+    }
+    else if (fillWidth < lastBarWidth)
+    {
+        tft.fillRect(72 + fillWidth, 82, lastBarWidth - fillWidth, 76, TFT_WHITE);
     }
 
-    // -------------------------------------------------------------------------
-    // REDRAW BORDER
-    // -------------------------------------------------------------------------
-
-    tft.drawRect(70, 80, 340, 80, TFT_BLUE);
-
-    // -------------------------------------------------------------------------
-    // UPDATE PERCENTAGE
-    // -------------------------------------------------------------------------
-
-    tft.fillRect(90, 175, 300, 60, TFT_WHITE);
-    tft.setTextDatum(MC_DATUM);
-    tft.setTextColor(TFT_BLUE, TFT_WHITE);
-    char levelText[30];
-    snprintf(levelText, sizeof(levelText), "%.1f %%", waterLevel);
-    tft.drawString(levelText, 240, 205, 6);
+    lastBarWidth = fillWidth;
 }
-
-// =============================================================================
-// AMMONIA PAGE
-// =============================================================================
 
 void drawAmmoniaPage()
 {
     tft.fillScreen(TFT_WHITE);
     drawHeader("MQ-137 AMMONIA");
-    tft.setTextDatum(MC_DATUM);
-    tft.setTextColor(TFT_ORANGE, TFT_WHITE);
 
-    char voltageText[30];
-    snprintf(voltageText, sizeof(voltageText), "%.3f V", mq137Voltage);
-    tft.drawString(voltageText, 240, 125, 7);
+    char ppmText[30];
+
+    if (ammoniaReady)
+    {
+        snprintf(ppmText, sizeof(ppmText), "%.1f ppm", ammoniaPpm);
+    }
+    else
+    {
+        strcpy(ppmText, "-- ppm");
+    }
+
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextColor(ppmText[0] == '-' ? TFT_RED : TFT_ORANGE, TFT_WHITE);
+    tft.drawString(ppmText, 240, 120, 7);
 
     tft.setTextColor(TFT_BLACK, TFT_WHITE);
     char rawText[30];
-    snprintf(rawText, sizeof(rawText), "RAW ADC: %d", mq137Raw);
-    tft.drawString(rawText, 240, 200, 3);
+    snprintf(rawText, sizeof(rawText), "RAW ADC: %d | %.3f V", mq137Raw, mq137Voltage);
+    tft.drawString(rawText, 240, 195, 3);
 
-    tft.drawString("MQ-137 AOUT", 240, 235, 2);
+    char r0Text[30];
+
+    if (mq137R0 > 0.0f)
+    {
+        snprintf(r0Text, sizeof(r0Text), "R0: %.1f kOhm", mq137R0);
+    }
+    else
+    {
+        strcpy(r0Text, "R0: -- kOhm");
+    }
+
+    tft.drawString(r0Text, 240, 235, 2);
+
     tft.setTextColor(TFT_DARKGREY, TFT_WHITE);
-    tft.drawString("Voltage test only", 240, 280, 2);
+    tft.drawString("NH3 gas concentration in air", 240, 275, 2);
+    tft.drawString("Triple-tap top-right: recalibrate", 240, 295, 2);
+    drawNavigation();
     drawPageDots();
 }
 
-// =============================================================================
-// UPDATE AMMONIA PAGE
-// =============================================================================
-
 void updateAmmoniaPage()
 {
-    // -------------------------------------------------------------------------
-    // VOLTAGE
-    // -------------------------------------------------------------------------
-
-    tft.fillRect(70, 85, 340, 80, TFT_WHITE);
+    tft.fillRect(60, 80, 360, 90, TFT_WHITE);
     tft.setTextDatum(MC_DATUM);
-    tft.setTextColor(TFT_ORANGE, TFT_WHITE);
-    char voltageText[30];
-    snprintf(voltageText, sizeof(voltageText), "%.3f V", mq137Voltage);
-    tft.drawString(voltageText, 240, 125, 7);
 
-    // -------------------------------------------------------------------------
-    // RAW ADC
-    // -------------------------------------------------------------------------
+    char ppmText[30];
 
-    tft.fillRect(120, 180, 240, 35, TFT_WHITE);
+    if (ammoniaReady)
+    {
+        snprintf(ppmText, sizeof(ppmText), "%.1f ppm", ammoniaPpm);
+    }
+    else
+    {
+        strcpy(ppmText, "-- ppm");
+    }
+
+    tft.setTextColor(ppmText[0] == '-' ? TFT_RED : TFT_ORANGE, TFT_WHITE);
+    tft.drawString(ppmText, 240, 120, 7);
+
+    tft.fillRect(100, 175, 280, 40, TFT_WHITE);
     tft.setTextColor(TFT_BLACK, TFT_WHITE);
     char rawText[30];
-    snprintf(rawText, sizeof(rawText), "RAW ADC: %d", mq137Raw);
-    tft.drawString(rawText, 240, 200, 3);
+    snprintf(rawText, sizeof(rawText), "RAW ADC: %d | %.3f V", mq137Raw, mq137Voltage);
+    tft.drawString(rawText, 240, 195, 3);
 }
-
-// =============================================================================
-// DRAW CURRENT PAGE
-// =============================================================================
-//
-// Called ONLY when changing pages.
-// =============================================================================
 
 void drawCurrentPage()
 {
@@ -772,15 +1014,9 @@ void drawCurrentPage()
             drawAmmoniaPage();
             break;
     }
-}
 
-// =============================================================================
-// UPDATE CURRENT PAGE
-// =============================================================================
-//
-// This does NOT call fillScreen().
-// This is the important anti-blinking section.
-// =============================================================================
+    drawNavigation();
+}
 
 void updateCurrentPage()
 {
@@ -802,11 +1038,9 @@ void updateCurrentPage()
             updateAmmoniaPage();
             break;
     }
-}
 
-// =============================================================================
-// NEXT PAGE
-// =============================================================================
+    drawNavigation();
+}
 
 void nextPage()
 {
@@ -816,12 +1050,8 @@ void nextPage()
         currentPage = PAGE_OVERVIEW;
     }
     drawCurrentPage();
-    lastSwipeTime = millis();
+    lastPageChange = millis();
 }
-
-// =============================================================================
-// PREVIOUS PAGE
-// =============================================================================
 
 void previousPage()
 {
@@ -831,22 +1061,14 @@ void previousPage()
         currentPage = PAGE_COUNT - 1;
     }
     drawCurrentPage();
-    lastSwipeTime = millis();
+    lastPageChange = millis();
 }
-
-// =============================================================================
-// TOUCH / SWIPE
-// =============================================================================
 
 void handleTouch()
 {
     uint16_t x = lastTouchX;
     uint16_t y = lastTouchY;
     bool pressed = getTouchPosition(x, y);
-
-    // -------------------------------------------------------------------------
-    // FINGER IS DOWN
-    // -------------------------------------------------------------------------
 
     if (pressed)
     {
@@ -856,119 +1078,114 @@ void handleTouch()
         if (!touching)
         {
             touching = true;
-            touchStartX = x;
-            touchStartY = y;
             Serial.print("[TOUCH START] X=");
             Serial.print(x);
             Serial.print(" Y=");
             Serial.println(y);
+
+            if (
+                (x < 80 && y > 240 && y < 305) ||
+                (x > 400 && y > 240 && y < 305)
+            )
+            {
+                drawNavigation(true);
+            }
         }
         return;
     }
-
-    // -------------------------------------------------------------------------
-    // NO TOUCH
-    // -------------------------------------------------------------------------
 
     if (!touching)
     {
         return;
     }
 
-    // -------------------------------------------------------------------------
-    // FINGER RELEASED
-    // -------------------------------------------------------------------------
-
     touching = false;
     uint16_t endX = lastTouchX;
     uint16_t endY = lastTouchY;
-    int dx = (int)endX - (int)touchStartX;
-    int dy = (int)endY - (int)touchStartY;
 
-    Serial.print("[SWIPE] DX=");
-    Serial.print(dx);
-    Serial.print(" DY=");
-    Serial.println(dy);
+    Serial.print("[TOUCH END] X=");
+    Serial.print(endX);
+    Serial.print(" Y=");
+    Serial.println(endY);
 
-    // -------------------------------------------------------------------------
-    // COOLDOWN
-    // -------------------------------------------------------------------------
+    drawNavigation();
 
-    if (millis() - lastSwipeTime < SWIPE_COOLDOWN)
+    if (millis() - lastPageChange < PAGE_CHANGE_COOLDOWN)
     {
         return;
     }
 
-    // -------------------------------------------------------------------------
-    // HORIZONTAL SWIPE ONLY
-    // -------------------------------------------------------------------------
-
-    if (abs(dx) >= SWIPE_DISTANCE && abs(dx) > abs(dy))
+    // Left arrow button region (bottom-left)
+    if (endX < 80 && endY > 240 && endY < 305)
     {
-        // ---------------------------------------------------------------------
-        // SWIPE LEFT
-        // ---------------------------------------------------------------------
-
-        if (dx < 0)
-        {
-            Serial.println("[SWIPE] LEFT -> NEXT PAGE");
-            nextPage();
-        }
-        // ---------------------------------------------------------------------
-        // SWIPE RIGHT
-        // ---------------------------------------------------------------------
-
-        else
-        {
-            Serial.println("[SWIPE] RIGHT -> PREVIOUS PAGE");
-            previousPage();
-        }
+        Serial.println("[NAV] LEFT ARROW -> PREVIOUS PAGE");
+        previousPage();
+        return;
     }
-    // -------------------------------------------------------------------------
-    // SPECIAL GESTURE: Tap top corner 3 times quickly to enter WiFi config
-    // -------------------------------------------------------------------------
-    else if (abs(dx) < 30 && abs(dy) < 30)  // Tap (not swipe)
+
+    // Right arrow button region (bottom-right)
+    if (endX > 400 && endY > 240 && endY < 305)
+    {
+        Serial.println("[NAV] RIGHT ARROW -> NEXT PAGE");
+        nextPage();
+        return;
+    }
+
+    // Triple tap on top-left corner for WiFi config
+    if (endX < 60 && endY < 60)
     {
         static uint8_t tapCount = 0;
         static unsigned long lastTapTime = 0;
         unsigned long now = millis();
 
-        // Reset tap counter if too much time has passed
         if (now - lastTapTime > 1000)
         {
             tapCount = 0;
         }
 
-        // Check if tap is in top-left corner (configuration trigger zone)
-        if (x < 60 && y < 60)
-        {
-            tapCount++;
-            lastTapTime = now;
-            Serial.printf("[CONFIG] Tap %d/3 detected\n", tapCount);
+        tapCount++;
+        lastTapTime = now;
+        Serial.printf("[CONFIG] Tap %d/3 detected\n", tapCount);
 
-            if (tapCount >= 3)
-            {
-                Serial.println("[CONFIG] Triple tap detected! Starting WiFi configuration...");
-                wifiConfigRequested = true;
-                tapCount = 0;  // Reset after triggering
-            }
-        }
-        else
+        if (tapCount >= 3)
         {
-            tapCount = 0;  // Reset if tap is not in the zone
+            Serial.println("[CONFIG] Triple tap detected! Starting WiFi configuration...");
+            wifiConfigRequested = true;
+            tapCount = 0;
+        }
+    }
+
+    // Triple tap on top-right corner to recalibrate the MQ-137 (clean air)
+    if (endX > 420 && endY < 60)
+    {
+        static uint8_t calTapCount = 0;
+        static unsigned long lastCalTapTime = 0;
+        unsigned long now = millis();
+
+        if (now - lastCalTapTime > 1000)
+        {
+            calTapCount = 0;
+        }
+
+        calTapCount++;
+        lastCalTapTime = now;
+        Serial.printf("[MQ-137] Calibration tap %d/3 detected\n", calTapCount);
+
+        if (calTapCount >= 3)
+        {
+            Serial.println("[MQ-137] Triple tap detected! Recalibrating R0 in clean air...");
+            calibrateMq137R0();
+            calTapCount = 0;
+            tft.fillScreen(TFT_WHITE);
+            drawCurrentPage();
         }
     }
 }
-
-// =============================================================================
-// START WIFI CONFIGURATION PORTAL
-// =============================================================================
 
 void startWifiConfigPortal()
 {
     Serial.println("[WIFI] Starting configuration portal...");
 
-    // Show configuration message on screen
     tft.fillScreen(TFT_WHITE);
     tft.setTextDatum(MC_DATUM);
     tft.setTextColor(TFT_BLACK, TFT_WHITE);
@@ -981,7 +1198,6 @@ void startWifiConfigPortal()
     WiFi.mode(WIFI_AP_STA);
     WiFiManager wm;
 
-    // Create parameters for configuration
     WiFiManagerParameter serverIPParam(
         "server_ip",
         "Backend Server IP (e.g. 192.168.1.100)",
@@ -1007,7 +1223,7 @@ void startWifiConfigPortal()
     wm.addParameter(&serverPortParam);
     wm.addParameter(&deviceIdParam);
 
-    wm.setConfigPortalTimeout(180);  // 3 minutes timeout
+    wm.setConfigPortalTimeout(180);
     wm.setConnectTimeout(10);
 
     bool wifiResult = wm.autoConnect("Aquaculture-Setup");
@@ -1019,12 +1235,10 @@ void startWifiConfigPortal()
         Serial.print("[WIFI] IP: ");
         Serial.println(WiFi.localIP());
 
-        // Save the configured values
         strncpy(serverIP, serverIPParam.getValue(), sizeof(serverIP) - 1);
         strncpy(serverPort, serverPortParam.getValue(), sizeof(serverPort) - 1);
         strncpy(deviceId, deviceIdParam.getValue(), sizeof(deviceId) - 1);
 
-        // Ensure null termination
         serverIP[sizeof(serverIP) - 1] = '\0';
         serverPort[sizeof(serverPort) - 1] = '\0';
         deviceId[sizeof(deviceId) - 1] = '\0';
@@ -1036,7 +1250,6 @@ void startWifiConfigPortal()
         Serial.print("[WIFI] Device ID: ");
         Serial.println(deviceId);
 
-        // Update the display to show connected status
         tft.fillScreen(TFT_WHITE);
         tft.setTextDatum(MC_DATUM);
         tft.setTextColor(TFT_BLACK, TFT_WHITE);
@@ -1059,12 +1272,8 @@ void startWifiConfigPortal()
 
     wifiConfigRequested = false;
     tft.fillScreen(TFT_WHITE);
-    drawCurrentPage();  // Redraw the current page after configuration
+    drawCurrentPage();
 }
-
-// =============================================================================
-// SEND SENSOR DATA TO BACKEND
-// =============================================================================
 
 void sendSensorData()
 {
@@ -1084,16 +1293,18 @@ void sendSensorData()
     url += "/sensor";
 
     http.begin(url);
+    http.setConnectTimeout(1000);
+    http.setTimeout(1000);
     http.addHeader("Content-Type", "application/json");
 
     float tempToSend = (temperature == -127.0) ? -1.0 : temperature;
-    float ammoniaValue = (mq137Voltage / 3.3);
+    float ammoniaToSend = ammoniaReady ? ammoniaPpm : -1.0;
 
     String payload = "{";
     payload += "\"device_id\":\"" + String(deviceId) + "\",";
     payload += "\"temperature\":" + String(tempToSend, 2) + ",";
     payload += "\"water_level\":" + String(waterLevel, 1) + ",";
-    payload += "\"ammonia\":" + String(ammoniaValue, 4);
+    payload += "\"ammonia\":" + String(ammoniaToSend, 3);
     payload += "}";
 
     Serial.print("[HTTP] POST ");
@@ -1113,16 +1324,11 @@ void sendSensorData()
         Serial.print("[HTTP] Error: ");
         Serial.println(http.errorToString(httpResponseCode));
 
-        // Mark as disconnected so we can retry
         wifiConnected = false;
     }
 
     http.end();
 }
-
-// =============================================================================
-// SETUP
-// =============================================================================
 
 void setup()
 {
@@ -1135,42 +1341,27 @@ void setup()
     Serial.println("for Crayfish Production");
     Serial.println("================================================");
 
-    // =========================================================================
-    // DS18B20
-    // =========================================================================
-
     sensors.begin();
+    sensors.setWaitForConversion(false);
     Serial.println("[OK] DS18B20 -> GPIO13");
-
-    // =========================================================================
-    // HC-SR04
-    // =========================================================================
 
     pinMode(TRIG_PIN, OUTPUT);
     pinMode(ECHO_PIN, INPUT);
     digitalWrite(TRIG_PIN, LOW);
     Serial.println("[OK] HC-SR04 -> GPIO26 / GPIO27");
 
-    // =========================================================================
-    // MQ-137
-    // =========================================================================
-
     pinMode(MQ137_PIN, INPUT);
     analogReadResolution(12);
-    Serial.println("[OK] MQ-137 -> GPIO34");
-
-    // =========================================================================
-    // TOUCH
-    // =========================================================================
+    // No analogSetPinAttenuation() call here on purpose: ALL ESP32 Arduino cores
+    // default ADC pins to 11dB attenuation (~3.1V max), and the attenuation
+    // enum names (ADC_ATTENDB_11 / ADC_ATTEN_DB_11 / ADC_11db) differ across
+    // core versions, which caused a compile error on older cores.
+    Serial.println("[OK] MQ-137 -> GPIO34 (default 11dB attenuation, 3.3V ADC)");
 
     pinMode(TOUCH_CS, OUTPUT);
     digitalWrite(TOUCH_CS, HIGH);
     touchSPI.begin(TOUCH_CLK, TOUCH_MISO, TOUCH_MOSI, TOUCH_CS);
     Serial.println("[OK] XPT2046 Touch initialized");
-
-    // =========================================================================
-    // ILI9488
-    // =========================================================================
 
     tft.init();
     tft.setRotation(1);
@@ -1180,10 +1371,6 @@ void setup()
     Serial.print("[DISPLAY] Height = ");
     Serial.println(tft.height());
 
-    // =========================================================================
-    // WIFI - Initial Connection Attempt
-    // =========================================================================
-
     Serial.println("[WIFI] Attempting to connect to saved network...");
     tft.fillScreen(TFT_WHITE);
     tft.setTextDatum(MC_DATUM);
@@ -1192,16 +1379,14 @@ void setup()
     tft.drawString("Connecting to saved network...", 240, 130, 2);
     tft.drawString("Tap top-left corner 3x to config", 240, 200, 2);
 
-    WiFi.mode(WIFI_STA);  // Start in station mode only
+    WiFi.mode(WIFI_STA);
 
-    // Try to connect to saved network first
     WiFi.begin();
 
     unsigned long startAttemptTime = millis();
     bool connected = false;
 
-    // Wait for connection with timeout
-    while (millis() - startAttemptTime < 15000)  // 15 second timeout
+    while (millis() - startAttemptTime < 15000)
     {
         if (WiFi.status() == WL_CONNECTED)
         {
@@ -1229,57 +1414,48 @@ void setup()
         Serial.println("[WIFI] No saved network or connection failed.");
         Serial.println("[WIFI] Starting configuration portal...");
 
-        // Start configuration portal since we couldn't connect
         startWifiConfigPortal();
     }
 
-    // =========================================================================
-    // INITIAL SENSOR READING
-    // =========================================================================
-
     readAllSensors();
 
-    // =========================================================================
-    // INITIAL SCREEN
-    // =========================================================================
+    // Load a previously calibrated MQ-137 R0, or run the clean-air calibration
+    // on first boot (needs the display up, since it shows progress on screen).
+    if (!loadMq137R0())
+    {
+        Serial.println("[MQ-137] No saved R0 - starting clean-air calibration...");
+        calibrateMq137R0();
+    }
+    else
+    {
+        Serial.printf("[MQ-137] Loaded R0 = %.2f kOhm from NVS\n", mq137R0);
+    }
 
     currentPage = PAGE_OVERVIEW;
     drawCurrentPage();
 
     Serial.println();
     Serial.println("[SYSTEM] READY");
-    Serial.println("[SYSTEM] Swipe LEFT  = Next Page");
-    Serial.println("[SYSTEM] Swipe RIGHT = Previous Page");
+    Serial.println("[SYSTEM] Tap RIGHT arrow = Next Page");
+    Serial.println("[SYSTEM] Tap LEFT arrow  = Previous Page");
     Serial.println("[SYSTEM] Tap top-left corner 3x = WiFi Config");
+    Serial.println("[SYSTEM] Tap top-right corner 3x = MQ-137 Recalibrate");
     Serial.println();
 }
-
-// =============================================================================
-// LOOP
-// =============================================================================
 
 void loop()
 {
     unsigned long now = millis();
-
-    // =========================================================================
-    // SENSOR READING
-    // =========================================================================
 
     if (now - lastSensorRead >= SENSOR_INTERVAL)
     {
         lastSensorRead = now;
         readAllSensors();
 
-        // IMPORTANT:
-        // Update values only.
-        // Do NOT redraw the complete screen.
         updateCurrentPage();
     }
 
-    // =========================================================================
-    // SEND DATA TO BACKEND
-    // =========================================================================
+    handleTouch();
 
     if (now - lastSendTime >= SEND_INTERVAL)
     {
@@ -1287,22 +1463,10 @@ void loop()
         sendSensorData();
     }
 
-    // =========================================================================
-    // HANDLE WIFI CONFIGURATION REQUEST
-    // =========================================================================
-
     if (wifiConfigRequested)
     {
         startWifiConfigPortal();
     }
 
-    // =========================================================================
-    // TOUCH
-    // =========================================================================
-
-    handleTouch();
-
-    // Small delay prevents excessive touch polling
-    // while keeping the interface responsive.
-    delay(20);
+    delay(2);
 }

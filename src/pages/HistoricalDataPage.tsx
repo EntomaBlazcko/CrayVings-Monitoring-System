@@ -38,7 +38,18 @@ import TrendCard from "../components/TrendCard";
 import { ErrorCard } from "../components/Loading";
 import { useSensors } from "../hooks/useSensors";
 import { fetchSensorHistory, fetchWeeklyReport } from "../api/client";
+import { isAxiosError } from "axios";
 import type { ChartPoint, WeeklyReport } from "../types";
+
+// Detects a request that was cancelled by an AbortController. React
+// (fetch) throws a native AbortError, while axios surfaces the same
+// cancellation as ERR_CANCELED / CanceledError. Checking both avoids
+// setting a spurious error on every range switch (the effect cleanup
+// aborts the previous request).
+function isAbortError(err: unknown): boolean {
+  if (err instanceof DOMException) return err.name === "AbortError";
+  return isAxiosError(err) && (err.code === "ERR_CANCELED" || err.name === "CanceledError");
+}
 
 type TimeRange = "1h" | "6h" | "24h" | "1w" | "all";
 
@@ -119,9 +130,9 @@ export default function HistoricalDataPage() {
         setHistoryFetchError(null);
         setDynamicLoading(false);
       })
-      .catch((err: Error) => {
-        if (err.name !== 'AbortError') {
-          setHistoryFetchError(err?.message || 'Failed to load historical data');
+      .catch((err: unknown) => {
+        if (!isAbortError(err)) {
+          setHistoryFetchError((err as Error)?.message || 'Failed to load historical data');
         }
         setDynamicLoading(false);
       });
@@ -148,9 +159,9 @@ export default function HistoricalDataPage() {
         setWeeklyReport(data);
         setWeeklyReportLoading(false);
       })
-      .catch((err: Error) => {
-        if (err.name !== 'AbortError') {
-          setWeeklyReportError(err?.message || 'Failed to load weekly report');
+      .catch((err: unknown) => {
+        if (!isAbortError(err)) {
+          setWeeklyReportError((err as Error)?.message || 'Failed to load weekly report');
         }
         setWeeklyReportLoading(false);
       });
@@ -267,7 +278,7 @@ export default function HistoricalDataPage() {
     const s = [
       `Temperature: Avg ${(summary.temp_avg ?? 0).toFixed(1)}°C, Min ${(summary.temp_min ?? 0).toFixed(1)}°C, Max ${(summary.temp_max ?? 0).toFixed(1)}°C`,
       `Water Level: Avg ${(summary.water_avg ?? 0).toFixed(0)}%, Min ${(summary.water_min ?? 0).toFixed(0)}%, Max ${(summary.water_max ?? 0).toFixed(0)}%`,
-      `Ammonia: Avg ${(summary.ammonia_avg ?? 0).toFixed(2)} mg/L, Min ${(summary.ammonia_min ?? 0).toFixed(2)} mg/L, Max ${(summary.ammonia_max ?? 0).toFixed(2)} mg/L`,
+      `Ammonia: Avg ${(summary.ammonia_avg ?? 0).toFixed(2)} ppm, Min ${(summary.ammonia_min ?? 0).toFixed(2)} ppm, Max ${(summary.ammonia_max ?? 0).toFixed(2)} ppm`,
       `Total Readings: ${(summary.total_readings ?? 0).toLocaleString()}`,
       `Total Alerts: ${report.alerts.total ?? 0}`,
     ];
@@ -284,8 +295,8 @@ export default function HistoricalDataPage() {
         `${(d.temp_min ?? 0).toFixed(1)} - ${(d.temp_max ?? 0).toFixed(1)}°C`,
         `${(d.water_avg ?? 0).toFixed(0)}%`,
         `${(d.water_min ?? 0).toFixed(0)} - ${(d.water_max ?? 0).toFixed(0)}%`,
-        `${(d.ammonia_avg ?? 0).toFixed(2)} mg/L`,
-        `${(d.ammonia_min ?? 0).toFixed(2)} - ${(d.ammonia_max ?? 0).toFixed(2)} mg/L`,
+        `${(d.ammonia_avg ?? 0).toFixed(2)} ppm`,
+        `${(d.ammonia_min ?? 0).toFixed(2)} - ${(d.ammonia_max ?? 0).toFixed(2)} ppm`,
         (d.readings ?? 0).toLocaleString(),
         String(d.alerts ?? 0),
       ]),
@@ -606,7 +617,7 @@ export default function HistoricalDataPage() {
             )}
           </div>
           <div className="text-2xl font-bold text-gray-800">
-            {latestReading?.ammonia != null ? Number(latestReading.ammonia).toFixed(2) : "--"}<span className="text-base font-normal text-gray-500"> mg/L</span>
+            {latestReading?.ammonia != null ? Number(latestReading.ammonia).toFixed(2) : "--"}<span className="text-base font-normal text-gray-500"> ppm</span>
           </div>
         </div>
       </div>
@@ -627,7 +638,7 @@ export default function HistoricalDataPage() {
             stroke="#2563eb"
           />
           <TrendCard
-            title="Ammonia (mg/L)"
+            title="Ammonia (ppm)"
             data={filteredHistory}
             dataKey="ammonia"
             stroke="#10b981"

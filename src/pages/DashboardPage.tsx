@@ -80,7 +80,7 @@ export default function DashboardPage() {
         <div className={offlineClass}>
           <StatCard
             title="Ammonia"
-            value={data ? `${data.ammonia} mg/L` : "-- mg/L"}
+            value={data ? `${data.ammonia} ppm` : "-- ppm"}
             loading={loading}
             color={loading ? "#9ca3af" : isOfflineWithData ? "#9ca3af" : data ? "#10b981" : "#ef4444"}
             icon={<FlaskConical size={18} />}
@@ -193,7 +193,7 @@ export default function DashboardPage() {
                       <td className="py-1">{new Date(h.timestamp).toLocaleTimeString()}</td>
                       <td className="text-center py-1">{h.temperature != null ? `${h.temperature}°C` : "--"}</td>
                       <td className="text-center py-1">{h.water_level != null ? `${h.water_level}%` : "--"}</td>
-                      <td className="text-center py-1">{h.ammonia != null ? `${h.ammonia} mg/L` : "--"}</td>
+                      <td className="text-center py-1">{h.ammonia != null ? `${h.ammonia} ppm` : "--"}</td>
                     </tr>
                   ))}
                 </tbody>

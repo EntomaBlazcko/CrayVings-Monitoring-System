@@ -50,7 +50,7 @@ This can help reduce risks caused by poor water conditions and improve overall m
 |-----------|--------|------------|
 | Temperature | DS18B20 | 20 - 31°C |
 | Water Level | Ultrasonic HC-SR04 | 10 - 100% |
-| Ammonia | Simulated (MQ-137 when available) | 0 - 1.0 mg/L |
+| Ammonia | MQ-137 (NH3 gas) | 0 - 25 ppm |
 
 ### Dashboard Pages
 - **Home** - Overview, quick stats, connection status, system alerts
@@ -281,7 +281,7 @@ esp32code/esp32code.ino        # ESP32 firmware (WiFiManager)
 ```bash
 curl http://localhost:3000/health
 curl http://localhost:3000/sensor/latest
-curl -X POST http://localhost:3000/sensor -H "Content-Type: application/json" -d '{"device_id":"TEST","temperature":25,"water_level":75,"ammonia":0.12}'
+curl -X POST http://localhost:3000/sensor -H "Content-Type: application/json" -d '{"device_id":"TEST","temperature":25,"water_level":75,"ammonia":4.5}'
 curl -X POST http://localhost:3000/alert/mute -H "Content-Type: application/json" -d '{"hours": 4}'
 ```
 

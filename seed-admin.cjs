@@ -2,10 +2,14 @@ const { Pool } = require("pg");
 const crypto = require("crypto");
 require("dotenv").config();
 
+const PBKDF2_ITERATIONS = 600000;
+const PBKDF2_KEYLEN = 64;
+const PBKDF2_DIGEST = "sha512";
+
 function hashPassword(password) {
   const salt = crypto.randomBytes(16).toString("hex");
-  const hash = crypto.pbkdf2Sync(password, salt, 10000, 64, "sha512").toString("hex");
-  return `${salt}:${hash}`;
+  const hash = crypto.pbkdf2Sync(password, salt, PBKDF2_ITERATIONS, PBKDF2_KEYLEN, PBKDF2_DIGEST).toString("hex");
+  return `${PBKDF2_ITERATIONS}:${salt}:${hash}`;
 }
 
 async function seedAdmin() {
@@ -18,7 +22,11 @@ async function seedAdmin() {
   });
 
   try {
-    const password = process.env.ADMIN_INITIAL_PASSWORD || "Admin@123";
+    const password = process.env.ADMIN_INITIAL_PASSWORD;
+    if (!password) {
+      console.error("❌ ADMIN_INITIAL_PASSWORD is not set. Set it in .env to create the initial admin.");
+      return;
+    }
     console.log("Checking admin account...");
     const result = await pool.query("SELECT id FROM users WHERE username = $1", ["admin"]);
 

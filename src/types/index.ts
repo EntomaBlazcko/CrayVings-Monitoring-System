@@ -32,7 +32,7 @@ export type SensorEntry = {
   device_id: string;       // ESP32 device identifier
   temperature: number;     // Water temperature in Celsius
   water_level: number;     // Water level as percentage
-  ammonia: number;         // Ammonia concentration in mg/L
+  ammonia: number;         // Ammonia gas concentration in ppm (NH3, MQ-137)
   timestamp?: string;      // ISO 8601 timestamp of the reading
 };
 
@@ -127,7 +127,7 @@ export type SensorSettings = {
 /**
  * Default threshold values used when no settings exist in the database.
  * These represent safe ranges for crayfish aquaculture.
- * Temperature: 20-31°C, Water Level: 10-100%, Ammonia: 0-1.0 mg/L
+ * Temperature: 20-31°C, Water Level: 10-100%, Ammonia: 0-25 ppm
  */
 export const DEFAULT_SETTINGS: SensorSettings = {
   temp_min:20.0,
@@ -135,7 +135,7 @@ export const DEFAULT_SETTINGS: SensorSettings = {
   water_level_min:10.0,
   water_level_max:100.0,
   ammonia_min:0.0,
-  ammonia_max:1.0,
+  ammonia_max:25.0,
 };
 
 // ========================
@@ -188,7 +188,7 @@ export function getSettingsThresholds(settings: SensorSettings | null): Record<s
     },
     ammonia: {
       name: "Ammonia",
-      unit: "mg/L",
+      unit: "ppm",
       range: { min: defaults.ammonia_min, max: defaults.ammonia_max },
       isMinOnly: false,
       color: "text-emerald-500",

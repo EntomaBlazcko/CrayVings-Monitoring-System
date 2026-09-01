@@ -76,8 +76,8 @@ const SETTING_BOUNDS: Record<string, { min: number; max: number }> = {
   temp_max: { min: -10, max: 50 },
   water_level_min: { min: 0, max: 100 },
   water_level_max: { min: 0, max: 100 },
-  ammonia_min: { min: 0, max: 10 },
-  ammonia_max: { min: 0, max: 10 },
+  ammonia_min: { min: 0, max: 500 },
+  ammonia_max: { min: 0, max: 500 },
 };
 
 const KEY_MAPPING: Record<string, { min: keyof SensorSettings; max: keyof SensorSettings }> = {
@@ -1103,7 +1103,8 @@ export default function SettingsPage() {
               <div>
                 <p className="text-sm font-semibold text-amber-800">Default Admin Account</p>
                 <p className="text-xs text-amber-700 mt-1">
-                  Username: <span className="font-mono">admin</span> | Password: <span className="font-mono">Admin@123</span>
+                  The initial admin password is set via the <span className="font-mono">ADMIN_INITIAL_PASSWORD</span> environment
+                  variable on first setup. It is not shown here.
                 </p>
                 <p className="text-xs text-amber-600 mt-1">Change this password after your first login for security.</p>
               </div>
