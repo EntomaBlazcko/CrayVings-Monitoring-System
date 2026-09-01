@@ -68,9 +68,9 @@ This can help reduce risks caused by poor water conditions and improve overall m
 
 ### Hardware
 - **ESP32 DevKit V1** with WiFiManager support
-- **DS18B20** - Temperature sensor (GPIO4, OneWire)
-- **HC-SR04** - Ultrasonic distance sensor (GPIO5, GPIO18)
-- **Ammonia sensor** - Not yet installed; simulated in firmware (planned: MQ-137 on an analog pin)
+- **DS18B20** - Temperature sensor (GPIO13, OneWire)
+- **HC-SR04** - Ultrasonic distance sensor (GPIO26 TRIG, GPIO27 ECHO)
+- **MQ-137** - Ammonia sensor (GPIO34, analog; R0 calibrated in clean air on first boot, persisted to NVS)
 
 ### Software
 | Component | Technology | Version |
@@ -103,7 +103,7 @@ Sensors → ESP32 → Wi-Fi → Express API → PostgreSQL → React Dashboard
 1. **Sensors** read environmental data
 2. **ESP32** collects and sends data via HTTP POST
 3. **Express API** validates and stores in PostgreSQL
-4. **React Dashboard** polls for data every 3 seconds
+4. **React Dashboard** polls for data every 1 second
 5. **Connection check** compares sensor data timestamp against current time
 6. **Alerts** triggered when values exceed thresholds or ESP32 disconnects
 7. **SMS** sent to active recipients for critical events (unless muted)
@@ -164,7 +164,7 @@ Dashboard opens at http://localhost:5173
 
 ### 5. Connect ESP32
 
-Flash the ESP32 with `esp32code/esp32code.ino`. On first boot, connect to the "CRAYvings-Config" WiFi access point to configure your WiFi credentials via the captive portal.
+Flash the ESP32 with `esp32code/esp32code.ino`. On first boot, connect to the "Aquaculture-Setup" WiFi access point to configure your WiFi credentials (and backend server IP/port/device ID) via the captive portal. The firmware's default backend address is `192.168.1.16:3000` (`SERVER_IP_DEFAULT` in `esp32code.ino`) — change it if your backend machine has a different LAN IP.
 
 ---
 
@@ -246,7 +246,7 @@ esp32code/esp32code.ino        # ESP32 firmware (WiFiManager)
 ## Connection & Offline Handling
 
 ### How Connection Status Works
-- Frontend polls `GET /sensor/latest` every 3 seconds
+- Frontend polls `GET /sensor/latest` every 1 second
 - `lastUpdate` uses the **actual sensor data timestamp** (not poll time)
 - If sensor data is older than 15 seconds → status = **offline**
 - After 5 consecutive failed API requests → status = **offline**

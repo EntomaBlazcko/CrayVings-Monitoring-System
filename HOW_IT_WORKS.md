@@ -201,7 +201,7 @@ The ESP32 microcontroller reads sensor values at regular intervals:
 The ESP32 sends a POST request to the backend server via Wi-Fi:
 
 ```http
-POST http://192.168.1.20:3000/sensor
+POST http://192.168.1.16:3000/sensor
 Content-Type: application/json
 X-Device-Secret: your_shared_secret   # required only if DEVICE_SECRET is set on the server
 
@@ -540,7 +540,8 @@ Method: POST
 Content-Type: application/json
 Device auth: X-Device-Secret header (when a device secret is configured)
 URL: http://<server>:3000/sensor
-Baud Rate: 19200
+Send interval: 1000 ms (same as sensor read interval)
+Serial monitor: 115200 baud (diagnostics only)
 WiFi: WiFiManager captive portal (configurable on first boot)
 ```
 
@@ -551,14 +552,14 @@ WiFi: WiFiManager captive portal (configurable on first boot)
 - Server on same local network
 - Port 3000 accessible
 - Static IP recommended for server
-- Auto-reconnect on WiFi drop: on disconnect the firmware retries STA connection for 20 seconds, then falls back to a 180-second WiFiManager portal before retrying
+- The ESP32 keeps retrying the **blocking HTTP POST** with a 1-second connect timeout and 1-second response timeout; when the backend IP is wrong/unreachable the POST can hog the loop for ~2s per second, so keep `SERVER_IP_DEFAULT` (or the portal's `server_ip`) pointed at the real backend machine (default: `192.168.1.16`)
 
 ### Sensor Types & Measurement Ranges
 
 | Sensor | Type | Range | Accuracy | Pin |
 |--------|------|-------|----------|-----|
-| DS18B20 | Digital | 0°C to 50°C | ±0.5°C | GPIO4 |
-| HC-SR04 | Ultrasonic | 0 - 100% | ±3mm | GPIO5, GPIO18 |
+| DS18B20 | Digital | 0°C to 50°C | ±0.5°C | GPIO13 |
+| HC-SR04 | Ultrasonic | 0 - 100% | ±3mm | GPIO26 (TRIG), GPIO27 (ECHO) |
 | Ammonia | MQ-137 (NH3 gas) | 0 - 500 ppm | 0.1 ppm (approx.) | GPIO34 |
 
 ### ESP32 Sensor Validation
@@ -633,7 +634,7 @@ Dashboard available at http://localhost:5173
 
 ### 3. ESP32
 
-Flash the ESP32 with `esp32code/esp32code.ino`. On first boot, connect to the "CRAYvings-Config" WiFi access point and configure your network via the captive portal.
+Flash the ESP32 with `esp32code/esp32code.ino`. On first boot, connect to the "Aquaculture-Setup" WiFi access point and configure your network via the captive portal. The portal also lets you set the backend server IP, port, and device ID. The firmware default backend address is `192.168.1.16:3000` (`SERVER_IP_DEFAULT` in `esp32code.ino`); set it to your backend machine's LAN IP if it differs.
 
 ---
 
