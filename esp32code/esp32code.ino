@@ -43,7 +43,7 @@ SPIClass touchSPI(HSPI);
 #define RAW_Y_MIN 479
 #define RAW_Y_MAX 3762
 
-#define MIN_PRESSURE 100
+#define MIN_PRESSURE 40
 
 // =============================================================================
 // DS18B20
@@ -105,9 +105,9 @@ float lastShownLevel = -1.0;
 #define MQ137_CLEAN_AIR_RATIO 3.6  // Rs/R0 expected in clean air (datasheet)
 #define MQ137_PPM_MAX   500.0  // Datasheet NH3 range upper bound (5-500 ppm)
 #define MQ137_SAT_VOLTS 3.24   // ADC saturation threshold (11dB attenuation ~3.3V)
-#define MQ137_EMA_ALPHA 0.1    // Smoothing factor for the displayed ppm (lower = heavier smoothing)
+#define MQ137_EMA_ALPHA 0.4    // Smoothing factor for the displayed ppm (0.4 = fast response)
 #define MQ137_PPM_DEADBAND 0.1 // Don't repaint unless ppm changes by this much
-#define MQ137_SPIKE_PPM_MAX 15.0 // Max ppm jump allowed before spike rejection kicks in
+#define MQ137_SPIKE_PPM_MAX 25.0 // Max ppm jump allowed before spike rejection kicks in
 #define MQ137_ADC_SAMPLES 8   // Number of ADC samples to average per read
 
 float mq137R0 = 0.0;        // Sensor resistance in clean air (kOhm), persisted in NVS
@@ -222,6 +222,10 @@ uint16_t readTouchRaw(uint8_t command)
 // Sample a touch axis repeatedly and return the average (reduces noise)
 uint16_t readTouchSample(uint8_t command, int samples)
 {
+    // Discard the first read after a channel change: the XPT2046 first sample
+    // can still contain the previous channel's data.
+    readTouchRaw(command);
+
     uint32_t total = 0;
     for (int i = 0; i < samples; i++)
     {
@@ -259,10 +263,13 @@ bool isTouchPressed()
     touchSPI.endTransaction();
     digitalWrite(TOUCH_CS, HIGH);
 
+    // Lower-bound check is only applied to Z1 (the primary pressure axis).
+    // Some panels report a low/near-zero Z2 while pressed, so requiring
+    // Z2 > MIN_PRESSURE wrongly rejected valid touches.
     if (
         z1 > MIN_PRESSURE &&
         z1 < 4000 &&
-        z2 > MIN_PRESSURE &&
+        z2 > 0 &&
         z2 < 4000
     )
     {
@@ -493,11 +500,19 @@ void calibrateMq137R0()
     const int samples = 10;
     float sum = 0.0;
     int good = 0;
+    float maxVout = 0.0f;
 
     for (int i = 0; i < samples; i++)
     {
         mq137Raw = analogRead(MQ137_PIN);
         mq137Voltage = analogReadMilliVolts(MQ137_PIN) / 1000.0f;
+        if (mq137Voltage > maxVout)
+        {
+            maxVout = mq137Voltage;
+        }
+
+        Serial.printf("[MQ-137] Sample %2d: raw=%d  Vout=%.3f V\n",
+                      i + 1, mq137Raw, mq137Voltage);
 
         char buf[40];
         snprintf(buf, sizeof(buf), "Sample %d/%d: %.3f V", i + 1, samples, mq137Voltage);
@@ -513,9 +528,20 @@ void calibrateMq137R0()
         delay(500);
     }
 
+    if (maxVout >= 3.0f)
+    {
+        // The module output is reaching/past the 3.3V ADC ceiling even in
+        // clean air, so it can never read correctly. Hardware causes: module
+        // not sharing a GND with the ESP32, supply not really 5V, RL not 10k,
+        // or AOUT needing a 2:1 resistor divider.
+        Serial.printf("[MQ-137] WARNING: Vout %.3f V near ADC ceiling during calibration!\n", maxVout);
+        Serial.printf("[MQ-137] Check shared GND (module GND -> ESP32 GND), 5V supply, RL=10k.\n");
+    }
+
     if (good == 0)
     {
         Serial.println("[MQ-137] Calibration failed: no valid readings!");
+        Serial.printf("[MQ-137] Raw ADC = %d (0 => module unpowered or no shared GND).\n", mq137Raw);
         tft.fillScreen(TFT_WHITE);
         tft.setTextDatum(MC_DATUM);
         tft.setTextColor(TFT_BLACK, TFT_WHITE);
@@ -526,7 +552,26 @@ void calibrateMq137R0()
     }
 
     float rsAvg = sum / good;
-    mq137R0 = rsAvg / MQ137_CLEAN_AIR_RATIO;
+    float r0Candidate = rsAvg / MQ137_CLEAN_AIR_RATIO;
+
+    // Only accept a physically sensible R0 (the same window loadMq137R0() uses).
+    // This prevents a garbage R0 from being baked into NVS and then silently
+    // broken data being reported until the next recalibration.
+    if (r0Candidate < 5.0f || r0Candidate > 200.0f)
+    {
+        Serial.printf("[MQ-137] Calibration REJECTED: R0 = %.2f kOhm outside valid 5-200 kOhm window.\n", r0Candidate);
+        Serial.printf("[MQ-137] Raw ADC = %d | Vout = %.3f V | Rs = %.2f kOhm\n",
+                      mq137Raw, mq137Voltage, rsAvg);
+        tft.fillScreen(TFT_WHITE);
+        tft.setTextDatum(MC_DATUM);
+        tft.setTextColor(TFT_BLACK, TFT_WHITE);
+        tft.drawString("CALIBRATION FAILED", 240, 100, 4);
+        tft.drawString("Check module supply/GND/wiring", 240, 150, 2);
+        delay(2000);
+        return;
+    }
+
+    mq137R0 = r0Candidate;
     saveMq137R0();
 
     Serial.printf("[MQ-137] Clean-air Rs avg = %.2f kOhm -> R0 = %.2f kOhm\n", rsAvg, mq137R0);
@@ -1409,11 +1454,17 @@ void setup()
 
     pinMode(MQ137_PIN, INPUT);
     analogReadResolution(12);
-    // No analogSetPinAttenuation() call here on purpose: ALL ESP32 Arduino cores
-    // default ADC pins to 11dB attenuation (~3.1V max), and the attenuation
-    // enum names (ADC_ATTENDB_11 / ADC_ATTEN_DB_11 / ADC_11db) differ across
-    // core versions, which caused a compile error on older cores.
-    Serial.println("[OK] MQ-137 -> GPIO34 (default 11dB attenuation, 3.3V ADC)");
+    // Explicitly apply the widest input range (11dB, ~0-3.3V) to GPIO34. Most
+    // Arduino-ESP32 cores default to 11dB, but some setups keep a pin on a
+    // lower attenuation, which clips the module's ~1-3.3V analog output and
+    // produces wrong readings. Guarded with #if so it compiles on both old
+    // (ADC_ATTEN_11db) and new (ADC_ATTENDB_11) core enums.
+#if defined(ADC_ATTEN_11db)
+    analogSetPinAttenuation(MQ137_PIN, ADC_ATTEN_11db);
+#elif defined(ADC_ATTENDB_11)
+    analogSetPinAttenuation(MQ137_PIN, ADC_ATTENDB_11);
+#endif
+    Serial.println("[OK] MQ-137 -> GPIO34 (11dB attenuation explicitly set)");
 
     pinMode(TOUCH_CS, OUTPUT);
     digitalWrite(TOUCH_CS, HIGH);
@@ -1428,16 +1479,35 @@ void setup()
     Serial.print("[DISPLAY] Height = ");
     Serial.println(tft.height());
 
+    // MQ-137: load or run the clean-air calibration EARLY, before any WiFi
+    // work, so a fresh board calibrates immediately even if WiFi setup later
+    // blocks the boot (previously this made the device look completely dead).
+    // refreshMq137R0Once() forces one fresh calibration the first boot after a
+    // firmware update, so an R0 stored under the old RL assumption is thrown
+    // away instead of being loaded silently.
+    if (refreshMq137R0Once() || !loadMq137R0())
+    {
+        Serial.println("[MQ-137] No valid R0 - starting clean-air calibration...");
+        calibrateMq137R0();
+    }
+    else
+    {
+        Serial.printf("[MQ-137] Loaded R0 = %.2f kOhm from NVS\n", mq137R0);
+    }
+
+    currentPage = PAGE_OVERVIEW;
+    drawCurrentPage();
+
+    // One full initial sensor read so the UI shows live values right away.
+    readAllSensors();
+
+    // WiFi: attempt the saved network for 15s. On failure we go OFFLINE instead
+    // of auto-opening the config portal - that portal blocked the boot for up
+    // to 3 minutes with no visible progress, which looked exactly like a dead
+    // device. The portal can still be opened with serial command 'W' or by
+    // triple-tapping the top-left corner.
     Serial.println("[WIFI] Attempting to connect to saved network...");
-    tft.fillScreen(TFT_WHITE);
-    tft.setTextDatum(MC_DATUM);
-    tft.setTextColor(TFT_BLACK, TFT_WHITE);
-    tft.drawString("WiFi Setup", 240, 80, 4);
-    tft.drawString("Connecting to saved network...", 240, 130, 2);
-    tft.drawString("Tap top-left corner 3x to config", 240, 200, 2);
-
     WiFi.mode(WIFI_STA);
-
     WiFi.begin();
 
     unsigned long startAttemptTime = millis();
@@ -1459,40 +1529,13 @@ void setup()
         Serial.println("[WIFI] Connected to saved network!");
         Serial.print("[WIFI] IP: ");
         Serial.println(WiFi.localIP());
-        tft.fillScreen(TFT_WHITE);
-        tft.setTextDatum(MC_DATUM);
-        tft.setTextColor(TFT_BLACK, TFT_WHITE);
-        tft.drawString("WiFi Connected!", 240, 100, 4);
-        tft.drawString("IP: " + String(WiFi.localIP().toString()), 240, 150, 2);
-        delay(1500);
     }
     else
     {
-        Serial.println("[WIFI] No saved network or connection failed.");
-        Serial.println("[WIFI] Starting configuration portal...");
-
-        startWifiConfigPortal();
+        wifiConnected = false;
+        Serial.println("[WIFI] No saved network or connection failed. Running offline.");
+        Serial.println("[WIFI] Type 'W' to open the WiFi configuration portal.");
     }
-
-    readAllSensors();
-
-    // Load a previously calibrated MQ-137 R0, or run the clean-air calibration
-    // on first boot (needs the display up, since it shows progress on screen).
-    // refreshMq137R0Once() forces one fresh calibration the first boot after
-    // this firmware update, so any R0 stored under the old RL value is thrown
-    // away instead of being loaded silently.
-    if (refreshMq137R0Once() || !loadMq137R0())
-    {
-        Serial.println("[MQ-137] No valid R0 - starting clean-air calibration...");
-        calibrateMq137R0();
-    }
-    else
-    {
-        Serial.printf("[MQ-137] Loaded R0 = %.2f kOhm from NVS\n", mq137R0);
-    }
-
-    currentPage = PAGE_OVERVIEW;
-    drawCurrentPage();
 
     Serial.println();
     Serial.println("[SYSTEM] READY");
@@ -1500,7 +1543,81 @@ void setup()
     Serial.println("[SYSTEM] Tap LEFT arrow  = Previous Page");
     Serial.println("[SYSTEM] Tap top-left corner 3x = WiFi Config");
     Serial.println("[SYSTEM] Tap top-right corner 3x = MQ-137 Recalibrate");
+    Serial.println("[SERIAL] Commands: 'C' = MQ-137 calibrate, 'T' = touch raw test, 'R' = read sensors, 'W' = WiFi portal");
     Serial.println();
+}
+
+// Streams raw XPT2046 values for 5s so touch state can be diagnosed on the
+// Serial Monitor even when the screen does nothing. Press and move on the
+// panel during the window.
+void touchRawDump()
+{
+    Serial.println("[TOUCH] Raw dump for 5s - press the screen");
+    Serial.println("[TOUCH]    Z1    Z2  rawX  rawY");
+    unsigned long end = millis() + 5000;
+    while (millis() < end)
+    {
+        uint16_t z1 = readTouchRaw(XPT2046_Z1);
+        uint16_t z2 = readTouchRaw(XPT2046_Z2);
+        uint16_t rx = readTouchRaw(XPT2046_X);
+        uint16_t ry = readTouchRaw(XPT2046_Y);
+        if (z1 > 20 && z1 < 4080)
+        {
+            Serial.printf("[TOUCH]  %4u  %4u  %4u  %4u\n", z1, z2, rx, ry);
+        }
+        delay(50);
+    }
+    Serial.println("[TOUCH] Dump finished.");
+}
+
+// Simple serial command interface, independent of the (possibly broken) touch:
+//   C = run MQ-137 clean-air calibration
+//   T = 5s raw XPT2046 dump (touch diagnostics)
+//   R = force one full sensor read + serial print
+//   W = open the WiFi configuration portal
+void checkSerialCommands()
+{
+    if (Serial.available() <= 0)
+    {
+        return;
+    }
+
+    char cmd = Serial.read();
+    while (Serial.available())
+    {
+        Serial.read();
+    }
+
+    switch (cmd)
+    {
+        case 'c':
+        case 'C':
+            Serial.println("[CMD] MQ-137 calibration requested (clean air required)...");
+            calibrateMq137R0();
+            tft.fillScreen(TFT_WHITE);
+            drawCurrentPage();
+            break;
+
+        case 't':
+        case 'T':
+            touchRawDump();
+            break;
+
+        case 'r':
+        case 'R':
+            readAllSensors();
+            break;
+
+        case 'w':
+        case 'W':
+            Serial.println("[CMD] Opening WiFi configuration portal...");
+            startWifiConfigPortal();
+            break;
+
+        default:
+            Serial.println("[CMD] Unknown. Commands: C=calibrate MQ-137, T=touch raw test, R=read sensors, W=WiFi portal");
+            break;
+    }
 }
 
 void loop()
@@ -1516,6 +1633,8 @@ void loop()
     }
 
     handleTouch();
+
+    checkSerialCommands();
 
     if (now - lastSendTime >= SEND_INTERVAL)
     {
