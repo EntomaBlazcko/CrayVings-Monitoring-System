@@ -134,8 +134,8 @@ export const DEFAULT_SETTINGS: SensorSettings = {
   temp_max:31.0,
   water_level_min:10.0,
   water_level_max:100.0,
-  ammonia_min:0.0,
-  ammonia_max:25.0,
+  ammonia_min:0.25,
+  ammonia_max:1.0,
 };
 
 // ========================

@@ -97,7 +97,7 @@ float lastShownLevel = -1.0;
 // RL (multimeter between module VCC and AOUT) and fix MQ137_RL_KOHM below.
 #define MQ137_PIN 34
 
-#define MQ137_RL_KOHM   1.0    // Load resistor on your module (kOhm). Default 1.0 (common SMD)
+#define MQ137_RL_KOHM   10.0   // Load resistor on this module (kOhm). Marked "103" = 10k
 #define MQ137_VC_VOLTS  5.0    // Sensor circuit supply (module VCC; usually 5V)
 
 #define MQ137_CURVE_M   -0.263 // NH3 log-log slope:      log(Rs/R0) = m*log(ppm) + b
@@ -105,8 +105,10 @@ float lastShownLevel = -1.0;
 #define MQ137_CLEAN_AIR_RATIO 3.6  // Rs/R0 expected in clean air (datasheet)
 #define MQ137_PPM_MAX   500.0  // Datasheet NH3 range upper bound (5-500 ppm)
 #define MQ137_SAT_VOLTS 3.24   // ADC saturation threshold (11dB attenuation ~3.3V)
-#define MQ137_EMA_ALPHA 0.2    // Smoothing factor for the displayed ppm
+#define MQ137_EMA_ALPHA 0.1    // Smoothing factor for the displayed ppm (lower = heavier smoothing)
 #define MQ137_PPM_DEADBAND 0.1 // Don't repaint unless ppm changes by this much
+#define MQ137_SPIKE_PPM_MAX 15.0 // Max ppm jump allowed before spike rejection kicks in
+#define MQ137_ADC_SAMPLES 8   // Number of ADC samples to average per read
 
 float mq137R0 = 0.0;        // Sensor resistance in clean air (kOhm), persisted in NVS
 float mq137RsKohm = 0.0;    // Latest computed sensor resistance (kOhm, diagnostics)
@@ -115,6 +117,7 @@ float ammoniaPpm = -1.0;    // Computed NH3 concentration (ppm); -1 = sensor fai
 float mq137PpmEma = -1.0;   // Smoothed ppm
 float lastShownPpm = -1.0;  // Last ppm painted to the screen (deadbanded)
 bool ammoniaReady = false;  // True once a valid reading has been produced
+int mq137SpikeStreak = 0;   // Consecutive spike count for spike rejection
 
 // =============================================================================
 // SENSOR VALUES
@@ -169,7 +172,7 @@ unsigned long lastPageChange = 0;
 // =============================================================================
 
 #define DEVICE_ID_DEFAULT "ESP32_01"
-#define SERVER_IP_DEFAULT "192.168.1.16"
+#define SERVER_IP_DEFAULT "192.168.1.20"
 #define SERVER_PORT_DEFAULT "3000"
 #define SEND_INTERVAL 1000
 
@@ -442,6 +445,27 @@ bool loadMq137R0()
     return mq137R0 > 5.0 && mq137R0 < 200.0;
 }
 
+// One-time R0 reset: on the first boot after this change the stored R0 is
+// deleted (and a flag set) so the fresh clean-air calibration always runs.
+// This prevents a stale/wrong R0 saved under the old RL assumption from being
+// loaded. Runs exactly once, then never again unless the flag key is removed.
+bool refreshMq137R0Once()
+{
+    Preferences prefs;
+    prefs.begin("mq137", false);
+    bool done = prefs.getBool("r0_refreshed", false);
+    if (!done)
+    {
+        prefs.remove("r0_kohm");
+        prefs.putBool("r0_refreshed", true);
+        prefs.end();
+        Serial.println("[MQ-137] One-time R0 refresh: clearing stored R0 for fresh calibration");
+        return true;
+    }
+    prefs.end();
+    return false;
+}
+
 // Instantaneous sensor resistance (kOhm) from the current analog voltage,
 // using the module's assumed Vc / RL. Returns -1 on invalid readings.
 float mq137RsFromVoltage()
@@ -524,14 +548,23 @@ void calibrateMq137R0()
 
 void readAmmonia()
 {
-    mq137Raw = analogRead(MQ137_PIN);
-    mq137Voltage = analogReadMilliVolts(MQ137_PIN) / 1000.0f;
+    // Multi-sample ADC averaging to reduce electrical noise
+    uint32_t adcSum = 0;
+    uint32_t mvSum = 0;
+    for (int i = 0; i < MQ137_ADC_SAMPLES; i++)
+    {
+        adcSum += analogRead(MQ137_PIN);
+        mvSum += analogReadMilliVolts(MQ137_PIN);
+    }
+    mq137Raw = adcSum / MQ137_ADC_SAMPLES;
+    mq137Voltage = (mvSum / MQ137_ADC_SAMPLES) / 1000.0f;
 
     // ~0V output: module unpowered/disconnected -> mark the sensor as failed
     if (mq137Raw < 8)
     {
         ammoniaReady = false;
         ammoniaPpm = -1.0f;
+        mq137SpikeStreak = 0;
         return;
     }
 
@@ -540,6 +573,7 @@ void readAmmonia()
     {
         ammoniaReady = false;
         ammoniaPpm = -1.0f;
+        mq137SpikeStreak = 0;
         return;
     }
 
@@ -550,6 +584,7 @@ void readAmmonia()
         // No calibration data yet -> can't compute a ratio, flag the error.
         ammoniaReady = false;
         ammoniaPpm = -1.0f;
+        mq137SpikeStreak = 0;
         return;
     }
 
@@ -571,6 +606,28 @@ void readAmmonia()
     }
 
     ppm = constrain(ppm, 0.0f, MQ137_PPM_MAX);
+
+    // Spike rejection: if the new reading jumps more than MQ137_SPIKE_PPM_MAX
+    // from the current EMA, require it to repeat before accepting.
+    if (mq137PpmEma >= 0.0f && fabsf(ppm - mq137PpmEma) > MQ137_SPIKE_PPM_MAX)
+    {
+        mq137SpikeStreak++;
+        if (mq137SpikeStreak < 2)
+        {
+            // First spike: reject, keep previous value
+            Serial.printf("[MQ-137] Spike rejected: raw %.1f ppm vs EMA %.1f ppm (streak %d)\n",
+                          ppm, mq137PpmEma, mq137SpikeStreak);
+            return;
+        }
+        // Spike repeated: accept it (likely a real change)
+        Serial.printf("[MQ-137] Spike accepted after %d repeats: %.1f ppm\n",
+                      mq137SpikeStreak, ppm);
+        mq137SpikeStreak = 0;
+    }
+    else
+    {
+        mq137SpikeStreak = 0;
+    }
 
     // EMA smoothing to tame MQ-series drift/noise
     if (mq137PpmEma < 0.0f)
@@ -1421,9 +1478,12 @@ void setup()
 
     // Load a previously calibrated MQ-137 R0, or run the clean-air calibration
     // on first boot (needs the display up, since it shows progress on screen).
-    if (!loadMq137R0())
+    // refreshMq137R0Once() forces one fresh calibration the first boot after
+    // this firmware update, so any R0 stored under the old RL value is thrown
+    // away instead of being loaded silently.
+    if (refreshMq137R0Once() || !loadMq137R0())
     {
-        Serial.println("[MQ-137] No saved R0 - starting clean-air calibration...");
+        Serial.println("[MQ-137] No valid R0 - starting clean-air calibration...");
         calibrateMq137R0();
     }
     else

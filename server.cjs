@@ -575,6 +575,9 @@ let lastAlertedState = {};
 let smsMuteUntil = null;
 // Tracks the last device-disconnect SMS to prevent spam when the connection flaps
 let lastDisconnectSmsTs = 0;
+// Server-side ammonia spike guard: tracks last stored reading per device
+let lastAmmoniaReading = {};
+const AMMONIA_SPIKE_THRESHOLD = 20; // ppm — reject readings that jump more than this from last stored value
 
 // Hourly SMS timestamp - loaded from DB on startup, persisted on each send
 let lastHourlyUpdateTs = null;
@@ -622,12 +625,11 @@ let lastHourlyUpdateTs = null;
     // Ammonia is a real NH3 gas reading in ppm (MQ-137): default threshold range
     // is 0-25 ppm (ACGIH 8h TWA for ammonia).
     await pool.query(`ALTER TABLE sensors ADD COLUMN IF NOT EXISTS ammonia DECIMAL(5,3) DEFAULT 0`);
-    await pool.query(`ALTER TABLE sensor_settings ADD COLUMN IF NOT EXISTS ammonia_min DECIMAL(5,2) DEFAULT 0`);
-    await pool.query(`ALTER TABLE sensor_settings ADD COLUMN IF NOT EXISTS ammonia_max DECIMAL(5,2) DEFAULT 25.00`);
+    await pool.query(`ALTER TABLE sensor_settings ADD COLUMN IF NOT EXISTS ammonia_min DECIMAL(5,2) DEFAULT 0.25`);
+    await pool.query(`ALTER TABLE sensor_settings ADD COLUMN IF NOT EXISTS ammonia_max DECIMAL(5,2) DEFAULT 1.00`);
     // Rebase pre-existing threshold rows that still carry the old 0-1.0 value
     // default so they match the new ppm scale. Custom values (not 1.0) are left
     // untouched.
-    await pool.query(`UPDATE sensor_settings SET ammonia_max = 25.00 WHERE ammonia_max = 1.00`);
 
     // Migrations: session token expiry (24-hour expiration).
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS token_expires_at TIMESTAMP`);
@@ -759,6 +761,17 @@ app.post("/sensor", async (req, res) => {
     const { device_id, temperature, water_level, ammonia } = parsed.data;
     if (!device_id) return res.status(400).json({ message: "device_id is required" });
 
+    // Server-side ammonia spike guard: reject readings that jump too far from the
+    // last stored value (electrical noise from USB disconnect causes wild spikes).
+    const ammoniaVal = Number(ammonia ?? 0);
+    if (ammoniaVal > 0 && lastAmmoniaReading[device_id] != null) {
+      const jump = Math.abs(ammoniaVal - lastAmmoniaReading[device_id]);
+      if (jump > AMMONIA_SPIKE_THRESHOLD) {
+        console.warn(`[${new Date().toISOString()}] Ammonia spike rejected from ${device_id}: ${ammoniaVal} ppm (last: ${lastAmmoniaReading[device_id]} ppm, jump: ${jump.toFixed(1)} ppm)`);
+        return res.status(400).json({ message: "Ammonia reading rejected: spike exceeds threshold", last_value: lastAmmoniaReading[device_id], rejected_value: ammoniaVal, jump: jump.toFixed(1) });
+      }
+    }
+
     // Store sensor reading in the database
     const ts = new Date();
     const result = await pool.query(
@@ -767,6 +780,11 @@ app.post("/sensor", async (req, res) => {
     );
     console.log(`[${new Date().toISOString()}] Sensor data saved from ${device_id}`);
 
+    // Track last ammonia value for spike guard
+    if (ammoniaVal > 0) {
+      lastAmmoniaReading[device_id] = ammoniaVal;
+    }
+
     // Respond immediately to ESP32 — process alerts in the background
     res.status(201).json({ message: "Saved", data: result.rows[0] });
 
@@ -774,7 +792,7 @@ app.post("/sensor", async (req, res) => {
     setImmediate(async () => {
       try {
         const settingsResult = await pool.query("SELECT * FROM sensor_settings LIMIT 1");
-const settings = settingsResult.rows[0] || { temp_min: 20, temp_max: 31, water_level_min: 10, water_level_max: 100, ammonia_min: 0, ammonia_max: 25 };
+const settings = settingsResult.rows[0] || { temp_min: 20, temp_max: 31, water_level_min: 10, water_level_max: 100, ammonia_min: 0.25, ammonia_max: 1 };
 
         const sensorChecks = [
           { key: "Temperature", val: Number(temperature), min: Number(settings.temp_min), max: Number(settings.temp_max), minValid: 0.0001 },
@@ -1277,7 +1295,7 @@ app.get("/settings", async (req, res) => {
   try {
     const result = await pool.query("SELECT * FROM sensor_settings LIMIT 1");
     if (result.rows.length === 0) {
-      return res.json({ temp_min: 20, temp_max: 31, water_level_min: 10, water_level_max: 100, ammonia_min: 0, ammonia_max: 25 });
+      return res.json({ temp_min: 20, temp_max: 31, water_level_min: 10, water_level_max: 100, ammonia_min: 0.25, ammonia_max: 1 });
     }
     const row = result.rows[0];
     res.json({
@@ -1343,7 +1361,7 @@ app.post("/settings", requireAdmin, async (req, res) => {
  */
 app.post("/settings/reset", requireAdmin, async (req, res) => {
   try {
-    const defaults = { temp_min: 20, temp_max: 31, water_level_min: 10, water_level_max: 100, ammonia_min: 0, ammonia_max: 25 };
+    const defaults = { temp_min: 20, temp_max: 31, water_level_min: 10, water_level_max: 100, ammonia_min: 0.25, ammonia_max: 1 };
     const existing = await pool.query("SELECT * FROM sensor_settings LIMIT 1");
     let savedSettings;
     if (existing.rows.length > 0) {
@@ -1448,7 +1466,7 @@ app.post("/settings/recipients/test/:id", requireAdmin, async (req, res) => {
 
     // Fetch current settings and latest sensor reading to build the test message
     const settingsResult = await pool.query("SELECT * FROM sensor_settings LIMIT 1");
-    const settings = settingsResult.rows[0] || { temp_min: 20, temp_max: 31, water_level_min: 10, water_level_max: 100, ammonia_min: 0, ammonia_max: 25 };
+const settings = settingsResult.rows[0] || { temp_min: 20, temp_max: 31, water_level_min: 10, water_level_max: 100, ammonia_min: 0.25, ammonia_max: 1 };
     const sensorResult = await pool.query("SELECT * FROM sensors ORDER BY timestamp DESC LIMIT 1");
     const sensor = sensorResult.rows[0] || null;
 
@@ -1770,6 +1788,16 @@ async function startServer() {
         lastAlertedState[`${row.device_id}:${row.sensor_key}`] = { status: row.status, value: parseFloat(row.value), timestamp: row.timestamp?.toISOString() };
       }
       console.log(`[${new Date().toISOString()}] Loaded ${lastAlertsResult.rows.length} alert states from DB`);
+
+      // Seed ammonia spike guard with latest reading per device
+      const lastAmmoniaResult = await client.query(
+        "SELECT DISTINCT ON (device_id) device_id, ammonia FROM sensors WHERE ammonia > 0 ORDER BY device_id, timestamp DESC"
+      );
+      lastAmmoniaReading = {};
+      for (const row of lastAmmoniaResult.rows) {
+        lastAmmoniaReading[row.device_id] = Number(row.ammonia);
+      }
+      console.log(`[${new Date().toISOString()}] Loaded ammonia baseline for ${lastAmmoniaResult.rows.length} device(s) from DB`);
 
       // Verify SMS configuration
       if (!process.env.SKYSMS_API_KEY) {
