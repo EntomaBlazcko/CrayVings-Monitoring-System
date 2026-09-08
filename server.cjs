@@ -750,6 +750,9 @@ app.post("/sensor", async (req, res) => {
       if (!presented || presented !== DEVICE_SECRET) {
         return res.status(401).json({ message: "Invalid device secret" });
       }
+    } else if (process.env.NODE_ENV === "production") {
+      // Fail closed: never accept unauthenticated sensor ingestion in production.
+      return res.status(503).json({ message: "Sensor ingestion is disabled: DEVICE_SECRET not configured" });
     } else if (!deviceSecretWarned) {
       deviceSecretWarned = true;
       console.warn(`[${new Date().toISOString()}] DEVICE_SECRET not set - sensor ingestion is unauthenticated. Set DEVICE_SECRET in production.`);
@@ -785,8 +788,10 @@ app.post("/sensor", async (req, res) => {
       lastAmmoniaReading[device_id] = ammoniaVal;
     }
 
-    // Respond immediately to ESP32 — process alerts in the background
-    res.status(201).json({ message: "Saved", data: result.rows[0] });
+    // Respond immediately to ESP32 — process alerts in the background.
+    // Return the timestamp as an explicit UTC ISO-8601 string so the frontend
+    // can render it in the farm timezone without silent timezone conversion.
+    res.status(201).json({ message: "Saved", data: { ...result.rows[0], timestamp: ts.toISOString() } });
 
     // Background: evaluate thresholds and send SMS alerts asynchronously
     setImmediate(async () => {

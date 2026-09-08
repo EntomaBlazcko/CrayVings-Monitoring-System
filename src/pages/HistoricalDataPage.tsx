@@ -40,6 +40,7 @@ import { useSensors } from "../hooks/useSensors";
 import { fetchSensorHistory, fetchWeeklyReport } from "../api/client";
 import { isAxiosError } from "axios";
 import type { ChartPoint, WeeklyReport } from "../types";
+import { formatFarmTime, formatFarmDateTime } from "../utils/time";
 
 // Detects a request that was cancelled by an AbortController. React
 // (fetch) throws a native AbortError, while axios surfaces the same
@@ -80,7 +81,7 @@ function getStats(data: { temperature?: number | string | null; water_level?: nu
 }
 
 export default function HistoricalDataPage() {
-  const { history, loading, connectionStatus, lastUpdate } = useSensors();
+  const { history, loading, connectionStatus, lastUpdate, historyStale, historyLastUpdated } = useSensors();
   const [timeRange, setTimeRange] = useState<TimeRange>("all");
   const [dynamicHistory, setDynamicHistory] = useState<ChartPoint[]>([]);
   const [dynamicLoading, setDynamicLoading] = useState(false);
@@ -433,7 +434,20 @@ export default function HistoricalDataPage() {
           <AlertTriangle size={16} className="shrink-0" />
           <span>
             Device offline — showing recorded data up to{" "}
-            {lastUpdate ? new Date(lastUpdate).toLocaleString() : "last connection"}
+            {lastUpdate ? formatFarmDateTime(lastUpdate) : "last connection"}
+          </span>
+        </div>
+      )}
+
+      {/* Stale history warning - the last history fetch failed */}
+      {historyStale && (
+        <div className="bg-amber-50 border border-amber-200 text-amber-800 rounded-xl p-3 text-sm flex items-center gap-2">
+          <AlertTriangle size={16} className="shrink-0" />
+          <span>
+            Chart data may be outdated — the latest refresh failed
+            {historyLastUpdated
+              ? ` (last successful update: ${formatFarmTime(historyLastUpdated)})`
+              : ""}. Showing the most recent data we have.
           </span>
         </div>
       )}

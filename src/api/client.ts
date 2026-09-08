@@ -26,6 +26,7 @@
 import axios, { isAxiosError, type AxiosError } from "axios";
 import type { SensorEntry, ChartPoint, LogEntry, SensorSettings, ActivityLog, ActivityLogEntry, AuthResponse, WeeklyReport } from "../types";
 import { API_BASE } from "../types";
+import { formatFarmTime } from "../utils/time";
 
 // ========================
 // USER TYPE (Admin Management)
@@ -166,9 +167,7 @@ export async function fetchSensorHistory(limit = 1000, signal?: AbortSignal): Pr
     .map((item) => {
       const timestamp = item.timestamp ? new Date(item.timestamp) : null;
       return {
-        name: timestamp
-          ? timestamp.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
-          : "--:--",
+        name: timestamp ? formatFarmTime(timestamp) : "--:--",
         timestamp: timestamp ? timestamp.toISOString() : "",
         // The ESP32 sends temperature 0 and water_level/ammonia -1 when a sensor fails.
         // These match the server's minValid checks; anything below them is a

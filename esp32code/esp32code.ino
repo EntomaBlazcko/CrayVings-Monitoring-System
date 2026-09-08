@@ -1287,15 +1287,28 @@ void handleTouch()
 void startWifiConfigPortal()
 {
     Serial.println("[WIFI] Starting configuration portal...");
+    Serial.println("[WIFI] 1) On your phone or any device, open Wi-Fi settings.");
+    Serial.println("[WIFI] 2) Connect to the access point: Aquaculture-Setup");
+    Serial.println("[WIFI] 3) Open a browser and visit http://192.168.4.1 to configure.");
+    Serial.println("[WIFI] If no page loads, reconnect to the AP and try again.");
 
     tft.fillScreen(TFT_WHITE);
-    tft.setTextDatum(MC_DATUM);
+    tft.setTextDatum(TL_DATUM);
     tft.setTextColor(TFT_BLACK, TFT_WHITE);
-    tft.drawString("WiFi Setup", 240, 80, 4);
-    tft.drawString("Connect to AP:", 240, 130, 2);
-    tft.drawString("Aquaculture-Setup", 240, 160, 4);
-    tft.drawString("to configure WiFi", 240, 200, 2);
-    tft.drawString("Timeout: 3 minutes", 240, 240, 2);
+    tft.drawString("WiFi Setup Mode", 20, 30, 4);
+    tft.setTextColor(TFT_DARKGREY, TFT_WHITE);
+    tft.drawString("1. Open Wi-Fi settings", 20, 82, 2);
+    tft.drawString("   on your phone/device", 20, 104, 2);
+    tft.setTextColor(TFT_ORANGE, TFT_WHITE);
+    tft.drawString("2. Connect to the access point:", 20, 142, 2);
+    tft.setTextColor(TFT_BLUE, TFT_WHITE);
+    tft.drawString("   Aquaculture-Setup", 20, 166, 3);
+    tft.setTextColor(TFT_DARKGREY, TFT_WHITE);
+    tft.drawString("3. Open a browser and visit:", 20, 212, 2);
+    tft.setTextColor(TFT_BLUE, TFT_WHITE);
+    tft.drawString("   http://192.168.4.1", 20, 236, 3);
+    tft.setTextColor(TFT_RED, TFT_WHITE);
+    tft.drawString("Timeout: 3 minutes", 20, 292, 2);
 
     WiFi.mode(WIFI_AP_STA);
     WiFiManager wm;
@@ -1328,7 +1341,12 @@ void startWifiConfigPortal()
     wm.setConfigPortalTimeout(180);
     wm.setConnectTimeout(10);
 
-    bool wifiResult = wm.autoConnect("Aquaculture-Setup");
+    // startConfigPortal forces the access point to open even if the ESP32
+    // already has a saved network (autoConnect would skip the portal when
+    // already connected, so the on-screen "connect your phone" steps wouldn't
+    // work). The phone/device joins the "Aquaculture-Setup" AP, then opens
+    // http://192.168.4.1 to enter the Wi-Fi and backend details.
+    bool wifiResult = wm.startConfigPortal("Aquaculture-Setup");
 
     if (wifiResult)
     {
@@ -1479,34 +1497,19 @@ void setup()
     Serial.print("[DISPLAY] Height = ");
     Serial.println(tft.height());
 
-    // MQ-137: load or run the clean-air calibration EARLY, before any WiFi
-    // work, so a fresh board calibrates immediately even if WiFi setup later
-    // blocks the boot (previously this made the device look completely dead).
-    // refreshMq137R0Once() forces one fresh calibration the first boot after a
-    // firmware update, so an R0 stored under the old RL assumption is thrown
-    // away instead of being loaded silently.
-    if (refreshMq137R0Once() || !loadMq137R0())
-    {
-        Serial.println("[MQ-137] No valid R0 - starting clean-air calibration...");
-        calibrateMq137R0();
-    }
-    else
-    {
-        Serial.printf("[MQ-137] Loaded R0 = %.2f kOhm from NVS\n", mq137R0);
-    }
-
-    currentPage = PAGE_OVERVIEW;
-    drawCurrentPage();
-
-    // One full initial sensor read so the UI shows live values right away.
-    readAllSensors();
-
-    // WiFi: attempt the saved network for 15s. On failure we go OFFLINE instead
-    // of auto-opening the config portal - that portal blocked the boot for up
-    // to 3 minutes with no visible progress, which looked exactly like a dead
-    // device. The portal can still be opened with serial command 'W' or by
-    // triple-tapping the top-left corner.
+    // WiFi: attempt the saved network for 15s, restoring the past working
+    // version's visible boot screens. A "Connecting to saved network..." screen
+    // is drawn while trying, then "WiFi Connected!" with the IP on success, or
+    // the config portal (AP: Aquaculture-Setup) automatically opens on failure
+    // so the phone/device can connect and enter the Wi-Fi + backend details.
     Serial.println("[WIFI] Attempting to connect to saved network...");
+    tft.fillScreen(TFT_WHITE);
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextColor(TFT_BLACK, TFT_WHITE);
+    tft.drawString("WiFi Setup", 240, 80, 4);
+    tft.drawString("Connecting to saved network...", 240, 130, 2);
+    tft.drawString("Tap top-left corner 3x to config", 240, 200, 2);
+
     WiFi.mode(WIFI_STA);
     WiFi.begin();
 
@@ -1529,13 +1532,42 @@ void setup()
         Serial.println("[WIFI] Connected to saved network!");
         Serial.print("[WIFI] IP: ");
         Serial.println(WiFi.localIP());
+
+        tft.fillScreen(TFT_WHITE);
+        tft.setTextDatum(MC_DATUM);
+        tft.setTextColor(TFT_BLACK, TFT_WHITE);
+        tft.drawString("WiFi Connected!", 240, 100, 4);
+        tft.drawString("IP: " + String(WiFi.localIP().toString()), 240, 150, 2);
+        delay(1500);
     }
     else
     {
         wifiConnected = false;
-        Serial.println("[WIFI] No saved network or connection failed. Running offline.");
-        Serial.println("[WIFI] Type 'W' to open the WiFi configuration portal.");
+        Serial.println("[WIFI] No saved network or connection failed.");
+        Serial.println("[WIFI] Starting configuration portal (AP: Aquaculture-Setup)...");
+        startWifiConfigPortal();
     }
+
+    // One full initial sensor read so the UI shows live values right away.
+    readAllSensors();
+
+    // Load a previously calibrated MQ-137 R0, or run the clean-air calibration
+    // on first boot (needs the display up, since it shows progress on screen).
+    // refreshMq137R0Once() forces one fresh calibration the first boot after a
+    // firmware update, so an R0 stored under the old RL value is thrown away
+    // instead of being loaded silently.
+    if (refreshMq137R0Once() || !loadMq137R0())
+    {
+        Serial.println("[MQ-137] No valid R0 - starting clean-air calibration...");
+        calibrateMq137R0();
+    }
+    else
+    {
+        Serial.printf("[MQ-137] Loaded R0 = %.2f kOhm from NVS\n", mq137R0);
+    }
+
+    currentPage = PAGE_OVERVIEW;
+    drawCurrentPage();
 
     Serial.println();
     Serial.println("[SYSTEM] READY");
@@ -1555,19 +1587,18 @@ void touchRawDump()
     Serial.println("[TOUCH] Raw dump for 5s - press the screen");
     Serial.println("[TOUCH]    Z1    Z2  rawX  rawY");
     unsigned long end = millis() + 5000;
+    unsigned long count = 0;
     while (millis() < end)
     {
         uint16_t z1 = readTouchRaw(XPT2046_Z1);
         uint16_t z2 = readTouchRaw(XPT2046_Z2);
         uint16_t rx = readTouchRaw(XPT2046_X);
         uint16_t ry = readTouchRaw(XPT2046_Y);
-        if (z1 > 20 && z1 < 4080)
-        {
-            Serial.printf("[TOUCH]  %4u  %4u  %4u  %4u\n", z1, z2, rx, ry);
-        }
+        Serial.printf("[TOUCH]  %4u  %4u  %4u  %4u\n", z1, z2, rx, ry);
+        count++;
         delay(50);
     }
-    Serial.println("[TOUCH] Dump finished.");
+    Serial.printf("[TOUCH] Dump finished. %lu frames.\n", count);
 }
 
 // Simple serial command interface, independent of the (possibly broken) touch:
@@ -1611,6 +1642,10 @@ void checkSerialCommands()
         case 'w':
         case 'W':
             Serial.println("[CMD] Opening WiFi configuration portal...");
+            Serial.println("[CMD] On your phone or any device:");
+            Serial.println("[CMD]   1) Open Wi-Fi settings");
+            Serial.println("[CMD]   2) Connect to AP: Aquaculture-Setup");
+            Serial.println("[CMD]   3) Open browser to http://192.168.4.1 to configure");
             startWifiConfigPortal();
             break;
 

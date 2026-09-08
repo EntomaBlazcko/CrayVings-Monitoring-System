@@ -23,6 +23,7 @@ import { Thermometer, Waves, FlaskConical, AlertTriangle, AlertCircle, CheckCirc
 import type { MenuKey } from "../types";
 import { useSensors } from "../hooks/useSensors";
 import { getSettingsThresholds, getThresholdStatus } from "../types";
+import { formatFarmTime } from "../utils/time";
 
 type Props = {
   onNavigate?: (menu: MenuKey) => void;
@@ -186,7 +187,7 @@ export default function HomePage({ onNavigate }: Props) {
         <div className="bg-yellow-50 border border-yellow-200 rounded-xl p-3 flex items-center gap-2">
           <AlertTriangle size={16} className="text-yellow-600 shrink-0" />
           <span className="text-xs text-yellow-800">
-            ESP32 is offline — showing last known readings. Last update: {lastUpdate ? new Date(lastUpdate).toLocaleTimeString() : "N/A"}
+            ESP32 is offline — showing last known readings. Last update: {lastUpdate ? formatFarmTime(lastUpdate) : "N/A"}
           </span>
         </div>
       )}
@@ -211,7 +212,7 @@ export default function HomePage({ onNavigate }: Props) {
               </span>
               {lastUpdate && !loading && (
                 <span className="text-xs text-gray-400">
-                  Last updated: {new Date(lastUpdate).toLocaleTimeString()}
+                  Last updated: {formatFarmTime(lastUpdate)}
                 </span>
               )}
             </div>

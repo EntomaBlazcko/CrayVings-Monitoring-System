@@ -88,15 +88,19 @@ export function useThresholdAlert() {
 
       // Evaluate current status against thresholds
       const newStatus = getThresholdStatus(value, config.range, config.isMinOnly);
-       
-      // Update previous status tracker
+
+      // Fire an alert ONLY when we TRANSITION into a breached state (previous
+      // status was "good"). This prevents a burst of duplicate toasts on every
+      // poll (or on ESP32 reconnect after an outage) while the reading stays
+      // out of range. The cooldown below still guards against repeated reselection.
+      const prevStatus = previousStatusRef.current[key];
       previousStatusRef.current[key] = newStatus;
-      
-      // Skip if the reading is within the safe range
-      if (newStatus === "good") {
+
+      // Skip if we were already breached (no new transition) or are now good.
+      if (newStatus === "good" || (prevStatus && prevStatus !== "good")) {
         continue;
       }
-      
+
       // Determine which threshold was breached (min or max)
       const isBelowMin = value < config.range.min;
       const thresholdType = isBelowMin ? "min" : "max";

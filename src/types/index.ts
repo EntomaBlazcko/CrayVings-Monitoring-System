@@ -225,13 +225,22 @@ export function getThresholdStatus(
   const max = Number(range.max);
   const val = Number(value);
 
-  if (isMinOnly) {
-    return val >= min ? "good" : "warning";
-  }
-  
   const rangeSize = max - min;
   const criticalMargin = rangeSize * 0.15;
-  
+
+  // IMPORTANT: This must stay a behavioral mirror of server.cjs getThresholdStatus()
+  // (15% margin). Any change here affects the Alerts page severity AND the
+  // threshold cross-check test (src/types/threshold.test.cjs).
+  if (isMinOnly) {
+    // A one-sided (min-only) threshold uses the max as the "good" bound and
+    // treats values only below min as a breach, with the same 15% margin.
+    if (val < min) {
+      const deviation = min - val;
+      return deviation >= criticalMargin ? "critical" : "warning";
+    }
+    return "good";
+  }
+
   if (val < min) {
     const deviation = min - val;
     return deviation >= criticalMargin ? "critical" : "warning";
@@ -240,7 +249,7 @@ export function getThresholdStatus(
     const deviation = val - max;
     return deviation >= criticalMargin ? "critical" : "warning";
   }
-  
+
   return "good";
 }
 

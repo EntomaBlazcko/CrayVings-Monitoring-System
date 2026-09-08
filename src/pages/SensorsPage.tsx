@@ -34,6 +34,7 @@ import {
 import { useSensors } from "../hooks/useSensors";
 import { LoadingCard, ErrorCard } from "../components/Loading";
 import { getSettingsThresholds, getThresholdStatus } from "../types";
+import { formatFarmDateTime } from "../utils/time";
 
 /**
  * Formats a timestamp into a human-readable relative time string.
@@ -236,7 +237,7 @@ export default function SensorsPage() {
             <div className="flex justify-between">
               <span className="text-gray-600">Timestamp</span>
               <span className="font-medium">
-                {data?.timestamp ? new Date(data.timestamp).toLocaleString() : "N/A"}
+                {data?.timestamp ? formatFarmDateTime(data.timestamp) : "N/A"}
               </span>
             </div>
             <div className="flex justify-between">

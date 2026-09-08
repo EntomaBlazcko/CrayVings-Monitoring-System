@@ -48,6 +48,8 @@ export function useSensors() {
     connectionStatus: dataContext.connectionStatus,
     lastUpdate: dataContext.lastUpdate,
     consecutiveFailures: dataContext.consecutiveFailures,
+    historyStale: dataContext.historyStale,
+    historyLastUpdated: dataContext.historyLastUpdated,
     refetch: dataContext.refetch,
     // Settings fields
     settings: settingsContext.settings,

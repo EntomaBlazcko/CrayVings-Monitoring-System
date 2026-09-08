@@ -54,6 +54,8 @@ export interface SensorDataContextValue {
   connectionStatus: ConnectionStatus;  // ESP32 device connection state
   lastUpdate: Date | null;             // Timestamp of last successful fetch
   consecutiveFailures: number;         // Count of consecutive failed polls
+  historyStale: boolean;               // True if the last history fetch failed
+  historyLastUpdated: Date | null;     // Timestamp of last successful history fetch
   refetch: () => void;                 // Manual trigger to re-fetch data
 }
 

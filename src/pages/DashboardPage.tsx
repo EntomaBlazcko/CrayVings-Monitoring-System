@@ -21,9 +21,10 @@ import TrendCard from "../components/TrendCard";
 import { Skeleton } from "../components/Loading";
 import { useSensors } from "../hooks/useSensors";
 import { getSettingsThresholds, getThresholdStatus } from "../types";
+import { formatFarmTime } from "../utils/time";
 
 export default function DashboardPage() {
-  const { data, history, connectionStatus, lastUpdate, settings, loading } = useSensors();
+  const { data, history, connectionStatus, lastUpdate, settings, loading, historyStale, historyLastUpdated } = useSensors();
   
   const thresholds = useMemo(() => getSettingsThresholds(settings), [settings]);
   
@@ -92,7 +93,19 @@ export default function DashboardPage() {
         <div className="bg-yellow-50 border border-yellow-200 rounded-xl p-3 mb-4 flex items-center gap-2">
           <AlertTriangle size={16} className="text-yellow-600 shrink-0" />
           <span className="text-xs text-yellow-800">
-            ESP32 is offline — showing last known readings from {lastUpdate?.toLocaleTimeString()}
+            ESP32 is offline — showing last known readings from {formatFarmTime(lastUpdate)}
+          </span>
+        </div>
+      )}
+
+      {historyStale && (
+        <div className="bg-amber-50 border border-amber-200 text-amber-800 rounded-xl p-3 text-sm flex items-center gap-2 mb-4">
+          <AlertTriangle size={16} className="shrink-0" />
+          <span>
+            Chart data may be outdated — the latest refresh failed
+            {historyLastUpdated
+              ? ` (last successful update: ${formatFarmTime(historyLastUpdated)})`
+              : ""}. Showing the most recent data we have.
           </span>
         </div>
       )}
@@ -155,7 +168,7 @@ export default function DashboardPage() {
             </span>
           </div>
           <div className="text-xs text-gray-500 mt-4">
-            Updated: {loading ? "Loading..." : lastUpdate ? lastUpdate.toLocaleTimeString() : "N/A"}
+            Updated: {loading ? "Loading..." : lastUpdate ? formatFarmTime(lastUpdate) : "N/A"}
           </div>
         </div>
 
@@ -190,7 +203,7 @@ export default function DashboardPage() {
                 <tbody>
                   {history.slice(-5).reverse().map((h, i) => (
                     <tr key={i} className="border-t">
-                      <td className="py-1">{new Date(h.timestamp).toLocaleTimeString()}</td>
+                      <td className="py-1">{formatFarmTime(h.timestamp)}</td>
                       <td className="text-center py-1">{h.temperature != null ? `${h.temperature}°C` : "--"}</td>
                       <td className="text-center py-1">{h.water_level != null ? `${h.water_level}%` : "--"}</td>
                       <td className="text-center py-1">{h.ammonia != null ? `${h.ammonia} ppm` : "--"}</td>

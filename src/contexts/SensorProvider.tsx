@@ -92,6 +92,8 @@ interface SensorDataState {
   connectionStatus: "online" | "offline" | "connecting" | "unknown";
   lastUpdate: Date | null;
   consecutiveFailures: number;
+  historyStale: boolean;
+  historyLastUpdated: Date | null;
 }
 
 interface SensorSettingsState {
@@ -158,6 +160,8 @@ function useSensorDataPolling(): SensorDataState & { refetch: () => void } {
     connectionStatus: "connecting",
     lastUpdate: null,
     consecutiveFailures: 0,
+    historyStale: false,
+    historyLastUpdated: null,
   });
 
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -255,9 +259,15 @@ function useSensorDataPolling(): SensorDataState & { refetch: () => void } {
     try {
       const historyData = await fetchSensorHistory(1000, historyAbortRef.current.signal);
       if (reqId !== historyReqIdRef.current) return;
-      setState((prev) => ({ ...prev, history: historyData }));
+      setState((prev) => ({ ...prev, history: historyData, historyStale: false, historyLastUpdated: new Date() }));
     } catch (error) {
       if (isAxiosError(error) && error.code === "ERR_CANCELED") return;
+      // Mark history as stale so UIs can surface "chart data may be outdated"
+      // instead of silently showing old data. Only set stale if a later poll
+      // hasn't already superseded this one.
+      if (reqId === historyReqIdRef.current) {
+        setState((prev) => ({ ...prev, historyStale: true }));
+      }
     }
   }, []);
 
@@ -717,6 +727,8 @@ export function SensorProvider({ children }: { children: ReactNode }) {
       connectionStatus: sensorData.connectionStatus,
       lastUpdate: sensorData.lastUpdate,
       consecutiveFailures: sensorData.consecutiveFailures,
+      historyStale: sensorData.historyStale,
+      historyLastUpdated: sensorData.historyLastUpdated,
       refetch: sensorData.refetch,
     }),
     [sensorData]
