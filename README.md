@@ -44,6 +44,8 @@ This can help reduce risks caused by poor water conditions and improve overall m
 - **PDF export** - Export system logs to PDF (LogsPage) and weekly reports to PDF (Historical Data)
 - **Activity logging** - Track user interactions including device connect/disconnect events
 - **WiFiManager** - ESP32 firmware uses captive portal for WiFi config (no hardcoded credentials)
+- **Touchscreen UI** - 480x320 TFT with XPT2046 resistive touch (HSPI); on-screen left/right page arrows and triple-tap gestures
+- **Non-blocking data send** - HTTP POST runs on a background FreeRTOS task, so a slow/unreachable backend never freezes the UI or touch input
 
 ### Monitoring Parameters
 | Parameter | Sensor | Safe Range |
@@ -68,6 +70,7 @@ This can help reduce risks caused by poor water conditions and improve overall m
 
 ### Hardware
 - **ESP32 DevKit V1** with WiFiManager support
+- **480x320 TFT + XPT2046 resistive touch** - on-device dashboard UI (touch on HSPI: CLK32, CS33, MOSI22, MISO19)
 - **DS18B20** - Temperature sensor (GPIO13, OneWire)
 - **HC-SR04** - Ultrasonic distance sensor (GPIO26 TRIG, GPIO27 ECHO)
 - **MQ-137** - Ammonia sensor (GPIO34, analog; R0 calibrated in clean air on first boot, persisted to NVS)
@@ -164,7 +167,7 @@ Dashboard opens at http://localhost:5173
 
 ### 5. Connect ESP32
 
-Flash the ESP32 with `esp32code/esp32code.ino`. On first boot, connect to the "Aquaculture-Setup" WiFi access point to configure your WiFi credentials (and backend server IP/port/device ID) via the captive portal. The firmware's default backend address is `192.168.1.16:3000` (`SERVER_IP_DEFAULT` in `esp32code.ino`) — change it if your backend machine has a different LAN IP.
+Flash the ESP32 with `esp32code/esp32code.ino`. On boot it first tries the saved network; if that fails it automatically opens the "Aquaculture-Setup" WiFi access point so you can configure credentials (and backend server IP/port/device ID) via the captive portal at http://192.168.4.1 (or serial command `W`, or triple-tap the top-left corner). The firmware's default backend address is `192.168.100.152:3000` (`SERVER_IP_DEFAULT` in `esp32code.ino`) — set it to your backend machine's LAN IP if it differs.
 
 ---
 

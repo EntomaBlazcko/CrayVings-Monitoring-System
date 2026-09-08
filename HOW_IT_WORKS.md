@@ -201,7 +201,7 @@ The ESP32 microcontroller reads sensor values at regular intervals:
 The ESP32 sends a POST request to the backend server via Wi-Fi:
 
 ```http
-POST http://192.168.1.16:3000/sensor
+POST http://192.168.100.152:3000/sensor
 Content-Type: application/json
 X-Device-Secret: your_shared_secret   # required only if DEVICE_SECRET is set on the server
 
@@ -539,11 +539,16 @@ Protocol: HTTP/1.1
 Method: POST
 Content-Type: application/json
 Device auth: X-Device-Secret header (when a device secret is configured)
-URL: http://<server>:3000/sensor
+URL: http://192.168.100.152:3000/sensor (default SERVER_IP_DEFAULT)
 Send interval: 1000 ms (same as sensor read interval)
+Send location: background FreeRTOS task (never blocks the touch/UI loop)
 Serial monitor: 115200 baud (diagnostics only)
-WiFi: WiFiManager captive portal (configurable on first boot)
+WiFi: WiFiManager captive portal (auto-opens when the saved network fails)
 ```
+
+The firmware posts only `device_id`, `temperature`, `water_level`, and `ammonia`
+in the JSON body — it does **not** currently attach the `X-Device-Secret` header,
+so leave `DEVICE_SECRET` unset on the server or the POST will be rejected.
 
 ### Network Requirements
 
@@ -552,7 +557,7 @@ WiFi: WiFiManager captive portal (configurable on first boot)
 - Server on same local network
 - Port 3000 accessible
 - Static IP recommended for server
-- The ESP32 keeps retrying the **blocking HTTP POST** with a 1-second connect timeout and 1-second response timeout; when the backend IP is wrong/unreachable the POST can hog the loop for ~2s per second, so keep `SERVER_IP_DEFAULT` (or the portal's `server_ip`) pointed at the real backend machine (default: `192.168.1.16`)
+- The HTTP POST runs on a **background FreeRTOS task** (`sendSensorTask` in `esp32code.ino`) with a 1-second connect timeout and 1-second response timeout. The main loop only sets a `sendPending`/`sendBusy` flag every `SEND_INTERVAL` (1000 ms), so even when the backend IP is wrong/unreachable the POST stalls the background task only — the screen and touch keep running at full responsiveness. Keep `SERVER_IP_DEFAULT` (or the portal's `server_ip`) pointed at the real backend machine (default: `192.168.100.152`)
 
 ### Sensor Types & Measurement Ranges
 
@@ -561,6 +566,18 @@ WiFi: WiFiManager captive portal (configurable on first boot)
 | DS18B20 | Digital | 0°C to 50°C | ±0.5°C | GPIO13 |
 | HC-SR04 | Ultrasonic | 0 - 100% | ±3mm | GPIO26 (TRIG), GPIO27 (ECHO) |
 | Ammonia | MQ-137 (NH3 gas) | 0 - 500 ppm | 0.1 ppm (approx.) | GPIO34 |
+| XPT2046 | Resistive touch | 480 x 320 | - | HSPI: CLK32, CS33, MOSI22, MISO19 |
+
+### Touchscreen Interface (Display & Touch)
+
+The device runs its own on-screen dashboard on a **480x320 TFT** via `TFT_eSPI`, with a **XPT2046 resistive touch panel** on the HSPI bus:
+
+- **Boot screens** - "WiFi Setup / Connecting to saved network..." while connecting, then "WiFi Connected! IP:..." on success
+- **Page navigation** - on-screen left/right arrow buttons at the bottom (tap the screen, release, then the region is matched); page cooldown `PAGE_CHANGE_COOLDOWN` (500 ms) prevents accidental double-taps
+- **Triple-tap top-left corner** - opens the WiFi configuration portal (`Aquaculture-Setup` AP, http://192.168.4.1)
+- **Triple-tap top-right corner** - re-runs the MQ-137 clean-air R0 calibration
+- **Touch mapping** - raw XPT2046 coordinates are scaled to screen pixels with hardcoded map constants (`RAW_X_MIN/MAX`, `RAW_Y_MIN/MAX` in `esp32code.ino`)
+- **Press detection** - pressure threshold `MIN_PRESSURE` (default 40) with a `Z1/Z2` validity range guard (readings outside ~0-4000 are ignored)
 
 ### ESP32 Sensor Validation
 
@@ -634,7 +651,7 @@ Dashboard available at http://localhost:5173
 
 ### 3. ESP32
 
-Flash the ESP32 with `esp32code/esp32code.ino`. On first boot, connect to the "Aquaculture-Setup" WiFi access point and configure your network via the captive portal. The portal also lets you set the backend server IP, port, and device ID. The firmware default backend address is `192.168.1.16:3000` (`SERVER_IP_DEFAULT` in `esp32code.ino`); set it to your backend machine's LAN IP if it differs.
+Flash the ESP32 with `esp32code/esp32code.ino`. On boot it first tries the saved network; if that fails it automatically opens the "Aquaculture-Setup" WiFi access point so you can configure your network (and backend server IP, port, and device ID) via the captive portal at http://192.168.4.1. The firmware default backend address is `192.168.100.152:3000` (`SERVER_IP_DEFAULT` in `esp32code.ino`); set it to your backend machine's LAN IP if it differs.
 
 ---
 

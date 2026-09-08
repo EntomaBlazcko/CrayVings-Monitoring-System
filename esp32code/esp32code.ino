@@ -172,9 +172,9 @@ unsigned long lastPageChange = 0;
 // =============================================================================
 
 #define DEVICE_ID_DEFAULT "ESP32_01"
-#define SERVER_IP_DEFAULT "192.168.1.20"
+#define SERVER_IP_DEFAULT "192.168.100.152"
 #define SERVER_PORT_DEFAULT "3000"
-#define SEND_INTERVAL 1000
+#define SEND_INTERVAL 1000  
 
 char serverIP[50] = SERVER_IP_DEFAULT;
 char serverPort[10] = SERVER_PORT_DEFAULT;
@@ -182,6 +182,11 @@ char deviceId[50] = DEVICE_ID_DEFAULT;
 
 unsigned long lastSendTime = 0;
 bool wifiConnected = false;
+
+// Background-send flags: the blocking HTTP POST runs on its own task so it
+// can never stall the main loop (and therefore the touchscreen).
+volatile bool sendPending = false;
+volatile bool sendBusy = false;
 
 // Flag to trigger WiFi configuration
 bool wifiConfigRequested = false;
@@ -1450,6 +1455,24 @@ void sendSensorData()
     http.end();
 }
 
+// Runs the slow HTTP POST off the main loop. Polls for pending sends so the
+// main loop only ever sets a BOOL flag - a slow/unreachable backend can no
+// longer freeze touch input for up to a second or two.
+void sendSensorTask(void *pvParameters)
+{
+    while (true)
+    {
+        if (sendPending && !sendBusy)
+        {
+            sendBusy = true;
+            sendPending = false;
+            sendSensorData();
+            sendBusy = false;
+        }
+        vTaskDelay(50 / portTICK_PERIOD_MS);
+    }
+}
+
 void setup()
 {
     Serial.begin(115200);
@@ -1569,6 +1592,11 @@ void setup()
     currentPage = PAGE_OVERVIEW;
     drawCurrentPage();
 
+    // Send sensor data on a background task so the blocking HTTP POST (which
+    // can stall for ~1-2s on a slow/unreachable server) never freezes touch
+    // or the display.
+    xTaskCreate(sendSensorTask, "sendSensor", 4096, NULL, 1, NULL);
+
     Serial.println();
     Serial.println("[SYSTEM] READY");
     Serial.println("[SYSTEM] Tap RIGHT arrow = Next Page");
@@ -1659,6 +1687,10 @@ void loop()
 {
     unsigned long now = millis();
 
+    // Touch is serviced FIRST on every tick so a tap never waits behind
+    // sensor reads, screen redraws, or Wi-Fi sends.
+    handleTouch();
+
     if (now - lastSensorRead >= SENSOR_INTERVAL)
     {
         lastSensorRead = now;
@@ -1667,14 +1699,13 @@ void loop()
         updateCurrentPage();
     }
 
-    handleTouch();
-
     checkSerialCommands();
 
+    // Slow POST is handled by the background task - main loop only sets a flag.
     if (now - lastSendTime >= SEND_INTERVAL)
     {
         lastSendTime = now;
-        sendSensorData();
+        sendPending = true;
     }
 
     if (wifiConfigRequested)
@@ -1682,5 +1713,5 @@ void loop()
         startWifiConfigPortal();
     }
 
-    delay(2);
+    delay(1);
 }
