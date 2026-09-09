@@ -1056,7 +1056,7 @@ export default function SettingsPage() {
                               : "bg-blue-100 text-blue-700"
                           }`}>
                             {u.role === "admin" ? <Shield size={12} /> : <User size={12} />}
-                            {u.role}
+                            {u.role.charAt(0).toUpperCase() + u.role.slice(1)}
                           </span>
                         </td>
                         <td className="px-4 py-3 text-sm text-gray-500">

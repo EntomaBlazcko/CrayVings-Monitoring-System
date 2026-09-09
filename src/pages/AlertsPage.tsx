@@ -151,7 +151,7 @@ export default function AlertsPage() {
                             : "bg-gray-500 text-white"
                       }`}
                     >
-                      {log.action}
+                      {log.action.split(/[\s_]+/).map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(" ")}
                     </span>
                     <span className="font-semibold text-sm">{log.parameter}</span>
                   </div>
@@ -166,15 +166,15 @@ export default function AlertsPage() {
                   {log.action === "Alert" ? (
                     <span>
                       <span className="font-medium">{log.parameter}</span> is{" "}
-                      <span className="font-bold">{String(log.new_value)}</span>
+                      <span className="font-bold">{String(log.new_value).split(/[\s_]+/).map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(" ")}</span>
                       {log.old_value && (
-                        <span> (recorded: <span className="font-bold">{log.old_value}</span>)</span>
+                        <span> (recorded: <span className="font-bold">{String(log.old_value).split(/[\s_]+/).map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(" ")}</span>)</span>
                       )}
                     </span>
                   ) : (
                     <span>
-                      Changed from <span className="font-bold">{log.old_value}</span> to{" "}
-                      <span className="font-bold">{log.new_value}</span>
+                      Changed from <span className="font-bold">{String(log.old_value).split(/[\s_]+/).map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(" ")}</span> to{" "}
+                      <span className="font-bold">{String(log.new_value).split(/[\s_]+/).map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(" ")}</span>
                     </span>
                   )}
                 </div>

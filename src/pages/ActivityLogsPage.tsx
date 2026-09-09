@@ -166,7 +166,7 @@ export default function ActivityLogsPage() {
           <option value="">All Actions</option>
           {FILTER_ACTION_TYPES.map((type) => (
             <option key={type} value={type}>
-              {type.replace("_", " ")}
+              {type.split("_").map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(" ")}
             </option>
           ))}
         </select>
@@ -222,11 +222,11 @@ export default function ActivityLogsPage() {
                         {log.timestamp ? new Date(log.timestamp).toLocaleString() : "-"}
                       </td>
                       <td className="px-4 py-3 text-sm font-medium text-gray-800">
-                        {log.user_name || "Admin"}
+                        {(log.user_name || "Admin").split(/[\s_]+/).map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(" ")}
                       </td>
                       <td className="px-4 py-3">
                         <span className={`inline-flex items-center px-2 py-0.5 rounded text-xs font-medium ${ACTION_TYPE_COLORS[log.action_type] || "bg-gray-100 text-gray-700"}`}>
-                          {ACTION_TYPE_ICONS[log.action_type] || "•"} {log.action_type.replace("_", " ")}
+                          {ACTION_TYPE_ICONS[log.action_type] || "•"} {log.action_type.split("_").map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(" ")}
                         </span>
                       </td>
                       <td className="px-4 py-3 text-sm text-gray-600 max-w-[300px] truncate">

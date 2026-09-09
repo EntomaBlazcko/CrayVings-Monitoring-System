@@ -1,0 +1,272 @@
+# CRAYvings Monitoring System - Database Schema
+
+> Database: `crayvings_monitoring_system_db` (PostgreSQL)
+
+## Overview
+
+The database stores user accounts, sensor readings, alert state, activity/audit trails, SMS recipients, and SMS send history for the Smart Aquaculture Monitoring System for Crayfish Production.
+
+## Table: users
+
+Stores application login accounts with PBKDF2-hashed passwords and session tokens.
+
+| Column            | Type         | Constraints              | Notes                                  |
+| ----------------- | ------------ | ------------------------ | -------------------------------------- |
+| id                | SERIAL       | PRIMARY KEY              |                                        |
+| name              | VARCHAR(100) | NOT NULL                 | Display name                           |
+| username          | VARCHAR(50)  | NOT NULL UNIQUE          | Login name                             |
+| email             | VARCHAR(255) | NOT NULL UNIQUE          |                                        |
+| password_hash     | TEXT         | NOT NULL                 | PBKDF2 (`iterations:salt:hash`)        |
+| role              | VARCHAR(20)  | NOT NULL DEFAULT 'user'  | `admin` or `user`                      |
+| token             | VARCHAR(255) |                          | Active session token                   |
+| created_at        | TIMESTAMP    | DEFAULT CURRENT_TIMESTAMP|                                        |
+| updated_at        | TIMESTAMP    | DEFAULT CURRENT_TIMESTAMP|                                        |
+| token_expires_at  | TIMESTAMP    |                          | 24-hour session token expiry           |
+
+**Indexes/constraints:** UNIQUE (`username`), UNIQUE (`email`).
+
+## Table: activity_logs
+
+Audit trail of user interactions (navigation, settings changes, device connect/disconnect, login/logout).
+
+| Column       | Type         | Constraints              | Notes                                              |
+| ------------ | ------------ | ------------------------ | -------------------------------------------------- |
+| id           | SERIAL       | PRIMARY KEY              |                                                    |
+| user_name    | VARCHAR(100) | DEFAULT 'Admin'          | Username of acting user (looked up via `users.username`) |
+| action_type  | VARCHAR(50)  | NOT NULL                 | e.g. `navigation`, `settings_change`, `device_connect`, `device_disconnect`, `login`, `logout` |
+| description  | TEXT         |                          | Human-readable event description                   |
+| module       | VARCHAR(100) |                          | App module where the event occurred                |
+| timestamp    | TIMESTAMP    | DEFAULT CURRENT_TIMESTAMP|                                                     |
+
+**Indexes:** `idx_activity_logs_timestamp` (timestamp DESC), `idx_activity_logs_action_type` (action_type).
+
+## Table: sensors
+
+Time-series log of ESP32 sensor readings. One row per reading.
+
+| Column       | Type          | Constraints | Notes                      |
+| ------------ | ------------- | ----------- | -------------------------- |
+| id           | SERIAL        | PRIMARY KEY |                            |
+| device_id    | VARCHAR(50)   | NOT NULL    | ESP32 device identifier    |
+| temperature  | DECIMAL(5,2)  | DEFAULT 0   | Degrees Celsius            |
+| water_level  | DECIMAL(5,2)  | DEFAULT 0   | Percent (%)                |
+| ammonia      | DECIMAL(5,3)  | DEFAULT 0   | ppm (MQ-137 sensor)        |
+| timestamp    | TIMESTAMP     | DEFAULT CURRENT_TIMESTAMP | Reading time |
+
+**Indexes:** `idx_sensors_timestamp` (timestamp DESC), `idx_sensors_device_id` (device_id).
+
+## Table: sensor_settings
+
+Singleton row of current alert thresholds for each sensor parameter.
+
+| Column            | Type         | Constraints | Notes                       |
+| ----------------- | ------------ | ----------- | --------------------------- |
+| id                | SERIAL       | PRIMARY KEY |                             |
+| temp_min          | DECIMAL(5,2) | NOT NULL DEFAULT 20.0  | Min temperature (°C) |
+| temp_max          | DECIMAL(5,2) | NOT NULL DEFAULT 31.0  | Max temperature (°C) |
+| water_level_min   | DECIMAL(5,2) | NOT NULL DEFAULT 10.0  | Min water level (%) |
+| water_level_max   | DECIMAL(5,2) | NOT NULL DEFAULT 100.0 | Max water level (%) |
+| ammonia_min       | DECIMAL(5,2) | NOT NULL DEFAULT 0.25  | Min ammonia (ppm)  |
+| ammonia_max       | DECIMAL(5,2) | NOT NULL DEFAULT 1.00  | Max ammonia (ppm)  |
+| updated_at        | TIMESTAMP    | DEFAULT CURRENT_TIMESTAMP |                       |
+
+## Table: system_logs
+
+Change and alert records for sensor parameters (feed the Alerts & Logs page and PDF export).
+
+| Column    | Type          | Constraints | Notes                                  |
+| --------- | ------------- | ----------- | -------------------------------------- |
+| id        | SERIAL        | PRIMARY KEY |                                        |
+| action    | VARCHAR(100)  | NOT NULL    | e.g. `Alert`, `Change`, `Alert Resolved`, `Alert Muted` |
+| parameter | VARCHAR(100)  | NOT NULL    | e.g. `Temperature`, `Water Level`, `Ammonia` |
+| old_value | VARCHAR(50)   |             | Previous value or `Low`/`High`/status  |
+| new_value | VARCHAR(50)   |             | New value or status (`good`, `warning`, `critical`) |
+| timestamp | TIMESTAMP     | DEFAULT CURRENT_TIMESTAMP |                        |
+
+**Indexes:** `idx_system_logs_timestamp` (timestamp DESC), `idx_system_logs_action` (action).
+
+## Table: last_alerts
+
+Current alert state per device per sensor key (used for alert deduplication/cooldown and restored from DB on server start).
+
+| Column    | Type          | Constraints | Notes                                  |
+| --------- | ------------- | ----------- | -------------------------------------- |
+| device_id | VARCHAR(50)   | PRIMARY KEY (composite) | ESP32 device identifier |
+| sensor_key| VARCHAR(50)   | PRIMARY KEY (composite) | e.g. `Temperature`, `Water Level`, `Ammonia` |
+| status    | VARCHAR(20)   |             | `good`, `warning`, or `critical`       |
+| value     | DECIMAL       |             | Reading that triggered/cleared the state |
+| timestamp | TIMESTAMP     |             |                                        |
+
+**PK:** composite (`device_id`, `sensor_key`).
+
+## Table: system_state
+
+Simple key/value store for server-persisted runtime state (survives restarts).
+
+| Column | Type         | Constraints | Notes                                               |
+| ------ | ------------ | ----------- | --------------------------------------------------- |
+| key    | VARCHAR(255) | PRIMARY KEY | e.g. `last_hourly_update_ts`, `sms_mute_until`      |
+| value  | TEXT         |             |                                                     |
+
+## Table: authorized_recipients
+
+SMS recipients allowed to receive alert notifications.
+
+| Column       | Type          | Constraints | Notes                                     |
+| ------------ | ------------- | ----------- | ----------------------------------------- |
+| id           | SERIAL        | PRIMARY KEY |                                           |
+| phone_number | VARCHAR(20)   | NOT NULL UNIQUE | Contact number in E.164 format       |
+| name         | VARCHAR(100)  |             | Recipient display name                    |
+| is_active    | BOOLEAN       | DEFAULT true| Whether alerts are sent to this recipient |
+| created_at   | TIMESTAMP     | DEFAULT CURRENT_TIMESTAMP |                          |
+| updated_at   | TIMESTAMP     | DEFAULT CURRENT_TIMESTAMP |                          |
+
+## Table: sms_logs
+
+Audit trail of every SMS send attempt (sent/failed/muted) including SkySMS message IDs.
+
+| Column         | Type        | Constraints | Notes                                |
+| -------------- | ----------- | ----------- | ------------------------------------ |
+| id             | SERIAL      | PRIMARY KEY |                                      |
+| recipient_phone| VARCHAR(20) | NOT NULL    | Phone number SMS was sent to         |
+| message        | TEXT        | NOT NULL    | Full message body                    |
+| status         | VARCHAR(20) | NOT NULL    | `sent`, `failed`, or `muted`         |
+| error_message  | TEXT        |             | Failure reason (SMS provider or mute) |
+| sms_id         | VARCHAR(100)|             | SkySMS message identifier            |
+| sent_at        | TIMESTAMP   | DEFAULT CURRENT_TIMESTAMP |                          |
+
+**Indexes:** `idx_sms_logs_sent_at` (sent_at DESC), `idx_sms_logs_status` (status).
+
+## Relationships
+
+- `activity_logs.user_name` is derived from `users.username` server-side (looked up from the session token) to maintain an accurate audit trail. Falls back to the built-in `admin` account when no token is present.
+- `last_alerts` is keyed by `(device_id, sensor_key)` so each device keeps its own alert state; it is derived from the latest `sensors` reading by the alert engine (no direct 1:1 row match).
+- `sensors.device_id` and `last_alerts.device_id` reference the same ESP32 device identifier strings.
+- `sms_logs.recipient_phone` references `authorized_recipients.phone_number`; deleting a recipient also removes their SMS history.
+- `users.token` + `users.token_expires_at` implement 24-hour session authentication.
+- `sensor_settings`, `system_state`, and `system_logs` are standalone tables (no foreign relationships).
+
+## Data Retention
+
+- `system_logs` and `sms_logs` older than **30 days** are automatically purged (cleanup runs on server startup and daily).
+- The alert engine enforces SMS cooldowns (`warning` vs `critical` intervals) stored in the server config.
+
+## Notes
+
+- **Schema creation:** Tables are created outside this repository (e.g., manual setup in pgAdmin / SQL shell). The server only creates `system_state` and applies additive migrations (`ADD COLUMN IF NOT EXISTS`) for columns like `ammonia`, `ammonia_min/max`, and `token_expires_at`.
+- **Hash format:** `password_hash` = `PBKDF2_ITERATIONS:salt_hex:hash_hex` (sha512, 600,000 iterations, 64-byte key).
+- **Default admin:** seeded via `seed-admin.cjs` (`Administrator` / `admin` / `admin@crayvings.com`).
+
+---
+
+## dbdiagram.io Schema (DBML)
+
+Copy the block below into [dbdiagram.io](https://dbdiagram.io) to render the full diagram.
+
+```dbml
+Table users {
+  id int [pk, increment]
+  name varchar(100) [not null]
+  username varchar(50) [not null, unique]
+  email varchar(255) [not null, unique]
+  password_hash text [not null]
+  role varchar(20) [not null, default: "'user'"]
+  token varchar(255)
+  created_at timestamp [default: `now()`]
+  updated_at timestamp [default: `now()`]
+  token_expires_at timestamp
+}
+
+Table activity_logs {
+  id int [pk, increment]
+  user_name varchar(100) [default: "'Admin'"]
+  action_type varchar(50) [not null]
+  description text
+  module varchar(100)
+  timestamp timestamp [default: `now()`]
+
+  Indexes {
+    (timestamp) [name: 'idx_activity_logs_timestamp']
+    (action_type) [name: 'idx_activity_logs_action_type']
+  }
+}
+
+Table sensors {
+  id int [pk, increment]
+  device_id varchar(50) [not null]
+  temperature decimal(5,2) [default: 0]
+  water_level decimal(5,2) [default: 0]
+  ammonia decimal(5,3) [default: 0]
+  timestamp timestamp [default: `now()`]
+
+  Indexes {
+    (timestamp) [name: 'idx_sensors_timestamp']
+    (device_id) [name: 'idx_sensors_device_id']
+  }
+}
+
+Table sensor_settings {
+  id int [pk, increment]
+  temp_min decimal(5,2) [not null, default: 20.00]
+  temp_max decimal(5,2) [not null, default: 31.00]
+  water_level_min decimal(5,2) [not null, default: 10.00]
+  water_level_max decimal(5,2) [not null, default: 100.00]
+  ammonia_min decimal(5,2) [not null, default: 0.25]
+  ammonia_max decimal(5,2) [not null, default: 1.00]
+  updated_at timestamp [default: `now()`]
+}
+
+Table system_logs {
+  id int [pk, increment]
+  action varchar(100) [not null]
+  parameter varchar(100) [not null]
+  old_value varchar(50)
+  new_value varchar(50)
+  timestamp timestamp [default: `now()`]
+
+  Indexes {
+    (timestamp) [name: 'idx_system_logs_timestamp']
+    (action) [name: 'idx_system_logs_action']
+  }
+}
+
+Table last_alerts {
+  device_id varchar(50) [pk]
+  sensor_key varchar(50) [pk]
+  status varchar(20)
+  value decimal
+  timestamp timestamp
+}
+
+Table system_state {
+  key varchar(255) [pk]
+  value text
+}
+
+Table authorized_recipients {
+  id int [pk, increment]
+  phone_number varchar(20) [not null, unique]
+  name varchar(100)
+  is_active boolean [default: true]
+  created_at timestamp [default: `now()`]
+  updated_at timestamp [default: `now()`]
+}
+
+Table sms_logs {
+  id int [pk, increment]
+  recipient_phone varchar(20) [not null]
+  message text [not null]
+  status varchar(20) [not null]
+  error_message text
+  sms_id varchar(100)
+  sent_at timestamp [default: `now()`]
+
+  Indexes {
+    (sent_at) [name: 'idx_sms_logs_sent_at']
+    (status) [name: 'idx_sms_logs_status']
+  }
+}
+
+Ref: activity_logs.user_name > users.username
+Ref: sms_logs.recipient_phone > authorized_recipients.phone_number
+```

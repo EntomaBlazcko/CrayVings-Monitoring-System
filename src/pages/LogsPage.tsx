@@ -316,14 +316,14 @@ export default function LogsPage() {
                     </div>
                   </td>
                   <td className="px-4 py-3 text-sm text-gray-600">
-                    {log.old_value}
+                    {String(log.old_value).split(/[\s_]+/).map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(" ")}
                   </td>
                   <td className="px-4 py-3 text-sm font-semibold text-gray-800">
-                    {log.new_value}
+                    {String(log.new_value).split(/[\s_]+/).map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(" ")}
                   </td>
                   <td className="px-4 py-3">
                     <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-amber-100 text-amber-700">
-                      {log.action}
+                      {log.action.split(/[\s_]+/).map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(" ")}
                     </span>
                   </td>
                 </tr>
