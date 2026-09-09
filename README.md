@@ -1,3 +1,6 @@
+
+![Uploading image.png…]()
+
 # CRAYvings Monitoring System
 
 An IoT-based smart monitoring system designed for aquaculture, specifically for **crayfish/crab pond or tank monitoring**. This project helps monitor important water conditions in real time using sensors connected to an **ESP32**, with data sent to a **web-based dashboard** for viewing and tracking.
