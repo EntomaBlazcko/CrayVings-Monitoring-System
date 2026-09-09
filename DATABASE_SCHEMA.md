@@ -47,13 +47,27 @@ Time-series log of ESP32 sensor readings. One row per reading.
 | Column       | Type          | Constraints | Notes                      |
 | ------------ | ------------- | ----------- | -------------------------- |
 | id           | SERIAL        | PRIMARY KEY |                            |
-| device_id    | VARCHAR(50)   | NOT NULL    | ESP32 device identifier    |
+| device_id    | VARCHAR(50)   | NOT NULL, FK → `devices.device_id` | ESP32 device identifier |
 | temperature  | DECIMAL(5,2)  | DEFAULT 0   | Degrees Celsius            |
 | water_level  | DECIMAL(5,2)  | DEFAULT 0   | Percent (%)                |
 | ammonia      | DECIMAL(5,3)  | DEFAULT 0   | ppm (MQ-137 sensor)        |
 | timestamp    | TIMESTAMP     | DEFAULT CURRENT_TIMESTAMP | Reading time |
 
 **Indexes:** `idx_sensors_timestamp` (timestamp DESC), `idx_sensors_device_id` (device_id).
+
+## Table: devices
+
+Canonical registry of ESP32 devices. Referenced by `sensors` and `last_alerts`.
+
+| Column    | Type         | Constraints | Notes                                  |
+| --------- | ------------ | ----------- | -------------------------------------- |
+| device_id | VARCHAR(50)  | PRIMARY KEY | ESP32 device identifier                |
+| name      | VARCHAR(100) |             | Optional friendly name                 |
+| is_active | BOOLEAN      | NOT NULL DEFAULT true | Whether the device is enabled |
+| created_at| TIMESTAMP    | DEFAULT CURRENT_TIMESTAMP | Initially seen date |
+| last_seen | TIMESTAMP    |             | Latest reading timestamp               |
+
+Devices are auto-registered server-side on first sensor ingest (`INSERT INTO devices ... ON CONFLICT ...`) so the `sensors.device_id` FK never fails.
 
 ## Table: sensor_settings
 
@@ -91,7 +105,7 @@ Current alert state per device per sensor key (used for alert deduplication/cool
 
 | Column    | Type          | Constraints | Notes                                  |
 | --------- | ------------- | ----------- | -------------------------------------- |
-| device_id | VARCHAR(50)   | PRIMARY KEY (composite) | ESP32 device identifier |
+| device_id | VARCHAR(50)   | PRIMARY KEY (composite), FK → `devices.device_id` | ESP32 device identifier |
 | sensor_key| VARCHAR(50)   | PRIMARY KEY (composite) | e.g. `Temperature`, `Water Level`, `Ammonia` |
 | status    | VARCHAR(20)   |             | `good`, `warning`, or `critical`       |
 | value     | DECIMAL       |             | Reading that triggered/cleared the state |
@@ -139,10 +153,10 @@ Audit trail of every SMS send attempt (sent/failed/muted) including SkySMS messa
 
 ## Relationships
 
-- `activity_logs.user_name` is derived from `users.username` server-side (looked up from the session token) to maintain an accurate audit trail. Falls back to the built-in `admin` account when no token is present.
-- `last_alerts` is keyed by `(device_id, sensor_key)` so each device keeps its own alert state; it is derived from the latest `sensors` reading by the alert engine (no direct 1:1 row match).
-- `sensors.device_id` and `last_alerts.device_id` reference the same ESP32 device identifier strings.
-- `sms_logs.recipient_phone` references `authorized_recipients.phone_number`; deleting a recipient also removes their SMS history.
+- `activity_logs.user_name` → `users.username` (**FK enforced**, `ON UPDATE CASCADE ON DELETE RESTRICT`). The acting user is derived from the session token server-side for an accurate audit trail; falls back to the built-in `admin` account when no token is present.
+- `sms_logs.recipient_phone` → `authorized_recipients.phone_number` (**FK enforced**, `ON DELETE CASCADE`). Deleting a recipient also removes their SMS history.
+- `sensors.device_id` → `devices.device_id` (**FK enforced**). Each reading belongs to a registered device; devices are auto-registered on first ingest.
+- `last_alerts.device_id` → `devices.device_id` (**FK enforced**). Keyed by `(device_id, sensor_key)` so each device keeps its own alert state; derived from the latest `sensors` reading by the alert engine.
 - `users.token` + `users.token_expires_at` implement 24-hour session authentication.
 - `sensor_settings`, `system_state`, and `system_logs` are standalone tables (no foreign relationships).
 
@@ -203,6 +217,14 @@ Table sensors {
     (timestamp) [name: 'idx_sensors_timestamp']
     (device_id) [name: 'idx_sensors_device_id']
   }
+}
+
+Table devices {
+  device_id varchar(50) [pk]
+  name varchar(100)
+  is_active boolean [not null, default: true]
+  created_at timestamp [default: `now()`]
+  last_seen timestamp
 }
 
 Table sensor_settings {
@@ -269,4 +291,6 @@ Table sms_logs {
 
 Ref: activity_logs.user_name > users.username
 Ref: sms_logs.recipient_phone > authorized_recipients.phone_number
+Ref: sensors.device_id > devices.device_id
+Ref: last_alerts.device_id > devices.device_id
 ```

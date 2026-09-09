@@ -777,6 +777,11 @@ app.post("/sensor", async (req, res) => {
 
     // Store sensor reading in the database
     const ts = new Date();
+    // Auto-register the device so the sensors.device_id FK to devices never fails
+    await pool.query(
+      `INSERT INTO devices (device_id, last_seen) VALUES ($1, $2) ON CONFLICT (device_id) DO UPDATE SET last_seen = $2`,
+      [device_id, ts]
+    );
     const result = await pool.query(
       `INSERT INTO sensors (device_id, temperature, water_level, ammonia, timestamp) VALUES ($1, $2, $3, $4, $5) RETURNING *`,
       [device_id, Number(temperature ?? 0), Number(water_level ?? 0), Number(ammonia ?? 0), ts]
