@@ -1,0 +1,327 @@
+================================================================================
+ CRAYvings Monitoring System - Deployment Guide
+================================================================================
+
+Scope: taking the 3-part system (React frontend, Express + PostgreSQL backend,
+ESP32 firmware) from the local dev setup and running it on a real server so
+the dashboard is accessible from browsers/phones and ESP32 devices can post
+live readings.
+
+The guide assumes you have already run the project locally (see README Quick
+Start). It focuses on the production-specific configuration values, cloud
+hosting options, and the two firmware changes required before the ESP32 can
+talk to a public (HTTPS, authenticated) backend.
+
+================================================================================
+ARCHITECTURE (WHAT GETS DEPLOYED)
+================================================================================
+
+  1) Backend   - Express 5 server (server.cjs, Node.js 18+)
+                 Postgres-backed API on PORT (default 3000), binds 0.0.0.0.
+  2) Database  - PostgreSQL 15+ (tables, indexes, admin account).
+  3) Frontend  - React/Vite SPA; build output in dist/ (static files only).
+                 All API calls go to API_BASE (src/types/index.ts), which is
+                 the VITE_API_BASE value baked in at build time.
+  4) Firmware  - ESP32 posts JSON to http://<serverIP>:<port>/sensor every
+                 read cycle (see esp32code/esp32code.ino).
+
+  ESP32 -----------------------> Backend -----------------------> PostgreSQL
+    (HTTP POST /sensor)           (Express, /sensor, /settings,       ^
+                                   /system-logs, /alert/...,          |
+                                   SMS via SkySMS)                dashboard reads
+                                                              <--- from here
+  Browser --------------------------------------> Frontend (dist/)
+    (static HTML/JS)  +  XHR to API_BASE for live data
+
+
+================================================================================
+HOSTING OPTIONS (PICK ONE)
+================================================================================
+
+OPTION A - LAN ONLY (SIMPLEST, RECOMMENDED FOR A CAPSTONE DEMO)
+  Backend + PostgreSQL run on a desktop/server machine on the same network
+  as the ESP32. Frontend (dist/) is served by nginx or just `npm run preview`
+  on that machine.
+
+  - No HTTPS, no domain, no CORS headaches (browser opened from same LAN).
+  - ESP32 points to the machine's LAN IP via the WiFiManager captive portal.
+  - Dashboard reachable from any device on the LAN: http://<SERVER_IP>:3000
+    (or via nginx on port 80).
+
+  Keep NODE_ENV=development ONLY if you leave DEVICE_SECRET blank; a blank
+  DEVICE_SECRET in production mode disables /sensor entirely (fail-closed).
+  For LAN demos you may set NODE_ENV=production together with DEVICE_SECRET
+  only if the firmware is updated to send X-Device-Secret (see section 5).
+
+OPTION B - PUBLIC CLOUD (ACCESS FROM ANYWHERE)
+  - Backend: Railway, Render, or Fly.io (free/cheap tiers are enough).
+  - Database: Aiven, Supabase (Postgres), Railway's managed PG, or Render PG.
+  - Frontend: Netlify, Vercel, or Cloudflare Pages (static dist/ upload).
+  - This is the option where the two ESP32 firmware caveats in section 5
+    become mandatory.
+
+OPTION C - SINGLE VPS (FULL CONTROL)
+  - One Ubuntu/Debian box: nginx serves dist/ and reverse-proxies the API to
+    node:3000, PostgreSQL installed locally, HTTPS via Certbot.
+  - Best fit if the sySTEM must also be reachable on the ESP32's plain-HTTP
+    port while the browser uses HTTPS (see section 5 caveat).
+
+  (TYPICAL) RAILWAY + NETLIFY LAYOUT:
+
+    Netlify (dist/) ---------> GET/dist files            Browser
+    https://app.yourdomain.com
+    VITE_API_BASE=https://api.yourdomain.com (or same domain + nginx proxy)
+    Railway backend  https://api.yourdomain.com (node server.cjs)
+    Railway managed Postgres --------------------------> backend
+    ESP32 (LAN or internet) ---------------------------> backend /sensor
+
+
+================================================================================
+1. ENVIRONMENT VARIABLES (BACKEND)
+================================================================================
+Referenced from .env.example. Every deployment must set these:
+
+  Variable                    Default                 Notes
+  --------------------------  ----------------------  -------------------------
+  PORT                        3000                    HTTP listen port
+  NODE_ENV                    development             Set to "production".
+                                                      Blank DEVICE_SECRET then
+                                                      disables /sensor (503).
+  PG_HOST                     (none - required)       DB host
+  PG_PORT                     (none - required)       Usually 5432
+  PG_DATABASE                 (none - required)       crayvings_monitoring_system_db
+  PG_USER                     (none - required)       DB user
+  PG_PASSWORD                 (none - required)       DB password
+  ALLOWED_ORIGINS             http://localhost:5173   Comma-separated browser
+                                                      origins allowed (CORS).
+                                                      Requests without an Origin
+                                                      header (ESP32, curl) are
+                                                      always allowed.
+  DEVICE_SECRET               (blank)                 Shared secret ESP32 sends
+                                                      as X-Device-Secret.
+                                                      REQUIRED in production.
+  ADMIN_INITIAL_PASSWORD      (none)                  Only used on first boot to
+                                                      create the 'admin' user
+                                                      (never logs in plaintext).
+                                                      REQUIRED if no admin row
+                                                      exists yet.
+  SKYSMS_API_KEY              (blank)                 If missing, SMS alerts
+                                                      fail (server logs a
+                                                      start-up warning).
+  SKYSMS_API_URL              https://skysms.skyio.site/api/v1
+  HOURLY_SMS_ENABLED          true                    "false" disables hourly SMS
+  HOURLY_SMS_INTERVAL_MS      3600000                 1h default
+  WARNING_SMS_COOLDOWN_MS     3600000                 Min gap between warning SMS
+  SMS_COOLDOWN_MS             300000                  5 min default for critical
+
+  NOTE: .env.example also documents ARDUINO_* serial emulator settings
+  (dev-only) and SMS message templates.
+
+  SSL caveat: PG_* values are read as plain host/port/user/password in
+  server.cjs (no connection string). If your managed Postgres requires SSL,
+  add to the Pool config in server.cjs:
+      ssl: { rejectUnauthorized: false }
+  (or pick a provider that accepts non-SSL connections on its host).
+
+
+================================================================================
+2. PROVISION POSTGRESQL
+================================================================================
+  - Create the database, e.g. locally:
+      createdb crayvings_monitoring_system_db
+  - Create the tables BEFORE first server start. The server will NOT create
+    them; it only auto-creates system_state and applies additive migrations
+    (ADD COLUMN IF NOT EXISTS / indexes), and it exits at startup when it
+    cannot query the users table. Full schema in docs/DATABASE_SCHEMA.txt
+    (users, devices, sensors, sensor_settings, system_logs, last_alerts,
+    activity_logs, system_state, authorized_recipients, sms_logs).
+  - The server auto-registers ESP32 device_ids in devices on first ingest,
+    so no manual device rows are needed.
+  - Retention: system_logs and sms_logs older than 30 days are purged on
+    server startup and daily. Schedule a nightly pg_dump yourself if you want
+    longer-term archives.
+
+  Managed providers that work well for this project: Aiven, Supabase
+  (use its SQL console to create tables), Railway, Render. Google Cloud SQL / 
+  AWS RDS also fine when you add an allowed-IP whitelist for the backend.
+
+
+================================================================================
+3. DEPLOY THE BACKEND
+================================================================================
+  A) ON A VPS/PC (systemd or PM2):
+       cd /srv/crayvings
+       npm ci
+       copy .env (from section 1)
+       node server.cjs            # or: pm2 start server.cjs --name crayvings
+     systemd unit (example) saves a redis/pm2 dependency; simplest robust
+     route is PM2:  pm2 start server.cjs --name crayvings && pm2 save
+
+  B) ON RAILWAY / RENDER:
+       - Start command:  npm start   (maps to node server.cjs)
+       - Add every env var from section 1 in the dashboard.
+       - Healthcheck path: /health.
+       - Attach/shared managed Postgres and copy its host/port/user/password
+         into PG_*.
+
+  First boot must succeed: backend connects to PG, seeds the admin account
+  from ADMIN_INITIAL_PASSWORD (if 'admin' does not exist yet), restores alert
+  mute/dedup state, loads the ammonia spike-guard baseline, then listens on
+  0.0.0.0:PORT. Verify:
+      curl http://<host>:3000/health
+      -> {"status":"ok"}  (shape handled by /health in server.cjs)
+
+
+================================================================================
+4. BUILD & DEPLOY THE FRONTEND
+================================================================================
+  IMPORTANT: VITE_API_BASE is baked into the bundle at build time. It falls
+  back to http://localhost:3000 (src/types/index.ts), which is wrong for any
+  remote deployment.
+
+  Windows PowerShell:
+      $env:VITE_API_BASE="https://api.yourdomain.com"; npm run build
+  Linux / macOS:
+      VITE_API_BASE="https://api.yourdomain.com" npm run build
+
+  Output goes to dist/. Upload it to Netlify/Vercel/Cloudflare Pages, or copy
+  into an nginx webroot on your VPS.
+
+  - The SPA uses internal React state routing (no react-router paths), so no
+    history-rewrite rules are needed; index.html is the only entry.
+  - Backend CORS: set ALLOWED_ORIGINS on the backend to the deployed frontend
+    origin (and keep http://localhost:5173 while you develop).
+  - Same-origin alternative on a VPS: serve dist via nginx and reverse-proxy
+    the API paths (/sensor, /settings, /system-logs, /activity-logs,
+    /alert/..., /report/..., /health) to 127.0.0.1:3000, then set
+    VITE_API_BASE to the same domain; no CORS entry needed.
+
+  Quick nginx snippet (section of a server block):
+      server {
+        listen 80;
+        server_name app.yourdomain.com;
+        root /var/www/crayvings/dist;
+        index index.html;
+        location / { try_files $uri $uri/ /index.html; }
+        location ~ ^/(health|sensor|settings|system-logs|activity-logs|alert|report) {
+          proxy_pass http://127.0.0.1:3000;
+          proxy_set_header Host $host;
+          proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        }
+      }
+
+
+================================================================================
+5. CONNECT THE ESP32 (FIRMWARE)
+================================================================================
+  LAN MODE: no firmware re-flash needed.
+    - Backend machine is on the same Wi-Fi (LAN IP).
+    - On boot the ESP32 first tries the saved network, then opens the
+      "Aquaculture-Setup" captive portal at http://192.168.4.1 where you set
+      WiFi credentials plus:
+         serverIP   (default "192.168.100.152", esp32code.ino:157)
+         serverPort (default "3000", esp32code.ino:158)
+         deviceId   (default "ESP32_01")
+      Config is also reachable via serial command 'W' or triple-tap the
+      display's top-left corner. WiFiManager parameters are registered in
+      esp32code.ino (lines ~1281-1304).
+
+  PUBLIC/CLOUD MODE: TWO FIRMWARE CHANGES ARE REQUIRED before the backend will
+  accept the device:
+
+    1) AUTHENTICATION. The ESP32 currently does NOT send X-Device-Secret
+       (sendSensorData() only adds Content-Type). With NODE_ENV=production:
+         - DEVICE_SECRET blank  -> /sensor replies 503 (fail-closed).
+         - DEVICE_SECRET set    -> /sensor replies 401 (header missing).
+       Add before http.POST(payload) in esp32code.ino:
+           http.addHeader("X-Device-Secret", "your_shared_secret");
+
+    2) TRANSPORT. The firmware uses plain http:// (esp32code.ino, url build in
+       sendSensorData()). Over the public internet:
+         - Strongly prefer https:// + WiFiClientSecure so credentials and
+           data are not sent in cleartext.
+         - Never ship the client code with certificate validation disabled
+           (setInsecure()); pin the server cert/fingerprint instead.
+
+    If you cannot change the firmware (e.g., demo boards), keep the ESP32 on
+    the LAN and have only the dashboard public, or bridge the ESP32 to the
+    backend over a VPN/tunnel. Do not expose an unauthenticated public /sensor.
+
+
+================================================================================
+6. SECURITY & OPERATIONS CHECKLIST
+================================================================================
+  [ ] NODE_ENV=production on the backend
+  [ ] DEVICE_SECRET set (strong value) and present in the flashed firmware
+  [ ] ADMIN_INITIAL_PASSWORD set on first boot; change the admin password
+      from the Settings page right after login (existing passwords are never
+      overwritten by seeding)
+  [ ] ALLOWED_ORIGINS narrowed to your real frontend origins
+  [ ] SkySMS key configured and SMS recipients pre-authorized in Settings
+  [ ] HTTPS in front of the browser-facing app (Netlify/Vercel give this free;
+      on a VPS use Certbot; on the ESP32 path use wifiClientSecure)
+  [ ] Rate limiter: 300 req/min/IP globally; /sensor is exempt from it but is
+      guarded by DEVICE_SECRET instead (server.cjs)
+  [ ] 10kb JSON body limit on the Express server (Express JSON parser limit)
+  [ ] Backups: nightly pg_dump; logs >30 days are purged automatically
+  [ ] Session tokens expire after 24h (users.token_expires_at)
+
+
+================================================================================
+7. GO-LIVE VERIFICATION
+================================================================================
+  Health:
+      curl https://api.yourdomain.com/health
+
+  Simulate an ESP32 reading (authenticated):
+      curl -X POST https://api.yourdomain.com/sensor \
+        -H "Content-Type: application/json" \
+        -H "X-Device-Secret: your_shared_secret" \
+        -d '{"device_id":"ESP32_TEST","temperature":25.4,"water_level":78.5,"ammonia":1.2}'
+
+  Expect 200. Then confirm the dashboard shows the reading and the device
+  appears online; check /sensor/latest.
+  Wrong/missing secret -> 401; production mode with no secret set -> 503.
+
+  Frontend:
+      - Open the deployed URL, log in with admin, watch the reading update
+        within ~1s (frontend polls /sensor/latest every second).
+      - Cross-check Settings -> SMS recipient test and a threshold breach
+        triggers an alert.
+
+
+================================================================================
+8. TROUBLESHOOTING
+================================================================================
+  Server exits at startup          PostgreSQL unreachable OR the users table
+                                   doesn't exist yet (run the schema first),
+                                   OR 'admin' is missing and
+                                   ADMIN_INITIAL_PASSWORD is unset.
+  SMS "not configured" warning     SKYSMS_API_KEY missing/empty.
+  Browser shows CORS errors        ALLOWED_ORIGINS does not contain the exact
+                                   origin (scheme+host+port) you opened the
+                                   dashboard from.
+  /sensor returns 503              NODE_ENV=production with DEVICE_SECRET blank.
+  /sensor returns 401              X-Device-Secret header missing/wrong
+                                   (firmware not updated - section 5).
+  Dashboard shows ESP32 offline    serverIP/serverPort on the device point at
+                                   the wrong host, or the backend is not
+                                   reachable from the device's network.
+  Readings rejected (400)          body exceeds the 10kb limit or fails the
+                                   Zod sensor schema (see docs/HOW_IT_WORKS.txt).
+  PG connection refused            managed DB whitelist/allow-listed IPs do not
+                                   include the backend's egress IP; or SSL
+                                   required (section 1 caveat).
+
+
+================================================================================
+REFERENCES
+================================================================================
+  docs/DATABASE_SCHEMA.txt   Full table DDL + relationships + dbdiagram.io DBML
+  docs/HOW_IT_WORKS.txt      Endpoint-by-endpoint backend behaviour
+  docs/SMS_HOWTO.txt         SkySMS setup, env vars, cooldowns, templates
+  .env.example               Every supported environment variable
+  README.md                  Local Quick Start, API endpoint table
+================================================================================
+ END OF DEPLOYMENT GUIDE
+================================================================================
