@@ -1,23 +1,6 @@
 // =============================================================================
-// FILE: src/pages/AuthPage.tsx
-// =============================================================================
-// PURPOSE: Login/authentication page for the CRAYvings Monitoring System.
-//
-// This page:
-//   1. Displays the login form with username and password fields
-//   2. Validates input using Zod schema (min length, format checks)
-//   3. Calls the backend API via AuthContext's login function
-//   4. Shows loading spinner during authentication
-//   5. Displays validation errors and API error messages
-//   6. Supports password visibility toggle
-//
-// AUTH FLOW:
-//   User enters credentials -> Zod validation -> API call -> Token stored
-//   -> AuthContext updates user state -> App.tsx redirects to DashboardLayout
-//
-// DEFAULT CREDENTIALS (created by server on first startup):
-//   Username: admin
-//   Password: Admin@123
+// src/pages/AuthPage.tsx
+// Login page with Zod validation and API authentication.
 // =============================================================================
 
 import { useState, useCallback } from "react";
@@ -29,9 +12,6 @@ import logo from "../assets/crayvings.png";
 // ========================
 // LOGIN FORM VALIDATION SCHEMA
 // ========================
-// Zod schema for validating login form input.
-// Username: 3-50 characters
-// Password: 6-100 characters
 const loginSchema = z.object({
   username: z.string().min(3, "Username must be at least 3 characters").max(50),
   password: z.string().min(6, "Password must be at least 6 characters").max(100),
@@ -41,9 +21,7 @@ type LoginForm = z.infer<typeof loginSchema>;
 type FormErrors = Record<string, string>;
 
 /**
- * Login page component with form validation and API authentication.
- * Displays the app branding, login form, and error messages.
- * On successful login, the AuthContext updates and redirects to the dashboard.
+ * Login page component with Zod form validation and API authentication.
  */
 export default function AuthPage() {
   const { login, isLoading, clearError } = useAuth();
@@ -56,10 +34,7 @@ export default function AuthPage() {
   const [loginErrors, setLoginErrors] = useState<FormErrors>({});
   const [apiError, setApiError] = useState<string | null>(null);
 
-  /**
-   * Validates the login form against the Zod schema.
-   * Returns an object of field-specific error messages.
-   */
+  // Validates login form against Zod schema; returns field-specific errors.
   const validateLoginForm = useCallback((): FormErrors => {
     try {
       loginSchema.parse(loginForm);
@@ -78,11 +53,7 @@ export default function AuthPage() {
     }
   }, [loginForm]);
 
-  /**
-   * Handles form submission.
-   * Validates input, clears previous errors, attempts login.
-   * On failure, displays the error message to the user.
-   */
+  // Validates input, clears previous errors, attempts login.
   const handleLoginSubmit = useCallback(async (e: React.FormEvent) => {
     e.preventDefault();
     clearError();

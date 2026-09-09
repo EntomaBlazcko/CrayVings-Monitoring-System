@@ -1,35 +1,13 @@
 // =============================================================================
 // FILE: src/utils/playAlertSound.ts
 // =============================================================================
-// PURPOSE: Web Audio API utility for playing alert sounds.
-//
-// This file provides a complete sound system for the monitoring dashboard:
-//   1. Pre-loads MP3 sound files from /sounds/ directory
-//   2. Falls back to synthesized tones if MP3 files fail to load
-//   3. Supports volume control and mute toggle (persisted in localStorage)
-//   4. Handles browser autoplay restrictions (requires user interaction)
-//
-// SOUND TYPES:
-//   - "warning":   440Hz sine wave or warning.mp3
-//   - "critical":  880Hz square wave (plays twice) or critical.mp3
-//   - "low":       300Hz sine wave or low.mp3
-//   - "high":      600Hz square wave or high.mp3
-//
-// AUDIO CONTEXT LIFECYCLE:
-//   - Created on first call to ensureAudioContext()
-//   - Resumed on user interaction (click/keydown) to bypass browser autoplay blocks
-//   - Shared singleton instance for all sound playback
-//
-// USAGE:
-//   import { playWarningSound, playCriticalSound } from "./playAlertSound";
-//   await playWarningSound();  // Plays warning alert sound
+// PURPOSE: Web Audio utility for alert sounds (MP3 with synth-tone fallback).
 // =============================================================================
 
 // ========================
 // TONE CONFIGURATION
 // ========================
-// Default synthesized tone parameters for each alert type.
-// Used as fallback when MP3 files are not available.
+// Default synthesized tone parameters, used as fallback when MP3 files are unavailable
 const TONE_CONFIG = {
   warning: { frequency: 440, duration: 0.3, type: "sine" as OscillatorType },
   critical: { frequency: 880, duration: 0.15, type: "square" as OscillatorType, repeatDelay: 200 },
@@ -40,30 +18,26 @@ const TONE_CONFIG = {
 // ========================
 // AUDIO PARAMETERS
 // ========================
-const DEFAULT_VOLUME = 0.8;    // Default volume level (0.0 to 1.0)
-const MIN_FREQ = 1;            // Minimum valid frequency (Hz)
-const MAX_FREQ = 20000;        // Maximum valid frequency (Hz)
-const MAX_DURATION = 10;       // Maximum valid duration (seconds)
+const DEFAULT_VOLUME = 0.8;
+const MIN_FREQ = 1;
+const MAX_FREQ = 20000;
+const MAX_DURATION = 10;
 
 // ========================
 // SHARED STATE
 // ========================
-// Singleton AudioContext instance and volume setting.
+// Singleton AudioContext and volume setting
 let audioContext: AudioContext | null = null;
 let volume: number = DEFAULT_VOLUME;
 
-// Pre-loaded audio buffers indexed by sound key (e.g., "warning", "critical")
+// Pre-loaded audio buffers indexed by sound key ("warning", "critical", etc.)
 const audioBuffers: Record<string, AudioBuffer> = {};
 
 // ========================
 // AUDIO CONTEXT MANAGEMENT
 // ========================
 
-/**
- * Creates or resumes the Web Audio API AudioContext.
- * Browsers suspend AudioContext until user interaction, so this
- * attempts to resume it. Failures are silently caught.
- */
+// Browsers suspend the AudioContext until a user interaction; resume it here
 async function ensureAudioContext(): Promise<AudioContext> {
   if (!audioContext) {
     const AudioCtx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
@@ -82,10 +56,7 @@ async function ensureAudioContext(): Promise<AudioContext> {
   return audioContext;
 }
 
-/**
- * Validates tone parameters to prevent audio errors.
- * Ensures frequency, duration, and waveform type are within valid ranges.
- */
+// Validates tone params to prevent audio errors
 function validateParams(frequency: number, duration: number, type: OscillatorType): void {
   if (frequency < MIN_FREQ || frequency > MAX_FREQ) {
     throw new Error(`Invalid frequency`);
@@ -103,7 +74,6 @@ function validateParams(frequency: number, duration: number, type: OscillatorTyp
 // SOUND ENABLE/DISABLE (localStorage)
 // ========================
 
-/** Checks if sound playback is enabled (defaults to true if not set). */
 function isSoundEnabled(): boolean {
   try {
     const enabled = localStorage.getItem("alertSoundEnabled");
@@ -113,12 +83,11 @@ function isSoundEnabled(): boolean {
   }
 }
 
-/** Public getter for sound enabled state. */
 export function getIsSoundEnabled(): boolean {
   return isSoundEnabled();
 }
 
-/** Enables or disables sound playback. Persists to localStorage. */
+// Enables/disables sound; persisted to localStorage
 export function setSoundEnabled(enabled: boolean): void {
   try {
     localStorage.setItem("alertSoundEnabled", enabled ? "true" : "false");
@@ -131,15 +100,11 @@ export function setSoundEnabled(enabled: boolean): void {
 // VOLUME CONTROL
 // ========================
 
-/** Gets the current volume level. */
 export function getVolume(): number {
   return volume;
 }
 
-/**
- * Sets the volume level (clamped to 0-1 range).
- * Invalid values are reset to the default.
- */
+// Sets volume, clamped to 0-1; invalid values reset to default
 export function setVolume(newVolume: number): void {
   if (typeof newVolume !== "number" || !Number.isFinite(newVolume)) {
     volume = DEFAULT_VOLUME;
@@ -152,11 +117,7 @@ export function setVolume(newVolume: number): void {
 // SYNTHESIZED TONE PLAYBACK
 // ========================
 
-/**
- * Plays a synthesized tone using the Web Audio API.
- * Creates an oscillator and gain node, applies exponential fade-out,
- * and cleans up resources after playback.
- */
+// Plays a synth tone via oscillator + gain with exponential fade-out
 async function playTone(frequency: number, duration: number, type: OscillatorType = "sine"): Promise<void> {
   validateParams(frequency, duration, type);
 
@@ -174,7 +135,7 @@ async function playTone(frequency: number, duration: number, type: OscillatorTyp
     oscillator.frequency.value = frequency;
     oscillator.type = type;
     
-    // Set volume and apply exponential fade-out for smooth ending
+    // Exponential fade-out avoids an abrupt click at the end
     gainNode.gain.setValueAtTime(volume, ctx.currentTime);
     gainNode.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + duration);
 
@@ -194,10 +155,7 @@ async function playTone(frequency: number, duration: number, type: OscillatorTyp
 // CUSTOM SOUND (MP3) PLAYBACK
 // ========================
 
-/**
- * Plays a pre-loaded audio buffer (MP3 file).
- * Uses AudioBufferSourceNode for high-quality playback.
- */
+// Plays a pre-loaded audio buffer (MP3) via AudioBufferSourceNode
 async function playCustomSound(audioBuffer: AudioBuffer): Promise<void> {
   const ctx = await ensureAudioContext();
   let source: AudioBufferSourceNode | null = null;
@@ -224,7 +182,7 @@ async function playCustomSound(audioBuffer: AudioBuffer): Promise<void> {
   }
 }
 
-/** Decodes raw audio data into an AudioBuffer using the AudioContext. */
+// Decodes raw audio data into an AudioBuffer
 async function decodeAudioData(arrayBuffer: ArrayBuffer): Promise<AudioBuffer> {
   const ctx = await ensureAudioContext();
   return ctx.decodeAudioData(arrayBuffer);
@@ -234,7 +192,7 @@ async function decodeAudioData(arrayBuffer: ArrayBuffer): Promise<AudioBuffer> {
 // SOUND LOADING FUNCTIONS
 // ========================
 
-/** Fetches and decodes an audio file from a URL, storing it by key. */
+// Fetches and decodes an audio file from a URL, storing it by key
 export async function setCustomSound(key: string, url: string): Promise<void> {
   const response = await fetch(url);
   if (!response.ok) {
@@ -245,19 +203,17 @@ export async function setCustomSound(key: string, url: string): Promise<void> {
   audioBuffers[key] = audioBuffer;
 }
 
-/** Decodes and stores an audio file from a Blob object. */
+// Decodes and stores an audio file from a Blob
 export async function setCustomSoundFromBlob(key: string, blob: Blob): Promise<void> {
   const arrayBuffer = await blob.arrayBuffer();
   const audioBuffer = await decodeAudioData(arrayBuffer);
   audioBuffers[key] = audioBuffer;
 }
 
-/** Removes a custom sound by key. */
 export function clearCustomSound(key: string): void {
   delete audioBuffers[key];
 }
 
-/** Checks if a custom sound is loaded for the given key. */
 export function hasCustomSound(key: string): boolean {
   return key in audioBuffers;
 }
@@ -265,7 +221,7 @@ export function hasCustomSound(key: string): boolean {
 // ========================
 // DEFAULT SOUND FILE URLS
 // ========================
-// Paths to MP3 files in the public/sounds/ directory.
+// MP3 paths in public/sounds/
 const SOUND_URLS = {
   warning: "/sounds/warning.mp3",
   critical: "/sounds/critical.mp3",
@@ -273,11 +229,7 @@ const SOUND_URLS = {
   high: "/sounds/high.mp3",
 } as const;
 
-/**
- * Pre-loads all default sound files on app startup.
- * Uses Promise.allSettled so one failure doesn't block others.
- * Falls back to synthesized tones for any failed loads.
- */
+// Pre-loads all default sound files; failures fall back to synth tones
 export async function initializeCustomSounds(): Promise<void> {
   const loadPromises = Object.entries(SOUND_URLS).map(async ([key, url]) => {
     try {
@@ -289,15 +241,12 @@ export async function initializeCustomSounds(): Promise<void> {
   await Promise.allSettled(loadPromises);
 }
 
-/** Ensures the AudioContext is ready for playback. Called from main.tsx. */
+// Ensures AudioContext is ready for playback (called from main.tsx)
 export async function ensureAudioContextReady(): Promise<void> {
   await ensureAudioContext();
 }
 
-/**
- * Determines whether to use a custom sound (MP3) or synthesized tone.
- * Returns an object with the sound type and a play function.
- */
+// Picks a pre-loaded custom sound (MP3) or falls back to a synthesized tone
 async function getActiveSound(key: string): Promise<{ type: "custom" | "synth"; play: () => Promise<void> }> {
   if (audioBuffers[key]) {
     return {
@@ -313,10 +262,7 @@ async function getActiveSound(key: string): Promise<{ type: "custom" | "synth"; 
   };
 }
 
-/**
- * Returns the synthesized tone configuration for a given sound key.
- * Falls back to a default 440Hz sine wave for unknown keys.
- */
+// Tone config for a sound key; unknown keys fall back to a default 440Hz sine
 function getToneConfigForKey(key: string): { frequency: number; duration: number; type: OscillatorType } {
   switch (key) {
     case "warning": return TONE_CONFIG.warning;
@@ -330,19 +276,14 @@ function getToneConfigForKey(key: string): { frequency: number; duration: number
 // ========================
 // PUBLIC SOUND PLAYBACK FUNCTIONS
 // ========================
-// These are the main entry points used by components to play alert sounds.
 
-/** Plays the warning alert sound (or low threshold sound). */
 export async function playWarningSound(): Promise<void> {
   if (!isSoundEnabled()) return;
   const sound = await getActiveSound("warning");
   await sound.play();
 }
 
-/**
- * Plays the critical alert sound.
- * For synthesized tones, plays twice with a short delay for urgency.
- */
+// Synth critical tone plays twice with a short delay for urgency
 export async function playCriticalSound(): Promise<void> {
   if (!isSoundEnabled()) return;
   const sound = await getActiveSound("critical");
@@ -354,14 +295,12 @@ export async function playCriticalSound(): Promise<void> {
   }
 }
 
-/** Plays the low threshold alert sound. */
 export async function playLowAlertSound(): Promise<void> {
   if (!isSoundEnabled()) return;
   const sound = await getActiveSound("low");
   await sound.play();
 }
 
-/** Plays the high threshold alert sound. */
 export async function playHighAlertSound(): Promise<void> {
   if (!isSoundEnabled()) return;
   const sound = await getActiveSound("high");

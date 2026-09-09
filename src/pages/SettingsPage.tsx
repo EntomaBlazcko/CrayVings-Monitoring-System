@@ -1,42 +1,6 @@
 // =============================================================================
-// FILE: src/pages/SettingsPage.tsx
-// =============================================================================
-// PURPOSE: Comprehensive settings and administration page.
-//
-// This is the largest page in the application. It manages:
-//
-// 1. ALERT THRESHOLDS (all users view, admin users edit):
-//    - Min/Max inputs for Temperature, Water Level, and Ammonia
-//    - Validation (bounds checking, min < max enforcement)
-//    - Save and Reset to Defaults buttons
-//    - Non-admin users see read-only fields with lock icon
-//
-// 2. SMS RECIPIENTS (admin only):
-//    - Add new recipients with name and Philippine phone number (+639XXXXXXXXX)
-//    - Toggle recipients active/inactive
-//    - Send test SMS to verify delivery
-//    - Delete recipients with confirmation modal
-//
-// 3. SMS ALERT MUTE/SLEEP (admin only):
-//    - Mute SMS alerts for 1h, 2h, 4h, 6h, 8h, 12h, or 24h
-//    - Unmute button when alerts are muted
-//    - Status display showing when mute expires
-//
-// 4. USER MANAGEMENT (admin only):
-//    - Create new user accounts with Zod-validated form
-//    - Password strength requirements (uppercase, lowercase, number, 8+ chars)
-//    - Role assignment (user or admin)
-//    - Reset user passwords via modal dialog
-//    - Delete user accounts with confirmation modal
-//    - Cannot delete own account
-//
-// 5. DEFAULT ADMIN CREDENTIALS DISPLAY:
-//    - Shows admin/Admin@123 reminder for first-time setup
-//
-// VALIDATION:
-//    - Zod schema for user creation form
-//    - Manual validation for settings bounds and range checks
-//    - Real-time error display on form fields
+// src/pages/SettingsPage.tsx
+// Settings page: alert thresholds, SMS recipients/mute, and user management.
 // =============================================================================
 
 import { useState, useCallback, useMemo, useEffect } from "react";
@@ -507,9 +471,7 @@ export default function SettingsPage() {
     }
   }, [resetModal, showToast]);
 
-  // Only block the page on the very first load — once settings exist, keep the
-  // page rendered while a background refetch (e.g. after save/reset) happens,
-  // so the form doesn't flash away on every save.
+  // Only block on first load; keep form visible during background refetch after save/reset.
   if (settingsLoading && !settings) {
     return <LoadingCard title="Settings" message="Loading settings..." />;
   }

@@ -1,17 +1,6 @@
 // =============================================================================
-// FILE: src/pages/DashboardPage.tsx
-// =============================================================================
-// PURPOSE: Main monitoring dashboard with live readings and trend charts.
-//
-// This page provides a comprehensive real-time view of the aquaculture system:
-//   1. Three StatCards showing current temperature, water level, and ammonia
-//   2. Three TrendCards with line charts showing historical trends
-//   3. Sensor Hub Status panel showing ESP32 connection state
-//   4. Recent Readings table with the last 5 sensor entries
-//   5. Tank Status indicator (safe vs alert) with detail messages
-//
-// LAYOUT: 3-column grid on desktop (status | readings | tank status)
-// DATA: Real-time from SensorProvider (3-second polling)
+// src/pages/DashboardPage.tsx
+// Main dashboard with live stat cards, trend charts, and sensor hub status.
 // =============================================================================
 
 import { useMemo } from "react";

@@ -1,64 +1,37 @@
 // =============================================================================
 // FILE: src/types/index.ts
 // =============================================================================
-// PURPOSE: Central TypeScript type definitions for the CRAYvings Monitoring System.
-//
-// This file defines all shared types, interfaces, constants, and utility functions
-// used across the frontend. It serves as the single source of truth for:
-//   - Data shapes (SensorEntry, ChartPoint, LogEntry, etc.)
-//   - Configuration constants (DEFAULT_SETTINGS, API_BASE)
-//   - Navigation types (MenuKey, validation)
-//   - Threshold evaluation logic (frontend duplicate of server logic)
-//   - Authentication types (AuthUser, AuthResponse)
-//   - Activity logging types (ActivityLog, ActivityActionType)
-//
-// Having types centralized ensures type safety across all components,
-// hooks, API calls, and context providers.
+// Central TypeScript types, constants, and threshold logic for the frontend.
 // =============================================================================
 
 // ========================
 // SENSOR DATA TYPES
 // ========================
-// These types represent the raw data received from the ESP32 device
-// and the transformed data used for chart rendering.
+// Raw data from the ESP32 and transformed data for charts.
 
-/**
- * Raw sensor reading as stored in the PostgreSQL "sensors" table.
- * Represents a single data point from the ESP32 device.
- * The _id field is optional (used if MongoDB was considered, but PG uses numeric id).
- */
 export type SensorEntry = {
   _id?: string;
-  device_id: string;       // ESP32 device identifier
-  temperature: number;     // Water temperature in Celsius
-  water_level: number;     // Water level as percentage
-  ammonia: number;         // Ammonia gas concentration in ppm (NH3, MQ-137)
-  timestamp?: string;      // ISO 8601 timestamp of the reading
+  device_id: string;
+  temperature: number;
+  water_level: number;
+  ammonia: number;
+  timestamp?: string;
 };
 
-/**
- * Transformed sensor data point optimized for Recharts line charts.
- * The "name" field is a formatted time string for the X-axis display.
- * Created by the API client's fetchSensorHistory function.
- */
+// Optimized for Recharts; "name" is a formatted time label for the X-axis.
 export type ChartPoint = {
-  name: string;            // Formatted time label (e.g., "02:30 PM")
-  timestamp: string;       // ISO 8601 timestamp
-  temperature: number | null;     // Temperature value for charting (null = sensor failure)
-  water_level: number | null;     // Water level value for charting (null = sensor failure)
-  ammonia: number | null;         // Ammonia value for charting (null = sensor failure)
+  name: string;
+  timestamp: string;
+  temperature: number | null;     // null = sensor failure
+  water_level: number | null;
+  ammonia: number | null;
 };
 
 // ========================
 // NAVIGATION TYPES
 // ========================
-// Defines valid page/menu keys used throughout the app for routing
-// and sidebar navigation.
+// Valid page/menu keys for routing and sidebar navigation.
 
-/**
- * Array of all valid menu/page keys used for navigation.
- * Marked as const to create a readonly tuple for type inference.
- */
 export const VALID_MENU_KEYS = [
   "Home",
   "Dashboard",
@@ -70,17 +43,9 @@ export const VALID_MENU_KEYS = [
   "Sensor Logs",
 ] as const;
 
-/**
- * Union type of all valid menu keys.
- * Automatically derived from VALID_MENU_KEYS array.
- * Any new page added to the app must be included in VALID_MENU_KEYS.
- */
 export type MenuKey = typeof VALID_MENU_KEYS[number];
 
-/**
- * Type guard function to validate if a string is a valid MenuKey.
- * Used when restoring saved menu state from localStorage.
- */
+// Type guard for validating saved menu state from localStorage.
 export function isValidMenuKey(value: string): value is MenuKey {
   return VALID_MENU_KEYS.includes(value as MenuKey);
 }
@@ -89,30 +54,21 @@ export function isValidMenuKey(value: string): value is MenuKey {
 // LOG ENTRY TYPES
 // ========================
 
-/**
- * A system log entry from the "system_logs" database table.
- * Records sensor alerts, setting changes, and system events.
- * Used by the AlertsPage and LogsPage.
- */
 export type LogEntry = {
   id?: number;
-  action: string;              // e.g., "Alert", "Change", "Device Disconnect"
-  parameter: string;           // e.g., "Temperature", "Water Level"
-  old_value: string | number;  // Previous value or threshold direction ("Low"/"High")
-  new_value: string | number;  // New sensor reading value
-  timestamp?: string;          // ISO 8601 timestamp
+  action: string;
+  parameter: string;
+  old_value: string | number;
+  new_value: string | number;
+  timestamp?: string;
 };
 
 // ========================
 // SENSOR SETTINGS TYPES
 // ========================
-// Threshold configuration that determines when alerts are triggered.
+// Threshold configuration for alert triggering.
 
-/**
- * Sensor threshold settings stored in the "sensor_settings" table.
- * Defines the acceptable min/max range for each sensor parameter.
- * Values outside these ranges trigger warning or critical alerts.
- */
+// Min/max acceptable ranges for each sensor parameter.
 export type SensorSettings = {
   id?: number;
   temp_min: number;
@@ -124,11 +80,7 @@ export type SensorSettings = {
   updated_at?: string;
 };
 
-/**
- * Default threshold values used when no settings exist in the database.
- * These represent safe ranges for crayfish aquaculture.
- * Temperature: 20-31°C, Water Level: 10-100%, Ammonia: 0-25 ppm
- */
+// Default safe ranges for crayfish aquaculture (used when no DB settings exist).
 export const DEFAULT_SETTINGS: SensorSettings = {
   temp_min:20.0,
   temp_max:31.0,
@@ -141,34 +93,22 @@ export const DEFAULT_SETTINGS: SensorSettings = {
 // ========================
 // THRESHOLD CONFIGURATION TYPES
 // ========================
-// Used to configure how each sensor is displayed and evaluated in the UI.
 
-/**
- * Simple min/max range for a single sensor parameter.
- */
 export type ThresholdRange = {
   min: number;
   max: number;
 };
 
-/**
- * Complete threshold configuration for a sensor.
- * Includes display name, unit, range, color, and evaluation mode.
- * Generated by getSettingsThresholds() from SensorSettings.
- */
+// Per-sensor config including display name, unit, range, color, and evaluation mode.
 export type SensorThreshold = {
-  name: string;              // Display name (e.g., "Temperature")
-  unit: string;              // Unit symbol (e.g., "°C", "%")
-  range: ThresholdRange;     // Min/max acceptable values
-  isMinOnly: boolean;        // If true, only checks against minimum
-  color: string;             // Tailwind CSS color class for UI
+  name: string;
+  unit: string;
+  range: ThresholdRange;
+  isMinOnly: boolean;
+  color: string;
 };
 
-/**
- * Converts SensorSettings into a map of SensorThreshold configurations.
- * Maps database field names (temp_min/temp_max) to sensor keys
- * (temperature/water_level) used throughout the frontend.
- */
+// Maps DB field names (temp_min/temp_max) to sensor keys (temperature/water_level).
 export function getSettingsThresholds(settings: SensorSettings | null): Record<string, SensorThreshold> {
   const defaults = settings ?? DEFAULT_SETTINGS;
   return {
@@ -199,23 +139,11 @@ export function getSettingsThresholds(settings: SensorSettings | null): Record<s
 // ========================
 // THRESHOLD STATUS EVALUATION
 // ========================
-// Frontend duplicate of the server's getThresholdStatus() function.
-// Uses the same algorithm (15% margin for critical vs warning).
+// Frontend mirror of server.cjs getThresholdStatus() with same 15% margin logic.
 
-/**
- * Possible threshold status values.
- * "good" = within range, "warning" = slightly outside, "critical" = far outside
- */
 export type ThresholdStatus = "good" | "warning" | "critical";
 
-/**
- * Evaluates a sensor value against its threshold range on the frontend.
- * Uses the same 15% margin logic as the server's getThresholdStatus().
- * @param value - Current sensor reading
- * @param range - Min/max acceptable range
- * @param isMinOnly - If true, only checks against minimum (not currently used)
- * @returns "good", "warning", or "critical"
- */
+// Evaluates a value against its range; 15% deviation = critical, otherwise warning.
 export function getThresholdStatus(
   value: number,
   range: ThresholdRange,
@@ -228,12 +156,10 @@ export function getThresholdStatus(
   const rangeSize = max - min;
   const criticalMargin = rangeSize * 0.15;
 
-  // IMPORTANT: This must stay a behavioral mirror of server.cjs getThresholdStatus()
-  // (15% margin). Any change here affects the Alerts page severity AND the
-  // threshold cross-check test (src/types/threshold.test.cjs).
+  // IMPORTANT: Must stay in sync with server.cjs getThresholdStatus().
+  // Changes affect Alerts page severity and threshold cross-check test.
   if (isMinOnly) {
-    // A one-sided (min-only) threshold uses the max as the "good" bound and
-    // treats values only below min as a breach, with the same 15% margin.
+    // Min-only threshold: only values below min are breaches, with same 15% margin.
     if (val < min) {
       const deviation = min - val;
       return deviation >= criticalMargin ? "critical" : "warning";
@@ -257,19 +183,9 @@ export function getThresholdStatus(
 // ALERT TYPES
 // ========================
 
-/**
- * Severity levels for alert display in the UI.
- * "critical" = red/danger, "warning" = orange/caution, "info" = blue/neutral
- */
 export type AlertSeverity = "info" | "warning" | "critical";
 
-/**
- * Determines the severity of an alert based on sensor parameter and value.
- * Uses the user-configured threshold ranges from SensorSettings:
- *   - Critical when the value deviates from the configured range by 15% or more
- *   - Warning when it is only slightly outside
- *   - Falls back to DEFAULT_SETTINGS when no settings are available
- */
+// Determines alert severity from log entry and configured thresholds.
 export function parseAlertSeverity(log: LogEntry, settings?: SensorSettings | null): AlertSeverity {
   if (log.action !== "Alert") return "info";
 
@@ -286,19 +202,10 @@ export function parseAlertSeverity(log: LogEntry, settings?: SensorSettings | nu
 // ========================
 // API CONFIGURATION
 // ========================
-// Determines the backend API base URL for all frontend HTTP requests.
 
-/**
- * Default API base URL for development (local server).
- * In production, this is overridden by the VITE_API_BASE environment variable.
- */
 const DEFAULT_API_BASE = "http://localhost:3000";
 
-/**
- * Returns the API base URL from environment variables or falls back to default.
- * Uses import.meta.env for Vite environment variable access.
- * This allows deploying the frontend to different environments without code changes.
- */
+// Returns API base URL from VITE_API_BASE env var or falls back to localhost.
 export function getApiBase(): string {
   if (typeof import.meta !== "undefined" && import.meta.env) {
     return import.meta.env.VITE_API_BASE || DEFAULT_API_BASE;
@@ -309,58 +216,35 @@ export function getApiBase(): string {
 // ========================
 // SENSOR KEY MAPPINGS
 // ========================
-// Bidirectional mappings between internal sensor keys and display names.
-// Used to convert between database/API keys and user-facing labels.
 
-/**
- * Maps internal sensor keys to human-readable display names.
- * e.g., "temperature" -> "Temperature", "water_level" -> "Water Level"
- */
 export const SENSOR_KEY_TO_DISPLAY: Record<string, string> = {
   temperature: "Temperature",
   water_level: "Water Level",
   ammonia: "Ammonia",
 };
 
-/**
- * Maps display names back to internal sensor keys.
- * e.g., "Temperature" -> "temperature", "Water Level" -> "water_level"
- */
 export const DISPLAY_TO_SENSOR_KEY: Record<string, string> = {
   "Temperature": "temperature",
   "Water Level": "water_level",
   "Ammonia": "ammonia",
 };
 
-/**
- * Computed API base URL constant.
- * Evaluated at module load time, used by the API client for all requests.
- */
 export const API_BASE = getApiBase();
 
 // ========================
 // ACTIVITY LOG TYPES
 // ========================
-// Types for tracking user interactions and system events.
 
-/**
- * An activity log entry from the "activity_logs" database table.
- * Records user navigation, settings changes, logins, etc.
- */
 export type ActivityLog = {
   id?: number;
-  user_name: string;         // User who performed the action
-  action_type: string;       // Type of action (see ActivityActionType)
-  description: string;       // Human-readable description
-  module: string;            // Module/page where the action occurred
-  timestamp?: string;        // ISO 8601 timestamp
+  user_name: string;
+  action_type: string;
+  description: string;
+  module: string;
+  timestamp?: string;
 };
 
-/**
- * Union type of all possible activity action types.
- * Used for type-safe activity logging and filtering.
- */
-export type ActivityActionType = 
+export type ActivityActionType =
   | "navigation"
   | "button_click"
   | "form_submit"
@@ -371,10 +255,6 @@ export type ActivityActionType =
   | "login"
   | "logout";
 
-/**
- * Array of all valid activity action types.
- * Used for populating filter dropdowns in the Activity Logs page.
- */
 export const ACTIVITY_ACTION_TYPES: ActivityActionType[] = [
   "navigation",
   "button_click",
@@ -387,10 +267,7 @@ export const ACTIVITY_ACTION_TYPES: ActivityActionType[] = [
   "logout",
 ];
 
-/**
- * Input type for creating a new activity log entry.
- * user_name is optional (defaults to "Admin" on the server).
- */
+// Input for creating activity log entries; user_name defaults to "Admin" server-side.
 export interface ActivityLogEntry {
   user_name?: string;
   action_type: ActivityActionType;
@@ -402,17 +279,9 @@ export interface ActivityLogEntry {
 // AUTHENTICATION TYPES
 // ========================
 
-/**
- * Possible user roles in the system.
- * "admin" = full access to settings and user management
- * "user" = read-only access to dashboards and logs
- */
+// "admin" = full access, "user" = read-only dashboards/logs.
 export type UserRole = "user" | "admin";
 
-/**
- * Authenticated user information returned after login.
- * Stored in localStorage for session persistence.
- */
 export interface AuthUser {
   id: number;
   username: string;
@@ -421,10 +290,7 @@ export interface AuthUser {
   name: string;
 }
 
-/**
- * Response structure from the POST /auth/login endpoint.
- * Contains the authenticated user object and session token.
- */
+// Response from POST /auth/login.
 export interface AuthResponse {
   message: string;
   user: AuthUser;

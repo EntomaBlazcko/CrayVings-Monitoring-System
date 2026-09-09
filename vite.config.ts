@@ -6,14 +6,11 @@ import tailwindcss from '@tailwindcss/vite'
 export default defineConfig({
   plugins: [react(), tailwindcss()],
   build: {
-    // Pages are lazy-loaded, so their chunks (recharts, jspdf) are only fetched
-    // on demand. Allow them to exceed the default 500 kB warning threshold —
-    // they no longer affect the initial page load.
+    // Lazy-loaded chunks (recharts, jspdf) no longer affect initial load, so allow >500 kB.
     chunkSizeWarningLimit: 700,
     rolldownOptions: {
       output: {
-        // Named vendor chunks improve browser caching: changing app code or a
-        // single library doesn't invalidate the cached chunks for the others.
+        // Named vendor chunks keep browser caching stable across app/library changes.
         manualChunks(id: string) {
           if (id.includes('node_modules')) {
             if (id.includes('jspdf')) return 'pdf'

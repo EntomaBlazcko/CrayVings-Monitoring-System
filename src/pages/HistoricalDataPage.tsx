@@ -1,23 +1,6 @@
 // =============================================================================
-// FILE: src/pages/HistoricalDataPage.tsx
-// =============================================================================
-// PURPOSE: Historical data analysis page with time-range filtering.
-//
-// This page allows users to view sensor trends over different time periods:
-//   1. Time range selector: 1 Hour / 6 Hours / 24 Hours / All Time
-//   2. Two summary cards showing Min/Average/Max for each sensor
-//   3. Two full-width line charts (vertical layout for readability)
-//
-// FEATURES:
-//   - Dynamically fetches more data from the backend for longer time ranges
-//   - Uses AbortController to cancel stale requests when switching ranges
-//   - Filters and sorts data client-side for the selected time window
-//   - Shows loading skeletons during data fetch
-//
-// DATA FLOW:
-//   - Short ranges (1h, 6h): Uses locally cached history from SensorProvider
-//   - Long ranges (24h, all): Fetches additional data directly from API
-//   - Data is filtered by timestamp cutoff based on selected range
+// src/pages/HistoricalDataPage.tsx
+// Historical data analysis with time-range filtering and weekly PDF report.
 // =============================================================================
 
 import { useState, useMemo, useEffect, useCallback } from "react";
@@ -42,11 +25,7 @@ import { isAxiosError } from "axios";
 import type { ChartPoint, WeeklyReport } from "../types";
 import { formatFarmTime, formatFarmDateTime } from "../utils/time";
 
-// Detects a request that was cancelled by an AbortController. React
-// (fetch) throws a native AbortError, while axios surfaces the same
-// cancellation as ERR_CANCELED / CanceledError. Checking both avoids
-// setting a spurious error on every range switch (the effect cleanup
-// aborts the previous request).
+// Detects AbortError from AbortController cancellation (native fetch or axios).
 function isAbortError(err: unknown): boolean {
   if (err instanceof DOMException) return err.name === "AbortError";
   return isAxiosError(err) && (err.code === "ERR_CANCELED" || err.name === "CanceledError");
@@ -54,10 +33,7 @@ function isAbortError(err: unknown): boolean {
 
 type TimeRange = "1h" | "6h" | "24h" | "1w" | "all";
 
-/**
- * Calculates min, max, and average statistics for each sensor parameter.
- * Returns null if no data is available.
- */
+// Calculates min/max/avg stats for each sensor parameter from chart data.
 function getStats(data: { temperature?: number | string | null; water_level?: number | string | null; ammonia?: number | string | null }[]) {
   if (!data || data.length === 0) return null;
 
@@ -111,9 +87,7 @@ export default function HistoricalDataPage() {
     }
   };
 
-  // The page always fetches its own history from the server (the DB), so it
-  // keeps working even when the live device is offline. Provider `history` is
-  // only used as an instant seed while the page fetch is in flight.
+  // Always fetches from server (DB), so it works offline. Provider history is only seed.
   const fetchDynamicData = useCallback(async (range: TimeRange, signal: AbortSignal) => {
     const limit = getLimitForRange(range);
     const data = await fetchSensorHistory(limit, signal);
@@ -246,9 +220,8 @@ export default function HistoricalDataPage() {
     }
 
     try {
-      // jspdf is heavy (~150kB+), so it's only loaded when the user actually
-      // exports a PDF rather than when this page opens.
-      const [{ jsPDF }, { default: autoTable }] = await Promise.all([
+    // Lazy-load jspdf (~150kB+) only when user actually exports.
+    const [{ jsPDF }, { default: autoTable }] = await Promise.all([
         import("jspdf"),
         import("jspdf-autotable"),
       ]);
@@ -378,8 +351,7 @@ export default function HistoricalDataPage() {
     }
   }, [weeklyReport, exportingPdf]);
 
-  // Only show the loading skeleton on the very first load — keep the previous
-  // range's charts on screen while re-fetching after a range switch.
+  // Only show loading skeleton on first load; keep previous charts during re-fetch.
   if (activeLoading && (!activeHistory || activeHistory.length === 0)) {
     return (
       <div className="space-y-4">

@@ -1,22 +1,10 @@
 // =============================================================================
 // FILE: src/components/Loading.tsx
-// =============================================================================
-// PURPOSE: Shared loading UI primitives used across all pages.
-//
-// Provides a consistent loading experience for the app:
-//   - Spinner:     Inline animated spinner (lucide Loader2)
-//   - LoadingCard: Full-width white card with a centered spinner + message
-//   - Skeleton:    Pulsing gray placeholder block for content-sized layouts
-//
-// These replace the previous mix of plain text and per-page spinner styles so
-// every page uses the same visual language while data is being fetched.
+// PURPOSE: Shared loading/error UI primitives used across all pages.
 // =============================================================================
 
 import { Loader2, AlertTriangle, RefreshCw } from "lucide-react";
 
-/**
- * Inline animated spinner. Size and color are configurable.
- */
 export function Spinner({
   size = 16,
   className = "text-gray-500",
@@ -27,10 +15,6 @@ export function Spinner({
   return <Loader2 size={size} className={`animate-spin shrink-0 ${className}`} />;
 }
 
-/**
- * Full-width loading card with a centered spinner and optional title/message.
- * Used for full-page or full-section initial loading states.
- */
 export function LoadingCard({
   title,
   message = "Loading...",
@@ -53,20 +37,12 @@ export function LoadingCard({
   );
 }
 
-/**
- * Pulsing gray placeholder block used to build content-shaped skeletons
- * (e.g. chart placeholders, text lines, stat values).
- */
 export function Skeleton({ className = "" }: { className?: string }) {
   return (
     <div className={`animate-pulse bg-gray-200 rounded ${className}`} />
   );
 }
 
-/**
- * Formal error state card with a consistent icon, title, message, and an
- * optional Retry button. Used by all pages when a data fetch fails.
- */
 export function ErrorCard({
   title = "Failed to load",
   message = "Something went wrong while loading this page.",
@@ -108,10 +84,7 @@ export function ErrorCard({
   );
 }
 
-/**
- * Skeleton for a full table card (headers + rows), matching the white card
- * style used by Logs, Alerts, and Activity Logs pages.
- */
+// Skeleton for a full table card (headers + rows), matching other list pages.
 export function TableSkeleton({
   rows = 4,
   cols = 4,

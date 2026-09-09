@@ -308,4 +308,4 @@ ISC
 
 ## Support
 
-For detailed documentation see HOW_IT_WORKS.md. For SMS configuration see SMS_HOWTO.md.
+For detailed documentation see docs/HOW_IT_WORKS.txt. For SMS configuration see docs/SMS_HOWTO.txt.

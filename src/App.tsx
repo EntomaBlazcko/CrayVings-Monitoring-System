@@ -1,29 +1,6 @@
 // =============================================================================
 // FILE: src/App.tsx
-// =============================================================================
-// PURPOSE: Root application component with routing, layout, and providers.
-//
-// This file is the top-level component that:
-//   1. Wraps the entire app in context providers (Auth, Sensor, FloatingAlert)
-//   2. Manages navigation state (which page is currently active)
-//   3. Renders the sidebar navigation and page content based on active menu
-//   4. Handles authentication flow (shows AuthPage if not logged in)
-//   5. Persists the last viewed page in localStorage
-//   6. Logs navigation events for activity tracking
-//
-// LAYOUT STRUCTURE:
-//   App (outermost)
-//   └── AuthProvider (manages login/logout state)
-//       └── SensorProvider (manages sensor data, settings, logs)
-//           └── FloatingAlertProvider (manages toast notifications)
-//               ├── AppContent (auth check: shows AuthPage or DashboardLayout)
-//               ├── FloatingAlertContainer (toast notification display)
-//               └── DeviceConnectionMonitor (ESP32 connection watcher)
-//
-// NAVIGATION:
-//   Uses client-side state (useState) instead of react-router.
-//   The activeMenu state determines which page component to render.
-//   Menu items are defined in baseMenuItems array.
+// PURPOSE: Root component with routing, layout, and context providers.
 // =============================================================================
 
 import { useState, useCallback, useRef, useMemo, lazy, Suspense } from "react";
@@ -53,8 +30,7 @@ import { DeviceConnectionMonitor } from "./components/DeviceConnectionMonitor";
 import { FloatingAlertProvider, FloatingAlertContainer } from "./components/FloatingAlert";
 import { useThresholdAlert } from "./hooks/useThresholdAlert";
 
-// Pages are lazy-loaded so heavy dependencies (recharts, jspdf) only download
-// when the user actually visits those pages instead of on login.
+// Lazy-loaded pages so heavy deps (recharts, jspdf) download only on demand.
 const HomePage = lazy(() => import("./pages/HomePage"));
 const DashboardPage = lazy(() => import("./pages/DashboardPage"));
 const SensorsPage = lazy(() => import("./pages/SensorsPage"));
@@ -67,8 +43,6 @@ const ActivityLogsPage = lazy(() => import("./pages/ActivityLogsPage"));
 // ========================
 // NAVIGATION MENU DEFINITION
 // ========================
-// Defines all available pages with their labels and icons.
-// Each label must match a valid MenuKey from types/index.ts.
 const baseMenuItems: { label: MenuKey; icon: React.ReactNode }[] = [
   { label: "Home", icon: <Home size={18} /> },
   { label: "Dashboard", icon: <LayoutDashboard size={18} /> },
@@ -83,11 +57,6 @@ const baseMenuItems: { label: MenuKey; icon: React.ReactNode }[] = [
 // ========================
 // LOCAL STORAGE STATE RESTORATION
 // ========================
-/**
- * Restores the previously active menu from localStorage.
- * Falls back to "Home" if no saved state or the saved value is invalid.
- * This allows the app to remember the user's last viewed page across refreshes.
- */
 function getInitialMenuDefault(): MenuKey {
   const saved = localStorage.getItem("activeMenu");
   if (saved && isValidMenuKey(saved)) {
@@ -99,17 +68,6 @@ function getInitialMenuDefault(): MenuKey {
 // ========================
 // DASHBOARD LAYOUT COMPONENT
 // ========================
-/**
- * Main dashboard layout with sidebar navigation and page content area.
- * Only rendered when the user is authenticated (useAuth returns a user).
- *
- * Features:
- *   - Responsive sidebar (collapsible on mobile with hamburger menu)
- *   - Page title display based on active menu
- *   - Navigation logging for activity tracking
- *   - localStorage persistence of active menu selection
- *   - Threshold alert monitoring hook
- */
 function DashboardLayout() {
   const { user, logout } = useAuth();
   const { logActivity } = useActivityLogs();
@@ -118,21 +76,13 @@ function DashboardLayout() {
   const [activeMenu, setActiveMenu] = useState<MenuKey>(getInitialMenuDefault);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   
-  // Activate threshold monitoring - checks sensor readings against limits
-  // and displays floating alerts when values go out of range
   useThresholdAlert();
 
-  // Memoized menu items to prevent unnecessary re-renders
   const menuItems = useMemo(
     () => baseMenuItems,
     []
   );
 
-  /**
-   * Handles navigation between pages.
-   * Logs the navigation event, updates state, persists to localStorage,
-   * and closes the mobile sidebar.
-   */
   const handleNavigate = useCallback((menu: MenuKey) => {
     const prev = activeMenuRef.current;
     logActivity("navigation", `Navigated to ${menu}`, prev);
@@ -143,11 +93,6 @@ function DashboardLayout() {
     setSidebarOpen(false);
   }, [logActivity]);
 
-  /**
-   * Renders the appropriate page component based on activeMenu state.
-   * This is a manual routing approach (no react-router).
-   * Each case renders a different page component.
-   */
   const renderPage = useCallback(() => {
     let page: React.ReactNode;
 
@@ -181,8 +126,7 @@ function DashboardLayout() {
         break;
     }
 
-    // Suspense keeps a consistent loading state while a lazy page chunk
-    // (and its dependencies like recharts/jspdf) finishes downloading.
+    // Suspense shows a loading state while lazy page chunks download.
     return (
       <Suspense
         fallback={
@@ -194,12 +138,10 @@ function DashboardLayout() {
     );
   }, [activeMenu, handleNavigate]);
 
-  // Don't render anything if no user is authenticated
   if (!user) return null;
 
   return (
     <div className="flex min-h-screen bg-gray-100 font-sans">
-      {/* Mobile hamburger menu button - only visible on small screens */}
       <button
         onClick={() => setSidebarOpen(!sidebarOpen)}
         className="fixed top-4 left-4 z-50 p-2 bg-white rounded-lg shadow-lg md:hidden"
@@ -207,7 +149,6 @@ function DashboardLayout() {
         {sidebarOpen ? <X size={24} /> : <Menu size={24} />}
       </button>
 
-      {/* Mobile overlay - darkens background when sidebar is open */}
       {sidebarOpen && (
         <div
           className="fixed inset-0 bg-black/50 z-40 md:hidden"
@@ -215,13 +156,11 @@ function DashboardLayout() {
         />
       )}
 
-      {/* Sidebar navigation - slides in on mobile, always visible on desktop */}
       <div
         className={`fixed md:static inset-y-0 left-0 z-50 w-24 bg-[#f5efe9] border-r border-[#eadfd6] min-h-screen flex flex-col items-center pt-4 transform transition-transform duration-300 ${
           sidebarOpen ? "translate-x-0" : "-translate-x-full md:translate-x-0"
         }`}
-      >
-        {/* App logo at the top of the sidebar */}
+        >
         <div className="w-14 h-14 rounded-full bg-white flex items-center justify-center overflow-hidden border-2 border-[#e9d3c6] mb-4">
           <img
             src={logo}
@@ -230,7 +169,6 @@ function DashboardLayout() {
           />
         </div>
 
-        {/* Navigation menu buttons */}
         <div className="w-full flex flex-col gap-1 px-2">
           {menuItems.map((item) => {
             const isActive = activeMenu === item.label;
@@ -253,27 +191,21 @@ function DashboardLayout() {
         </div>
       </div>
 
-      {/* Main content area: header + page content */}
       <div className="flex-1 flex flex-col w-full md:w-auto">
-        {/* Top header bar with user info and logout button */}
         <Header user={user} onLogout={() => {
           logActivity("logout", `${user.name} logged out`, "Auth");
           logout();
         }} />
 
-        {/* Page content container */}
         <div className="p-3 md:p-5">
-          {/* Page title */}
           <div className="text-xl md:text-2xl font-extrabold text-gray-800 mb-1 mt-10 md:mt-0">
             {activeMenu}
           </div>
 
-          {/* Page subtitle */}
           <div className="text-xs text-gray-400 mb-4">
             Current live sensor data and tank overview
           </div>
 
-          {/* Active page component */}
           {renderPage()}
         </div>
       </div>
@@ -284,10 +216,6 @@ function DashboardLayout() {
 // ========================
 // APP CONTENT COMPONENT
 // ========================
-/**
- * Conditional renderer: shows AuthPage for unauthenticated users,
- * DashboardLayout for authenticated users.
- */
 function AppContent() {
   const { user } = useAuth();
 
@@ -301,19 +229,6 @@ function AppContent() {
 // ========================
 // ROOT APP COMPONENT
 // ========================
-/**
- * The root component that wraps the entire application in context providers.
- * Provider nesting order matters: AuthProvider > SensorProvider > FloatingAlertProvider.
- * 
- * Provider responsibilities:
- *   - AuthProvider: Manages user authentication state
- *   - SensorProvider: Manages sensor data polling, settings, logs
- *   - FloatingAlertProvider: Manages toast notifications
- * 
- * Global components (outside page routing):
- *   - FloatingAlertContainer: Displays toast notifications
- *   - DeviceConnectionMonitor: Watches ESP32 connection status
- */
 export default function App() {
   return (
     <AuthProvider>

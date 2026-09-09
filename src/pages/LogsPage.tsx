@@ -1,21 +1,6 @@
 // =============================================================================
-// FILE: src/pages/LogsPage.tsx
-// =============================================================================
-// PURPOSE: System logs page with parameter filtering and PDF export.
-//
-// This page displays system log entries in a table format with:
-//   1. Parameter filter buttons: All / Temperature / Water Level / Ammonia
-//   2. Paginated table showing timestamp, parameter, old value, new value, action
-//   3. PDF export functionality (via jsPDF + autoTable)
-//
-// PDF EXPORT FEATURES:
-//   - Title header with generation timestamp
-//   - Summary section with total entries and per-parameter counts
-//   - Formatted table with alternating row colors
-//   - Page numbers and footer on each page
-//   - Filename includes date (e.g., CRAYvings_System_Logs_2025-01-15.pdf)
-//
-// DATA: System logs from SensorProvider (auto-polled every 5 seconds)
+// src/pages/LogsPage.tsx
+// System logs table with parameter filtering and PDF export.
 // =============================================================================
 
 import { useState, useMemo, useCallback } from "react";
@@ -43,7 +28,7 @@ export default function LogsPage() {
     return SENSOR_KEY_TO_DISPLAY[param] ?? param;
   };
 
-  // Logs are already filtered server-side by the active parameter filter.
+  // Logs are filtered server-side by the active parameter filter.
   const filteredLogs = logs;
 
   const totalPages = useMemo(() => {
@@ -71,8 +56,7 @@ export default function LogsPage() {
       return;
     }
 
-    // jspdf is heavy (~150kB+), so it's only loaded when the user actually
-    // exports a PDF rather than when the Logs page opens.
+    // Lazy-load jspdf (~150kB+) only when user actually exports.
     let jsPDFModule: typeof import("jspdf");
     let autoTableModule: typeof import("jspdf-autotable");
     try {
@@ -166,8 +150,7 @@ export default function LogsPage() {
       margin: { left: 14, right: 14 },
     });
 
-    // Stamp footers after the table is drawn so the page total is accurate.
-    // (didDrawPage can't know the final count while earlier pages are rendered.)
+    // Stamp footers after table drawn so page total is accurate.
     const finalPageCount = doc.getNumberOfPages();
     for (let i = 1; i <= finalPageCount; i++) {
       doc.setPage(i);

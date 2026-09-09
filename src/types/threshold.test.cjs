@@ -1,30 +1,12 @@
 // =============================================================================
 // FILE: src/types/threshold.test.cjs
-// =============================================================================
-// PURPOSE: Cross-check that the server and client threshold evaluation logic
-//          stay in agreement across a grid of values.
-//
-// WHY THIS EXISTS:
-//   The 15%-margin "good / warning / critical" logic is implemented in TWO
-//   places:
-//     - server: server.cjs getThresholdStatus(value, min, max)
-//     - client: src/types/index.ts getThresholdStatus(value, range, isMinOnly)
-//   If they drift apart, the SMS alert severity and the dashboard badge can
-//   disagree about whether the tank is safe. This test snapshots both from the
-//   CURRENT source and asserts they agree for every value in the grid below.
-//
-// NOTE:
-//   This is a "regression guard" mirroring the two implementations, not an
-//   import of the live modules (the client is TypeScript/ESM and the server is
-//   a full CommonJS process). If you edit either threshold function, update the
-//   mirrored copy here and re-run:  node --test src/types/threshold.test.cjs
+// PURPOSE: Mirrors server.cjs threshold logic to guard against drift.
 // =============================================================================
 
 const { test } = require("node:test");
 const assert = require("node:assert");
 
 // --- Mirror of server.cjs getThresholdStatus(value, min, max) ---
-// (server.cjs lines ~402-414)
 function serverStatus(value, min, max) {
   const rangeSize = max - min;
   const criticalMargin = rangeSize * 0.15;
@@ -40,7 +22,6 @@ function serverStatus(value, min, max) {
 }
 
 // --- Mirror of src/types/index.ts getThresholdStatus(value, range, isMinOnly) ---
-// (src/types/index.ts lines ~219-260)
 function clientStatus(value, min, max, isMinOnly) {
   const rangeSize = max - min;
   const criticalMargin = rangeSize * 0.15;
@@ -71,8 +52,7 @@ const RANGES = [
   { label: "Ammonia", min: 0.25, max: 1.0, isMinOnly: false },
 ];
 
-// A grid of values covering: far below, near-below margin, at min, inside,
-// at max, near-above margin, and far above — for each range.
+// Grid covering values across and around each range's margins and boundaries.
 function buildGrid(range) {
   const { min, max } = range;
   const margin = (max - min) * 0.15;

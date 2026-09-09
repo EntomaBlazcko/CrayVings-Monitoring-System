@@ -1,24 +1,6 @@
 // =============================================================================
-// FILE: src/pages/ActivityLogsPage.tsx
-// =============================================================================
-// PURPOSE: User activity tracking page with search, filter, and sort.
-//
-// This page displays user interaction logs (navigation, settings changes,
-// device connect/disconnect, etc.) from the activity_logs database table with:
-//   1. Search bar with debounced input (300ms delay)
-//   2. Action type filter dropdown (navigation, settings_change, device_connect, device_disconnect)
-//   3. Sort toggle (newest first / oldest first)
-//   4. Refresh button for manual re-fetch
-//   5. Paginated table with time, user, action, description, module
-//
-// ACTION TYPE COLOR CODING:
-//   - navigation: Blue
-//   - settings_change: Orange
-//   - device_connect: Green
-//   - device_disconnect: Red
-//   - Others: Various colors
-//
-// DATA: Activity logs from SensorProvider (fetched on mount, refreshed on demand)
+// src/pages/ActivityLogsPage.tsx
+// User activity logs with search, filter, sort, and pagination.
 // =============================================================================
 
 import { useCallback, useEffect, useState } from "react";

@@ -1,38 +1,7 @@
 // =============================================================================
-// FILE: src/contexts/SensorProvider.tsx
-// =============================================================================
-// PURPOSE: Central data management provider for the CRAYvings Monitoring System.
-//
-// This is the most important state management file in the frontend. It:
-//   1. Polls the backend API every 3 seconds for live sensor data
-//   2. Manages connection status (online/offline/connecting/unknown)
-//   3. Fetches and caches sensor threshold settings
-//   4. Fetches and paginates system logs
-//   5. Fetches and manages activity logs with search/filter/sort
-//   6. Provides all state via React Context to child components
-//
-// DATA POLLING ARCHITECTURE:
-//   - Sensor data: Polled every 3 seconds (POLL_INTERVAL)
-//   - System logs: Polled every 5 seconds (LOGS_POLL_INTERVAL)
-//   - Settings: Fetched once on mount, re-fetched on demand
-//   - Activity logs: Fetched once on mount, re-fetched on demand
-//
-// ABORT CONTROLLER PATTERN:
-//   Each fetch operation uses an AbortController to cancel in-flight
-//   requests when a new poll starts or the component unmounts.
-//   This prevents race conditions and memory leaks.
-//
-// CONNECTION STATUS LOGIC:
-//   - "connecting": Loading state or initial fetch in progress
-//   - "online":      Data received within last 15 seconds
-//   - "offline":     No data for 15+ seconds or 5+ consecutive failures
-//   - "unknown":     No data has ever been received
-//
-// FOUR CUSTOM HOOKS INSIDE THIS FILE:
-//   1. useSensorDataPolling()   - Live sensor data + history + connection
-//   2. useSettingsManager()     - Threshold settings + save operations
-//   3. useLogsManager()         - System logs pagination
-//   4. useActivityLogsManager() - Activity logs with search/filter/sort
+// src/contexts/SensorProvider.tsx
+// Central data provider: polls sensors (1s), logs (5s), settings, activity logs.
+// Four hooks: useSensorDataPolling, useSettingsManager, useLogsManager, useActivityLogsManager.
 // =============================================================================
 
 import {
@@ -71,18 +40,16 @@ import {
 // ========================
 // POLLING CONFIGURATION
 // ========================
-// How often to poll the backend for fresh data.
-const POLL_INTERVAL = 1000;             // 1 second for sensor data (matches ESP32 send rate)
-const HISTORY_POLL_INTERVAL = 30000;     // 30 seconds for chart history (heavy query)
-const OFFLINE_THRESHOLD = 15000;         // 15 seconds without data = offline
-const MAX_CONSECUTIVE_FAILURES = 5;      // After 5 failures, mark as offline
-const LOGS_POLL_INTERVAL = 5000;         // 5 seconds for system logs
-const LOGS_PAGE_SIZE = 20;               // 20 logs per page
+const POLL_INTERVAL = 1000;             // 1s sensor data (matches ESP32 send rate)
+const HISTORY_POLL_INTERVAL = 30000;     // 30s chart history (heavy query)
+const OFFLINE_THRESHOLD = 15000;         // 15s without data = offline
+const MAX_CONSECUTIVE_FAILURES = 5;      // After 5 failures, mark offline
+const LOGS_POLL_INTERVAL = 5000;         // 5s system logs
+const LOGS_PAGE_SIZE = 20;
 
 // ========================
 // STATE INTERFACES
 // ========================
-// Internal state shapes for each data domain.
 
 interface SensorDataState {
   data: SensorEntry | null;
@@ -119,11 +86,7 @@ interface LogsState {
 // ========================
 // CONNECTION STATUS HELPER
 // ========================
-/**
- * Computes the connection status based on loading state, last update time,
- * and consecutive polling failures.
- * This is a pure function used for consistent status calculation.
- */
+// Pure function: derives online/offline/connecting/unknown from last update + failure count.
 function computeConnectionStatus(
   loading: boolean,
   lastUpdate: Date | null,
@@ -140,17 +103,9 @@ function computeConnectionStatus(
 // ========================
 // HOOK 1: SENSOR DATA POLLING
 // ========================
-/**
- * Custom hook that polls the backend for live sensor data every 3 seconds.
- * Fetches both the latest reading and historical data in parallel.
- * Manages connection status, error states, and consecutive failure counting.
- *
- * Features:
- *   - AbortController for canceling stale requests
- *   - Stale data detection (timestamp gap > 15 seconds)
- *   - Consecutive failure tracking for offline detection
- *   - Automatic cleanup on unmount
- */
+// Polls sensor data every 1s + history every 30s. Tracks connection status via
+// consecutive failures and stale timestamps. Uses request IDs (not AbortController)
+// to drop superseded responses without canceling in-flight requests.
 function useSensorDataPolling(): SensorDataState & { refetch: () => void } {
   const [state, setState] = useState<SensorDataState>({
     data: null,
@@ -168,26 +123,15 @@ function useSensorDataPolling(): SensorDataState & { refetch: () => void } {
   const historyIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const latestAbortRef = useRef<AbortController | null>(null);
   const historyAbortRef = useRef<AbortController | null>(null);
-  // Monotonically increasing request ids let slow responses from a superseded
-  // poll be dropped WITHOUT aborting the previous request. Aborting was the
-  // bug: every 1s poll aborted the previous in-flight request, which surfaced
-  // as ERR_CANCELED and returned early without counting a failure — so when the
-  // ESP32/server went offline, the counter never advanced and the status could
-  // freeze at "online" forever (slow requests never got a chance to time out
-  // before being aborted). Letting requests finish and then dropping stale ones
-  // lets genuine timeouts/errors advance the failure counter. The AbortController
-  // is kept only so unmount can cancel any request still pending.
+  // Request IDs: drop superseded responses without aborting (aborting caused
+  // ERR_CANCELED to bypass the failure counter, freezing status at "online").
   const latestReqIdRef = useRef(0);
   const historyReqIdRef = useRef(0);
   const consecutiveFailuresRef = useRef(0);
 
-  /**
-   * Fetches the latest sensor reading from the backend (lightweight, every 1s).
-   * Determines connection status from the sensor data's own timestamp.
-   */
+  // Fetches latest sensor reading (every 1s). Connection status derived from timestamp.
   const fetchLatest = useCallback(async () => {
-    // Let the previous in-flight request run to completion instead of aborting
-    // it (see comment above). Bump the id so its (now stale) result is ignored.
+    // Bump id so any in-flight response from a prior poll is ignored.
     const reqId = ++latestReqIdRef.current;
     latestAbortRef.current = new AbortController();
 
@@ -211,7 +155,6 @@ function useSensorDataPolling(): SensorDataState & { refetch: () => void } {
           consecutiveFailures: 0,
         }));
       } else {
-        // No latest reading; keep any historical data we already have
         setState((prev) => ({
           ...prev,
           data: null,
@@ -221,15 +164,12 @@ function useSensorDataPolling(): SensorDataState & { refetch: () => void } {
         }));
       }
     } catch (error) {
-      // A request aborted because a newer poll started (or unmount) just means
-      // it was superseded — not a real failure.
+      // Superseded or unmounted: not a real failure.
       if (isAxiosError(error) && error.code === "ERR_CANCELED") return;
-      // Ignore the result if a newer poll has already superseded this one.
       if (reqId !== latestReqIdRef.current) return;
 
       consecutiveFailuresRef.current += 1;
 
-      // Only show error after multiple consecutive failures
       if (consecutiveFailuresRef.current >= MAX_CONSECUTIVE_FAILURES) {
         setState((prev) => ({
           ...prev,
@@ -248,10 +188,7 @@ function useSensorDataPolling(): SensorDataState & { refetch: () => void } {
     }
   }, []);
 
-  /**
-   * Fetches chart history from the backend (heavier query, every 30s).
-   * Errors are swallowed — the last good history stays on screen.
-   */
+  // Fetches chart history (every 30s). Errors swallowed; last good data stays on screen.
   const fetchHistory = useCallback(async () => {
     const reqId = ++historyReqIdRef.current;
     historyAbortRef.current = new AbortController();
@@ -262,9 +199,7 @@ function useSensorDataPolling(): SensorDataState & { refetch: () => void } {
       setState((prev) => ({ ...prev, history: historyData, historyStale: false, historyLastUpdated: new Date() }));
     } catch (error) {
       if (isAxiosError(error) && error.code === "ERR_CANCELED") return;
-      // Mark history as stale so UIs can surface "chart data may be outdated"
-      // instead of silently showing old data. Only set stale if a later poll
-      // hasn't already superseded this one.
+      // Mark stale so UI can show "chart data may be outdated" warning.
       if (reqId === historyReqIdRef.current) {
         setState((prev) => ({ ...prev, historyStale: true }));
       }
@@ -276,8 +211,7 @@ function useSensorDataPolling(): SensorDataState & { refetch: () => void } {
     fetchHistory();
   }, [fetchLatest, fetchHistory]);
 
-  // Start polling on mount, clean up on unmount.
-  // Both polls pause while the tab is hidden to reduce background load.
+  // Start polling on mount; both pause while the tab is hidden.
   useEffect(() => {
     refetch();
     intervalRef.current = setInterval(() => {
@@ -303,7 +237,6 @@ function useSensorDataPolling(): SensorDataState & { refetch: () => void } {
     };
   }, [refetch, fetchLatest, fetchHistory]);
 
-  // Recompute connection status whenever loading, lastUpdate, or failures change
   const computedConnectionStatus = useMemo(
     () => computeConnectionStatus(state.loading, state.lastUpdate, state.consecutiveFailures),
     [state.loading, state.lastUpdate, state.consecutiveFailures]
@@ -322,11 +255,7 @@ function useSensorDataPolling(): SensorDataState & { refetch: () => void } {
 // ========================
 // HOOK 2: SETTINGS MANAGER
 // ========================
-/**
- * Custom hook that manages sensor threshold settings.
- * Fetches settings on mount, provides save functionality,
- * and handles loading/error states.
- */
+// Manages sensor threshold settings: fetch on mount, save with optimistic update.
 function useSettingsManager(): SensorSettingsState & { refetch: () => void; save: (s: Partial<SensorSettings>) => Promise<void> } {
   const [state, setState] = useState<SensorSettingsState>({
     settings: null,
@@ -340,7 +269,6 @@ function useSettingsManager(): SensorSettingsState & { refetch: () => void; save
   const abortControllerRef = useRef<AbortController | null>(null);
   const savedTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  /** Fetches current settings from the backend. */
   const fetchData = useCallback(async () => {
     if (abortControllerRef.current) {
       abortControllerRef.current.abort();
@@ -376,10 +304,7 @@ function useSettingsManager(): SensorSettingsState & { refetch: () => void; save
     };
   }, [fetchData]);
 
-  /**
-   * Saves updated settings to the backend.
-   * Optimistically updates local state, shows "saved" confirmation for 2 seconds.
-   */
+  // Saves settings: optimistic local update + "saved" confirmation for 2s.
   const save = useCallback(async (newSettings: Partial<SensorSettings>) => {
     if (abortControllerRef.current) {
       abortControllerRef.current.abort();
@@ -397,7 +322,6 @@ function useSettingsManager(): SensorSettingsState & { refetch: () => void; save
         settings: prev.settings ? { ...prev.settings, ...newSettings } : null,
       }));
 
-      // Clear "saved" confirmation after 2 seconds
       if (savedTimeoutRef.current) {
         clearTimeout(savedTimeoutRef.current);
       }
@@ -413,7 +337,6 @@ function useSettingsManager(): SensorSettingsState & { refetch: () => void; save
   }
 }, []);
 
-  /** Re-fetches settings from the backend (e.g., after a reset). */
   const refetch = useCallback(() => {
     setState((prev) => ({ ...prev, settingsLoading: true, settingsError: null, saveError: null }));
     fetchData();
@@ -432,10 +355,7 @@ function useSettingsManager(): SensorSettingsState & { refetch: () => void; save
 // ========================
 // HOOK 3: LOGS MANAGER
 // ========================
-/**
- * Custom hook that manages paginated system logs.
- * Auto-polls every 5 seconds for fresh log entries.
- */
+// Paginated system logs, auto-polled every 5s.
 function useLogsManager(): LogsState & { refetch: () => void; setPage: (page: number) => void; setLogsActionFilter: (filter: string) => void; setLogsParameterFilter: (filter: string) => void } {
   const [state, setState] = useState<LogsState>({
     logs: [],
@@ -450,7 +370,6 @@ function useLogsManager(): LogsState & { refetch: () => void; setPage: (page: nu
 
   const abortControllerRef = useRef<AbortController | null>(null);
 
-  /** Fetches a specific page of system logs with the active filters. */
   const fetchData = useCallback(async (page = 1, actionFilter = "", parameterFilter = "") => {
     if (abortControllerRef.current) {
       abortControllerRef.current.abort();
@@ -486,7 +405,7 @@ function useLogsManager(): LogsState & { refetch: () => void; setPage: (page: nu
     }
   }, []);
 
-  // Fetch logs on mount and set up auto-polling (pauses while the tab is hidden)
+  // Fetch on mount; auto-poll pauses while the tab is hidden.
   useEffect(() => {
     fetchData(state.logsPage, state.logsActionFilter, state.logsParameterFilter);
     const interval = setInterval(
@@ -546,16 +465,8 @@ function useLogsManager(): LogsState & { refetch: () => void; setPage: (page: nu
 // ========================
 // HOOK 4: ACTIVITY LOGS MANAGER
 // ========================
-/**
- * Custom hook that manages user activity logs with advanced features:
- *   - Pagination (20 entries per page)
- *   - Search (by description or user name, case-insensitive)
- *   - Sort (newest/oldest first)
- *   - Filter (by action type)
- *
- * Uses isMountedRef to prevent state updates on unmounted components,
- * and stateRef to access the latest state in async callbacks.
- */
+// Activity logs with pagination (20/page), search, sort, and action-type filter.
+// Uses isMountedRef to prevent setState on unmounted components.
 interface ActivityLogsState {
   activityLogs: ActivityLog[];
   activityLogsLoading: boolean;
@@ -585,15 +496,11 @@ function useActivityLogsManager() {
   const isMountedRef = useRef(true);
   const stateRef = useRef(state);
 
-  // Keep stateRef in sync with current state for use in async callbacks
   useEffect(() => {
     stateRef.current = state;
   }, [state]);
 
-  /**
-   * Fetches activity logs with the specified page, search, sort, and filter.
-   * Uses stateRef to get the latest values if parameters aren't explicitly provided.
-   */
+  // Fetches activity logs with optional page/search/sort/filter params.
   const fetchData = useCallback(async (page = 1, search?: string, sortBy?: "newest" | "oldest", actionFilter?: string) => {
     if (abortControllerRef.current) {
       abortControllerRef.current.abort();
@@ -601,7 +508,6 @@ function useActivityLogsManager() {
     abortControllerRef.current = new AbortController();
 
     const currentState = stateRef.current;
-    // Use parameters if provided, otherwise use current state
     const currentSearch = search !== undefined ? search : currentState.activitySearch;
     const currentSort = sortBy !== undefined ? sortBy : currentState.activitySortBy;
     const currentFilter = actionFilter !== undefined ? actionFilter : currentState.activityActionFilter;
@@ -676,10 +582,7 @@ function useActivityLogsManager() {
     fetchData(1, undefined, undefined, filter);
   }, [fetchData]);
 
-  /**
-   * Logs a user activity event to the backend.
-   * Fire-and-forget: errors are handled silently by the API client.
-   */
+  // Fire-and-forget: logs user activity to the backend.
   const logActivity = useCallback((actionType: ActivityActionType, description: string, module: string) => {
     apiLogActivity({ action_type: actionType, description, module });
   }, []);
@@ -701,23 +604,13 @@ function useActivityLogsManager() {
 // ========================
 // SENSOR PROVIDER COMPONENT
 // ========================
-/**
- * Main context provider that combines all four data hooks.
- * Wraps child components in all four context providers, making
- * sensor data, settings, logs, and activity logs available globally.
- *
- * Usage in App.tsx:
- *   <SensorProvider>
- *     <AppContent />
- *   </SensorProvider>
- */
+// Combines all four hooks into a single provider tree.
 export function SensorProvider({ children }: { children: ReactNode }) {
   const sensorData = useSensorDataPolling();
   const settingsState = useSettingsManager();
   const logsState = useLogsManager();
   const activityLogsState = useActivityLogsManager();
 
-  // Memoize context values to prevent unnecessary re-renders of consumers
   const dataContextValue = useMemo(
     () => ({
       data: sensorData.data,

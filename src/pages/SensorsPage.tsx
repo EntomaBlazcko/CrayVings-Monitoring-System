@@ -1,22 +1,6 @@
 // =============================================================================
-// FILE: src/pages/SensorsPage.tsx
-// =============================================================================
-// PURPOSE: Detailed sensor status page showing individual sensor readings.
-//
-// This page provides a sensor-focused view with:
-//   1. Connection status header (ONLINE/OFFLINE/CONNECTING indicator)
-//   2. Three sensor cards showing current value, status icon, and threshold range
-//   3. Connection Info panel (device ID, status)
-//   4. Last Update panel (timestamp, relative time like "2m ago")
-//
-// Each sensor card shows:
-//   - Icon and color-coded theme
-//   - Current reading value with unit
-//   - Green checkmark (in range) or red X (out of range)
-//   - Configured threshold range
-//   - Warning text if reading is outside the range
-//
-// DATA: Real-time from SensorProvider
+// src/pages/SensorsPage.tsx
+// Detailed sensor status page with cards for each sensor's value and threshold.
 // =============================================================================
 
 import { useMemo } from "react";
@@ -36,10 +20,7 @@ import { LoadingCard, ErrorCard } from "../components/Loading";
 import { getSettingsThresholds, getThresholdStatus } from "../types";
 import { formatFarmDateTime } from "../utils/time";
 
-/**
- * Formats a timestamp into a human-readable relative time string.
- * e.g., "5s ago", "3m ago", "2h ago", "1d ago"
- */
+// Formats a timestamp into a relative time string (e.g. "5s ago", "3m ago").
 function formatTimeAgo(timestamp: string): string {
   const date = new Date(timestamp);
   if (isNaN(date.getTime())) return "Invalid date";
@@ -60,8 +41,7 @@ export default function SensorsPage() {
   
   const thresholds = useMemo(() => getSettingsThresholds(settings), [settings]);
 
-  // Use the provider's centrally-computed status so this page agrees with the
-  // rest of the app (15s threshold + consecutive-failure detection).
+  // Use provider's centrally-computed status (15s threshold + consecutive-failure detection).
   const isOnline = connectionStatus === "online";
 
   const isConnecting = connectionStatus === "connecting";

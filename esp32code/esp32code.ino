@@ -63,10 +63,8 @@ DallasTemperature sensors(&oneWire);
 
 #define TANK_HEIGHT_CM 36.0
 
-// HC-SR04 filtering: the module needs ~60ms between pings, so we do NOT sample
-// back-to-back (that causes echo crosstalk / false readings). Instead we fire one
-// ping per read (every 1s) and smooth across successive reads, with spike
-// rejection and a display deadband so the shown value stays rock-solid.
+// HC-SR04 filtering: needs ~60ms between pings to avoid echo crosstalk. One
+// ping per read (every 1s), smoothed across reads with spike rejection + deadband.
 #define DISTANCE_JUMP_CM 5.0
 #define DISTANCE_EMA_ALPHA 0.3
 #define WATER_LEVEL_DEADBAND 1.0
@@ -74,27 +72,11 @@ DallasTemperature sensors(&oneWire);
 float filteredDistance = -1.0;
 float lastShownLevel = -1.0;
 
-// =============================================================================
-// MQ-137 AMMONIA (NH3) GAS SENSOR
-// =============================================================================
-//
-// Measures real ammonia gas concentration (ppm in AIR) from the module's analog
-// output using the standard MQ-series chemiresistor model:
-//
-//   Vout = Vc * RL / (Rs + RL)            ->   Rs = RL * (Vc/Vout - 1)
-//   ppm  = 10^((log10(Rs/R0) - b) / m)
-//
-// R0 is the sensor resistance in clean air. Rs and R0 both come from the same
-// divider formula, so their RATIO is largely insensitive to the exact RL/Vc you
-// assume -- but keep them close to reality (serial prints Rs; clean air should
-// read tens of kOhm). Calibration curve (NH3) fitted from the MQ-137 datasheet
-// (widely published): m = -0.263, b = 0.42, clean-air ratio Rs/R0 = 3.6.
-//
-// 3.3V ADC WARNING: GPIO34 is clamped at ~3.3V while the module AO is a 0-5V
-// divider. With the most common module RL (1kOhm SMD) the whole 5-500ppm NH3
-// range stays below 3.3V. If your module uses RL=47kOhm the output saturates at
-// moderate ppm -- readings are then clamped and flagged on serial. Measure your
-// RL (multimeter between module VCC and AOUT) and fix MQ137_RL_KOHM below.
+// MQ-137 NH3 gas sensor: analog chemiresistor model.
+//   Rs = RL * (Vc/Vout - 1)    ppm = 10^((log10(Rs/R0) - b) / m)
+// Calibration: m=-0.263, b=0.42, clean-air Rs/R0=3.6 (from MQ-137 datasheet).
+// 3.3V ADC WARNING: GPIO34 clamped at ~3.3V. With RL=10k the 5-500ppm range stays
+// below 3.3V; RL=47k causes saturation. Measure your RL and fix MQ137_RL_KOHM below.
 #define MQ137_PIN 34
 
 #define MQ137_RL_KOHM   10.0   // Load resistor on this module (kOhm). Marked "103" = 10k
@@ -183,8 +165,7 @@ char deviceId[50] = DEVICE_ID_DEFAULT;
 unsigned long lastSendTime = 0;
 bool wifiConnected = false;
 
-// Background-send flags: the blocking HTTP POST runs on its own task so it
-// can never stall the main loop (and therefore the touchscreen).
+// Background-send flags: HTTP POST runs off the main loop to avoid stalling touch input.
 volatile bool sendPending = false;
 volatile bool sendBusy = false;
 
@@ -227,8 +208,8 @@ uint16_t readTouchRaw(uint8_t command)
 // Sample a touch axis repeatedly and return the average (reduces noise)
 uint16_t readTouchSample(uint8_t command, int samples)
 {
-    // Discard the first read after a channel change: the XPT2046 first sample
-    // can still contain the previous channel's data.
+// Discard first read after channel change: XPT2046 first sample may contain
+// previous channel's data.
     readTouchRaw(command);
 
     uint32_t total = 0;
@@ -268,9 +249,7 @@ bool isTouchPressed()
     touchSPI.endTransaction();
     digitalWrite(TOUCH_CS, HIGH);
 
-    // Lower-bound check is only applied to Z1 (the primary pressure axis).
-    // Some panels report a low/near-zero Z2 while pressed, so requiring
-    // Z2 > MIN_PRESSURE wrongly rejected valid touches.
+    // Z1 lower-bound only: some panels report low Z2 while pressed.
     if (
         z1 > MIN_PRESSURE &&
         z1 < 4000 &&
@@ -301,13 +280,7 @@ bool getTouchPosition(
     uint16_t rawX = readTouchSample(XPT2046_X, 4);
     uint16_t rawY = readTouchSample(XPT2046_Y, 4);
 
-    // Rotation 1:
-    //
-    // RAW Y -> SCREEN X
-    // RAW X -> SCREEN Y
-    //
-    // Reversed according to your working calibration.
-
+    // Rotation 1: RAW Y -> SCREEN X, RAW X -> SCREEN Y
     screenX = map(
         rawY,
         RAW_Y_MIN,
@@ -393,13 +366,13 @@ void readWaterLevel()
     }
     else if (fabsf(rawDistance - filteredDistance) <= DISTANCE_JUMP_CM)
     {
-        // Normal reading: ease the filtered distance toward it (smooths jitter).
+        // Normal reading: smooth toward it.
         spikeStreak = 0;
         filteredDistance += (rawDistance - filteredDistance) * DISTANCE_EMA_ALPHA;
     }
     else
     {
-        // Big jump: likely a spurious echo. Only accept if it repeats next read.
+        // Big jump: likely spurious echo; accept only if it repeats next read.
         spikeStreak++;
         if (spikeStreak >= 2)
         {
@@ -425,8 +398,7 @@ void readWaterLevel()
     float level = (waterHeight / TANK_HEIGHT_CM) * 100.0;
     level = constrain(level, 0.0, 100.0);
 
-    // Deadband: keep showing the last level until a real change of at least
-    // WATER_LEVEL_DEADBAND% happens, so the screen never jitters over noise.
+    // Deadband: suppress jitter by ignoring changes < WATER_LEVEL_DEADBAND%.
     if (lastShownLevel < 0.0 || fabsf(level - lastShownLevel) >= WATER_LEVEL_DEADBAND)
     {
         lastShownLevel = level;
@@ -457,10 +429,8 @@ bool loadMq137R0()
     return mq137R0 > 5.0 && mq137R0 < 200.0;
 }
 
-// One-time R0 reset: on the first boot after this change the stored R0 is
-// deleted (and a flag set) so the fresh clean-air calibration always runs.
-// This prevents a stale/wrong R0 saved under the old RL assumption from being
-// loaded. Runs exactly once, then never again unless the flag key is removed.
+// One-time R0 reset: clears stored R0 on first boot after firmware update so
+// fresh clean-air calibration always runs. Prevents stale R0 under old RL value.
 bool refreshMq137R0Once()
 {
     Preferences prefs;
@@ -478,8 +448,7 @@ bool refreshMq137R0Once()
     return false;
 }
 
-// Instantaneous sensor resistance (kOhm) from the current analog voltage,
-// using the module's assumed Vc / RL. Returns -1 on invalid readings.
+// Instantaneous sensor resistance (kOhm) from analog voltage. Returns -1 on invalid.
 float mq137RsFromVoltage()
 {
     if (mq137Voltage < 0.005f)
@@ -489,10 +458,8 @@ float mq137RsFromVoltage()
     return MQ137_RL_KOHM * (MQ137_VC_VOLTS / mq137Voltage - 1.0f);
 }
 
-// Average several readings in clean air and derive R0 = Rs_clean / 3.6, then
-// persist to NVS so a reboot doesn't throw the calibration away. The MQ-137
-// needs minutes to thermally stabilize after power-up, so readings taken too
-// early will drift -- let the device run a while before calibrating.
+// Clean-air calibration: average readings to derive R0 = Rs_avg / 3.6, persist
+// to NVS. Sensor needs minutes to thermally stabilize after power-up.
 void calibrateMq137R0()
 {
     tft.fillScreen(TFT_WHITE);
@@ -535,10 +502,7 @@ void calibrateMq137R0()
 
     if (maxVout >= 3.0f)
     {
-        // The module output is reaching/past the 3.3V ADC ceiling even in
-        // clean air, so it can never read correctly. Hardware causes: module
-        // not sharing a GND with the ESP32, supply not really 5V, RL not 10k,
-        // or AOUT needing a 2:1 resistor divider.
+        // ADC ceiling hit in clean air: check shared GND, 5V supply, RL=10k.
         Serial.printf("[MQ-137] WARNING: Vout %.3f V near ADC ceiling during calibration!\n", maxVout);
         Serial.printf("[MQ-137] Check shared GND (module GND -> ESP32 GND), 5V supply, RL=10k.\n");
     }
@@ -559,9 +523,7 @@ void calibrateMq137R0()
     float rsAvg = sum / good;
     float r0Candidate = rsAvg / MQ137_CLEAN_AIR_RATIO;
 
-    // Only accept a physically sensible R0 (the same window loadMq137R0() uses).
-    // This prevents a garbage R0 from being baked into NVS and then silently
-    // broken data being reported until the next recalibration.
+    // Only accept R0 in 5-200 kOhm (same window as loadMq137R0).
     if (r0Candidate < 5.0f || r0Candidate > 200.0f)
     {
         Serial.printf("[MQ-137] Calibration REJECTED: R0 = %.2f kOhm outside valid 5-200 kOhm window.\n", r0Candidate);
@@ -598,7 +560,7 @@ void calibrateMq137R0()
 
 void readAmmonia()
 {
-    // Multi-sample ADC averaging to reduce electrical noise
+    // Multi-sample ADC averaging to reduce noise.
     uint32_t adcSum = 0;
     uint32_t mvSum = 0;
     for (int i = 0; i < MQ137_ADC_SAMPLES; i++)
@@ -609,7 +571,7 @@ void readAmmonia()
     mq137Raw = adcSum / MQ137_ADC_SAMPLES;
     mq137Voltage = (mvSum / MQ137_ADC_SAMPLES) / 1000.0f;
 
-    // ~0V output: module unpowered/disconnected -> mark the sensor as failed
+    // ~0V: module unpowered/disconnected.
     if (mq137Raw < 8)
     {
         ammoniaReady = false;
@@ -631,7 +593,7 @@ void readAmmonia()
 
     if (mq137R0 <= 0.0f)
     {
-        // No calibration data yet -> can't compute a ratio, flag the error.
+        // No calibration data.
         ammoniaReady = false;
         ammoniaPpm = -1.0f;
         mq137SpikeStreak = 0;
@@ -648,8 +610,7 @@ void readAmmonia()
 
     if (mq137Voltage >= MQ137_SAT_VOLTS)
     {
-        // ADC at/near full scale: the true concentration is higher than we can
-        // resolve. Clamp and keep reporting (so web alerts still fire).
+        // ADC saturated: clamp to max and keep reporting (web alerts still fire).
         ppm = MQ137_PPM_MAX;
         Serial.printf("[MQ-137] ADC SATURATION (%.3f V) - reading clamped to %.0f ppm\n",
                       mq137Voltage, MQ137_PPM_MAX);
@@ -657,19 +618,18 @@ void readAmmonia()
 
     ppm = constrain(ppm, 0.0f, MQ137_PPM_MAX);
 
-    // Spike rejection: if the new reading jumps more than MQ137_SPIKE_PPM_MAX
-    // from the current EMA, require it to repeat before accepting.
+    // Spike rejection: require repeat before accepting large jumps.
     if (mq137PpmEma >= 0.0f && fabsf(ppm - mq137PpmEma) > MQ137_SPIKE_PPM_MAX)
     {
         mq137SpikeStreak++;
         if (mq137SpikeStreak < 2)
         {
-            // First spike: reject, keep previous value
+            // First spike: reject.
             Serial.printf("[MQ-137] Spike rejected: raw %.1f ppm vs EMA %.1f ppm (streak %d)\n",
                           ppm, mq137PpmEma, mq137SpikeStreak);
             return;
         }
-        // Spike repeated: accept it (likely a real change)
+        // Spike repeated: accept (likely real change).
         Serial.printf("[MQ-137] Spike accepted after %d repeats: %.1f ppm\n",
                       mq137SpikeStreak, ppm);
         mq137SpikeStreak = 0;
@@ -679,7 +639,7 @@ void readAmmonia()
         mq137SpikeStreak = 0;
     }
 
-    // EMA smoothing to tame MQ-series drift/noise
+    // EMA smoothing to tame MQ-series drift.
     if (mq137PpmEma < 0.0f)
     {
         mq137PpmEma = ppm;
@@ -1346,11 +1306,9 @@ void startWifiConfigPortal()
     wm.setConfigPortalTimeout(180);
     wm.setConnectTimeout(10);
 
-    // startConfigPortal forces the access point to open even if the ESP32
-    // already has a saved network (autoConnect would skip the portal when
-    // already connected, so the on-screen "connect your phone" steps wouldn't
-    // work). The phone/device joins the "Aquaculture-Setup" AP, then opens
-    // http://192.168.4.1 to enter the Wi-Fi and backend details.
+    // startConfigPortal forces AP open even with saved network (autoConnect
+    // would skip the portal). Phone joins "Aquaculture-Setup" AP, visits
+    // http://192.168.4.1 to enter Wi-Fi + backend details.
     bool wifiResult = wm.startConfigPortal("Aquaculture-Setup");
 
     if (wifiResult)
@@ -1455,9 +1413,7 @@ void sendSensorData()
     http.end();
 }
 
-// Runs the slow HTTP POST off the main loop. Polls for pending sends so the
-// main loop only ever sets a BOOL flag - a slow/unreachable backend can no
-// longer freeze touch input for up to a second or two.
+// Runs HTTP POST on its own task so blocking never freezes touch/display.
 void sendSensorTask(void *pvParameters)
 {
     while (true)
@@ -1495,11 +1451,8 @@ void setup()
 
     pinMode(MQ137_PIN, INPUT);
     analogReadResolution(12);
-    // Explicitly apply the widest input range (11dB, ~0-3.3V) to GPIO34. Most
-    // Arduino-ESP32 cores default to 11dB, but some setups keep a pin on a
-    // lower attenuation, which clips the module's ~1-3.3V analog output and
-    // produces wrong readings. Guarded with #if so it compiles on both old
-    // (ADC_ATTEN_11db) and new (ADC_ATTENDB_11) core enums.
+    // Apply widest ADC range (11dB, ~0-3.3V) to GPIO34. Some cores default to
+    // lower attenuation which clips the module output.
 #if defined(ADC_ATTEN_11db)
     analogSetPinAttenuation(MQ137_PIN, ADC_ATTEN_11db);
 #elif defined(ADC_ATTENDB_11)
@@ -1520,11 +1473,7 @@ void setup()
     Serial.print("[DISPLAY] Height = ");
     Serial.println(tft.height());
 
-    // WiFi: attempt the saved network for 15s, restoring the past working
-    // version's visible boot screens. A "Connecting to saved network..." screen
-    // is drawn while trying, then "WiFi Connected!" with the IP on success, or
-    // the config portal (AP: Aquaculture-Setup) automatically opens on failure
-    // so the phone/device can connect and enter the Wi-Fi + backend details.
+    // WiFi: try saved network for 15s, then open config portal on failure.
     Serial.println("[WIFI] Attempting to connect to saved network...");
     tft.fillScreen(TFT_WHITE);
     tft.setTextDatum(MC_DATUM);
@@ -1571,14 +1520,11 @@ void setup()
         startWifiConfigPortal();
     }
 
-    // One full initial sensor read so the UI shows live values right away.
+    // Initial sensor read so UI shows live values immediately.
     readAllSensors();
 
-    // Load a previously calibrated MQ-137 R0, or run the clean-air calibration
-    // on first boot (needs the display up, since it shows progress on screen).
-    // refreshMq137R0Once() forces one fresh calibration the first boot after a
-    // firmware update, so an R0 stored under the old RL value is thrown away
-    // instead of being loaded silently.
+    // Load calibrated R0, or run clean-air calibration on first boot.
+    // refreshMq137R0Once() forces fresh calibration after firmware update.
     if (refreshMq137R0Once() || !loadMq137R0())
     {
         Serial.println("[MQ-137] No valid R0 - starting clean-air calibration...");
@@ -1592,9 +1538,7 @@ void setup()
     currentPage = PAGE_OVERVIEW;
     drawCurrentPage();
 
-    // Send sensor data on a background task so the blocking HTTP POST (which
-    // can stall for ~1-2s on a slow/unreachable server) never freezes touch
-    // or the display.
+    // Background task so blocking HTTP POST never freezes touch/display.
     xTaskCreate(sendSensorTask, "sendSensor", 4096, NULL, 1, NULL);
 
     Serial.println();
@@ -1607,9 +1551,7 @@ void setup()
     Serial.println();
 }
 
-// Streams raw XPT2046 values for 5s so touch state can be diagnosed on the
-// Serial Monitor even when the screen does nothing. Press and move on the
-// panel during the window.
+// Streams raw XPT2046 values for 5s for touch diagnostics on Serial Monitor.
 void touchRawDump()
 {
     Serial.println("[TOUCH] Raw dump for 5s - press the screen");
@@ -1629,11 +1571,7 @@ void touchRawDump()
     Serial.printf("[TOUCH] Dump finished. %lu frames.\n", count);
 }
 
-// Simple serial command interface, independent of the (possibly broken) touch:
-//   C = run MQ-137 clean-air calibration
-//   T = 5s raw XPT2046 dump (touch diagnostics)
-//   R = force one full sensor read + serial print
-//   W = open the WiFi configuration portal
+// Serial commands: C=calibrate, T=touch dump, R=read sensors, W=WiFi portal.
 void checkSerialCommands()
 {
     if (Serial.available() <= 0)
@@ -1687,8 +1625,7 @@ void loop()
 {
     unsigned long now = millis();
 
-    // Touch is serviced FIRST on every tick so a tap never waits behind
-    // sensor reads, screen redraws, or Wi-Fi sends.
+    // Touch serviced first so it never waits behind sensor/screen/WiFi.
     handleTouch();
 
     if (now - lastSensorRead >= SENSOR_INTERVAL)
@@ -1701,7 +1638,7 @@ void loop()
 
     checkSerialCommands();
 
-    // Slow POST is handled by the background task - main loop only sets a flag.
+    // Slow POST handled by background task; main loop only sets a flag.
     if (now - lastSendTime >= SEND_INTERVAL)
     {
         lastSendTime = now;

@@ -1,26 +1,7 @@
 // =============================================================================
 // FILE: src/api/client.ts
 // =============================================================================
-// PURPOSE: Centralized API client for all backend communication.
-//
-// This file provides typed wrapper functions around axios that call every
-// backend API endpoint. It handles:
-//   - Axios instance creation with base URL and timeout
-//   - Automatic Bearer token injection via request interceptors
-//   - Error classification (ApiError with statusCode and isNetworkError)
-//   - Data transformation (e.g., sensor history → ChartPoint format)
-//   - AbortSignal support for cancellable requests
-//
-// Every function in this file corresponds to a specific backend route
-// defined in server.cjs. The functions are used by:
-//   - SensorProvider (data polling hooks)
-//   - SettingsPage, AuthPage, LogsPage, etc. (UI interactions)
-//   - DeviceConnectionMonitor (disconnect alerts)
-//
-// USAGE PATTERN:
-//   import { fetchLatestSensor, saveSettings } from "../api/client";
-//   const data = await fetchLatestSensor();
-//   await saveSettings({ temp_min: 22, temp_max: 30 });
+// PURPOSE: Centralized API client with typed wrappers for every backend endpoint.
 // =============================================================================
 
 import axios, { isAxiosError, type AxiosError } from "axios";
@@ -31,7 +12,6 @@ import { formatFarmTime } from "../utils/time";
 // ========================
 // USER TYPE (Admin Management)
 // ========================
-/** Represents a user account in the system (admin management). */
 export interface UserEntry {
   id: number;
   name: string;
@@ -44,10 +24,6 @@ export interface UserEntry {
 // ========================
 // AXIOS CLIENT INSTANCE
 // ========================
-// Creates a pre-configured axios instance for all API calls.
-// - baseURL: Automatically determined from environment (local or production)
-// - timeout: 10 seconds max per request to prevent hanging
-// - Content-Type: Always application/json
 
 const client = axios.create({
   baseURL: API_BASE,
@@ -60,9 +36,7 @@ const client = axios.create({
 // ========================
 // REQUEST INTERCEPTOR
 // ========================
-// Automatically attaches the authentication token to every outgoing request.
-// The token is stored in localStorage under "crayvings_token" after login.
-// This eliminates the need to manually pass the token with each API call.
+// Attaches the auth token from localStorage to every request.
 
 client.interceptors.request.use((config) => {
   const token = localStorage.getItem("crayvings_token");
@@ -75,11 +49,8 @@ client.interceptors.request.use((config) => {
 // ========================
 // RESPONSE INTERCEPTOR
 // ========================
-// Handles network errors silently to prevent UI crashes from transient failures.
-// Connection timeouts and canceled requests are not treated as errors here
-// (they are handled at the call site).
-// A 401 on a protected route means the token is invalid or expired — clear the
-// stored session so the app returns to the login page on next load.
+// Timeouts/cancels are left to the call site. A 401 clears the stored
+// session so the app returns to login on next load.
 
 client.interceptors.response.use(
   (response) => response,
@@ -98,12 +69,8 @@ client.interceptors.response.use(
 // ========================
 // CUSTOM ERROR CLASS
 // ========================
-// Extends Error with HTTP-specific properties for better error handling in UI.
 
-/**
- * Custom error class for API failures.
- * Includes HTTP status code and network error flag for UI handling.
- */
+// API failure error with HTTP status and network-error flag for UI handling
 export class ApiError extends Error {
   statusCode: number | undefined;
   isNetworkError: boolean;
@@ -119,12 +86,7 @@ export class ApiError extends Error {
 // SENSOR DATA ENDPOINTS
 // ========================
 
-/**
- * GET /sensor/latest
- * Fetches the most recent sensor reading from the database.
- * Returns null if no data exists or the request is canceled.
- * Called every 3 seconds by the SensorProvider for real-time updates.
- */
+// GET /sensor/latest - fetch latest reading; null when none/canceled
 export async function fetchLatestSensor(signal?: AbortSignal): Promise<SensorEntry | null> {
   try {
     const response = await client.get<SensorEntry>("/sensor/latest", { signal });
@@ -140,23 +102,13 @@ export async function fetchLatestSensor(signal?: AbortSignal): Promise<SensorEnt
   }
 }
 
-/**
- * GET /sensor
- * Fetches sensor history for chart rendering.
- * Transforms raw SensorEntry[] into ChartPoint[] format:
- *   - Sorts by timestamp (oldest first for chronological charts)
- *   - Formats timestamps as human-readable time labels
- *   - Normalizes failed-sensor sentinels (temperature 0, water_level/ammonia -1) to null so
- *     charts show gaps and stats exclude them
- * Called on initial load and when switching time ranges in HistoricalDataPage.
- */
+// GET /sensor - fetch sensor history sorted oldest-first as ChartPoints for charts
 export async function fetchSensorHistory(limit = 1000, signal?: AbortSignal): Promise<ChartPoint[]> {
   const response = await client.get<SensorEntry[]>("/sensor", {
     params: { limit },
     signal,
   });
   
-  // Transform and sort data for chart display
   const data = (response.data || [])
     .slice()
     .sort((a, b) => {
@@ -169,9 +121,8 @@ export async function fetchSensorHistory(limit = 1000, signal?: AbortSignal): Pr
       return {
         name: timestamp ? formatFarmTime(timestamp) : "--:--",
         timestamp: timestamp ? timestamp.toISOString() : "",
-        // The ESP32 sends temperature 0 and water_level/ammonia -1 when a sensor fails.
-        // These match the server's minValid checks; anything below them is a
-        // failed sensor, not a real reading.
+        // ESP32 failed-sensor sentinels: temperature 0, water_level/ammonia -1
+        // (below server minValid, not real readings)
         temperature: item.temperature !== undefined && item.temperature >= 0.0001 ? item.temperature : null,
         water_level: item.water_level !== undefined && item.water_level >= 0 ? item.water_level : null,
         ammonia: item.ammonia !== undefined && item.ammonia >= 0 ? item.ammonia : null,
@@ -185,11 +136,7 @@ export async function fetchSensorHistory(limit = 1000, signal?: AbortSignal): Pr
 // WEEKLY REPORT ENDPOINT
 // ========================
 
-/**
- * GET /report/weekly
- * Fetches aggregated weekly report data from the backend.
- * Returns summary stats, daily breakdown, and alert counts for the past 7 days.
- */
+// GET /report/weekly - fetch 7-day aggregate report stats
 export async function fetchWeeklyReport(signal?: AbortSignal): Promise<WeeklyReport> {
   const response = await client.get<WeeklyReport>("/report/weekly", { signal });
   return response.data;
@@ -199,7 +146,7 @@ export async function fetchWeeklyReport(signal?: AbortSignal): Promise<WeeklyRep
 // SYSTEM LOGS ENDPOINTS
 // ========================
 
-/** Response shape for paginated system logs. */
+// Response shape for paginated system logs
 export interface LogsResponse {
   data: LogEntry[];
   total: number;
@@ -208,17 +155,13 @@ export interface LogsResponse {
   counts: Record<string, number>;
 }
 
-/** Optional filters for paginated system logs (applied server-side). */
+// Optional server-side filters for paginated system logs
 export interface LogsFilter {
   action?: string;
   parameter?: string;
 }
 
-/**
- * GET /system-logs
- * Fetches paginated system log entries.
- * Used by AlertsPage and LogsPage to display alert history.
- */
+// GET /system-logs - fetch paginated system log entries
 export async function fetchLogs(
   page = 1,
   limit = 20,
@@ -242,12 +185,7 @@ export async function fetchLogs(
 // SETTINGS ENDPOINTS
 // ========================
 
-/**
- * GET /settings
- * Fetches current sensor threshold settings.
- * Converts PostgreSQL NUMERIC strings to JavaScript numbers.
- * Used by SensorProvider on initialization and when settings change.
- */
+// GET /settings - fetch thresholds, converting PostgreSQL NUMERIC strings to numbers
 export async function fetchSettings(signal?: AbortSignal): Promise<SensorSettings> {
   const response = await client.get<SensorSettings>("/settings", { signal });
   const data = response.data as Record<string, unknown>;
@@ -263,20 +201,12 @@ export async function fetchSettings(signal?: AbortSignal): Promise<SensorSetting
   };
 }
 
-/**
- * POST /settings (Admin only)
- * Saves updated sensor threshold settings.
- * Requires admin authentication (token sent via interceptor).
- */
+// POST /settings (Admin only) - save sensor thresholds
 export async function saveSettings(settings: Partial<SensorSettings>, signal?: AbortSignal): Promise<void> {
   await client.post("/settings", settings, { signal });
 }
 
-/**
- * POST /settings/reset (Admin only)
- * Resets all thresholds to factory defaults.
- * Returns the new settings after reset.
- */
+// POST /settings/reset (Admin only) - reset thresholds to factory defaults
 export async function resetSettings(signal?: AbortSignal): Promise<SensorSettings> {
   const response = await client.post<{ data: SensorSettings }>("/settings/reset", {}, { signal });
   return response.data.data;
@@ -286,7 +216,7 @@ export async function resetSettings(signal?: AbortSignal): Promise<SensorSetting
 // SMS RECIPIENT ENDPOINTS
 // ========================
 
-/** Represents an SMS recipient in the authorized_recipients table. */
+// SMS recipient in the authorized_recipients table
 export interface SmsRecipient {
   id: number;
   phone_number: string;
@@ -295,30 +225,30 @@ export interface SmsRecipient {
   created_at: string;
 }
 
-/** GET /settings/recipients - Fetches all authorized SMS recipients. */
+// GET /settings/recipients - fetch all authorized SMS recipients
 export async function fetchRecipients(signal?: AbortSignal): Promise<SmsRecipient[]> {
   const response = await client.get<SmsRecipient[]>("/settings/recipients", { signal });
   return response.data;
 }
 
-/** POST /settings/recipients - Adds a new SMS recipient. */
+// POST /settings/recipients - add a new SMS recipient
 export async function addRecipient(phone_number: string, name: string, signal?: AbortSignal): Promise<SmsRecipient> {
   const response = await client.post<{ data: SmsRecipient }>("/settings/recipients", { phone_number, name }, { signal });
   return response.data.data;
 }
 
-/** PUT /settings/recipients/:id - Updates a recipient's name or active status. */
+// PUT /settings/recipients/:id - update a recipient's name or active status
 export async function updateRecipient(id: number, updates: Partial<SmsRecipient>, signal?: AbortSignal): Promise<SmsRecipient> {
   const response = await client.put<{ data: SmsRecipient }>(`/settings/recipients/${id}`, updates, { signal });
   return response.data.data;
 }
 
-/** DELETE /settings/recipients/:id - Removes an SMS recipient. */
+// DELETE /settings/recipients/:id - remove an SMS recipient
 export async function deleteRecipient(id: number, signal?: AbortSignal): Promise<void> {
   await client.delete(`/settings/recipients/${id}`, { signal });
 }
 
-/** POST /settings/recipients/test/:id - Sends a test SMS to verify a recipient. */
+// POST /settings/recipients/test/:id - send a test SMS to verify a recipient
 export async function sendTestSms(id: number, signal?: AbortSignal): Promise<{ success: boolean; message: string }> {
   const response = await client.post(`/settings/recipients/test/${id}`, {}, { signal });
   return response.data;
@@ -328,11 +258,7 @@ export async function sendTestSms(id: number, signal?: AbortSignal): Promise<{ s
 // LOG CREATION ENDPOINT
 // ========================
 
-/**
- * POST /logs
- * Creates a new system log entry.
- * Called internally when sensor alerts are triggered or settings change.
- */
+// POST /logs - create a new system log entry
 export async function createLog(
   action: string,
   parameter: string,
@@ -357,7 +283,7 @@ export async function createLog(
 // HEALTH CHECK
 // ========================
 
-/** GET /health - Checks if the backend server is running and responsive. */
+// GET /health - check backend is running and responsive
 export async function checkHealth(signal?: AbortSignal): Promise<{ status: string; serverTime: string }> {
   const response = await client.get("/health", { signal });
   return response.data;
@@ -367,7 +293,7 @@ export async function checkHealth(signal?: AbortSignal): Promise<{ status: strin
 // ALERT MANAGEMENT ENDPOINTS
 // ========================
 
-/** Response shape for paginated activity logs. */
+// Response shape for paginated activity logs
 export interface ActivityLogsResponse {
   data: ActivityLog[];
   total: number;
@@ -376,12 +302,7 @@ export interface ActivityLogsResponse {
   totalPages: number;
 }
 
-/**
- * POST /alert/device-disconnect
- * Triggers SMS alerts to all active recipients when the ESP32 disconnects.
- * Called by DeviceConnectionMonitor when connection status changes to "offline".
- * Returns null on failure (graceful degradation - UI continues without alert).
- */
+// POST /alert/device-disconnect - SMS all active recipients on ESP32 disconnect
 export async function sendDeviceDisconnectAlert(
   description?: string,
   consecutiveFailures?: number,
@@ -400,11 +321,7 @@ export async function sendDeviceDisconnectAlert(
   }
 }
 
-/**
- * POST /alert/mute
- * Mutes SMS alerts for a specified number of hours, or unmutes if hours is null.
- * Used by the Settings page and FloatingAlert component.
- */
+// POST /alert/mute - mute SMS alerts for N hours, or unmute when hours is null
 export async function muteAlerts(hours: number | null, signal?: AbortSignal): Promise<{ muted: boolean; muteExpires: string | null } | null> {
   try {
     const response = await client.post(
@@ -419,7 +336,7 @@ export async function muteAlerts(hours: number | null, signal?: AbortSignal): Pr
   }
 }
 
-/** GET /alert/mute-status - Checks if SMS alerts are currently muted. */
+// GET /alert/mute-status - check whether SMS alerts are currently muted
 export async function getMuteStatus(signal?: AbortSignal): Promise<{ muted: boolean; muteExpires: string | null } | null> {
   try {
     const response = await client.get('/alert/mute-status', { signal });
@@ -434,11 +351,7 @@ export async function getMuteStatus(signal?: AbortSignal): Promise<{ muted: bool
 // ACTIVITY LOG ENDPOINTS
 // ========================
 
-/**
- * POST /activity-logs
- * Records a user activity event for audit trail.
- * Returns null on failure (non-critical - logging failure shouldn't break UX).
- */
+// POST /activity-logs - record a user activity event for audit trail
 export async function logActivity(
   entry: ActivityLogEntry,
   signal?: AbortSignal
@@ -456,11 +369,7 @@ export async function logActivity(
   }
 }
 
-/**
- * GET /activity-logs
- * Fetches paginated, searchable, filterable activity logs.
- * Used by ActivityLogsPage for the activity monitoring dashboard.
- */
+// GET /activity-logs - fetch paginated, searchable, filterable activity logs
 export async function fetchActivityLogs(
   page = 1,
   limit = 20,
@@ -480,11 +389,7 @@ export async function fetchActivityLogs(
 // AUTHENTICATION ENDPOINTS
 // ========================
 
-/**
- * POST /auth/login
- * Authenticates a user and returns a session token.
- * The token is stored in localStorage by AuthContext for subsequent requests.
- */
+// POST /auth/login - authenticate and return a session token
 export async function loginUser(
   username: string,
   password: string,
@@ -498,12 +403,7 @@ export async function loginUser(
   return response.data;
 }
 
-/**
- * POST /auth/logout (Authenticated)
- * Revokes the current session token server-side.
- * Called by AuthContext.logout; failures are silent since local
- * session state is cleared regardless.
- */
+// POST /auth/logout - revoke the current session token server-side
 export async function logoutUser(signal?: AbortSignal): Promise<void> {
   try {
     await client.post("/auth/logout", {}, { signal });
@@ -512,13 +412,13 @@ export async function logoutUser(signal?: AbortSignal): Promise<void> {
   }
 }
 
-/** GET /auth/users (Admin only) - Fetches all user accounts. */
+// GET /auth/users (Admin only) - fetch all user accounts
 export async function fetchUsers(signal?: AbortSignal): Promise<UserEntry[]> {
   const response = await client.get<UserEntry[]>("/auth/users", { signal });
   return response.data;
 }
 
-/** POST /auth/users (Admin only) - Creates a new user account. */
+// POST /auth/users (Admin only) - create a new user account
 export async function createUser(
   name: string,
   username: string,
@@ -535,7 +435,7 @@ export async function createUser(
   return response.data.data;
 }
 
-/** DELETE /auth/users/:id (Admin only) - Deletes a user account. */
+// DELETE /auth/users/:id (Admin only) - delete a user account
 export async function deleteUser(
   userId: number,
   signal?: AbortSignal
@@ -543,7 +443,7 @@ export async function deleteUser(
   await client.delete(`/auth/users/${userId}`, { signal });
 }
 
-/** PUT /auth/users/:id/password (Admin only) - Resets a user's password. */
+// PUT /auth/users/:id/password (Admin only) - reset a user's password
 export async function resetUserPassword(
   userId: number,
   newPassword: string,
@@ -552,5 +452,4 @@ export async function resetUserPassword(
   await client.put(`/auth/users/${userId}/password`, { newPassword }, { signal });
 }
 
-// Export the axios client instance for direct use if needed
 export default client;
