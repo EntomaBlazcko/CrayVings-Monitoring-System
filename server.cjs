@@ -72,7 +72,7 @@ const globalLimiter = rateLimit({
 
 const loginLimiter = rateLimit({
   windowMs: 10 * 60 * 1000,   // 10 minutes
-  limit: 10,                  // 10 login attempts / 10 min / IP
+  limit: 25,                  // 25 login attempts / 10 min / IP (was 10, too strict)
   standardHeaders: "draft-7",
   legacyHeaders: false,
   message: { message: "Too many login attempts. Please try again later." },
