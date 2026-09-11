@@ -38,6 +38,7 @@ export const VALID_MENU_KEYS = [
   "Sensors",
   "Alerts",
   "Historical Data",
+  "Analytics",
   "Activity Logs",
   "Settings",
   "Sensor Logs",
@@ -336,4 +337,71 @@ export type WeeklyReport = {
     by_parameter: Record<string, number>;
     by_action: Record<string, number>;
   };
+};
+
+// ========================
+// ANALYTICS TYPES
+// ========================
+// Server-computed aggregates, trends, and rule-engine suggestions.
+
+export type AnalyticsParamStats = { avg: number; min: number; max: number };
+export type AnalyticsTrend = { current_avg: number; previous_avg: number; change_pct: number; direction: "up" | "down" | "stable" };
+
+export type AnalyticsOverview = {
+  period: { start: string; end: string };
+  days: number;
+  summary: {
+    temperature: AnalyticsParamStats;
+    water_level: AnalyticsParamStats;
+    ammonia: AnalyticsParamStats;
+    total_readings: number;
+  };
+  trends: {
+    temperature: AnalyticsTrend;
+    water_level: AnalyticsTrend;
+    ammonia: AnalyticsTrend;
+  };
+  alerts: {
+    total: number;
+    resolved: number;
+    by_parameter: Record<string, number>;
+    by_action: Record<string, number>;
+  };
+  uptime: {
+    device_offline: boolean;
+    last_reading: string | null;
+    readings: number;
+    gap_events: number;
+  };
+};
+
+export type AnalyticsDailyEntry = {
+  date: string;
+  temp_avg: number;
+  water_avg: number;
+  ammonia_avg: number;
+  readings: number;
+  alerts: number;
+};
+
+export type AnalyticsDailyResponse = {
+  period: { start: string; end: string };
+  days: number;
+  daily: AnalyticsDailyEntry[];
+};
+
+export type InsightLevel = "info" | "warning" | "critical";
+
+export type Insight = {
+  level: InsightLevel;
+  area: string;
+  title: string;
+  message: string;
+  action?: string;
+};
+
+export type AnalyticsInsightsResponse = {
+  period: { start: string; end: string };
+  days: number;
+  insights: Insight[];
 };

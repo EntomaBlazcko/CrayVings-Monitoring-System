@@ -8,11 +8,10 @@ import { useSensorData } from "../hooks/useSensors";
 import { useFloatingAlerts } from "../hooks/useFloatingAlerts";
 import { useActivityLogger } from "../hooks/useSensors";
 import { playCriticalSound } from "../utils/playAlertSound";
-import { sendDeviceDisconnectAlert } from "../api/client";
 
 type ConnectionStatus = "online" | "offline" | "connecting" | "unknown";
 
-// Watches ESP32 connection status; triggers alerts/SMS on disconnect/reconnect.
+// Watches ESP32 connection status; triggers alerts on disconnect/reconnect.
 export function DeviceConnectionMonitor() {
   const { connectionStatus, consecutiveFailures, lastUpdate } = useSensorData();
   const { addNotification, removeNotification } = useFloatingAlerts();
@@ -50,11 +49,6 @@ export function DeviceConnectionMonitor() {
         "device_disconnect",
         `ESP32 device went offline after ${consecutiveFailures} failed polls`,
         "Sensors"
-      );
-
-      sendDeviceDisconnectAlert(
-        `ESP32 device disconnected — no data for 15+ seconds`,
-        consecutiveFailures
       );
 
       playCriticalSound();

@@ -5,7 +5,7 @@
 // =============================================================================
 
 import axios, { isAxiosError, type AxiosError } from "axios";
-import type { SensorEntry, ChartPoint, LogEntry, SensorSettings, ActivityLog, ActivityLogEntry, AuthResponse, WeeklyReport } from "../types";
+import type { SensorEntry, ChartPoint, LogEntry, SensorSettings, ActivityLog, ActivityLogEntry, AuthResponse, WeeklyReport, AnalyticsOverview, AnalyticsDailyResponse, AnalyticsInsightsResponse } from "../types";
 import { API_BASE } from "../types";
 import { formatFarmTime } from "../utils/time";
 
@@ -143,6 +143,37 @@ export async function fetchWeeklyReport(signal?: AbortSignal): Promise<WeeklyRep
 }
 
 // ========================
+// ANALYTICS ENDPOINTS
+// ========================
+
+// GET /analytics/overview - period summary, trends, alerts, uptime stats
+export async function fetchAnalyticsOverview(days = 7, signal?: AbortSignal): Promise<AnalyticsOverview> {
+  const response = await client.get<AnalyticsOverview>("/analytics/overview", {
+    params: { days },
+    signal,
+  });
+  return response.data;
+}
+
+// GET /analytics/daily - per-day aggregates for charting
+export async function fetchAnalyticsDaily(days = 30, signal?: AbortSignal): Promise<AnalyticsDailyResponse> {
+  const response = await client.get<AnalyticsDailyResponse>("/analytics/daily", {
+    params: { days },
+    signal,
+  });
+  return response.data;
+}
+
+// GET /analytics/insights - rule-engine suggestions for the selected period
+export async function fetchAnalyticsInsights(days = 7, signal?: AbortSignal): Promise<AnalyticsInsightsResponse> {
+  const response = await client.get<AnalyticsInsightsResponse>("/analytics/insights", {
+    params: { days },
+    signal,
+  });
+  return response.data;
+}
+
+// ========================
 // SYSTEM LOGS ENDPOINTS
 // ========================
 
@@ -213,48 +244,6 @@ export async function resetSettings(signal?: AbortSignal): Promise<SensorSetting
 }
 
 // ========================
-// SMS RECIPIENT ENDPOINTS
-// ========================
-
-// SMS recipient in the authorized_recipients table
-export interface SmsRecipient {
-  id: number;
-  phone_number: string;
-  name: string;
-  is_active: boolean;
-  created_at: string;
-}
-
-// GET /settings/recipients - fetch all authorized SMS recipients
-export async function fetchRecipients(signal?: AbortSignal): Promise<SmsRecipient[]> {
-  const response = await client.get<SmsRecipient[]>("/settings/recipients", { signal });
-  return response.data;
-}
-
-// POST /settings/recipients - add a new SMS recipient
-export async function addRecipient(phone_number: string, name: string, signal?: AbortSignal): Promise<SmsRecipient> {
-  const response = await client.post<{ data: SmsRecipient }>("/settings/recipients", { phone_number, name }, { signal });
-  return response.data.data;
-}
-
-// PUT /settings/recipients/:id - update a recipient's name or active status
-export async function updateRecipient(id: number, updates: Partial<SmsRecipient>, signal?: AbortSignal): Promise<SmsRecipient> {
-  const response = await client.put<{ data: SmsRecipient }>(`/settings/recipients/${id}`, updates, { signal });
-  return response.data.data;
-}
-
-// DELETE /settings/recipients/:id - remove an SMS recipient
-export async function deleteRecipient(id: number, signal?: AbortSignal): Promise<void> {
-  await client.delete(`/settings/recipients/${id}`, { signal });
-}
-
-// POST /settings/recipients/test/:id - send a test SMS to verify a recipient
-export async function sendTestSms(id: number, signal?: AbortSignal): Promise<{ success: boolean; message: string }> {
-  const response = await client.post(`/settings/recipients/test/${id}`, {}, { signal });
-  return response.data;
-}
-
-// ========================
 // LOG CREATION ENDPOINT
 // ========================
 
@@ -290,7 +279,7 @@ export async function checkHealth(signal?: AbortSignal): Promise<{ status: strin
 }
 
 // ========================
-// ALERT MANAGEMENT ENDPOINTS
+// ACTIVITY LOG ENDPOINTS
 // ========================
 
 // Response shape for paginated activity logs
@@ -301,55 +290,6 @@ export interface ActivityLogsResponse {
   limit: number;
   totalPages: number;
 }
-
-// POST /alert/device-disconnect - SMS all active recipients on ESP32 disconnect
-export async function sendDeviceDisconnectAlert(
-  description?: string,
-  consecutiveFailures?: number,
-  signal?: AbortSignal
-): Promise<{ sent: number; total: number } | null> {
-  try {
-    const response = await client.post(
-      '/alert/device-disconnect',
-      { event_type: 'disconnect', description, consecutive_failures: consecutiveFailures },
-      { signal }
-    );
-    return response.data;
-  } catch {
-    console.error('Failed to send device disconnect alert');
-    return null;
-  }
-}
-
-// POST /alert/mute - mute SMS alerts for N hours, or unmute when hours is null
-export async function muteAlerts(hours: number | null, signal?: AbortSignal): Promise<{ muted: boolean; muteExpires: string | null } | null> {
-  try {
-    const response = await client.post(
-      '/alert/mute',
-      { hours },
-      { signal }
-    );
-    return response.data;
-  } catch {
-    console.error('Failed to set alert mute');
-    return null;
-  }
-}
-
-// GET /alert/mute-status - check whether SMS alerts are currently muted
-export async function getMuteStatus(signal?: AbortSignal): Promise<{ muted: boolean; muteExpires: string | null } | null> {
-  try {
-    const response = await client.get('/alert/mute-status', { signal });
-    return response.data;
-  } catch {
-    console.error('Failed to get mute status');
-    return null;
-  }
-}
-
-// ========================
-// ACTIVITY LOG ENDPOINTS
-// ========================
 
 // POST /activity-logs - record a user activity event for audit trail
 export async function logActivity(
@@ -435,7 +375,71 @@ export async function createUser(
   return response.data.data;
 }
 
-// DELETE /auth/users/:id (Admin only) - delete a user account
+// -----------------------------------------------------------------------------
+// SECURE USER DELETION (EMAIL OTP 2-STEP) — replaces the old hard delete.
+// POST /auth/users/:id/deletion-request  (password + reason) -> emails OTP
+// POST /auth/users/:id/deletion-verify   (request_id + code) -> hard deletes
+// -----------------------------------------------------------------------------
+
+export interface DeletionRequestResponse {
+  message: string;
+  request_id: number;
+  otp_sent: boolean;
+  dev_fallback: boolean;
+  reason?: string;
+}
+
+export interface DeletionRequestEntry {
+  id: number;
+  user_id: number;
+  user_username: string;
+  requester_username: string;
+  status: string;
+  requested_at: string;
+  otp_verified_at: string | null;
+  executed_at: string | null;
+  reason: string | null;
+}
+
+// STEP 1 - Admin confirms their own password; server emails a 6-digit OTP to the
+// target user's address and returns an opaque request_id.
+export async function requestUserDeletion(
+  userId: number,
+  password: string,
+  reason?: string,
+  signal?: AbortSignal
+): Promise<DeletionRequestResponse> {
+  const response = await client.post<DeletionRequestResponse>(
+    `/auth/users/${userId}/deletion-request`,
+    { password, reason },
+    { signal }
+  );
+  return response.data;
+}
+
+// STEP 2 - Admin submits the emailed OTP; on success the user row is hard-deleted
+// and the full audit chain (requester -> OTP -> executor -> activity log) is written.
+export async function verifyUserDeletion(
+  userId: number,
+  request_id: number,
+  code: string,
+  signal?: AbortSignal
+): Promise<{ message: string; username?: string }> {
+  const response = await client.post<{ message: string; username?: string }>(
+    `/auth/users/${userId}/deletion-verify`,
+    { request_id, code },
+    { signal }
+  );
+  return response.data;
+}
+
+// GET /auth/users/deletion-requests (Admin) - pending deletion audit trail
+export async function fetchDeletionRequests(signal?: AbortSignal): Promise<DeletionRequestEntry[]> {
+  const response = await client.get<DeletionRequestEntry[]>("/auth/users/deletion-requests", { signal });
+  return response.data;
+}
+
+// DELETE /auth/users/:id (Admin only) - legacy direct delete (kept for compatibility)
 export async function deleteUser(
   userId: number,
   signal?: AbortSignal

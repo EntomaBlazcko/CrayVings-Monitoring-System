@@ -1,9 +1,10 @@
 // =============================================================================
 // src/pages/SettingsPage.tsx
-// Settings page: alert thresholds, SMS recipients/mute, and user management.
+// Settings page: alert thresholds, and user management.
 // =============================================================================
 
 import { useState, useCallback, useMemo, useEffect } from "react";
+import { isAxiosError } from "axios";
 import { useSensorSettings, useActivityLogger } from "../hooks/useSensors";
 import { useAuth } from "../contexts/useAuth";
 import {
@@ -22,18 +23,23 @@ import {
   CheckCircle2,
   Loader2,
   RefreshCw,
-  Phone,
-  MessageSquare,
-  Send,
-  ToggleLeft,
-  ToggleRight,
 } from "lucide-react";
 import type { SensorSettings } from "../types";
 import { DEFAULT_SETTINGS, getSettingsThresholds } from "../types";
 import { LoadingCard } from "../components/Loading";
 import { z } from "zod";
-import { fetchUsers, createUser, deleteUser, resetUserPassword, resetSettings as apiResetSettings, fetchRecipients, addRecipient, deleteRecipient, sendTestSms, updateRecipient, muteAlerts, getMuteStatus } from "../api/client";
-import type { UserEntry, SmsRecipient } from "../api/client";
+import {
+  fetchUsers,
+  createUser,
+  requestUserDeletion,
+  verifyUserDeletion,
+  resetUserPassword, resetSettings as apiResetSettings } from "../api/client";
+import type { UserEntry } from "../api/client";
+
+const getApiError = (err: unknown): string => {
+  if (isAxiosError(err)) return err.response?.data?.message ?? err.message;
+  return err instanceof Error ? err.message : "An unexpected error occurred";
+};
 
 const SETTING_BOUNDS: Record<string, { min: number; max: number }> = {
   temp_min: { min: -10, max: 50 },
@@ -140,12 +146,6 @@ export default function SettingsPage() {
   const [localSaveError, setLocalSaveError] = useState<string | null>(null);
   const [isResetting, setIsResetting] = useState(false);
 
-  const [recipients, setRecipients] = useState<SmsRecipient[]>([]);
-  const [isLoadingRecipients, setIsLoadingRecipients] = useState(true);
-  const [showAddRecipient, setShowAddRecipient] = useState(false);
-  const [newRecipient, setNewRecipient] = useState({ phone_number: "", name: "" });
-  const [recipientErrors, setRecipientErrors] = useState<FormErrors>({});
-
   const [users, setUsers] = useState<UserEntry[]>([]);
   const [isLoadingUsers, setIsLoadingUsers] = useState(true);
   const [showCreateForm, setShowCreateForm] = useState(false);
@@ -153,14 +153,14 @@ export default function SettingsPage() {
   const [formErrors, setFormErrors] = useState<FormErrors>({});
   const [actionLoading, setActionLoading] = useState<string | null>(null);
   const [resetModal, setResetModal] = useState<{ id: number; name: string; password: string; errors: FormErrors } | null>(null);
-  const [deleteConfirm, setDeleteConfirm] = useState<{ id: number; username: string; type: "user" | "recipient" } | null>(null);
+  const [deleteConfirm, setDeleteConfirm] = useState<{ id: number; username: string } | null>(null);
   const [toasts, setToasts] = useState<{ id: number; message: string; type: "success" | "error" }[]>([]);
-  const [muteStatus, setMuteStatus] = useState<{ muted: boolean; muteExpires: string | null }>({ muted: false, muteExpires: null });
-  const [muteLoading, setMuteLoading] = useState(false);
 
-  useEffect(() => {
-    getMuteStatus().then((s) => { if (s) setMuteStatus(s); });
-  }, []);
+  const [deletionStep, setDeletionStep] = useState<"request" | "verify" | null>(null);
+  const [deletionPassword, setDeletionPassword] = useState("");
+  const [deletionReason, setDeletionReason] = useState("");
+  const [deletionOtpCode, setDeletionOtpCode] = useState("");
+  const [deletionRequestId, setDeletionRequestId] = useState<number | null>(null);
 
   const showToast = useCallback((message: string, type: "success" | "error") => {
     const id = Date.now();
@@ -169,16 +169,6 @@ export default function SettingsPage() {
       setToasts((prev) => prev.filter((t) => t.id !== id));
     }, 4000);
   }, []);
-
-  const handleMute = useCallback(async (hours: number | null) => {
-    setMuteLoading(true);
-    const result = await muteAlerts(hours);
-    setMuteLoading(false);
-    if (result) {
-      setMuteStatus(result);
-      showToast(result.muted ? `SMS alerts muted for ${hours} hours` : "SMS alerts unmuted", result.muted ? "success" : "success");
-    }
-  }, [showToast]);
 
   const [form, setForm] = useState<UserForm>({
     name: "",
@@ -264,80 +254,6 @@ export default function SettingsPage() {
     }
   }, [logActivity, showToast, refetchSettings]);
 
-  const loadRecipients = useCallback(async () => {
-    try {
-      const data = await fetchRecipients();
-      setRecipients(data);
-    } catch {
-      showToast("Failed to load recipients", "error");
-    } finally {
-      setIsLoadingRecipients(false);
-    }
-  }, [showToast]);
-
-  const handleAddRecipient = useCallback(async (e: React.FormEvent) => {
-    e.preventDefault();
-    const errors: FormErrors = {};
-    if (!newRecipient.name.trim()) errors.name = "Name is required";
-    if (!newRecipient.phone_number.trim()) errors.phone_number = "Phone number is required";
-    else if (!/^\+639\d{9}$/.test(newRecipient.phone_number.trim())) errors.phone_number = "Format: +639XXXXXXXXX (11 digits)";
-    setRecipientErrors(errors);
-    if (Object.keys(errors).length > 0) return;
-    setActionLoading("add-recipient");
-    try {
-      await addRecipient(newRecipient.phone_number.trim(), newRecipient.name.trim());
-      showToast("Recipient added", "success");
-      setNewRecipient({ phone_number: "", name: "" });
-      setShowAddRecipient(false);
-      await loadRecipients();
-    } catch (err: unknown) {
-      if (err instanceof Error) {
-        const msg = err.message.includes("already exists") ? "Phone number already exists" : err.message;
-        showToast(msg, "error");
-      } else {
-        showToast("Failed to add recipient", "error");
-      }
-    } finally {
-      setActionLoading(null);
-    }
-  }, [newRecipient, showToast, loadRecipients]);
-
-  const handleToggleRecipient = useCallback(async (id: number, current: boolean) => {
-    try {
-      await updateRecipient(id, { is_active: !current });
-      setRecipients((prev) => prev.map((r) => (r.id === id ? { ...r, is_active: !current } : r)));
-      showToast(!current ? "Recipient enabled" : "Recipient disabled", "success");
-    } catch {
-      showToast("Failed to update recipient", "error");
-    }
-  }, [showToast]);
-
-  const handleDeleteRecipient = useCallback(async (id: number, name: string) => {
-    setActionLoading(`delete-recipient-${id}`);
-    try {
-      await deleteRecipient(id);
-      showToast(`"${name}" removed`, "success");
-      setDeleteConfirm(null);
-      await loadRecipients();
-    } catch {
-      showToast("Failed to delete recipient", "error");
-    } finally {
-      setActionLoading(null);
-    }
-  }, [showToast, loadRecipients]);
-
-  const handleTestSms = useCallback(async (id: number, name: string) => {
-    setActionLoading(`test-sms-${id}`);
-    try {
-      await sendTestSms(id);
-      showToast(`Test SMS sent to ${name}`, "success");
-    } catch {
-      showToast("Failed to send test SMS", "error");
-    } finally {
-      setActionLoading(null);
-    }
-  }, [showToast]);
-
   const thresholdConfig = useMemo(
     () => getSettingsThresholds(displaySettings),
     [displaySettings]
@@ -372,11 +288,6 @@ export default function SettingsPage() {
     }
   }, [isAdmin, showToast]);
 
-  useEffect(() => {
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    void loadRecipients();
-  }, [loadRecipients]);
-
   const validateForm = useCallback((): FormErrors => {
     try {
       userSchema.parse(form);
@@ -410,34 +321,48 @@ export default function SettingsPage() {
         setFormErrors({});
         await loadUsers();
       } catch (err: unknown) {
-        if (err instanceof Error && err.message) {
-          showToast(err.message, "error");
-        } else {
-          showToast("Failed to create user", "error");
-        }
+        showToast(getApiError(err), "error");
       } finally {
         setActionLoading(null);
       }
     }
   }, [form, validateForm, showToast, loadUsers]);
 
-  const handleDeleteUser = useCallback(async (id: number) => {
-    setActionLoading(`delete-${id}`);
+  const handleRequestDeletion = useCallback(async () => {
+    if (!deleteConfirm || !deletionPassword) return;
+    setActionLoading(`delete-${deleteConfirm.id}`);
     try {
-      await deleteUser(id);
-      showToast("User deleted successfully", "success");
-      setDeleteConfirm(null);
-      await loadUsers();
+      const res = await requestUserDeletion(deleteConfirm.id, deletionPassword, deletionReason || undefined);
+      setDeletionRequestId(res.request_id);
+      setDeletionStep("verify");
+      const hint = res.dev_fallback ? " (check server console)" : "";
+      showToast(`OTP sent to ${deleteConfirm.username}${hint}`, "success");
     } catch (err: unknown) {
-      if (err instanceof Error && err.message) {
-        showToast(err.message, "error");
-      } else {
-        showToast("Failed to delete user", "error");
-      }
+      showToast(getApiError(err), "error");
     } finally {
       setActionLoading(null);
     }
-  }, [showToast, loadUsers]);
+  }, [deleteConfirm, deletionPassword, deletionReason, showToast]);
+
+  const handleVerifyDeletion = useCallback(async () => {
+    if (!deleteConfirm || deletionRequestId === null || !deletionOtpCode) return;
+    setActionLoading(`verify-${deleteConfirm.id}`);
+    try {
+      await verifyUserDeletion(deleteConfirm.id, deletionRequestId, deletionOtpCode);
+      showToast("User deleted successfully", "success");
+      setDeleteConfirm(null);
+      setDeletionStep(null);
+      setDeletionPassword("");
+      setDeletionReason("");
+      setDeletionOtpCode("");
+      setDeletionRequestId(null);
+      await loadUsers();
+    } catch (err: unknown) {
+      showToast(getApiError(err), "error");
+    } finally {
+      setActionLoading(null);
+    }
+  }, [deleteConfirm, deletionRequestId, deletionOtpCode, showToast, loadUsers]);
 
   const handleResetPassword = useCallback(async (id: number) => {
     if (!resetModal) return;
@@ -599,191 +524,6 @@ export default function SettingsPage() {
 
       {isAdmin && (
         <div className="space-y-6 pt-6 border-t border-gray-200">
-          <div>
-            <div className="flex items-center justify-between mb-4">
-              <div>
-                <h2 className="text-lg font-bold text-gray-800">SMS Recipients</h2>
-                <p className="text-sm text-gray-500">Phone numbers that receive alert and hourly status messages</p>
-              </div>
-              {!showAddRecipient && (
-                <button
-                  onClick={() => setShowAddRecipient(true)}
-                  className="flex items-center gap-2 bg-gradient-to-r from-[#d94b1e] to-[#ef6a2e] text-white px-4 py-2 rounded-lg font-semibold text-sm hover:from-[#c2410c] hover:to-[#d94b1e] transition-all"
-                >
-                  <UserPlus size={16} />
-                  Add Recipient
-                </button>
-              )}
-            </div>
-
-            {showAddRecipient && (
-              <div className="bg-white rounded-lg shadow p-6 mb-4">
-                <div className="flex items-center justify-between mb-4">
-                  <h3 className="text-md font-bold text-gray-800">Add New Recipient</h3>
-                  <button
-                    onClick={() => { setShowAddRecipient(false); setRecipientErrors({}); setNewRecipient({ phone_number: "", name: "" }); }}
-                    className="text-gray-400 hover:text-gray-600"
-                  >
-                    <X size={20} />
-                  </button>
-                </div>
-                <form onSubmit={handleAddRecipient} className="flex flex-col sm:flex-row gap-3 items-end">
-                  <div className="flex-1">
-                    <label className="block text-sm font-medium text-gray-700 mb-1">Name</label>
-                    <input
-                      type="text"
-                      value={newRecipient.name}
-                      onChange={(e) => { setNewRecipient((p) => ({ ...p, name: e.target.value })); if (recipientErrors.name) setRecipientErrors((p) => ({ ...p, name: "" })); }}
-                      className={`w-full px-3 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-[#d94b1e]/20 focus:border-[#d94b1e] ${recipientErrors.name ? "border-red-500 bg-red-50" : "border-gray-300"}`}
-                      placeholder="e.g. Admin, Manager"
-                    />
-                    {recipientErrors.name && <p className="mt-1 text-xs text-red-600">{recipientErrors.name}</p>}
-                  </div>
-                  <div className="flex-1">
-                    <label className="block text-sm font-medium text-gray-700 mb-1">Phone Number</label>
-                    <input
-                      type="text"
-                      value={newRecipient.phone_number}
-                      onChange={(e) => { setNewRecipient((p) => ({ ...p, phone_number: e.target.value })); if (recipientErrors.phone_number) setRecipientErrors((p) => ({ ...p, phone_number: "" })); }}
-                      className={`w-full px-3 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-[#d94b1e]/20 focus:border-[#d94b1e] ${recipientErrors.phone_number ? "border-red-500 bg-red-50" : "border-gray-300"}`}
-                      placeholder="+639XXXXXXXXX"
-                    />
-                    {recipientErrors.phone_number && <p className="mt-1 text-xs text-red-600">{recipientErrors.phone_number}</p>}
-                  </div>
-                  <button
-                    type="submit"
-                    disabled={actionLoading === "add-recipient"}
-                    className="flex items-center gap-2 bg-blue-600 text-white px-4 py-2 rounded-lg font-semibold text-sm hover:bg-blue-700 disabled:opacity-50 h-10"
-                  >
-                    {actionLoading === "add-recipient" ? <Loader2 size={16} className="animate-spin" /> : <UserPlus size={16} />}
-                    Add
-                  </button>
-                </form>
-              </div>
-            )}
-
-            {isLoadingRecipients ? (
-              <div className="bg-white rounded-lg shadow p-8 text-center">
-                <Loader2 size={32} className="animate-spin mx-auto text-gray-400" />
-                <p className="text-sm text-gray-500 mt-2">Loading recipients...</p>
-              </div>
-            ) : recipients.length === 0 ? (
-              <div className="bg-white rounded-lg shadow p-8 text-center">
-                <MessageSquare size={32} className="mx-auto text-gray-400 mb-2" />
-                <p className="text-sm text-gray-500">No recipients added yet. Click "Add Recipient" to start receiving SMS alerts.</p>
-              </div>
-            ) : (
-              <div className="bg-white rounded-lg shadow overflow-hidden">
-                <div className="overflow-x-auto">
-                  <table className="w-full">
-                    <thead>
-                      <tr className="bg-gray-50 border-b border-gray-200">
-                        <th className="text-left px-4 py-3 text-xs font-semibold text-gray-500 uppercase">Name</th>
-                        <th className="text-left px-4 py-3 text-xs font-semibold text-gray-500 uppercase">Phone</th>
-                        <th className="text-left px-4 py-3 text-xs font-semibold text-gray-500 uppercase">Status</th>
-                        <th className="text-left px-4 py-3 text-xs font-semibold text-gray-500 uppercase">Added</th>
-                        <th className="text-right px-4 py-3 text-xs font-semibold text-gray-500 uppercase">Actions</th>
-                      </tr>
-                    </thead>
-                    <tbody className="divide-y divide-gray-100">
-                      {recipients.map((r) => (
-                        <tr key={r.id} className="hover:bg-gray-50 transition-colors">
-                          <td className="px-4 py-3">
-                            <div className="flex items-center gap-2">
-                              <Phone size={14} className="text-gray-400" />
-                              <p className="font-medium text-gray-800 text-sm">{r.name}</p>
-                            </div>
-                          </td>
-                          <td className="px-4 py-3 text-sm text-gray-600 font-mono">{r.phone_number}</td>
-                          <td className="px-4 py-3">
-                            <button
-                              onClick={() => handleToggleRecipient(r.id, r.is_active)}
-                              className="flex items-center gap-1 text-sm font-semibold"
-                            >
-                              {r.is_active ? (
-                                <ToggleRight size={20} className="text-emerald-500" />
-                              ) : (
-                                <ToggleLeft size={20} className="text-gray-400" />
-                              )}
-                              <span className={r.is_active ? "text-emerald-600" : "text-gray-400"}>
-                                {r.is_active ? "Active" : "Disabled"}
-                              </span>
-                            </button>
-                          </td>
-                          <td className="px-4 py-3 text-sm text-gray-500">
-                            {new Date(r.created_at).toLocaleDateString()}
-                          </td>
-                          <td className="px-4 py-3">
-                            <div className="flex items-center justify-end gap-1">
-                              <button
-                                onClick={() => handleTestSms(r.id, r.name)}
-                                disabled={actionLoading === `test-sms-${r.id}`}
-                                className="flex items-center gap-1 px-2 py-1.5 text-xs font-medium text-blue-600 hover:bg-blue-50 rounded-md transition-colors disabled:opacity-50"
-                                title="Send Test SMS"
-                              >
-                                {actionLoading === `test-sms-${r.id}` ? <Loader2 size={14} className="animate-spin" /> : <Send size={14} />}
-                                Test
-                              </button>
-                              <button
-                                onClick={() => setDeleteConfirm({ id: r.id, username: r.name, type: "recipient" })}
-                                className="p-1.5 text-gray-400 hover:text-red-600 hover:bg-red-50 rounded-md transition-colors"
-                                title="Delete Recipient"
-                              >
-                                <Trash2 size={16} />
-                              </button>
-                            </div>
-                          </td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              </div>
-            )}
-          </div>
-
-          <div>
-            <div className="flex items-center gap-2 mb-4">
-              <MessageSquare className="text-orange-600" size={18} />
-              <h2 className="text-lg font-bold text-gray-800">SMS Alert Sleep / Mute</h2>
-            </div>
-            <p className="text-sm text-gray-500 mb-4">Temporarily pause SMS alerts for device disconnections and threshold warnings</p>
-
-            {muteStatus.muted && muteStatus.muteExpires && (
-              <div className="bg-amber-50 border border-amber-200 rounded-lg p-4 mb-4">
-                <div className="flex items-center gap-2">
-                  <ToggleRight size={18} className="text-amber-600" />
-                  <span className="text-sm font-semibold text-amber-800">SMS alerts muted until {new Date(muteStatus.muteExpires).toLocaleString()}</span>
-                </div>
-              </div>
-            )}
-
-            <div className="bg-white rounded-lg shadow p-4">
-              <div className="grid grid-cols-4 sm:grid-cols-7 gap-2 mb-3">
-                {[1, 2, 4, 6, 8, 12, 24].map((hours) => (
-                  <button
-                    key={hours}
-                    onClick={() => handleMute(hours)}
-                    disabled={muteLoading}
-                    className="px-3 py-2 text-sm font-medium rounded-lg border border-gray-200 text-gray-700 hover:bg-gray-50 hover:border-orange-300 transition-all disabled:opacity-50"
-                  >
-                    {hours}h
-                  </button>
-                ))}
-              </div>
-              {muteStatus.muted && (
-                <button
-                  onClick={() => handleMute(null)}
-                  disabled={muteLoading}
-                  className="flex items-center gap-2 px-4 py-2 text-sm font-semibold rounded-lg bg-red-50 text-red-700 border border-red-200 hover:bg-red-100 transition-all disabled:opacity-50"
-                >
-                  <ToggleLeft size={16} />
-                  Unmute Alerts
-                </button>
-              )}
-            </div>
-          </div>
-
           <div className="flex items-center justify-between">
             <div>
               <h2 className="text-lg font-bold text-gray-800">User Management</h2>
@@ -1035,7 +775,7 @@ export default function SettingsPage() {
                             </button>
                             {user?.id !== u.id && (
                               <button
-                                onClick={() => setDeleteConfirm({ id: u.id, username: u.username, type: "user" })}
+                                onClick={() => setDeleteConfirm({ id: u.id, username: u.username })}
                                 className="p-1.5 text-gray-400 hover:text-red-600 hover:bg-red-50 rounded-md transition-colors"
                                 title="Delete User"
                               >
@@ -1118,7 +858,7 @@ export default function SettingsPage() {
       )}
 
       {deleteConfirm && (
-        <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4" onClick={() => setDeleteConfirm(null)}>
+        <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4" onClick={() => { setDeleteConfirm(null); setDeletionStep(null); setDeletionPassword(""); setDeletionReason(""); setDeletionOtpCode(""); setDeletionRequestId(null); }}>
           <div className="bg-white rounded-xl shadow-xl max-w-sm w-full p-6" onClick={(e) => e.stopPropagation()}>
             <div className="flex items-center gap-3 mb-4">
               <div className="w-10 h-10 rounded-full bg-red-100 flex items-center justify-center">
@@ -1126,33 +866,86 @@ export default function SettingsPage() {
               </div>
               <div>
                 <h3 className="text-lg font-bold text-gray-800">
-                  {deleteConfirm.type === "user" ? "Delete User" : "Delete Recipient"}
+                  {deletionStep === "verify" ? "Verify Deletion" : "Delete User"}
                 </h3>
-                <p className="text-sm text-gray-500">This action cannot be undone</p>
+                <p className="text-sm text-gray-500">
+                  {deletionStep === "verify" ? "Enter the OTP code sent to the user's email" : "This action requires email verification"}
+                </p>
               </div>
             </div>
-            <p className="text-sm text-gray-600 mb-6">
-              {deleteConfirm.type === "user" ? (
-                <>Are you sure you want to delete the account <span className="font-semibold">{deleteConfirm.username}</span>?</>
-              ) : (
-                <>Are you sure you want to remove <span className="font-semibold">{deleteConfirm.username}</span> from receiving SMS alerts?</>
-              )}
-            </p>
+
+            {deletionStep === "verify" ? (
+              <div className="mb-6">
+                <p className="text-sm text-gray-600 mb-3">
+                  An OTP code was sent to <span className="font-semibold">{deleteConfirm.username}</span>'s email. Enter the 6-digit code below.
+                </p>
+                <input
+                  type="text"
+                  value={deletionOtpCode}
+                  onChange={(e) => setDeletionOtpCode(e.target.value.replace(/\D/g, "").slice(0, 6))}
+                  className="w-full px-3 py-2 border border-gray-300 rounded-lg text-center text-lg font-mono tracking-[0.3em] focus:outline-none focus:ring-2 focus:ring-red-500/20 focus:border-red-500"
+                  placeholder="000000"
+                  maxLength={6}
+                  autoFocus
+                  onKeyDown={(e) => { if (e.key === "Enter") handleVerifyDeletion(); }}
+                />
+              </div>
+            ) : (
+              <div className="mb-6 space-y-3">
+                <p className="text-sm text-gray-600">
+                  Are you sure you want to delete the account <span className="font-semibold">{deleteConfirm.username}</span>?
+                </p>
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-1">Your Password</label>
+                  <input
+                    type="password"
+                    value={deletionPassword}
+                    onChange={(e) => setDeletionPassword(e.target.value)}
+                    className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-red-500/20 focus:border-red-500"
+                    placeholder="Enter your password to confirm"
+                    autoFocus
+                    onKeyDown={(e) => { if (e.key === "Enter") handleRequestDeletion(); }}
+                  />
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-1">Reason <span className="text-gray-400">(optional)</span></label>
+                  <input
+                    type="text"
+                    value={deletionReason}
+                    onChange={(e) => setDeletionReason(e.target.value)}
+                    className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-red-500/20 focus:border-red-500"
+                    placeholder="Why is this account being deleted?"
+                  />
+                </div>
+              </div>
+            )}
+
             <div className="flex gap-2 justify-end">
               <button
-                onClick={() => setDeleteConfirm(null)}
+                onClick={() => { setDeleteConfirm(null); setDeletionStep(null); setDeletionPassword(""); setDeletionReason(""); setDeletionOtpCode(""); setDeletionRequestId(null); }}
                 className="px-4 py-2 border border-gray-300 rounded-lg text-sm font-semibold text-gray-700 hover:bg-gray-50"
               >
                 Cancel
               </button>
-              <button
-                onClick={() => deleteConfirm.type === "user" ? handleDeleteUser(deleteConfirm.id) : handleDeleteRecipient(deleteConfirm.id, deleteConfirm.username)}
-                disabled={actionLoading === `delete-${deleteConfirm.id}` || actionLoading === `delete-recipient-${deleteConfirm.id}`}
-                className="flex items-center gap-2 bg-red-600 text-white px-4 py-2 rounded-lg text-sm font-semibold hover:bg-red-700 disabled:opacity-50"
-              >
-                {actionLoading === `delete-${deleteConfirm.id}` || actionLoading === `delete-recipient-${deleteConfirm.id}` ? <Loader2 size={16} className="animate-spin" /> : <Trash2 size={16} />}
-                Delete
-              </button>
+              {deletionStep === "verify" ? (
+                <button
+                  onClick={handleVerifyDeletion}
+                  disabled={actionLoading === `verify-${deleteConfirm.id}` || deletionOtpCode.length !== 6}
+                  className="flex items-center gap-2 bg-red-600 text-white px-4 py-2 rounded-lg text-sm font-semibold hover:bg-red-700 disabled:opacity-50"
+                >
+                  {actionLoading === `verify-${deleteConfirm.id}` ? <Loader2 size={16} className="animate-spin" /> : <CheckCircle2 size={16} />}
+                  Verify & Delete
+                </button>
+              ) : (
+                <button
+                  onClick={handleRequestDeletion}
+                  disabled={actionLoading === `delete-${deleteConfirm.id}` || !deletionPassword}
+                  className="flex items-center gap-2 bg-red-600 text-white px-4 py-2 rounded-lg text-sm font-semibold hover:bg-red-700 disabled:opacity-50"
+                >
+                  {actionLoading === `delete-${deleteConfirm.id}` ? <Loader2 size={16} className="animate-spin" /> : <Trash2 size={16} />}
+                  Request Deletion
+                </button>
+              )}
             </div>
           </div>
         </div>

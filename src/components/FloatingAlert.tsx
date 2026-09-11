@@ -1,19 +1,16 @@
 // =============================================================================
 // FILE: src/components/FloatingAlert.tsx
-// PURPOSE: Toast notification system with auto-dismiss and SMS mute support.
+// PURPOSE: Toast notification system with auto-dismiss.
 // =============================================================================
 
 import { useState, useEffect, useRef, useCallback, type ReactNode } from "react";
-import { X, AlertTriangle, AlertCircle, BellOff } from "lucide-react";
+import { X, AlertTriangle, AlertCircle } from "lucide-react";
 import { playLowAlertSound, playHighAlertSound } from "../utils/playAlertSound";
-import { muteAlerts } from "../api/client";
 import { 
   FloatingAlertContext, 
   useFloatingAlerts,
   type AlertNotification
 } from "../hooks/useFloatingAlerts";
-
-const MUTE_OPTIONS = [1, 2, 4, 6, 8, 12, 24];
 
 interface FloatingAlertProviderProps {
   children: ReactNode;
@@ -99,8 +96,6 @@ interface FloatingAlertItemProps {
 
 function FloatingAlertItem({ notification, onClose }: FloatingAlertItemProps) {
   const [isExiting, setIsExiting] = useState(false);
-  const [showMuteOptions, setShowMuteOptions] = useState(false);
-  const [muting, setMuting] = useState(false);
 
   // Keep latest onClose in a ref so the auto-dismiss timer isn't restarted on every re-render.
   const onCloseRef = useRef(onClose);
@@ -122,15 +117,6 @@ function FloatingAlertItem({ notification, onClose }: FloatingAlertItemProps) {
     setIsExiting(true);
     setTimeout(onClose, 300);
   };
-
-  const handleMute = useCallback(async (hours: number) => {
-    setMuting(true);
-    await muteAlerts(hours);
-    setMuting(false);
-    setShowMuteOptions(false);
-    setIsExiting(true);
-    setTimeout(onClose, 300);
-  }, [onClose]);
 
   const isWarning = notification.type === "warning";
   const bgColor = isWarning ? "bg-amber-50" : "bg-red-50";
@@ -163,16 +149,6 @@ function FloatingAlertItem({ notification, onClose }: FloatingAlertItemProps) {
           )}
         </div>
         <div className="flex-shrink-0 flex items-center gap-1">
-          {/* SMS mute button - device disconnect alerts only */}
-          {notification.parameter === "device" && (
-            <button
-              onClick={() => setShowMuteOptions(!showMuteOptions)}
-              className="text-gray-400 hover:text-gray-600 transition-colors"
-              title="Mute SMS alerts"
-            >
-              <BellOff size={16} />
-            </button>
-          )}
           <button
             onClick={handleClose}
             className="text-gray-400 hover:text-gray-600 transition-colors"
@@ -181,23 +157,6 @@ function FloatingAlertItem({ notification, onClose }: FloatingAlertItemProps) {
           </button>
         </div>
       </div>
-
-      {/* Expands when the bell icon is clicked */}
-      {showMuteOptions && (
-        <div className="flex flex-wrap gap-1 pt-1 border-t border-gray-200/50">
-          <span className="text-xs text-gray-500 w-full mb-1">Mute SMS alerts for:</span>
-          {MUTE_OPTIONS.map((hours) => (
-            <button
-              key={hours}
-              onClick={() => handleMute(hours)}
-              disabled={muting}
-              className="px-2 py-1 text-xs font-medium rounded bg-gray-100 text-gray-700 hover:bg-gray-200 transition-colors disabled:opacity-50"
-            >
-              {hours}h
-            </button>
-          ))}
-        </div>
-      )}
     </div>
   );
 }

@@ -10,11 +10,11 @@
 
 const express = require("express");
 const cors = require("cors");
-const axios = require("axios");
 const { Pool } = require("pg");
 const { z } = require("zod");
 const crypto = require("crypto");
 const rateLimit = require("express-rate-limit");
+const nodemailer = require("nodemailer");
 require("dotenv").config();
 
 // ========================
@@ -155,7 +155,23 @@ function requireAdmin(req, res, next) {
     .catch(err => res.status(500).json({ message: "Auth error", error: err.message }));
 }
 
-// Validates any authenticated user token; attaches user to req.user
+// Validates the token and attaches the user to req.adminUser (admin role required)
+// Used by all admin-gated routes.
+app._deleteUserHard = async (userId, actorUsername) => {
+  // Deferred hard-delete with audit: called only after email-OTP approval.
+  // activity_logs.user_name was relaxed to SET NULL by migration 001, so the
+  // audit rows survive even after the user row is removed.
+  const reqResult = await pool.query(
+    `DELETE FROM users WHERE id = $1 RETURNING id, username`,
+    [userId]
+  );
+  if (reqResult.rows.length === 0) {
+    const err = new Error("User not found");
+    err.statusCode = 404;
+    throw err;
+  }
+  return reqResult.rows[0];
+};
 function requireAuth(req, res, next) {
   const token = req.headers.authorization?.replace("Bearer ", "");
   if (!token) return res.status(401).json({ message: "Authentication required" });
@@ -172,6 +188,85 @@ function requireAuth(req, res, next) {
       next();
     })
     .catch(err => res.status(500).json({ message: "Auth error", error: err.message }));
+}
+
+// =============================================================================
+// EMAIL OTP — secure account deletion (2FA via SMTP)
+// =============================================================================
+// The existing admin-only DELETE /auth/users/:id is replaced by a three-phase
+// flow that keeps a full audit trail and requires a human-in-the-loop:
+//
+//   1. REQUEST  — admin supplies their password + the target user id.
+//                 A 6-digit OTP is generated, SMTP'd to the *admin's* email,
+//                 and a `user_deletion_requests` row is created (status
+//                 pending_otp) with a salted SHA-256 hash of the code.
+//   2. VERIFY   — admin submits the OTP (max 5 attempts, 10 min expiry).
+//                 Verified rows advance to status pending_approval; the code is
+//                 marked used so replay is impossible.
+//   3. APPROVE/EXECUTE — a *different* admin (second person) approves, which
+//                 performs the hard delete. The timestamped auth+reason history
+//                 lives in `status_history` + the activity-log audit trail.
+//
+// SMTP delivery is plug-and-play: set SMTP_HOST/SMTP_USER/SMTP_PASS/SMTP_FROM
+// in .env (see .env.example). When SMTP is not configured the server logs the
+// OTP to the console ONLY in non-production (DEV_OTP_CONSOLE_FALLBACK=true) —
+// that keeps the "no email server configured" demo usable without silently
+// leaking codes to the response body.
+
+let smtpTransporter = null;
+if (process.env.SMTP_HOST) {
+  smtpTransporter = nodemailer.createTransport({
+    host: process.env.SMTP_HOST,
+    port: Number(process.env.SMTP_PORT) || 587,
+    secure: (process.env.SMTP_SECURE || "").toUpperCase() === "TRUE",
+    auth: process.env.SMTP_USER
+      ? { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS }
+      : undefined,
+  });
+  console.log(`[${new Date().toISOString()}] SMTP transport ready for ${process.env.SMTP_HOST}:${Number(process.env.SMTP_PORT) || 587}`);
+} else {
+  console.warn(`[${new Date().toISOString()}] SMTP_HOST not set — OTP codes will be logged to the console (dev only)`);
+}
+
+const OTP_DIGITS = 6;
+const OTP_TTL_MS = 10 * 60 * 1000;   // 10 minutes
+const OTP_MAX_ATTEMPTS = 5;           // attempts before the code is invalidated
+
+// Random time-safe 6-digit code (crypto, not Math.random)
+function generateOtpCode() {
+  const raw = crypto.randomInt(0, 1000000).toString().padStart(OTP_DIGITS, "0");
+  return raw;
+}
+
+// Salted SHA-256 hash of the OTP (code never stored in plaintext)
+function hashOtpCode(code, salt = crypto.randomBytes(16).toString("hex")) {
+  const digest = crypto.createHash("sha256").update(`${salt}:${code}`).digest("hex");
+  return { digest, salt };
+}
+
+// Constant-time comparison (timing-attack safe)
+function safeEqual(a, b) {
+  if (typeof a !== "string" || typeof b !== "string" || a.length !== b.length) return false;
+  return crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b));
+}
+
+async function sendOtpEmail(to, code) {
+  if (!smtpTransporter) {
+    // No SMTP configured — dev fallback: log the code, DO NOT return it in JSON.
+    const mode = process.env.NODE_ENV !== "production" && process.env.DEV_OTP_CONSOLE_FALLBACK !== "false";
+    if (mode) {
+      console.log(`[${new Date().toISOString()}] [DEV-OTP] to=${to} code=${code} (no mail provider configured; see .env.example for SMTP_*)`);
+    }
+    return { delivered: false, devFallback: mode };
+  }
+  await smtpTransporter.sendMail({
+    from: process.env.SMTP_FROM || process.env.SMTP_USER,
+    to,
+    subject: "Your account-deletion confirmation code",
+    text: `Your CRAYvings confirmation code is: ${code}\nIt expires in 10 minutes. Do not share this code with anyone.\nIf you did not request this, ignore this email.`,
+    html: `<p>Your CRAYvings account-deletion confirmation code is:</p><p style="font-size:24px;letter-spacing:6px;font-weight:bold">${code}</p><p>It expires in 10 minutes. Do not share it with anyone.<br/>If you did not request this, ignore this email.</p>`,
+  });
+  return { delivered: true };
 }
 
 // =============================================================================
@@ -286,162 +381,19 @@ function getThresholdStatus(value, min, max) {
   return "good";
 }
 
-// =============================================================================
-// SMS NOTIFICATION SYSTEM (SkySMS Integration)
-// =============================================================================
-// Sends alert SMS via the SkySMS API. Cooldowns default to 2 min per alert
-// type (WARNING_SMS_COOLDOWN_MS / SMS_COOLDOWN_MS); hourly updates controlled
-// by HOURLY_SMS_ENABLED / HOURLY_SMS_INTERVAL_MS. Sends run asynchronously
-// (setImmediate) so the ESP32 response is never blocked.
-// =============================================================================
-
-const SKYSMS_API_KEY = process.env.SKYSMS_API_KEY;
-const SKYSMS_API_URL = process.env.SKYSMS_API_URL || "https://skysms.skyio.site/api/v1";
 // DEVICE_SECRET: ESP32 must send matching X-Device-Secret header for POST /sensor.
 // When set, requests without it are rejected; when unset (local dev), ingestion
 // is allowed but a warning is logged. Set DEVICE_SECRET in production.
 const DEVICE_SECRET = process.env.DEVICE_SECRET;
 let deviceSecretWarned = false;
 
-// SMS configuration: templates, sensor name/unit mappings, cooldowns
-const SMS_CONFIG = {
-  messages: {
-    warning: "⚠️ {{SENSOR}} WARNING\nRecipient: {{NAME}}\nReading: {{VALUE}}{{UNIT}}\nThreshold: {{THRESHOLD}}{{UNIT}}\nTime: {{TIME}}\nStatus: Warning",
-    critical: "🚨 {{SENSOR}} CRITICAL ALERT\nRecipient: {{NAME}}\nReading: {{VALUE}}{{UNIT}}\nThreshold: {{THRESHOLD}}{{UNIT}}\nTime: {{TIME}}\nStatus: CRITICAL",
-    hourlyUpdate: "📊 CRAYVINGS HOURLY UPDATE\nTime: {{TIME}}\nTemperature: {{TEMP}}°C ({{TEMP_STATUS}})\nWater Level: {{WATER}}% ({{WATER_STATUS}})\nAmmonia: {{AMMONIA}} ppm ({{AMMONIA_STATUS}})\n{{SUMMARY}}"
-  },
-  sensorNames: { "Temperature": "TEMPERATURE", "Water Level": "WATER LEVEL", "Ammonia": "AMMONIA" },
-  units: { "Temperature": "°C", "Water Level": "%", "Ammonia": " ppm" },
-  hourly: {
-    enabled: process.env.HOURLY_SMS_ENABLED !== "false",
-    intervalMs: parseInt(process.env.HOURLY_SMS_INTERVAL_MS) || 3600000
-  },
-  // Cooldowns prevent alert spam (time between repeated alerts)
-  cooldown: {
-    warning: parseInt(process.env.WARNING_SMS_COOLDOWN_MS) || 120000,   // 2 minutes
-    critical: parseInt(process.env.SMS_COOLDOWN_MS) || 120000            // 2 minutes
-  },
-  // Exponential backoff retry for failed SMS sends
-  retry: { maxRetries: 2, baseDelayMs: 2000 },
-  from: "CRAYVINGS"  // Sender name shown on the recipient's phone
-};
-
-// Replaces {{PLACEHOLDER}} tokens in a template with values
-function buildMessage(template, data) {
-  let message = template;
-  for (const [key, value] of Object.entries(data)) {
-    message = message.replace(new RegExp(`{{${key}}}`, "g"), String(value));
-  }
-  return message;
-}
-
-// Converts a threshold status to human-readable text with emoji
-function getStatusText(status) {
-  switch (status) {
-    case "good": return "✅ Good";
-    case "warning": return "⚠️ Warning";
-    case "critical": return "🚨 Critical";
-    default: return "Unknown";
-  }
-}
-
-// Sends one SMS via SkySMS with exponential backoff retries; logs to sms_logs
-async function sendSingleSMS(phoneNumber, message) {
-  const { maxRetries, baseDelayMs } = SMS_CONFIG.retry;
-  for (let attempt = 0; attempt <= maxRetries; attempt++) {
-    try {
-      if (!SKYSMS_API_KEY || !SKYSMS_API_URL) {
-        console.error("SkySMS configuration missing in .env");
-        await logSMS(phoneNumber, message, "failed", "Missing SkySMS config", null);
-        return false;
-      }
-      const response = await axios.post(
-        `${SKYSMS_API_URL}/sms/send`,
-        { phone_number: phoneNumber, message, from: SMS_CONFIG.from },
-        { headers: { "X-API-Key": SKYSMS_API_KEY, "Content-Type": "application/json" }, timeout: 10000 }
-      );
-      console.log(`✅ SMS sent to ${phoneNumber} (attempt ${attempt + 1})`);
-      await logSMS(phoneNumber, message, "sent", null, response.data?.id);
-      return true;
-    } catch (error) {
-      const errorMessage = error.response?.data?.message || error.message;
-      const statusCode = error.response?.status;
-      console.error(`❌ Failed to send SMS to ${phoneNumber} (attempt ${attempt + 1}/${maxRetries + 1}): ${errorMessage}`);
-      
-      // Don't retry on 403 (invalid key/no credits) or 400 (bad request)
-      if (statusCode === 403 || statusCode === 400) {
-        console.error(`❌ SMS failed with status ${statusCode} - not retrying (check API key/credits)`);
-        await logSMS(phoneNumber, message, "failed", `Status ${statusCode}: ${errorMessage}`, null);
-        return false;
-      }
-      
-      if (attempt === maxRetries) {
-        await logSMS(phoneNumber, message, "failed", errorMessage, null);
-        return false;
-      }
-      // Exponential backoff: 2s, then 4s, then 8s between retries
-      await new Promise(resolve => setTimeout(resolve, baseDelayMs * Math.pow(2, attempt)));
-    }
-  }
-  return false;
-}
-
-// Logs an SMS send to sms_logs for the audit trail; failures are caught silently
-async function logSMS(phone, message, status, error, smsId = null) {
-  try {
-    await pool.query(
-      `INSERT INTO sms_logs (recipient_phone, message, status, error_message, sms_id, sent_at) VALUES ($1, $2, $3, $4, $5, NOW())`,
-      [phone, message, status, error || null, smsId || null]
-    );
-  } catch (logErr) {
-    console.error("Failed to log SMS:", logErr.message);
-  }
-}
-
-// In-memory alert dedup state; last-alert per sensor, SMS mute, disconnect spam guard
+// In-memory alert dedup state; last-alert per sensor, disconnect spam guard
 let lastAlertedState = {};
-let smsMuteUntil = null;
-// Prevents disconnect SMS spam when the connection flaps
-let lastDisconnectSmsTs = 0;
 // Server-side ammonia spike guard: last stored reading per device
 let lastAmmoniaReading = {};
 const AMMONIA_SPIKE_THRESHOLD = 20; // ppm — reject readings jumping more than this from last stored value
-
-// Hourly SMS timestamp - loaded from DB on startup, persisted on each send
-let lastHourlyUpdateTs = null;
-
-// Restore hourly-update timestamp and SMS mute state from DB on startup
-(async () => {
-  try {
-    // Create system_state table if it doesn't exist
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS system_state (
-        key VARCHAR(255) PRIMARY KEY,
-        value TEXT
-      )
-    `);
-    const result = await pool.query("SELECT value FROM system_state WHERE key = 'last_hourly_update_ts'");
-    if (result.rows.length > 0 && result.rows[0].value) {
-      lastHourlyUpdateTs = new Date(result.rows[0].value).getTime();
-      console.log(`[${new Date().toISOString()}] Loaded lastHourlyUpdateTs from DB: ${new Date(lastHourlyUpdateTs).toISOString()}`);
-    }
-
-    // Restore SMS mute state from DB (survives server restarts)
-    const muteResult = await pool.query("SELECT value FROM system_state WHERE key = 'sms_mute_until'");
-    if (muteResult.rows.length > 0 && muteResult.rows[0].value) {
-      const storedMute = new Date(muteResult.rows[0].value);
-      if (storedMute > new Date()) {
-        smsMuteUntil = storedMute.toISOString();
-        console.log(`[${new Date().toISOString()}] Restored SMS mute until ${smsMuteUntil}`);
-      } else {
-        await pool.query("DELETE FROM system_state WHERE key = 'sms_mute_until'");
-        console.log(`[${new Date().toISOString()}] Cleared expired SMS mute from DB`);
-      }
-    }
-  } catch (err) {
-    console.error(`[${new Date().toISOString()}] Error initializing system_state:`, err.message);
-  }
-})();
+// Cooldown prevents system_logs alert spam for a repeated status (~2 minutes)
+const ALERT_COOLDOWN_MS = 120000;
 
 // =============================================================================
 // DATABASE OPTIMIZATION & CLEANUP
@@ -461,9 +413,6 @@ let lastHourlyUpdateTs = null;
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_system_logs_timestamp ON system_logs (timestamp DESC)`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_system_logs_action ON system_logs (action)`);
     
-    await pool.query(`CREATE INDEX IF NOT EXISTS idx_sms_logs_sent_at ON sms_logs (sent_at DESC)`);
-    await pool.query(`CREATE INDEX IF NOT EXISTS idx_sms_logs_status ON sms_logs (status)`);
-    
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_sensors_timestamp ON sensors (timestamp DESC)`);
     
     console.log(`[${new Date().toISOString()}] Database indexes verified/created`);
@@ -481,13 +430,6 @@ async function cleanupOldData() {
     );
     if (result.rowCount > 0) {
       console.log(`[${new Date().toISOString()}] Cleaned up ${result.rowCount} old system_logs entries`);
-    }
-    
-    const smsResult = await pool.query(
-      `DELETE FROM sms_logs WHERE sent_at < NOW() - INTERVAL '${LOGS_RETENTION_DAYS} days' RETURNING id`
-    );
-    if (smsResult.rowCount > 0) {
-      console.log(`[${new Date().toISOString()}] Cleaned up ${smsResult.rowCount} old sms_logs entries`);
     }
 
     // ESP32 posts ~1 reading/sec, so the sensors table grows fast — prune old readings
@@ -528,8 +470,7 @@ app.get("/", (req, res) => {
 // SENSOR DATA ENDPOINTS
 // ========================
 
-// POST /sensor - ESP32 ingestion; stores reading, then evaluates thresholds and
-// sends SMS alerts asynchronously in the background
+// POST /sensor - ESP32 ingestion; stores reading and evaluates thresholds
 app.post("/sensor", async (req, res) => {
   try {
     // Device auth: if DEVICE_SECRET is set, require a matching X-Device-Secret header
@@ -579,15 +520,15 @@ app.post("/sensor", async (req, res) => {
       lastAmmoniaReading[device_id] = ammoniaVal;
     }
 
-    // Respond immediately; timestamp returned as UTC ISO-8601 so the frontend
+// Respond immediately; timestamp returned as UTC ISO-8601 so the frontend
     // renders it in the farm timezone without silent timezone conversion.
     res.status(201).json({ message: "Saved", data: { ...result.rows[0], timestamp: ts.toISOString() } });
 
-    // Background: evaluate thresholds and send SMS alerts
+    // Background: evaluate thresholds and update alert state
     setImmediate(async () => {
       try {
         const settingsResult = await pool.query("SELECT * FROM sensor_settings LIMIT 1");
-const settings = settingsResult.rows[0] || { temp_min: 20, temp_max: 31, water_level_min: 10, water_level_max: 100, ammonia_min: 0.25, ammonia_max: 1 };
+        const settings = settingsResult.rows[0] || { temp_min: 20, temp_max: 31, water_level_min: 10, water_level_max: 100, ammonia_min: 0.25, ammonia_max: 1 };
 
         const sensorChecks = [
           { key: "Temperature", val: Number(temperature), min: Number(settings.temp_min), max: Number(settings.temp_max), minValid: 0.0001 },
@@ -596,8 +537,6 @@ const settings = settingsResult.rows[0] || { temp_min: 20, temp_max: 31, water_l
         ];
 
         const nowTs = ts.getTime();
-        const hourlyEnabled = SMS_CONFIG.hourly.enabled;
-        if (hourlyEnabled && !lastHourlyUpdateTs) lastHourlyUpdateTs = nowTs;
 
         for (const sensor of sensorChecks) {
           // Skip invalid readings: ESP32 sends -1 on failure, and 0 for temperature
@@ -607,7 +546,7 @@ const settings = settingsResult.rows[0] || { temp_min: 20, temp_max: 31, water_l
           const last = lastAlertedState[`${device_id}:${sensor.key}`] || {};
           const lastTs = last.timestamp ? new Date(last.timestamp).getTime() : 0;
 
-          // Reading returned to normal: resolve the alert and skip SMS
+          // Reading returned to normal: resolve the alert
           if (status === "good") {
             if (last.status && last.status !== "good") {
               await pool.query(
@@ -622,9 +561,8 @@ const settings = settingsResult.rows[0] || { temp_min: 20, temp_max: 31, water_l
             continue;
           }
 
-          // Cooldown prevents alert spam for a repeated status
-          const interval = status === "critical" ? SMS_CONFIG.cooldown.critical : SMS_CONFIG.cooldown.warning;
-          if (status === last.status && nowTs - lastTs < interval) continue;
+          // Cooldown prevents repeated alerts for a persistent status
+          if (status === last.status && nowTs - lastTs < ALERT_COOLDOWN_MS) continue;
 
           const direction = sensor.val < sensor.min ? "Low" : "High";
 
@@ -638,93 +576,9 @@ const settings = settingsResult.rows[0] || { temp_min: 20, temp_max: 31, water_l
             [device_id, sensor.key, status, sensor.val, ts.toISOString()]
           );
           lastAlertedState[`${device_id}:${sensor.key}`] = { status, value: sensor.val, timestamp: ts.toISOString() };
-
-          if (smsMuteUntil && new Date() < new Date(smsMuteUntil)) {
-            console.log(`[${new Date().toISOString()}] SMS alerts muted until ${smsMuteUntil}, skipping SMS for ${sensor.key} ${status}`);
-            const recipients = await pool.query("SELECT phone_number FROM authorized_recipients WHERE is_active = true");
-            const isCritical = status === "critical";
-            const template = isCritical ? SMS_CONFIG.messages.critical : SMS_CONFIG.messages.warning;
-            const timestamp = ts.toLocaleString("en-PH", { timeZone: "Asia/Manila", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: true });
-            const direction = sensor.val < sensor.min ? "Low" : "High";
-            for (const r of recipients.rows) {
-              const message = buildMessage(template, {
-                SENSOR: SMS_CONFIG.sensorNames[sensor.key] || sensor.key,
-                NAME: r.name || "User", VALUE: sensor.val, UNIT: SMS_CONFIG.units[sensor.key] || "",
-                THRESHOLD: direction === "Low" ? sensor.min : sensor.max, TIME: timestamp
-              });
-              await logSMS(r.phone_number, message, "muted", `SMS muted until ${smsMuteUntil}`, null);
-            }
-            await pool.query(`INSERT INTO system_logs (action, parameter, old_value, new_value) VALUES ($1, $2, $3, $4)`,
-              ["Alert Muted", sensor.key, status, `Muted until ${smsMuteUntil}`]);
-            continue;
-          }
-
-          const recipients = await pool.query("SELECT phone_number, name FROM authorized_recipients WHERE is_active = true");
-          if (recipients.rows.length > 0) {
-            const isCritical = status === "critical";
-            const template = isCritical ? SMS_CONFIG.messages.critical : SMS_CONFIG.messages.warning;
-            const timestamp = ts.toLocaleString("en-PH", { timeZone: "Asia/Manila", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: true });
-            // Send all recipient SMS in parallel rather than one-by-one
-            const smsPromises = recipients.rows.map(async (r) => {
-              const message = buildMessage(template, {
-                SENSOR: SMS_CONFIG.sensorNames[sensor.key] || sensor.key,
-                NAME: r.name || "User", VALUE: sensor.val, UNIT: SMS_CONFIG.units[sensor.key] || "",
-                THRESHOLD: direction === "Low" ? sensor.min : sensor.max, TIME: timestamp
-              });
-              return sendSingleSMS(r.phone_number, message);
-            });
-            await Promise.allSettled(smsPromises);
-          }
-        }
-
-        // Hourly status-update SMS (if enabled and interval elapsed)
-        if (hourlyEnabled && nowTs - lastHourlyUpdateTs >= SMS_CONFIG.hourly.intervalMs) {
-          lastHourlyUpdateTs = nowTs;
-          await pool.query(`INSERT INTO system_state (key, value) VALUES ('last_hourly_update_ts', $1) ON CONFLICT (key) DO UPDATE SET value = $1`,
-            [new Date(nowTs).toISOString()]);
-
-          if (smsMuteUntil && new Date() < new Date(smsMuteUntil)) {
-            console.log(`[${new Date().toISOString()}] SMS alerts muted until ${smsMuteUntil}, skipping hourly update`);
-            const hourlyRecipients = await pool.query("SELECT phone_number, name FROM authorized_recipients WHERE is_active = true");
-            if (hourlyRecipients.rows.length > 0) {
-              const hourlyMessage = buildMessage(SMS_CONFIG.messages.hourlyUpdate, {
-                TIME: ts.toLocaleString("en-PH", { timeZone: "Asia/Manila", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: true }),
-                TEMP: temperature ?? "N/A", TEMP_STATUS: "N/A",
-                WATER: water_level ?? "N/A", WATER_STATUS: "N/A",
-                AMMONIA: ammonia ?? "N/A", AMMONIA_STATUS: "N/A", SUMMARY: "SMS muted"
-              });
-              for (const r of hourlyRecipients.rows) {
-                await logSMS(r.phone_number, hourlyMessage, "muted", `SMS muted until ${smsMuteUntil}`, null);
-              }
-              await pool.query(`INSERT INTO system_logs (action, parameter, old_value, new_value) VALUES ($1, $2, $3, $4)`,
-                ["Hourly Update Muted", "SMS", "hourly", `Muted until ${smsMuteUntil}`]);
-            }
-          } else {
-            const hourlyRecipients = await pool.query("SELECT phone_number, name FROM authorized_recipients WHERE is_active = true");
-            if (hourlyRecipients.rows.length > 0) {
-              const tempVal = Number(temperature);
-              const waterVal = Number(water_level);
-              const ammoniaVal = Number(ammonia);
-              const tempOK = Number.isFinite(tempVal) && tempVal > 0;
-              const waterOK = Number.isFinite(waterVal) && waterVal >= 0;
-              const ammoniaOK = Number.isFinite(ammoniaVal) && ammoniaVal >= 0;
-              const tempStatus = tempOK ? getStatusText(getThresholdStatus(tempVal, Number(settings.temp_min), Number(settings.temp_max))) : "N/A (sensor offline)";
-              const waterStatus = waterOK ? getStatusText(getThresholdStatus(waterVal, Number(settings.water_level_min), Number(settings.water_level_max))) : "N/A (sensor offline)";
-              const ammoniaStatus = ammoniaOK ? getStatusText(getThresholdStatus(ammoniaVal, Number(settings.ammonia_min), Number(settings.ammonia_max))) : "N/A (sensor offline)";
-              const hourlyTimestamp = ts.toLocaleString("en-PH", { timeZone: "Asia/Manila", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: true });
-              const summary = (tempStatus === "✅ Good" && waterStatus === "✅ Good" && ammoniaStatus === "✅ Good") ? "All systems normal" : "Some parameters need attention";
-              const hourlyMessage = buildMessage(SMS_CONFIG.messages.hourlyUpdate, {
-                TIME: hourlyTimestamp, TEMP: tempOK ? temperature : "N/A", TEMP_STATUS: tempStatus,
-                WATER: waterOK ? water_level : "N/A", WATER_STATUS: waterStatus,
-                AMMONIA: ammoniaOK ? ammonia : "N/A", AMMONIA_STATUS: ammoniaStatus, SUMMARY: summary
-              });
-              const hourlyPromises = hourlyRecipients.rows.map(async (r) => sendSingleSMS(r.phone_number, hourlyMessage));
-              await Promise.allSettled(hourlyPromises);
-            }
-          }
         }
       } catch (bgErr) {
-        console.error(`[${new Date().toISOString()}] Background SMS processing error:`, bgErr.message);
+        console.error(`[${new Date().toISOString()}] Background alert processing error:`, bgErr.message);
       }
     });
   } catch (err) {
@@ -734,7 +588,7 @@ const settings = settingsResult.rows[0] || { temp_min: 20, temp_max: 31, water_l
 });
 
 // GET /sensor - sensor history, newest first; ?limit (default 300, max 1000)
-app.get("/sensor", async (req, res) => {
+app.get("/sensor", requireAuth, async (req, res) => {
   try {
     const limit = Math.min(1000, Math.max(1, parseInt(req.query.limit) || 300));
     const result = await pool.query("SELECT * FROM sensors ORDER BY timestamp DESC LIMIT $1", [limit]);
@@ -746,7 +600,7 @@ app.get("/sensor", async (req, res) => {
 });
 
 // GET /sensor/latest - most recent reading; 404 when none exist
-app.get("/sensor/latest", async (req, res) => {
+app.get("/sensor/latest", requireAuth, async (req, res) => {
   try {
     const result = await pool.query("SELECT * FROM sensors ORDER BY timestamp DESC LIMIT 1");
     if (result.rows.length === 0) return res.status(404).json({ message: "No sensor data found" });
@@ -762,7 +616,7 @@ app.get("/sensor/latest", async (req, res) => {
 // ========================
 
 // GET /report/weekly - 7-day aggregated report (summary, daily breakdown, alert counts)
-app.get("/report/weekly", async (req, res) => {
+app.get("/report/weekly", requireAuth, async (req, res) => {
   try {
     let summaryResult;
     try {
@@ -995,14 +849,172 @@ app.post("/auth/users", requireAdmin, async (req, res) => {
   }
 });
 
-// DELETE /auth/users/:id (Admin only) - delete a user; 404 if not found
-app.delete("/auth/users/:id", requireAdmin, async (req, res) => {
+// -----------------------------------------------------------------------------
+// SECURE USER DELETION (EMAIL-OTP 2-STEP)
+// -----------------------------------------------------------------------------
+// The real account is never deleted without proof that a human admin both knows
+// the requester's own password AND has access to the requester's email inbox.
+//
+//   STEP 1  POST /auth/users/:id/deletion-request   admin password + reason
+//           -> generates a 6-digit OTP, emails it, stores a hashed copy in
+//              user_deletion_requests (PENDING_OTP).
+//   STEP 2  POST /auth/users/:id/deletion-verify    OTP code from the email
+//           -> constant-time OTP check; on success the user row is deleted and
+//              the request flips to COMPLETED with the full audit chain. Returns
+//              the OTP handler result (email REDACTED if SMTP was not configured).
+
+// POST /auth/users/:id/deletion-request (Admin only)
+// Validates the admin's own password, creates a user_deletion_request, emails OTP.
+app.post("/auth/users/:id/deletion-request", requireAdmin, async (req, res) => {
   try {
-    const result = await pool.query("DELETE FROM users WHERE id = $1 RETURNING username", [req.params.id]);
-    if (result.rows.length === 0) return res.status(404).json({ message: "User not found" });
-    res.json({ message: "User deleted" });
+    const { password, reason } = req.body;
+    if (!password) return res.status(400).json({ message: "Current password required" });
+
+    const targetResult = await pool.query(
+      "SELECT id, username, email FROM users WHERE id = $1 AND status = 'active'",
+      [req.params.id]
+    );
+    if (targetResult.rows.length === 0) return res.status(404).json({ message: "Target user not found" });
+    const target = targetResult.rows[0];
+    if (!target.email) return res.status(400).json({ message: "Target user has no email address; cannot send an OTP." });
+
+    const passwordOk = verifyPassword(password, req.adminUser.password_hash);
+    if (!passwordOk) return res.status(401).json({ message: "Incorrect password" });
+
+    const code = generateOtpCode();
+    const { digest, salt } = hashOtpCode(code);
+
+    const created = await pool.query(
+      `INSERT INTO user_deletion_requests
+        (user_id, user_username, requester_username, requester_email, status, reason,
+         otp_hash, otp_salt, otp_expires_at, status_history)
+       VALUES ($1, $2, $3::text, $4, 'PENDING_OTP', $5, $6, $7, $8,
+         jsonb_build_array(jsonb_build_object('from','PENDING_OTP','to','PENDING_OTP','by',$3::text,'at',now())))
+       RETURNING id`,
+      [
+        target.id,
+        target.username,
+        req.adminUser.username,
+        req.adminUser.email || req.adminUser.username,
+        reason || "Account deletion requested by admin",
+        digest,
+        salt,
+        new Date(Date.now() + OTP_TTL_MS),
+      ]
+    );
+
+    const emailResult = await sendOtpEmail(target.email, code.raw ?? code);
+
+    await pool.query(
+      `UPDATE user_deletion_requests SET status = $2 WHERE id = $1`,
+      [created.rows[0].id, emailResult.delivered ? "PENDING_OTP" : "PENDING_OTP"]
+    );
+
+    res.status(201).json({
+      message: emailResult.delivered
+        ? "Confirmation code sent to the user's email"
+        : "Confirmation code generated (dev mode — SMTP not configured). Check server console.",
+      request_id: created.rows[0].id,
+      otp_sent: emailResult.delivered,
+      dev_fallback: emailResult.devFallback || false,
+    });
   } catch (err) {
-    res.status(500).json({ message: "Error deleting user", error: err.message });
+    console.error(`[${new Date().toISOString()}] Error requesting user deletion:`, err.message);
+    res.status(500).json({ message: "Error requesting user deletion", error: err.message });
+  }
+});
+
+// POST /auth/users/:id/deletion-verify (Admin only)
+// Verifies the emailed OTP (constant-time) and hard-deletes the user + audit chain.
+app.post("/auth/users/:id/deletion-verify", requireAdmin, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { request_id, code } = req.body;
+    if (!request_id || !code) return res.status(400).json({ message: "request_id and code are required" });
+
+    await client.query("BEGIN");
+    const reqResult = await client.query(
+      `SELECT * FROM user_deletion_requests
+        WHERE id = $1 AND user_id = $2 AND status = 'PENDING_OTP'
+        FOR UPDATE`,
+      [request_id, req.params.id]
+    );
+    if (reqResult.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ message: "No pending deletion request for this user" });
+    }
+    const row = reqResult.rows[0];
+
+    const now = Date.now();
+    if (row.otp_attempts >= OTP_MAX_ATTEMPTS || (row.otp_expires_at && new Date(row.otp_expires_at).getTime() < now)) {
+      await client.query(`UPDATE user_deletion_requests SET status = 'EXPIRED' WHERE id = $1`, [row.id]);
+      await client.query("COMMIT");
+      return res.status(410).json({ message: "Confirmation code expired or exceeded max attempts" });
+    }
+
+    const digest = require("crypto").createHash("sha256").update(`${row.otp_salt}:${code}`).digest("hex");
+    if (!safeEqual(digest, row.otp_hash)) {
+      await client.query(
+        `UPDATE user_deletion_requests SET otp_attempts = otp_attempts + 1 WHERE id = $1 RETURNING otp_attempts`,
+        [row.id]
+      );
+      await client.query("COMMIT");
+      const attempts = row.otp_attempts + 1;
+      return res.status(401).json({
+        message: attempts >= OTP_MAX_ATTEMPTS ? "Too many incorrect codes — request invalidated" : `Incorrect code (${attempts}/${OTP_MAX_ATTEMPTS})`,
+        remaining_attempts: Math.max(0, OTP_MAX_ATTEMPTS - attempts),
+      });
+    }
+
+    const userDel = await client.query(
+      "DELETE FROM users WHERE id = $1 RETURNING username",
+      [req.params.id]
+    );
+    if (userDel.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    const actor = req.adminUser.username;
+    await client.query(
+      `UPDATE user_deletion_requests
+          SET status = 'COMPLETED', otp_verified_at = NOW(), otp_verified_by = $2::text,
+              executed_by = $2::text, executed_at = NOW(),
+              status_history = status_history || jsonb_build_array(
+                jsonb_build_object('from','PENDING_OTP','to','COMPLETED','by',$2::text,'at',now())
+              )
+        WHERE id = $1`,
+      [row.id, actor]
+    );
+    await client.query(
+      `INSERT INTO activity_logs (user_name, action_type, description, module)
+       VALUES ($1, 'USER_DELETED', $2, 'settings')`,
+      [actor, `Deleted user account "${userDel.rows[0].username}" via OTP verification`]
+    );
+
+    await client.query("COMMIT");
+    res.json({ message: "User deleted", username: userDel.rows[0].username });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error(`[${new Date().toISOString()}] Error verifying deletion OTP:`, err.message);
+    res.status(500).json({ message: "Error verifying deletion OTP", error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+// GET /auth/users/deletion-requests (Admin only) - list pending deletion requests
+app.get("/auth/users/deletion-requests", requireAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT id, user_id, user_username, requester_username, status, reason,
+              requested_at, otp_verified_at, executed_at
+         FROM user_deletion_requests
+        ORDER BY requested_at DESC`
+    );
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ message: "Error fetching deletion requests", error: err.message });
   }
 });
 
@@ -1024,7 +1036,7 @@ app.put("/auth/users/:id/password", requireAdmin, async (req, res) => {
 // ========================
 
 // GET /settings - current thresholds, or defaults if none saved (public read)
-app.get("/settings", async (req, res) => {
+app.get("/settings", requireAuth, async (req, res) => {
   try {
     const result = await pool.query("SELECT * FROM sensor_settings LIMIT 1");
     if (result.rows.length === 0) {
@@ -1110,96 +1122,6 @@ app.post("/settings/reset", requireAdmin, async (req, res) => {
 });
 
 // ========================
-// SMS RECIPIENT MANAGEMENT ENDPOINTS
-// ========================
-
-// GET /settings/recipients (Admin only) - list all SMS recipients
-app.get("/settings/recipients", requireAdmin, async (req, res) => {
-  try {
-    const result = await pool.query("SELECT id, phone_number, name, is_active, created_at FROM authorized_recipients ORDER BY created_at DESC");
-    res.json(result.rows);
-  } catch (err) {
-    res.status(500).json({ error: "Failed to fetch recipients" });
-  }
-});
-
-// POST /settings/recipients (Admin only) - add recipient (+639XXXXXXXXX format,
-// 409 if phone already exists)
-app.post("/settings/recipients", requireAdmin, async (req, res) => {
-  try {
-    const { phone_number, name } = req.body;
-    if (!/^\+639\d{9}$/.test(phone_number)) return res.status(400).json({ error: "Invalid format: +639XXXXXXXXX" });
-    const existing = await pool.query("SELECT * FROM authorized_recipients WHERE phone_number = $1", [phone_number]);
-    if (existing.rows.length > 0) return res.status(409).json({ error: "Phone number already exists" });
-    const result = await pool.query("INSERT INTO authorized_recipients (phone_number, name) VALUES ($1, $2) RETURNING *", [phone_number, name || "Recipient"]);
-    res.status(201).json({ success: true, data: result.rows[0] });
-  } catch (err) {
-    res.status(500).json({ error: "Failed to add recipient" });
-  }
-});
-
-// PUT /settings/recipients/:id (Admin only) - update name/active status
-app.put("/settings/recipients/:id", requireAdmin, async (req, res) => {
-  try {
-    const id = parseInt(req.params.id);
-    const existing = await pool.query("SELECT * FROM authorized_recipients WHERE id = $1", [id]);
-    if (existing.rows.length === 0) return res.status(404).json({ error: "Not found" });
-    const updates = { name: req.body.name, is_active: req.body.is_active };
-    const result = await updateOnlyIfChanged(pool, { table: "authorized_recipients", keyColumn: "id", keyValue: id, currentRow: existing.rows[0], updates: Object.fromEntries(Object.entries(updates).filter(([, v]) => v !== undefined)), touchUpdatedAt: true });
-    res.json(result.changed ? { success: true, data: result.row } : { success: true, message: "No change", data: existing.rows[0] });
-  } catch (err) {
-    res.status(500).json({ error: "Failed to update recipient" });
-  }
-});
-
-// DELETE /settings/recipients/:id (Admin only) - remove an SMS recipient
-app.delete("/settings/recipients/:id", requireAdmin, async (req, res) => {
-  try {
-    const result = await pool.query("DELETE FROM authorized_recipients WHERE id = $1 RETURNING id", [req.params.id]);
-    if (result.rows.length === 0) return res.status(404).json({ error: "Not found" });
-    res.json({ success: true, message: "Deleted" });
-  } catch (err) {
-    res.status(500).json({ error: "Failed to delete recipient" });
-  }
-});
-
-// POST /settings/recipients/test/:id (Admin only) - send a test SMS with live readings
-app.post("/settings/recipients/test/:id", requireAdmin, async (req, res) => {
-  try {
-    const result = await pool.query("SELECT phone_number, name FROM authorized_recipients WHERE id = $1", [req.params.id]);
-    if (result.rows.length === 0) return res.status(404).json({ error: "Not found" });
-    const { phone_number, name } = result.rows[0];
-
-    // Fetch current settings and latest reading to build the test message
-    const settingsResult = await pool.query("SELECT * FROM sensor_settings LIMIT 1");
-const settings = settingsResult.rows[0] || { temp_min: 20, temp_max: 31, water_level_min: 10, water_level_max: 100, ammonia_min: 0.25, ammonia_max: 1 };
-    const sensorResult = await pool.query("SELECT * FROM sensors ORDER BY timestamp DESC LIMIT 1");
-    const sensor = sensorResult.rows[0] || null;
-
-    const temp = sensor?.temperature ?? "N/A";
-    const water = sensor?.water_level ?? "N/A";
-    const ammonia = sensor?.ammonia ?? "N/A";
-    const tempVal = Number(sensor?.temperature);
-    const waterVal = Number(sensor?.water_level);
-    const ammoniaVal = Number(sensor?.ammonia);
-    const tempOK = sensor && Number.isFinite(tempVal) && tempVal > 0;
-    const waterOK = sensor && Number.isFinite(waterVal) && waterVal >= 0;
-    const ammoniaOK = sensor && Number.isFinite(ammoniaVal) && ammoniaVal >= 0;
-    const tempStatus = tempOK ? getStatusText(getThresholdStatus(tempVal, Number(settings.temp_min), Number(settings.temp_max))) : "N/A (sensor offline)";
-    const waterStatus = waterOK ? getStatusText(getThresholdStatus(waterVal, Number(settings.water_level_min), Number(settings.water_level_max))) : "N/A (sensor offline)";
-    const ammoniaStatus = ammoniaOK ? getStatusText(getThresholdStatus(ammoniaVal, Number(settings.ammonia_min), Number(settings.ammonia_max))) : "N/A (sensor offline)";
-    const timestamp = new Date().toLocaleString("en-PH", { timeZone: "Asia/Manila", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: true });
-    const summary = (tempStatus === "✅ Good" && waterStatus === "✅ Good" && ammoniaStatus === "✅ Good") ? "All systems normal" : "Some parameters need attention";
-    const testMessage = `📊 CRAYVINGS LIVE READINGS (TEST)\nTime: ${timestamp}\nTemperature: ${tempOK ? temp : "N/A"}°C (${tempStatus})\nWater Level: ${waterOK ? water : "N/A"}% (${waterStatus})\nAmmonia: ${ammoniaOK ? ammonia : "N/A"} ppm (${ammoniaStatus})\n${summary}\n(This is a test message)`;
-
-    await sendSingleSMS(phone_number, testMessage);
-    res.json({ success: true, message: "Test SMS sent" });
-  } catch (err) {
-    res.status(500).json({ error: "Failed to send test SMS" });
-  }
-});
-
-// ========================
 // SYSTEM LOGS ENDPOINTS
 // ========================
 
@@ -1219,7 +1141,7 @@ app.post("/logs", async (req, res) => {
 });
 
 // GET /system-logs - paginated logs with per-action counts, optional filters
-app.get("/system-logs", async (req, res) => {
+app.get("/system-logs", requireAuth, async (req, res) => {
   try {
     const page = Math.max(1, parseInt(req.query.page) || 1);
     const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 20));
@@ -1246,95 +1168,6 @@ app.get("/system-logs", async (req, res) => {
     res.json({ data: result.rows, total: parseInt(countResult.rows[0].count), page, limit, counts });
   } catch (err) {
     res.status(500).json({ message: "Error fetching logs", error: err.message });
-  }
-});
-
-// ========================
-// ALERT MANAGEMENT ENDPOINTS
-// ========================
-
-// POST /alert/device-disconnect - SMS all recipients when the ESP32 goes offline
-app.post('/alert/device-disconnect', requireAuth, async (req, res) => {
-  try {
-    const { event_type, description, consecutive_failures } = req.body;
-    const recipients = await pool.query('SELECT phone_number, name FROM authorized_recipients WHERE is_active = true');
-    if (recipients.rows.length === 0) return res.status(200).json({ message: 'No active recipients', sent: 0 });
-
-    if (smsMuteUntil && new Date() < new Date(smsMuteUntil)) {
-      console.log('[' + new Date().toISOString() + '] SMS alerts muted until ' + smsMuteUntil + ', skipping disconnect alert');
-      await pool.query('INSERT INTO system_logs (action, parameter, old_value, new_value) VALUES ($1, $2, $3, $4)', ['Device Disconnect Muted', 'ESP32', String(consecutive_failures || 0), 'Muted until ' + smsMuteUntil]);
-      // Log muted SMS for audit trail
-      const muteTimestamp = new Date().toLocaleString('en-PH', { timeZone: 'Asia/Manila', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: true });
-      const muteMessage = 'CRAYVINGS DEVICE ALERT\nESP32 device disconnected\n' + (description || 'No data received for 15+ seconds') + '\nFailed polls: ' + (consecutive_failures || 0) + '\nTime: ' + muteTimestamp;
-      for (const r of recipients.rows) {
-        await logSMS(r.phone_number, muteMessage, 'muted', 'SMS muted until ' + smsMuteUntil, null);
-      }
-      return res.json({ message: 'SMS alerts muted', sent: 0, total: recipients.rows.length, muted: true, muteExpires: smsMuteUntil });
-    }
-
-    const timestamp = new Date().toLocaleString('en-PH', { timeZone: 'Asia/Manila', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: true });
-    const message = 'CRAYVINGS DEVICE ALERT\nESP32 device disconnected\n' + (description || 'No data received for 15+ seconds') + '\nFailed polls: ' + (consecutive_failures || 0) + '\nTime: ' + timestamp;
-
-    // Cooldown prevents SMS spam when the connection flaps on/off rapidly
-    const now = Date.now();
-    const cooldownMs = SMS_CONFIG.cooldown.critical;
-    if (now - lastDisconnectSmsTs < cooldownMs) {
-      await pool.query('INSERT INTO system_logs (action, parameter, old_value, new_value) VALUES ($1, $2, $3, $4)', ['Device Disconnect (cooldown)', 'ESP32', String(consecutive_failures || 0), 'SMS suppressed by cooldown']);
-      return res.json({ message: 'Disconnect alert suppressed (cooldown)', sent: 0, total: recipients.rows.length, cooldown: true });
-    }
-    lastDisconnectSmsTs = now;
-
-    // Send all SMS in parallel instead of sequentially
-    const smsPromises = recipients.rows.map(async (r) => sendSingleSMS(r.phone_number, message));
-    const results = await Promise.allSettled(smsPromises);
-    const sent = results.filter(r => r.status === 'fulfilled' && r.value === true).length;
-
-    await pool.query('INSERT INTO system_logs (action, parameter, old_value, new_value) VALUES ($1, $2, $3, $4)', ['Device Disconnect', 'ESP32', String(consecutive_failures || 0), description || '']);
-    res.json({ message: 'Disconnect alerts sent', sent, total: recipients.rows.length });
-  } catch (err) {
-    console.error('[' + new Date().toISOString() + '] Error sending disconnect alert:', err.message);
-    res.status(500).json({ message: 'Error sending disconnect alert', error: err.message });
-  }
-});
-
-// POST /alert/mute (Admin only) - mute alerts for N hours, or unmute (hours <= 0)
-app.post('/alert/mute', requireAdmin, async (req, res) => {
-  try {
-    const { hours } = req.body;
-    if (!hours || typeof hours !== 'number' || hours <= 0) {
-      smsMuteUntil = null;
-      await pool.query("DELETE FROM system_state WHERE key = 'sms_mute_until'");
-      console.log('[' + new Date().toISOString() + '] SMS alerts unmuted');
-      return res.json({ message: 'SMS alerts unmuted', muted: false, muteExpires: null });
-    }
-
-    smsMuteUntil = new Date(Date.now() + hours * 60 * 60 * 1000).toISOString();
-    // Persist the mute so it survives server restarts
-    await pool.query(`INSERT INTO system_state (key, value) VALUES ('sms_mute_until', $1) ON CONFLICT (key) DO UPDATE SET value = $1`, [smsMuteUntil]);
-    console.log('[' + new Date().toISOString() + '] SMS alerts muted for ' + hours + ' hours until ' + smsMuteUntil);
-
-    await pool.query('INSERT INTO system_logs (action, parameter, old_value, new_value) VALUES ($1, $2, $3, $4)', ['SMS Muted', 'Alerts', String(hours) + 'h', 'Until ' + smsMuteUntil]);
-    res.json({ message: 'SMS alerts muted for ' + hours + ' hours', muted: true, muteExpires: smsMuteUntil });
-  } catch (err) {
-    console.error('[' + new Date().toISOString() + '] Error setting mute:', err.message);
-    res.status(500).json({ message: 'Error setting mute', error: err.message });
-  }
-});
-
-// GET /alert/mute-status - whether alerts are muted and when the mute expires
-app.get('/alert/mute-status', async (req, res) => {
-  try {
-    if (smsMuteUntil && new Date() < new Date(smsMuteUntil)) {
-      return res.json({ muted: true, muteExpires: smsMuteUntil });
-    }
-    // Clear expired mute state (memory + database)
-    if (smsMuteUntil && new Date() >= new Date(smsMuteUntil)) {
-      smsMuteUntil = null;
-      await pool.query("DELETE FROM system_state WHERE key = 'sms_mute_until'");
-    }
-    res.json({ muted: false, muteExpires: null });
-  } catch (err) {
-    res.status(500).json({ message: 'Error checking mute status', error: err.message });
   }
 });
 
@@ -1369,8 +1202,8 @@ app.post("/activity-logs", async (req, res) => {
   }
 });
 
-// GET /activity-logs - paginated, searchable, filterable activity logs
-app.get("/activity-logs", async (req, res) => {
+// GET /activity-logs - paginated, searchable, filterable activity logs (admin only)
+app.get("/activity-logs", requireAdmin, async (req, res) => {
   try {
     const page = Math.max(1, parseInt(req.query.page) || 1);
     const limit = 20;
@@ -1400,10 +1233,373 @@ app.get("/activity-logs", async (req, res) => {
 });
 
 // =============================================================================
+// ANALYTICS ENDPOINTS
+// =============================================================================
+// Server-computed aggregates + a lightweight rule engine that turns raw sensor
+// stats into actionable suggestions. All endpoints require an authenticated
+// session; sensor POST ingestion stays public for the ESP32.
+// =============================================================================
+
+const ANALYTICS_MAX_DAYS = 90;
+const GAP_THRESHOLD_SECONDS = 120;   // inter-reading gap treated as a device dropout
+const OFFLINE_LIMIT_MS = 5 * 60 * 1000; // device considered offline after this long without data
+
+// Normalizes a pg DATE value (JS Date at local midnight or ISO string) to YYYY-MM-DD.
+function dateToDayString(value) {
+  if (!value) return "";
+  if (typeof value === "string") return value.slice(0, 10);
+  const y = value.getFullYear();
+  const m = String(value.getMonth() + 1).padStart(2, "0");
+  const d = String(value.getDate()).padStart(2, "0");
+  return `${y}-${m}-${d}`;
+}
+
+// Clamps ?days to a sane analytics window (default 7, max 90).
+function analyticsDays(req) {
+  const raw = parseInt(req.query.days, 10);
+  if (!Number.isFinite(raw)) return 7;
+  return Math.min(ANALYTICS_MAX_DAYS, Math.max(1, raw));
+}
+
+// Aggregated min/avg/max over a sensor window; invalid sentinels filtered out.
+async function queryPeriodStats(startTs) {
+  const result = await pool.query(
+    `SELECT
+       COALESCE(AVG(temperature) FILTER (WHERE temperature > 0), 0)::float AS temp_avg,
+       COALESCE(MIN(temperature) FILTER (WHERE temperature > 0), 0)::float AS temp_min,
+       COALESCE(MAX(temperature) FILTER (WHERE temperature > 0), 0)::float AS temp_max,
+       COALESCE(AVG(water_level) FILTER (WHERE water_level >= 0), 0)::float AS water_avg,
+       COALESCE(MIN(water_level) FILTER (WHERE water_level >= 0), 0)::float AS water_min,
+       COALESCE(MAX(water_level) FILTER (WHERE water_level >= 0), 0)::float AS water_max,
+       COALESCE(AVG(ammonia) FILTER (WHERE ammonia >= 0), 0)::float AS ammonia_avg,
+       COALESCE(MIN(ammonia) FILTER (WHERE ammonia >= 0), 0)::float AS ammonia_min,
+       COALESCE(MAX(ammonia) FILTER (WHERE ammonia >= 0), 0)::float AS ammonia_max,
+       COUNT(*) AS total_readings
+     FROM sensors
+     WHERE timestamp >= $1`,
+    [startTs]
+  );
+  const r = result.rows[0] || {};
+  return {
+    temperature: { avg: Number(r.temp_avg) || 0, min: Number(r.temp_min) || 0, max: Number(r.temp_max) || 0 },
+    water_level: { avg: Number(r.water_avg) || 0, min: Number(r.water_min) || 0, max: Number(r.water_max) || 0 },
+    ammonia: { avg: Number(r.ammonia_avg) || 0, min: Number(r.ammonia_min) || 0, max: Number(r.ammonia_max) || 0 },
+    total_readings: parseInt(r.total_readings, 10) || 0,
+  };
+}
+
+// Alert stats (total/resolved/by_parameter/by_action) within a window.
+async function queryAlertStats(startTs) {
+  const [all, alerts] = await Promise.all([
+    pool.query(
+      "SELECT action, COUNT(*)::int AS count FROM system_logs WHERE timestamp >= $1 GROUP BY action",
+      [startTs]
+    ),
+    pool.query(
+      "SELECT parameter, COUNT(*)::int AS count FROM system_logs WHERE timestamp >= $1 AND action = 'Alert' GROUP BY parameter",
+      [startTs]
+    ),
+  ]);
+
+  const byAction = {};
+  let total = 0;
+  let resolved = 0;
+  all.rows.forEach((row) => {
+    byAction[row.action] = row.count;
+    if (row.action === "Alert") total += row.count;
+    if (row.action === "Alert Resolved") resolved += row.count;
+  });
+
+  const byParameter = {};
+  alerts.rows.forEach((row) => { byParameter[row.parameter] = row.count; });
+
+  return { total, resolved, by_parameter: byParameter, by_action: byAction };
+}
+
+// Counts inter-reading gaps longer than GAP_THRESHOLD_SECONDS (device dropouts).
+async function queryGapEvents(startTs) {
+  const result = await pool.query(
+    `SELECT COUNT(*)::int AS gaps FROM (
+       SELECT timestamp,
+              LAG(timestamp) OVER (ORDER BY timestamp) AS prev_ts
+       FROM sensors
+       WHERE timestamp >= $1
+     ) t
+     WHERE prev_ts IS NOT NULL
+       AND EXTRACT(EPOCH FROM (timestamp - prev_ts)) > $2`,
+    [startTs, GAP_THRESHOLD_SECONDS]
+  );
+  return parseInt(result.rows[0]?.gaps, 10) || 0;
+}
+
+// Trend helper: compares two window averages and derives direction + % change.
+function buildTrend(current, previous) {
+  const changePct = previous > 0 ? ((current - previous) / previous) * 100 : 0;
+  let direction = "stable";
+  if (changePct >= 1) direction = "up";
+  else if (changePct <= -1) direction = "down";
+  return { current_avg: current, previous_avg: previous, change_pct: Math.round(changePct * 100) / 100, direction };
+}
+
+// GET /analytics/overview?days= - summary, trends, alerts, uptime for a window
+app.get("/analytics/overview", requireAuth, async (req, res) => {
+  try {
+    const days = analyticsDays(req);
+    const currentStart = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+    const prevStart = new Date(currentStart.getTime() - days * 24 * 60 * 60 * 1000);
+
+    const [currentStats, prevStats, alerts, readings, gapEvents, latest] = await Promise.all([
+      queryPeriodStats(currentStart),
+      queryPeriodStats(prevStart),
+      queryAlertStats(currentStart),
+      pool.query("SELECT COUNT(*)::int AS c FROM sensors WHERE timestamp >= $1", [currentStart]),
+      queryGapEvents(currentStart),
+      pool.query("SELECT timestamp FROM sensors ORDER BY timestamp DESC LIMIT 1"),
+    ]);
+
+    const lastReading = latest.rows[0]?.timestamp ? new Date(latest.rows[0].timestamp) : null;
+    const deviceOffline = !lastReading || (Date.now() - lastReading.getTime()) > OFFLINE_LIMIT_MS;
+
+    res.json({
+      period: { start: currentStart.toISOString(), end: new Date().toISOString() },
+      days,
+      summary: currentStats,
+      trends: {
+        temperature: buildTrend(currentStats.temperature.avg, prevStats.temperature.avg),
+        water_level: buildTrend(currentStats.water_level.avg, prevStats.water_level.avg),
+        ammonia: buildTrend(currentStats.ammonia.avg, prevStats.ammonia.avg),
+      },
+      alerts,
+      uptime: {
+        device_offline: deviceOffline,
+        last_reading: lastReading ? lastReading.toISOString() : null,
+        readings: parseInt(readings.rows[0]?.c, 10) || 0,
+        gap_events: gapEvents,
+      },
+    });
+  } catch (err) {
+    console.error(`[${new Date().toISOString()}] Error fetching analytics overview:`, err.message);
+    res.status(500).json({ message: "Error fetching analytics overview", error: err.message });
+  }
+});
+
+// GET /analytics/daily?days= - per-day averages for charting (max 90)
+app.get("/analytics/daily", requireAuth, async (req, res) => {
+  try {
+    const days = analyticsDays(req);
+    const startTs = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+
+    const [sensorResult, alertResult] = await Promise.all([
+      pool.query(
+        `SELECT
+           DATE(timestamp) AS date,
+           COALESCE(AVG(temperature) FILTER (WHERE temperature > 0), 0)::float AS temp_avg,
+           COALESCE(AVG(water_level) FILTER (WHERE water_level >= 0), 0)::float AS water_avg,
+           COALESCE(AVG(ammonia) FILTER (WHERE ammonia >= 0), 0)::float AS ammonia_avg,
+           COUNT(*)::int AS readings
+         FROM sensors
+         WHERE timestamp >= $1
+         GROUP BY DATE(timestamp)
+         ORDER BY date`,
+        [startTs]
+      ),
+      pool.query(
+        `SELECT DATE(timestamp) AS date, COUNT(*)::int AS count
+         FROM system_logs
+         WHERE timestamp >= $1 AND action = 'Alert'
+         GROUP BY DATE(timestamp)`,
+        [startTs]
+      ),
+    ]);
+
+    const alertMap = {};
+    alertResult.rows.forEach((row) => {
+      alertMap[dateToDayString(row.date)] = row.count;
+    });
+
+    const daily = sensorResult.rows.map((row) => ({
+      date: dateToDayString(row.date),
+      temp_avg: Number(row.temp_avg) || 0,
+      water_avg: Number(row.water_avg) || 0,
+      ammonia_avg: Number(row.ammonia_avg) || 0,
+      readings: parseInt(row.readings, 10) || 0,
+      alerts: alertMap[dateToDayString(row.date)] || 0,
+    }));
+
+    res.json({
+      period: { start: startTs.toISOString(), end: new Date().toISOString() },
+      days,
+      daily,
+    });
+  } catch (err) {
+    console.error(`[${new Date().toISOString()}] Error fetching analytics daily:`, err.message);
+    res.status(500).json({ message: "Error fetching analytics daily", error: err.message });
+  }
+});
+
+// Rule engine: turns an analytics overview + thresholds into suggestions.
+// Each insight has a level (info/warning/critical), an area, a title, a message
+// and an optional actionable hint. Mirrors getThresholdStatus() semantics.
+function generateInsights(overview, thresholds) {
+  const insights = [];
+  const { summary, trends, alerts, uptime } = overview;
+  const t = thresholds;
+
+  const push = (level, area, title, message, action) => insights.push({ level, area, title, message, action });
+
+  // ---- Device health ----
+  if (uptime.device_offline) {
+    push(
+      "critical", "device",
+      "Device offline",
+      uptime.last_reading
+        ? `No data received since ${new Date(uptime.last_reading).toLocaleString()}.`
+        : "No sensor readings have been recorded yet.",
+      "Check ESP32 power, Wi-Fi, and USB connections."
+    );
+  } else if (uptime.gap_events > 0) {
+    const perDay = Math.round((uptime.gap_events / overview.days) * 10) / 10;
+    push(
+      perDay > 2 ? "warning" : "info", "device",
+      "Data gaps detected",
+      `${uptime.gap_events} dropout(s) in the last ${overview.days} days (${perDay}/day).`,
+      "Verify the ESP32 stays powered and within Wi-Fi range."
+    );
+  }
+
+  // ---- Temperature ----
+  const temp = summary.temperature;
+  if (temp.avg > 0) {
+    if (temp.avg > t.temp_max) {
+      push("critical", "temperature", "Temperature too high",
+        `Average ${temp.avg.toFixed(1)}°C exceeds the ${t.temp_max}°C maximum.`,
+        "Increase aeration/cooling and monitor for stress."
+      );
+    } else if (temp.avg < t.temp_min) {
+      push("warning", "temperature", "Temperature below target",
+        `Average ${temp.avg.toFixed(1)}°C is below the ${t.temp_min}°C minimum.`,
+        "Check the heater and insulate the tank."
+      );
+    } else if (trends.temperature.direction === "up") {
+      push("info", "temperature", "Temperature trending up",
+        `Rising ${trends.temperature.change_pct}% toward the ${t.temp_max}°C limit.`,
+        "Watch for overheating; consider additional aeration."
+      );
+    }
+  }
+
+  // ---- Water level ----
+  const water = summary.water_level;
+  if (trends.water_level.direction === "down") {
+    push("warning", "water_level", "Water level dropping",
+      `Average fell ${Math.abs(trends.water_level.change_pct)}% over the period.`,
+      "Likely evaporation — top up the tank."
+    );
+  }
+  if (water.avg > 0 && water.avg < t.water_level_min) {
+    push("critical", "water_level", "Water level too low",
+      `Average ${water.avg.toFixed(0)}% is below the ${t.water_level_min}% minimum.`,
+      "Refill to restore the safe operating range."
+    );
+  }
+
+  // ---- Ammonia ----
+  const ammonia = summary.ammonia;
+  if (ammonia.avg > 0) {
+    if (ammonia.avg >= t.ammonia_max) {
+      push("critical", "ammonia", "Ammonia at or above maximum",
+        `Average ${ammonia.avg.toFixed(2)} ppm hits the ${t.ammonia_max} ppm limit.`,
+        "Perform a partial water change and check biofiltration."
+      );
+    } else if (ammonia.avg >= t.ammonia_max * 0.75) {
+      push("warning", "ammonia", "Ammonia rising risk",
+        `Average ${ammonia.avg.toFixed(2)} ppm is close to the ${t.ammonia_max} ppm limit.`,
+        "Plan a water change soon and verify filter media."
+      );
+    } else if (trends.ammonia.direction === "up") {
+      push("info", "ammonia", "Ammonia trending up",
+        `Ammonia rose ${trends.ammonia.change_pct}% over the period.`,
+        "Monitor closely; a build-up may follow overfeeding."
+      );
+    }
+  }
+
+  // ---- Alerts ----
+  if (alerts.total > 0 && alerts.resolved === 0) {
+    push("warning", "system", "Active alerts unresolved",
+      `${alerts.total} alert(s) fired and none resolved within the period.`,
+      "Review the Alerts page and confirm the tank has recovered."
+    );
+  }
+  if (alerts.by_parameter?.Ammonia) {
+    push("warning", "ammonia", "Frequent ammonia alerts",
+      `${alerts.by_parameter.Ammonia} ammonia alert(s) in the last ${overview.days} days.`,
+      "Check feeding load and biofilter health."
+    );
+  }
+
+  return insights;
+}
+
+// GET /analytics/insights?days= - rule-engine suggestions for the period
+app.get("/analytics/insights", requireAuth, async (req, res) => {
+  try {
+    const days = analyticsDays(req);
+    const currentStart = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+
+    const [currentStats, prevStats, alerts, readings, gapEvents, latest, settingsResult] = await Promise.all([
+      queryPeriodStats(currentStart),
+      queryPeriodStats(new Date(currentStart.getTime() - days * 24 * 60 * 60 * 1000)),
+      queryAlertStats(currentStart),
+      pool.query("SELECT COUNT(*)::int AS c FROM sensors WHERE timestamp >= $1", [currentStart]),
+      queryGapEvents(currentStart),
+      pool.query("SELECT timestamp FROM sensors ORDER BY timestamp DESC LIMIT 1"),
+      pool.query("SELECT * FROM sensor_settings LIMIT 1"),
+    ]);
+
+    const settings = settingsResult.rows[0] || { temp_min: 20, temp_max: 31, water_level_min: 10, water_level_max: 100, ammonia_min: 0.25, ammonia_max: 1 };
+
+    const lastReading = latest.rows[0]?.timestamp ? new Date(latest.rows[0].timestamp) : null;
+    const overview = {
+      days,
+      summary: currentStats,
+      trends: {
+        temperature: buildTrend(currentStats.temperature.avg, prevStats.temperature.avg),
+        water_level: buildTrend(currentStats.water_level.avg, prevStats.water_level.avg),
+        ammonia: buildTrend(currentStats.ammonia.avg, prevStats.ammonia.avg),
+      },
+      alerts,
+      uptime: {
+        device_offline: !lastReading || (Date.now() - lastReading.getTime()) > OFFLINE_LIMIT_MS,
+        last_reading: lastReading ? lastReading.toISOString() : null,
+        readings: parseInt(readings.rows[0]?.c, 10) || 0,
+        gap_events: gapEvents,
+      },
+    };
+
+    res.json({
+      period: { start: currentStart.toISOString(), end: new Date().toISOString() },
+      days,
+      insights: generateInsights(overview, {
+        temp_min: Number(settings.temp_min),
+        temp_max: Number(settings.temp_max),
+        water_level_min: Number(settings.water_level_min),
+        water_level_max: Number(settings.water_level_max),
+        ammonia_min: Number(settings.ammonia_min ?? 0),
+        ammonia_max: Number(settings.ammonia_max ?? 25),
+      }),
+    });
+  } catch (err) {
+    console.error(`[${new Date().toISOString()}] Error fetching analytics insights:`, err.message);
+    res.status(500).json({ message: "Error fetching analytics insights", error: err.message });
+  }
+});
+
+// =============================================================================
 // SERVER STARTUP
 // =============================================================================
 // Connects to PostgreSQL, ensures an admin account, restores alert state from
-// the DB, checks SMS config, and starts the HTTP listener.
+// the DB, and starts the HTTP listener.
 
 // Runs initialization and starts the HTTP listener
 async function startServer() {
@@ -1449,12 +1645,6 @@ async function startServer() {
         lastAmmoniaReading[row.device_id] = Number(row.ammonia);
       }
       console.log(`[${new Date().toISOString()}] Loaded ammonia baseline for ${lastAmmoniaResult.rows.length} device(s) from DB`);
-
-      if (!process.env.SKYSMS_API_KEY) {
-        console.warn(`[${new Date().toISOString()}] WARNING: SKYSMS_API_KEY not set. SMS alerts will fail.`);
-      } else {
-        console.log(`[${new Date().toISOString()}] SkySMS configured`);
-      }
     } finally {
       client.release();
     }

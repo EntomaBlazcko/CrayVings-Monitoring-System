@@ -15,10 +15,11 @@ import {
   Settings,
   FileText,
   ClipboardList,
+  BarChart3,
 } from "lucide-react";
 import logo from "./assets/crayvings.png";
-import type { MenuKey } from "./types";
-import { isValidMenuKey } from "./types";
+import type { MenuKey, UserRole } from "./types";
+import { isValidMenuKey, VALID_MENU_KEYS } from "./types";
 import Header from "./components/Header";
 import AuthPage from "./pages/AuthPage";
 import { LoadingCard } from "./components/Loading";
@@ -39,27 +40,51 @@ const HistoricalDataPage = lazy(() => import("./pages/HistoricalDataPage"));
 const SettingsPage = lazy(() => import("./pages/SettingsPage"));
 const LogsPage = lazy(() => import("./pages/LogsPage"));
 const ActivityLogsPage = lazy(() => import("./pages/ActivityLogsPage"));
+const AnalyticsPage = lazy(() => import("./pages/AnalyticsPage"));
 
 // ========================
 // NAVIGATION MENU DEFINITION
 // ========================
-const baseMenuItems: { label: MenuKey; icon: React.ReactNode }[] = [
+const menuDefinitions: { label: MenuKey; icon: React.ReactNode }[] = [
   { label: "Home", icon: <Home size={18} /> },
   { label: "Dashboard", icon: <LayoutDashboard size={18} /> },
   { label: "Sensors", icon: <Activity size={18} /> },
   { label: "Alerts", icon: <Bell size={18} /> },
   { label: "Historical Data", icon: <History size={18} /> },
+  { label: "Analytics", icon: <BarChart3 size={18} /> },
   { label: "Activity Logs", icon: <ClipboardList size={18} /> },
   { label: "Sensor Logs", icon: <FileText size={18} /> },
   { label: "Settings", icon: <Settings size={18} /> },
 ];
 
 // ========================
+// ROLE-BASED ACCESS CONTROL
+// ========================
+// Admin sees every page; users are restricted to monitoring pages (no audit
+// logs, settings, or user management). Enforced in the UI (menu + navigation)
+// and on the server (requireAuth / requireAdmin).
+const ADMIN_MENU_KEYS: MenuKey[] = [...VALID_MENU_KEYS];
+
+const USER_MENU_KEYS: MenuKey[] = [
+  "Home",
+  "Dashboard",
+  "Sensors",
+  "Alerts",
+  "Historical Data",
+  "Analytics",
+  "Sensor Logs",
+];
+
+function getAllowedMenuKeys(role?: UserRole): MenuKey[] {
+  return role === "admin" ? ADMIN_MENU_KEYS : USER_MENU_KEYS;
+}
+
+// ========================
 // LOCAL STORAGE STATE RESTORATION
 // ========================
-function getInitialMenuDefault(): MenuKey {
+function getInitialMenuDefault(role?: UserRole): MenuKey {
   const saved = localStorage.getItem("activeMenu");
-  if (saved && isValidMenuKey(saved)) {
+  if (saved && isValidMenuKey(saved) && getAllowedMenuKeys(role).includes(saved)) {
     return saved;
   }
   return "Home";
@@ -72,18 +97,24 @@ function DashboardLayout() {
   const { user, logout } = useAuth();
   const { logActivity } = useActivityLogs();
   const previousMenuRef = useRef<MenuKey>("Home");
-  const activeMenuRef = useRef<MenuKey>(getInitialMenuDefault());
-  const [activeMenu, setActiveMenu] = useState<MenuKey>(getInitialMenuDefault);
+  const activeMenuRef = useRef<MenuKey>(getInitialMenuDefault(user?.role));
+  const [activeMenu, setActiveMenu] = useState<MenuKey>(getInitialMenuDefault(user?.role));
   const [sidebarOpen, setSidebarOpen] = useState(false);
   
   useThresholdAlert();
 
+  const allowedKeys = useMemo(
+    () => getAllowedMenuKeys(user?.role),
+    [user?.role]
+  );
+
   const menuItems = useMemo(
-    () => baseMenuItems,
-    []
+    () => menuDefinitions.filter((item) => allowedKeys.includes(item.label)),
+    [allowedKeys]
   );
 
   const handleNavigate = useCallback((menu: MenuKey) => {
+    if (!allowedKeys.includes(menu)) return; // role guard: ignore disallowed pages
     const prev = activeMenuRef.current;
     logActivity("navigation", `Navigated to ${menu}`, prev);
     previousMenuRef.current = prev;
@@ -91,7 +122,7 @@ function DashboardLayout() {
     setActiveMenu(menu);
     localStorage.setItem("activeMenu", menu);
     setSidebarOpen(false);
-  }, [logActivity]);
+  }, [logActivity, allowedKeys]);
 
   const renderPage = useCallback(() => {
     let page: React.ReactNode;
@@ -111,6 +142,9 @@ function DashboardLayout() {
         break;
       case "Historical Data":
         page = <HistoricalDataPage />;
+        break;
+      case "Analytics":
+        page = <AnalyticsPage />;
         break;
       case "Activity Logs":
         page = <ActivityLogsPage />;
@@ -216,6 +250,8 @@ function DashboardLayout() {
 // ========================
 // APP CONTENT COMPONENT
 // ========================
+// SensorProvider only mounts after login so background polling (which now
+// requires auth) never fires on the AuthPage.
 function AppContent() {
   const { user } = useAuth();
 
@@ -223,7 +259,12 @@ function AppContent() {
     return <AuthPage />;
   }
 
-  return <DashboardLayout />;
+  return (
+    <SensorProvider>
+      <DeviceConnectionMonitor />
+      <DashboardLayout />
+    </SensorProvider>
+  );
 }
 
 // ========================
@@ -232,13 +273,10 @@ function AppContent() {
 export default function App() {
   return (
     <AuthProvider>
-      <SensorProvider>
-        <FloatingAlertProvider>
-          <AppContent />
-          <FloatingAlertContainer />
-          <DeviceConnectionMonitor />
-        </FloatingAlertProvider>
-      </SensorProvider>
+      <FloatingAlertProvider>
+        <AppContent />
+        <FloatingAlertContainer />
+      </FloatingAlertProvider>
     </AuthProvider>
   );
 }
