@@ -45,7 +45,7 @@ const HISTORY_POLL_INTERVAL = 30000;     // 30s chart history (heavy query)
 const OFFLINE_THRESHOLD = 15000;         // 15s without data = offline
 const MAX_CONSECUTIVE_FAILURES = 5;      // After 5 failures, mark offline
 const LOGS_POLL_INTERVAL = 5000;         // 5s system logs
-const LOGS_PAGE_SIZE = 20;
+const LOGS_PAGE_SIZE = 10;
 
 // ========================
 // STATE INTERFACES
@@ -530,7 +530,7 @@ function useActivityLogsManager() {
     try {
       const response = await fetchActivityLogs(
         page,
-        20,
+        10,
         currentSearch,
         currentSort,
         currentFilter || undefined,
@@ -545,7 +545,7 @@ function useActivityLogsManager() {
           activityLogsError: null,
           activityLogsPage: response.page,
           activityLogsTotal: response.total,
-          activityLogsTotalPages: response.totalPages ?? Math.ceil((response.total || 0) / 20),
+          activityLogsTotalPages: response.totalPages ?? Math.ceil((response.total || 0) / 10),
         }));
       }
     } catch (error) {

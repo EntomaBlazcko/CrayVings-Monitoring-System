@@ -126,6 +126,54 @@ function segmentTrend(data: ChartPoint[], key: SensorKey): "up" | "down" | "stab
   return last > first ? "up" : "down";
 }
 
+// Builds plain-language recommendations for the exported PDF by comparing the
+// report's period averages/alerts against the configured safe thresholds.
+function buildReportSuggestions(
+  report: WeeklyReport,
+  thresholds: ReturnType<typeof getSettingsThresholds>
+): string[] {
+  const lines: string[] = [];
+  const s = report.summary;
+  const alerts = report.alerts;
+
+  const temp = thresholds.temperature;
+  if (temp && s.temp_avg != null && (s.temp_avg < temp.range.min || s.temp_avg > temp.range.max)) {
+    lines.push(
+      `Temperature averaged ${s.temp_avg.toFixed(1)}°C, outside the configured safe range ` +
+        `(${temp.range.min}-${temp.range.max}°C). Check the heater, ventilation and probe placement.`
+    );
+  } else if (s.temp_avg != null) {
+    lines.push(`Temperature stayed within the configured safe range (avg ${s.temp_avg.toFixed(1)}°C).`);
+  }
+
+  const water = thresholds.water_level;
+  if (water && s.water_avg != null && (s.water_avg < water.range.min || s.water_avg > water.range.max)) {
+    lines.push(
+      `Water level averaged ${s.water_avg.toFixed(0)}%, outside the configured safe range ` +
+        `(${water.range.min}-${water.range.max}%). Inspect for leaks, pump issues or overflow.`
+    );
+  }
+
+  const ammonia = thresholds.ammonia;
+  if (ammonia && s.ammonia_avg != null && s.ammonia_avg > ammonia.range.max) {
+    lines.push(
+      `Ammonia averaged ${s.ammonia_avg.toFixed(2)} ppm, above the configured ceiling ` +
+        `(${ammonia.range.max} ppm). Do a partial water change, reduce feeding and check the biofilter.`
+    );
+  }
+
+  if (alerts.total > 0) {
+    lines.push(
+      `${alerts.total} alert(s) fired in this period. Review the Alerts page and acknowledge each one ` +
+        `so unresolved issues stay visible.`
+    );
+  } else {
+    lines.push("No alerts were recorded — conditions stayed calm throughout the period.");
+  }
+
+  return lines;
+}
+
 export default function HistoricalDataPage() {
   const { history, loading, connectionStatus, lastUpdate, historyStale, historyLastUpdated, settings } = useSensors();
   const { user } = useAuth();
@@ -493,11 +541,12 @@ export default function HistoricalDataPage() {
 
       const hasAlerts =
         Object.keys(report.alerts.by_parameter).length > 0 || Object.keys(report.alerts.by_action).length > 0;
+      let currentY = afterTableY;
 
       if (isRange) {
         // Range exports merge the alert block inline (no extra page).
         if (hasAlerts) {
-          let ay = afterTableY + 4;
+          let ay = currentY + 4;
           if (ay > pageHeight - 40) {
             doc.addPage();
             ay = 20;
@@ -534,6 +583,7 @@ export default function HistoricalDataPage() {
               ay += 4.5;
             });
           }
+          currentY = ay;
         }
       } else if (hasAlerts) {
         // Weekly keeps its dedicated alert page (existing behavior).
@@ -577,6 +627,31 @@ export default function HistoricalDataPage() {
         doc.setTextColor(128, 128, 128);
         doc.text("CRAYvings Monitoring System", 14, pageHeight - 10);
         doc.text(`Exported: ${formatFarmDate(new Date())}`, pageWidth - 14, pageHeight - 10, { align: "right" });
+        currentY = ay;
+      }
+
+      // Plain-language recommendations derived from the period averages/alerts.
+      const suggestions = buildReportSuggestions(report, thresholds);
+      let ry = currentY + 6;
+      if (ry > pageHeight - 100) {
+        doc.addPage();
+        ry = 20;
+      }
+      doc.setFontSize(11);
+      doc.setFont("helvetica", "bold");
+      doc.setTextColor(0, 0, 0);
+      doc.text("Recommendations", 14, ry);
+      ry += 6;
+      doc.setFontSize(8.5);
+      doc.setFont("helvetica", "normal");
+      for (const line of suggestions) {
+        const wrapped = doc.splitTextToSize(`- ${line}`, pageWidth - 28);
+        doc.text(wrapped, 14, ry);
+        ry += wrapped.length * 5 + 2;
+        if (ry > pageHeight - 30) {
+          doc.addPage();
+          ry = 20;
+        }
       }
 
       doc.save(
@@ -589,7 +664,7 @@ export default function HistoricalDataPage() {
     } finally {
       setExportingPdf(false);
     }
-  }, [weeklyReport, exportingPdf, timeRange]);
+  }, [weeklyReport, exportingPdf, timeRange, thresholds]);
 
   // Only show loading skeleton on first load; keep previous charts during re-fetch.
   if (activeLoading && (!activeHistory || activeHistory.length === 0)) {

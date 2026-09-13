@@ -1801,6 +1801,23 @@ app.post("/settings", requireAdmin, async (req, res) => {
       const setClauses = keys.map((k, i) => `${k} = $${i + 1}`).join(", ");
       const result = await pool.query(`UPDATE sensor_settings SET ${setClauses}, updated_at = NOW() WHERE id = $${keys.length + 1} RETURNING *`, [...values, existing.rows[0].id]);
       savedSettings = result.rows[0];
+      // Record each threshold change in system_logs so the Alerts/Logs pages show
+      // a "Change" entry for every setting that actually changed.
+      const changeParamLabels = {
+        temp_min: "Temperature",
+        temp_max: "Temperature",
+        water_level_min: "Water Level",
+        water_level_max: "Water Level",
+        ammonia_min: "Ammonia",
+        ammonia_max: "Ammonia",
+      };
+      for (const [field, newValue] of Object.entries(changes)) {
+        const paramLabel = changeParamLabels[field] || field;
+        await pool.query(
+          `INSERT INTO system_logs (action, parameter, old_value, new_value) VALUES ($1, $2, $3, $4)`,
+          ["Change", paramLabel, String(existing.rows[0][field] ?? ""), String(newValue)]
+        );
+      }
     } else {
       const result = await pool.query(
         `INSERT INTO sensor_settings (temp_min, temp_max, water_level_min, water_level_max, ammonia_min, ammonia_max) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,

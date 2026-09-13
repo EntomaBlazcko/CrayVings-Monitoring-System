@@ -193,10 +193,10 @@ export default function AlertsPage({ onNavigate }: { onNavigate?: (menu: MenuKey
     [totalEntries, activeAlerts, activeChanges]
   );
 
-  const logsTotalPages = useMemo(() => (logsTotal ? Math.ceil(logsTotal / 20) : 1), [logsTotal]);
+  const logsTotalPages = useMemo(() => (logsTotal ? Math.ceil(logsTotal / 10) : 1), [logsTotal]);
 
-  const startItem = (logsPage - 1) * 20 + 1;
-  const endItem = Math.min(logsPage * 20, totalEntries);
+  const startItem = (logsPage - 1) * 10 + 1;
+  const endItem = Math.min(logsPage * 10, totalEntries);
 
   const handlePageChange = (newPage: number) => {
     if (newPage < 1 || newPage > logsTotalPages || newPage === logsPage || isChangingPage) return;

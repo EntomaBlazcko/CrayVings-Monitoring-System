@@ -1,0 +1,44 @@
+CRAYvings Aquaculture Monitoring - Manual Testing Checklist
+============================================================
+
+Note: Restart the Node server (PID 27740) so the server-side change-logging
+fix takes effect. Frontend changes hot-reload automatically.
+
+1. Alert sound
+   - Load the app -> expect: no alarm sound from an already-out-of-range reading.
+   - Change a threshold in Settings and save -> expect: no alarm.
+   - Pause the ESP32 / force a low water level -> expect: sound plays once;
+     no repeats until it recovers and breaches again.
+
+2. Analytics
+   - Open Analytics, each range (7/30/90) -> expect: each param card shows
+     "Safe range: min-max (unit)" and either a green "all days within safe
+     range" or amber/red "N day(s) below/above".
+   - Water Level line on the "All" chart -> expect: full swing visible
+     (own axis), not flattened.
+   - Alert Activity card -> expect: "N of D days had at least one alert" line.
+
+3. Alerts page
+   - First load -> expect: exactly 10 rows; "Page 1 of N" + Next.
+   - Click Next -> expect: rows 11-20.
+   - In Settings, save a threshold change, then open Alerts > Changes tab
+     -> expect a "Changed from X to Y" entry.
+
+4. Historical Data / PDF
+   - Click 1 Hour / 6 Hours / 24 Hours -> expect: chart + stats + coverage %
+     update to that window.
+   - Export PDF (any range) -> expect: Summary, Data table, Alert Summary,
+     and a Recommendations section with per-parameter advice.
+
+5. Activity Logs
+   - First load -> expect: 10 rows, "Page 1 of N", Next works, filters work.
+
+6. Sensor Logs
+   - First load -> expect: 10 rows, "Page 1 of N", Next works.
+
+7. User Dashboard (log in as a non-admin user)
+   - Quick Controls -> expect: no Settings button, but Mute Alert Sounds
+     present; user menu still has no Settings.
+   - Click Mute Alert Sounds -> expect: toggles to "Unmute" (orange),
+     persists across reload; sounds stop.
+   - Log in as admin -> expect: Settings button back alongside the mute toggle.

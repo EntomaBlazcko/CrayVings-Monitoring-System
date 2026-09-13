@@ -57,7 +57,8 @@ const BAND_KEYS = ["bandMin", "bandMax"];
 
 const PARAM_META: Record<ParamKey, { label: string; unit: string; color: string; icon: React.ReactNode; yAxisId: string }> = {
   temperature: { label: "Temperature", unit: "°C", color: "#f97316", icon: <Thermometer size={14} />, yAxisId: "left" },
-  water_level: { label: "Water Level", unit: "%", color: "#2563eb", icon: <Waves size={14} />, yAxisId: "left" },
+  // Water Level gets its own (hidden) axis so % doesn't share a scale with °C.
+  water_level: { label: "Water Level", unit: "%", color: "#2563eb", icon: <Waves size={14} />, yAxisId: "water" },
   ammonia: { label: "Ammonia", unit: "ppm", color: "#10b981", icon: <FlaskConical size={14} />, yAxisId: "right" },
 };
 
@@ -154,7 +155,8 @@ function fmtAxisDate(v: string): string {
   return d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
 }
 
-// Param card: name, unit, status pill, average + trend badge, min/max range.
+// Param card: name, unit, status pill, average + trend badge, min/max range,
+// configured safe range, and how many days the daily average sat outside it.
 function ParamCard({
   name,
   unit,
@@ -165,6 +167,8 @@ function ParamCard({
   direction,
   icon,
   status,
+  safeRange,
+  breach,
 }: {
   name: string;
   unit: string;
@@ -175,10 +179,13 @@ function ParamCard({
   direction: "up" | "down" | "stable";
   icon: React.ReactNode;
   status: "good" | "warning" | "critical";
+  safeRange: { min: number; max: number };
+  breach: { below: number; above: number };
 }) {
   const decimals = name === "Ammonia" ? 2 : 1;
+  const breached = breach.below > 0 || breach.above > 0;
   return (
-    <div className="bg-white rounded-xl border border-gray-100 p-4 hover:shadow-sm transition">
+    <div className={`bg-white rounded-xl border p-4 hover:shadow-sm transition ${breached ? "border-amber-200" : "border-gray-100"}`}>
       <div className="flex items-center justify-between mb-2">
         <div className="flex items-center gap-2 text-gray-500">
           {icon}
@@ -205,8 +212,32 @@ function ParamCard({
         <span className="text-base font-normal text-gray-500">{unit}</span>
       </div>
       <div className="text-xs text-gray-400 mt-1">
-        Range {min.toFixed(decimals)} – {max.toFixed(decimals)} {unit}
+        Period range {min.toFixed(decimals)} – {max.toFixed(decimals)} {unit}
       </div>
+      {breached ? (
+        <div className="mt-2 border-t border-gray-100 pt-2">
+          <div className="text-[10px] text-gray-400 mb-1">
+            Safe range: {safeRange.min} – {safeRange.max} {unit}
+          </div>
+          <span className={`inline-flex items-center gap-1 text-[10px] font-bold px-1.5 py-0.5 rounded-full ${breach.below > 0 && breach.above > 0 ? "bg-red-100 text-red-700" : "bg-amber-100 text-amber-700"}`}>
+            <AlertTriangle size={10} />
+            {breach.below > 0 && breach.above > 0
+              ? `${breach.below} below · ${breach.above} above`
+              : breach.below > 0
+                ? `${breach.below} day${breach.below === 1 ? "" : "s"} below safe range`
+                : `${breach.above} day${breach.above === 1 ? "" : "s"} above safe range`}
+          </span>
+        </div>
+      ) : (
+        <div className="mt-2 border-t border-gray-100 pt-2">
+          <div className="text-[10px] text-gray-400 mb-1">
+            Safe range: {safeRange.min} – {safeRange.max} {unit}
+          </div>
+          <span className="inline-flex items-center gap-1 text-[10px] font-semibold text-emerald-600">
+            <CheckCircle2 size={10} /> all days within safe range
+          </span>
+        </div>
+      )}
     </div>
   );
 }
@@ -299,6 +330,36 @@ export default function AnalyticsSection() {
     }
     return { hottest, coldest, highestAmmonia, mostAlerts, busiest };
   }, [daily]);
+
+  // Days whose daily average fell below/above the configured safe range, per param.
+  const safeBreachDays = useMemo(() => {
+    const out: Record<ParamKey, { below: number; above: number }> = {
+      temperature: { below: 0, above: 0 },
+      water_level: { below: 0, above: 0 },
+      ammonia: { below: 0, above: 0 },
+    };
+    const keyToAvg: Record<ParamKey, (d: AnalyticsDailyEntry) => number> = {
+      temperature: (d) => Number(d.temp_avg),
+      water_level: (d) => Number(d.water_avg),
+      ammonia: (d) => Number(d.ammonia_avg),
+    };
+    for (const d of daily) {
+      for (const key of Object.keys(out) as ParamKey[]) {
+        const avg = keyToAvg[key](d);
+        const t = thresholds[key];
+        if (!Number.isFinite(avg) || !t) continue;
+        if (avg < t.range.min) out[key].below += 1;
+        else if (avg > t.range.max) out[key].above += 1;
+      }
+    }
+    return out;
+  }, [daily, thresholds]);
+
+  // Days in the window that had at least one recorded alert.
+  const alertDays = useMemo(
+    () => daily.filter((d) => Number(d.alerts) > 0).length,
+    [daily]
+  );
 
   if (loading && !overview) {
     return <LoadingCard title="Analytics" message="Analyzing sensor data..." />;
@@ -430,6 +491,8 @@ const tooltipSeriesFilter = (payload: readonly TooltipEntry[]): TooltipEntry[] =
           changePct={trends.temperature.change_pct}
           direction={trends.temperature.direction}
           status={focusedStatus("temperature")}
+          safeRange={{ min: thresholds.temperature.range.min, max: thresholds.temperature.range.max }}
+          breach={safeBreachDays.temperature}
         />
         <ParamCard
           name="Water Level"
@@ -441,6 +504,8 @@ const tooltipSeriesFilter = (payload: readonly TooltipEntry[]): TooltipEntry[] =
           changePct={trends.water_level.change_pct}
           direction={trends.water_level.direction}
           status={focusedStatus("water_level")}
+          safeRange={{ min: thresholds.water_level.range.min, max: thresholds.water_level.range.max }}
+          breach={safeBreachDays.water_level}
         />
         <ParamCard
           name="Ammonia"
@@ -452,6 +517,8 @@ const tooltipSeriesFilter = (payload: readonly TooltipEntry[]): TooltipEntry[] =
           changePct={trends.ammonia.change_pct}
           direction={trends.ammonia.direction}
           status={focusedStatus("ammonia")}
+          safeRange={{ min: thresholds.ammonia.range.min, max: thresholds.ammonia.range.max }}
+          breach={safeBreachDays.ammonia}
         />
       </div>
 
@@ -508,6 +575,13 @@ const tooltipSeriesFilter = (payload: readonly TooltipEntry[]): TooltipEntry[] =
               </span>
             )}
           </div>
+          {daily.length > 0 && (
+            <p className="text-[11px] text-gray-400 mt-1">
+              {alertDays > 0
+                ? `${alertDays} of ${daily.length} day${daily.length === 1 ? "" : "s"} had at least one alert`
+                : "No alert days in this window"}
+            </p>
+          )}
           {alertParams.length > 0 ? (
             <div className="flex flex-wrap gap-2 mt-2">
               {alertParams.map(([param, count]) => (
@@ -645,6 +719,8 @@ const tooltipSeriesFilter = (payload: readonly TooltipEntry[]): TooltipEntry[] =
                 yAxisId="right"
                 orientation="right"
               />
+              {/* Hidden axis so Water Level (%) scales independently of Temperature (°C) */}
+              <YAxis yAxisId="water" hide width={0} axisLine={false} tickLine={false} tick={false} />
               <Tooltip
                 content={({ active, payload, label }) => {
                   if (!active || !payload?.length) return null;

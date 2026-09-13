@@ -96,11 +96,11 @@ export default function LogsPage() {
 
   const totalPages = useMemo(() => {
     const total = Number(logsTotal) || 0;
-    return total > 0 ? Math.ceil(total / 20) : 1;
+    return total > 0 ? Math.ceil(total / 10) : 1;
   }, [logsTotal]);
 
-  const startItem = useMemo(() => ((logsPage - 1) * 20) + 1, [logsPage]);
-  const endItem = useMemo(() => Math.min(logsPage * 20, logsTotal || 0), [logsPage, logsTotal]);
+  const startItem = useMemo(() => ((logsPage - 1) * 10) + 1, [logsPage]);
+  const endItem = useMemo(() => Math.min(logsPage * 10, logsTotal || 0), [logsPage, logsTotal]);
 
   const handlePageChange = useCallback(async (newPage: number) => {
     if (newPage < 1 || newPage > totalPages || newPage === logsPage || isChangingPage) return;

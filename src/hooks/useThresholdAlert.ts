@@ -8,7 +8,7 @@
 import { useEffect, useRef, useCallback, useMemo } from "react";
 import { useSensorData, useSensorSettings } from "../contexts/SensorContext";
 import { useFloatingAlerts } from "../hooks/useFloatingAlerts";
-import { getSettingsThresholds, getThresholdStatus, type ThresholdStatus } from "../types";
+import { getSettingsThresholds, getThresholdStatus, type ThresholdRange, type ThresholdStatus } from "../types";
 
 // 60-second cooldown between alerts for the same sensor+threshold
 const ALERT_COOLDOWN_MS = 60000;
@@ -28,15 +28,39 @@ export function useThresholdAlert() {
 
   const lastAlertTimeRef = useRef<Record<string, number>>({});
   const previousStatusRef = useRef<Record<string, ThresholdStatus>>({});
+  // Thresholds used for the current previous-status map. A change here means the
+  // user edited settings, not that the sensor crossed anything — see below.
+  const thresholdsRef = useRef<Record<string, { range: ThresholdRange; isMinOnly: boolean }> | null>(null);
 
   const thresholds = useMemo(
     () => settings ? getSettingsThresholds(settings) : null,
     [settings]
   );
 
+  // Re-seeds the previous-status map for the current thresholds. Runs only on the
+  // first evaluation and whenever threshold settings change, so pre-existing
+  // out-of-range readings (and settings edits) are never announced as a crossing.
+  const seedStatuses = useCallback(() => {
+    if (!data || !thresholds) return;
+    for (const key of SENSOR_KEYS) {
+      const config = thresholds[key];
+      const value = toNumber(data[key] as string | number);
+      if (config && !isNaN(value)) {
+        previousStatusRef.current[key] = getThresholdStatus(value, config.range, config.isMinOnly);
+      }
+    }
+    thresholdsRef.current = thresholds;
+  }, [data, thresholds]);
+
   const checkThresholds = useCallback(() => {
     if (loading || !data || !thresholds) {
       return;
+    }
+
+    // If thresholds changed since the last check (e.g. a settings save), refresh
+    // the baseline statuses before evaluating so an edit never fires a fake alert.
+    if (thresholdsRef.current !== thresholds) {
+      seedStatuses();
     }
 
     const now = Date.now();
@@ -50,12 +74,16 @@ export function useThresholdAlert() {
 
       const newStatus = getThresholdStatus(value, config.range, config.isMinOnly);
 
-      // Fire alert ONLY on transition into breached state to avoid duplicate
-      // toasts on every poll or ESP32 reconnect while reading stays out of range.
+      // Fire alert ONLY on a live transition INTO a breached state. A missing
+      // previous status (first evaluation) or an already-breached status means
+      // the reading did not just cross a threshold, so we stay silent.
       const prevStatus = previousStatusRef.current[key];
       previousStatusRef.current[key] = newStatus;
 
-      if (newStatus === "good" || (prevStatus && prevStatus !== "good")) {
+      if (newStatus === "good") {
+        continue;
+      }
+      if (prevStatus !== "good") {
         continue;
       }
 
@@ -81,7 +109,7 @@ export function useThresholdAlert() {
         });
       }
     }
-  }, [data, thresholds, loading, addNotification]);
+  }, [data, thresholds, loading, addNotification, seedStatuses]);
 
   useEffect(() => {
     checkThresholds();

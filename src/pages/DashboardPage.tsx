@@ -5,14 +5,16 @@
 // =============================================================================
 
 import { useState, useMemo } from "react";
-import { Thermometer, Waves, FlaskConical, AlertTriangle, AlertCircle, CheckCircle, RefreshCw, BellOff, Settings } from "lucide-react";
+import { Thermometer, Waves, FlaskConical, AlertTriangle, AlertCircle, CheckCircle, RefreshCw, BellOff, Settings, Volume2, VolumeX } from "lucide-react";
 import type { MenuKey, ThresholdStatus } from "../types";
 import { useSensors } from "../hooks/useSensors";
+import { useAuth } from "../contexts/useAuth";
 import { getSettingsThresholds, getThresholdStatus } from "../types";
 import { formatFarmTime } from "../utils/time";
 import { buildLiveGuidance } from "../utils/alertGuidance";
 import type { AlertGuidance } from "../utils/alertGuidance";
 import { FixLegendPanel, FixLegendModal } from "../components/FixLegend";
+import { getIsSoundEnabled, setSoundEnabled } from "../utils/playAlertSound";
 import TrendCard from "../components/TrendCard";
 
 type Props = {
@@ -69,9 +71,12 @@ function StatCard({ title, value, description, gradient, icon, loading = false, 
 
 export default function DashboardPage({ onNavigate }: Props) {
   const { data, history, connectionStatus, lastUpdate, settings, loading, historyStale, historyLastUpdated, refetch } = useSensors();
+  const { user } = useAuth();
+  const isAdmin = user?.role === "admin";
   const [alertsDismissed, setAlertsDismissed] = useState(false);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [fixGuidance, setFixGuidance] = useState<AlertGuidance | null>(null);
+  const [alertsSoundEnabled, setAlertsSoundEnabled] = useState<boolean>(() => getIsSoundEnabled());
 
   const thresholds = useMemo(() => getSettingsThresholds(settings), [settings]);
 
@@ -235,6 +240,13 @@ export default function DashboardPage({ onNavigate }: Props) {
     } finally {
       setIsRefreshing(false);
     }
+  };
+
+  // Toggles the browser alert-sound preference (persisted to localStorage).
+  const toggleAlertSound = () => {
+    const next = !alertsSoundEnabled;
+    setSoundEnabled(next);
+    setAlertsSoundEnabled(next);
   };
 
   // Scenario keys currently breaching their safe range (e.g. "temperature:High")
@@ -455,12 +467,24 @@ export default function DashboardPage({ onNavigate }: Props) {
               {alertsDismissed ? "Show Alerts" : "Dismiss Alerts"}
             </button>
             <button
-              onClick={() => onNavigate?.("Settings")}
-              className="flex items-center gap-2 rounded-lg bg-emerald-500 px-4 py-3 text-sm font-semibold text-white transition hover:bg-emerald-600"
+              onClick={toggleAlertSound}
+              className={`flex items-center gap-2 rounded-lg px-4 py-3 text-sm font-semibold text-white transition ${
+                alertsSoundEnabled ? "bg-slate-500 hover:bg-slate-600" : "bg-orange-500 hover:bg-orange-600"
+              }`}
+              title={alertsSoundEnabled ? "Disable browser alert sounds" : "Enable browser alert sounds"}
             >
-              <Settings className="h-4 w-4" />
-              Settings
+              {alertsSoundEnabled ? <Volume2 className="h-4 w-4" /> : <VolumeX className="h-4 w-4" />}
+              {alertsSoundEnabled ? "Mute Alert Sounds" : "Unmute Alert Sounds"}
             </button>
+            {isAdmin && (
+              <button
+                onClick={() => onNavigate?.("Settings")}
+                className="flex items-center gap-2 rounded-lg bg-emerald-500 px-4 py-3 text-sm font-semibold text-white transition hover:bg-emerald-600"
+              >
+                <Settings className="h-4 w-4" />
+                Settings
+              </button>
+            )}
           </div>
         </div>
 
