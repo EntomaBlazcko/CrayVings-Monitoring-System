@@ -13,6 +13,7 @@ interface HeaderProps {
 }
 
 export default function Header({ user, onLogout }: HeaderProps) {
+  const roleLabel = user.owner ? "owner" : user.role;
   return (
     <div className="h-16 bg-gradient-to-r from-[#d94b1e] to-[#ef6a2e] text-white flex items-center justify-between px-5 shadow-md">
       <div>
@@ -24,7 +25,7 @@ export default function Header({ user, onLogout }: HeaderProps) {
         <div className="flex items-center gap-2 font-bold text-sm">
           {user.role === "admin" ? <Shield size={16} /> : <User size={16} />}
           <span className="hidden sm:inline">{user.name}</span>
-          <span className="text-xs opacity-75 capitalize">({user.role})</span>
+          <span className="text-xs opacity-75 capitalize">({roleLabel})</span>
         </div>
         <button
           onClick={onLogout}

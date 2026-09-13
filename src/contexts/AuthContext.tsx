@@ -5,7 +5,7 @@
 // with localStorage persistence and login/logout flows.
 // =============================================================================
 
-import { createContext, useState, useCallback, type ReactNode } from "react";
+import { createContext, useState, useCallback, useEffect, type ReactNode } from "react";
 import type { AuthUser } from "../types";
 import { loginUser, logoutUser } from "../api/client";
 
@@ -117,6 +117,18 @@ export function AuthProvider({ children }: AuthProviderProps) {
 
   const clearError = useCallback(() => {
     setError(null);
+  }, []);
+
+  // Force logout whenever the API reports an expired/invalid session (401), so
+  // the user goes back to the login screen instead of a stuck error card.
+  useEffect(() => {
+    const onUnauthorized = () => {
+      setUser(null);
+      setStoredUser(null);
+      setStoredToken(null);
+    };
+    window.addEventListener("crayvings_unauthorized", onUnauthorized);
+    return () => window.removeEventListener("crayvings_unauthorized", onUnauthorized);
   }, []);
 
   return (

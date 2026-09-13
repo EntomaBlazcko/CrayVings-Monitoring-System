@@ -19,6 +19,8 @@ export interface UserEntry {
   email: string;
   role: string;
   created_at: string;
+  owner?: boolean;
+  protected?: boolean;
 }
 
 // ========================
@@ -54,13 +56,56 @@ client.interceptors.request.use((config) => {
 
 client.interceptors.response.use(
   (response) => response,
-  (error: AxiosError) => {
-    if (error.code !== "ECONNABORTED" && error.code !== "ERR_CANCELED") {
-      // Silent fail for network errors - handled by calling code
+  (error: AxiosError<{ message?: unknown }>) => {
+    // Aborted requests (fetch cancel, component unmount) are not errors — the
+    // call sites handle them silently, so leave their message untouched.
+    if (error.code === "ERR_CANCELED") return Promise.reject(error);
+
+    // The server always replies with a { message } on failures. Substituting
+    // it for axios's default "Request failed with status code 401" means every
+    // UI that shows error.message displays the real reason (e.g. "Invalid
+    // credentials", "Incorrect password", "Session expired, please log in
+    // again") instead of a generic HTTP-status string.
+    const serverMsg =
+      error.response?.data &&
+      typeof (error.response.data as { message?: unknown }).message === "string"
+        ? ((error.response.data as { message?: unknown }).message as string)
+        : "";
+
+    if (serverMsg) {
+      error.message = serverMsg;
+    } else if (!error.response) {
+      // No HTTP response at all -> network unreachable or timed out.
+      error.message =
+        error.code === "ECONNABORTED"
+          ? "The request timed out. The server may be busy."
+          : "Cannot reach the server. Check your connection.";
     }
-    if (error.response?.status === 401 && localStorage.getItem("crayvings_token")) {
-      localStorage.removeItem("crayvings_token");
-      localStorage.removeItem("crayvings_user");
+
+    // A session is "gone" when the server no longer recognizes the token.
+    //   * 401 with no message / "Authentication required" / "Session expired"
+    //     = the server rejected or cleared the token.
+    //   * 403 "Invalid token" = the stored token no longer matches any session
+    //     (e.g. it was overwritten by another login on the same account).
+    // Both should end the local session instead of leaving a broken page behind.
+    // Other 401/403s (wrong password/OTP, admin-only route) must NOT log the
+    // user out — that would kick the admin to the login screen mid-flow.
+    if (localStorage.getItem("crayvings_token")) {
+      const status = error.response?.status;
+      const sessionLost =
+        (status === 401 &&
+          (!serverMsg ||
+            serverMsg === "Authentication required" ||
+            serverMsg.includes("Session expired"))) ||
+        (status === 403 && serverMsg === "Invalid token");
+      if (sessionLost) {
+        localStorage.removeItem("crayvings_token");
+        localStorage.removeItem("crayvings_user");
+        // Notify AuthProvider so the app returns to the login screen.
+        if (typeof window !== "undefined") {
+          window.dispatchEvent(new CustomEvent("crayvings_unauthorized"));
+        }
+      }
     }
     return Promise.reject(error);
   }
@@ -122,10 +167,11 @@ export async function fetchSensorHistory(limit = 1000, signal?: AbortSignal): Pr
         name: timestamp ? formatFarmTime(timestamp) : "--:--",
         timestamp: timestamp ? timestamp.toISOString() : "",
         // ESP32 failed-sensor sentinels: temperature 0, water_level/ammonia -1
-        // (below server minValid, not real readings)
-        temperature: item.temperature !== undefined && item.temperature >= 0.0001 ? item.temperature : null,
-        water_level: item.water_level !== undefined && item.water_level >= 0 ? item.water_level : null,
-        ammonia: item.ammonia !== undefined && item.ammonia >= 0 ? item.ammonia : null,
+        // (below server minValid, not real readings). Columns are DECIMAL so pg
+        // returns strings — coerce to numbers here.
+        temperature: item.temperature !== undefined && Number(item.temperature) >= 0.0001 ? Number(item.temperature) : null,
+        water_level: item.water_level !== undefined && Number(item.water_level) >= 0 ? Number(item.water_level) : null,
+        ammonia: item.ammonia !== undefined && Number(item.ammonia) >= 0 ? Number(item.ammonia) : null,
       };
     });
   
@@ -139,6 +185,14 @@ export async function fetchSensorHistory(limit = 1000, signal?: AbortSignal): Pr
 // GET /report/weekly - fetch 7-day aggregate report stats
 export async function fetchWeeklyReport(signal?: AbortSignal): Promise<WeeklyReport> {
   const response = await client.get<WeeklyReport>("/report/weekly", { signal });
+  return response.data;
+}
+
+// GET /report/range - aggregate report for a custom window.
+// hours: positive int (last N hours, hourly buckets when <= 24) or null (all time).
+export async function fetchRangeReport(hours: number | null, signal?: AbortSignal): Promise<WeeklyReport> {
+  const params = hours && hours > 0 ? { hours } : {};
+  const response = await client.get<WeeklyReport>("/report/range", { params, signal });
   return response.data;
 }
 
@@ -268,6 +322,22 @@ export async function createLog(
   return response.data.data;
 }
 
+// POST /logs/:id/ack - mark a specific alert log as confirmed (done) or allowed
+// (approved). The status is stored on the alert row itself, so it survives
+// reloads without needing to replay extra log entries.
+export async function acknowledgeLog(
+  logId: number,
+  status: "confirmed" | "allowed",
+  signal?: AbortSignal
+): Promise<LogEntry> {
+  const response = await client.post<{ data: LogEntry }>(
+    `/logs/${logId}/ack`,
+    { status },
+    { signal }
+  );
+  return response.data.data;
+}
+
 // ========================
 // HEALTH CHECK
 // ========================
@@ -385,6 +455,7 @@ export interface DeletionRequestResponse {
   message: string;
   request_id: number;
   otp_sent: boolean;
+  email_to?: string;
   dev_fallback: boolean;
   reason?: string;
 }
@@ -454,6 +525,120 @@ export async function resetUserPassword(
   signal?: AbortSignal
 ): Promise<void> {
   await client.put(`/auth/users/${userId}/password`, { newPassword }, { signal });
+}
+
+// ========================
+// SMS ALERT TYPES
+// ========================
+export interface SmsRecipient {
+  id: number;
+  phone_number: string;
+  name: string;
+  is_active: boolean;
+  created_at: string;
+}
+
+export interface MuteStatus {
+  muted: boolean;
+  muteExpires: string | null;
+}
+
+// GET /settings/recipients (Admin) - list SMS recipients
+export async function fetchSmsRecipients(signal?: AbortSignal): Promise<SmsRecipient[]> {
+  const response = await client.get<SmsRecipient[]>("/settings/recipients", { signal });
+  return response.data;
+}
+
+// POST /settings/recipients (Admin) - add an SMS recipient
+export async function addSmsRecipient(
+  payload: { phone_number: string; name: string },
+  signal?: AbortSignal
+): Promise<SmsRecipient> {
+  const response = await client.post<SmsRecipient>("/settings/recipients", payload, { signal });
+  return response.data;
+}
+
+// PUT /settings/recipients/:id (Admin) - rename and/or toggle a recipient
+export async function updateSmsRecipient(
+  id: number,
+  payload: { name?: string; is_active?: boolean },
+  signal?: AbortSignal
+): Promise<SmsRecipient> {
+  const response = await client.put<SmsRecipient>(`/settings/recipients/${id}`, payload, { signal });
+  return response.data;
+}
+
+// DELETE /settings/recipients/:id (Admin) - remove a recipient
+export async function deleteSmsRecipient(id: number, signal?: AbortSignal): Promise<void> {
+  await client.delete(`/settings/recipients/${id}`, { signal });
+}
+
+// POST /settings/recipients/test/:id (Admin) - deliver a test SMS to one recipient
+export async function sendTestSms(id: number, signal?: AbortSignal): Promise<{ message: string }> {
+  const response = await client.post<{ message: string }>(`/settings/recipients/test/${id}`, {}, { signal });
+  return response.data;
+}
+
+// POST /alert/status (Admin) - send the status update SMS immediately
+export async function sendStatusSms(signal?: AbortSignal): Promise<{ sent: number; total: number }> {
+  const response = await client.post<{ sent: number; total: number }>("/alert/status", {}, { signal });
+  return response.data;
+}
+
+// POST /alert/mute (Admin) - silence SMS for N hours (0 = unmute)
+export async function setSmsMute(hours: number, signal?: AbortSignal): Promise<MuteStatus> {
+  const response = await client.post<MuteStatus>("/alert/mute", { hours }, { signal });
+  return response.data;
+}
+
+// GET /alert/mute-status - current SMS mute state
+export async function fetchSmsMuteStatus(signal?: AbortSignal): Promise<MuteStatus> {
+  const response = await client.get<MuteStatus>("/alert/mute-status", { signal });
+  return response.data;
+}
+
+export interface SmsLogEntry {
+  id: number;
+  recipient_phone: string;
+  message: string;
+  status: string;
+  error_message: string | null;
+  failure_reason: string | null;
+  sms_id: string | null;
+  sent_at: string;
+  delivered_at: string | null;
+}
+
+export interface SmsLogPage {
+  rows: SmsLogEntry[];
+  total: number;
+  page: number;
+  pageSize: number;
+}
+
+export interface SmsHealth {
+  configured: boolean;
+  from: string | null;
+  smsToday: number;
+  smsCap: number;
+  last24h: { processed: number; failed: number; capped: number; stuckQueued: number };
+  degraded: boolean;
+  latestFailure: SmsLogEntry | null;
+}
+
+// GET /sms-logs (Admin) - paginated SMS history
+export async function fetchSmsLogs(
+  params: { page?: number; pageSize?: number; status?: string },
+  signal?: AbortSignal
+): Promise<SmsLogPage> {
+  const response = await client.get<SmsLogPage>("/sms-logs", { params, signal });
+  return response.data;
+}
+
+// GET /alert/sms-health - SMS delivery health snapshot
+export async function fetchSmsHealth(signal?: AbortSignal): Promise<SmsHealth> {
+  const response = await client.get<SmsHealth>("/alert/sms-health", { signal });
+  return response.data;
 }
 
 export default client;

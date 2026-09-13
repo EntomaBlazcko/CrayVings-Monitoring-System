@@ -6,6 +6,9 @@
 import { useState, useEffect, useRef, useCallback, type ReactNode } from "react";
 import { X, AlertTriangle, AlertCircle } from "lucide-react";
 import { playLowAlertSound, playHighAlertSound } from "../utils/playAlertSound";
+import { buildScenarioGuidance } from "../utils/alertGuidance";
+import type { AlertGuidance } from "../utils/alertGuidance";
+import { FixLegendModal } from "./FixLegend";
 import { 
   FloatingAlertContext, 
   useFloatingAlerts,
@@ -96,6 +99,7 @@ interface FloatingAlertItemProps {
 
 function FloatingAlertItem({ notification, onClose }: FloatingAlertItemProps) {
   const [isExiting, setIsExiting] = useState(false);
+  const [fixOpen, setFixOpen] = useState(false);
 
   // Keep latest onClose in a ref so the auto-dismiss timer isn't restarted on every re-render.
   const onCloseRef = useRef(onClose);
@@ -124,6 +128,17 @@ function FloatingAlertItem({ notification, onClose }: FloatingAlertItemProps) {
   const iconColor = isWarning ? "text-amber-500" : "text-red-500";
   const textColor = isWarning ? "text-amber-800" : "text-red-800";
 
+  // Threshold alerts carry a sensor key + direction, so fix guidance can be
+  // derived without any stored log. Device alerts have no fix guidance.
+  const guidance: AlertGuidance | null =
+    notification.parameter !== "device"
+      ? buildScenarioGuidance(
+          `${notification.parameter}:${notification.threshold === "min" ? "Low" : "High"}`,
+          null,
+          notification.value
+        )
+      : null;
+
   return (
     <div
       className={`
@@ -147,6 +162,14 @@ function FloatingAlertItem({ notification, onClose }: FloatingAlertItemProps) {
               Current: {notification.value} - Threshold: {notification.threshold === "min" ? "below min" : "above max"}
             </p>
           )}
+          {guidance && (
+            <button
+              onClick={() => setFixOpen(true)}
+              className="mt-1.5 inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[10px] font-semibold text-orange-700 bg-white/70 border border-orange-300 hover:bg-white transition"
+            >
+              Fix?
+            </button>
+          )}
         </div>
         <div className="flex-shrink-0 flex items-center gap-1">
           <button
@@ -157,6 +180,11 @@ function FloatingAlertItem({ notification, onClose }: FloatingAlertItemProps) {
           </button>
         </div>
       </div>
+
+      {/* Fix guidance modal (opened via "Fix?" on threshold alerts) */}
+      {fixOpen && guidance && (
+        <FixLegendModal guidance={guidance} onClose={() => setFixOpen(false)} />
+      )}
     </div>
   );
 }

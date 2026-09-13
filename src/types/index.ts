@@ -33,7 +33,6 @@ export type ChartPoint = {
 // Valid page/menu keys for routing and sidebar navigation.
 
 export const VALID_MENU_KEYS = [
-  "Home",
   "Dashboard",
   "Sensors",
   "Alerts",
@@ -62,6 +61,9 @@ export type LogEntry = {
   old_value: string | number;
   new_value: string | number;
   timestamp?: string;
+  ack_status?: string | null;
+  acknowledged_at?: string | null;
+  acknowledged_by?: string | null;
 };
 
 // ========================
@@ -289,6 +291,9 @@ export interface AuthUser {
   email: string;
   role: UserRole;
   name: string;
+  /** True when this account is the system owner (root admin). */
+  owner?: boolean;
+  protected?: boolean;
 }
 
 // Response from POST /auth/login.
@@ -318,6 +323,8 @@ export type WeeklyReportDaily = {
 };
 
 export type WeeklyReport = {
+  // "hour" | "day" when produced by /report/range; undefined for /report/weekly.
+  bucket?: "hour" | "day";
   period: { start: string; end: string };
   summary: {
     temp_avg: number;

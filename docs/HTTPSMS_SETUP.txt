@@ -1,0 +1,183 @@
+========================================================
+  HTTPSMS SMS SETUP GUIDE - CRAYvings Monitoring System
+========================================================
+This guide walks through setting up SMS alerts (critical
+alerts, hourly status, device-disconnect warnings) using
+HTTPSMS + an Android phone as the SMS gateway.
+
+NOTE: The HTTPSMS_API_KEY has already been configured
+(added to the project's .env file). You still need to:
+  1) Set up the gateway phone (Phase A)
+  2) Set HTTPSMS_FROM to your real number (Phase C)
+  3) Add a recipient and test (Phase D)
+
+
+--------------------------------------------------------
+PHASE A - GATEWAY PHONE (Android phone with PH SIM)
+--------------------------------------------------------
+1. Grab an Android phone with a Globe/Smart/TNT PH SIM
+   and plenty of battery.
+2. Install the "HttpSms" app on it
+   (available from https://httpsms.com). The phone becomes
+   your SMS gateway.
+3. Open the app, then log in / create your httpsms account.
+4. Make sure the app shows "Connected".
+5. Keep the phone alive:
+     Settings > Apps > HttpSms > Battery > Unrestricted
+   (otherwise Android kills it in the background and
+   nothing gets sent).
+6. Write down this phone's SIM number - you need it in
+   Phase C.
+
+
+--------------------------------------------------------
+PHASE B - API KEY (httpsms.com)
+--------------------------------------------------------
+1. On your computer, go to https://httpsms.com/settings
+   and log in with the same account used on the phone.
+2. Copy the API key shown there.
+
+DONE: The key was already added to this project's .env
+      file (HTTPSMS_API_KEY). If you ever regenerate the
+      key on httpsms.com, update it in .env again.
+
+
+--------------------------------------------------------
+PHASE C - CONFIGURE THE SERVER (.env)
+--------------------------------------------------------
+1. Open the .env file in the project root.
+2. HTTPSMS_API_KEY - already set to your key.
+3. Change HTTPSMS_FROM=+639XXXXXXXXXX to the gateway SIM's
+   real number, E.164 format (no space/dash):
+       HTTPSMS_FROM=+639123456789
+   (country code +63, then the 9 remaining digits of your
+   PH number - exactly 13 characters total, starts with
+   +639 and ends with the digits).
+4. Optional timing knobs (defaults are fine to start):
+     SMS_COOLDOWN_MS=300000    -> milliseconds between repeated
+                                  critical alerts per sensor
+                                  (5 min default; lower to
+                                  60000 for faster testing)
+     HOURLY_SMS_INTERVAL_MS=3600000 -> how often the status
+                                  SMS goes out (1 hour)
+DISCONNECT_STALE_MS=1800000 -> ms of silence before a "device
+                                   disconnected" warning
+                                   (30 min in the live .env;
+                                   30000 = 30 s for testing)
+     DISCONNECT_REARM_MS=300000 -> reconnect grace: after a
+                                   device recovers, it must stay
+                                   online this long (5 min)
+                                   before a NEW disconnect SMS
+                                   is allowed. Raise this if
+                                   your ESP32 keeps flickering
+                                   offline/online.
+     SMS_DAILY_CAP=100        -> daily SMS budget across all
+                                   producers (0 disables the cap).
+                                   When reached, sends are logged
+                                   as "capped" instead of going
+                                   out. Manual/test SMS bypass it.
+     SMS_DELIVERY_POLL_MS=45000 -> how often queued SMS are
+                                   checked against httpsms for
+                                   delivered/failed (ms).
+     SMS_RETENTION_DAYS=30    -> purge SMS history older than
+                                   N days (0 disables purging).
+ 5. Restart the backend:
+     npm run server
+   The console will print either:
+     [OK]  httpsms SMS configured (gateway +639...)
+     [WARN] HTTPSMS_API_KEY / HTTPSMS_FROM are not set
+   If you see the warning, fix the .env values and restart.
+
+
+--------------------------------------------------------
+PHASE D - ADD A RECIPIENT + SEND A TEST SMS
+--------------------------------------------------------
+1. Open the dashboard and log in as an admin.
+2. Go to Settings.
+3. Scroll to the "SMS Alerts" card.
+4. Under "Add Recipient":
+     - type a name (e.g. Farm Manager)
+     - type the phone number. EASIEST: just type it the
+       normal Filipino way - 09XXXXXXXXX (starts with 09).
+       (+639XXXXXXXXX works too; it gets stored as +639...)
+     - click "Add Recipient"
+5. Click the send (paper-plane) icon next to that
+   recipient - it sends a real test SMS.
+6. Check that phone - the text should arrive within a
+   minute or two.
+
+
+--------------------------------------------------------
+PHASE E - TEST THE REAL FEATURES
+--------------------------------------------------------
+1. CRITICAL ALERT
+   Settings > Alert Thresholds > set a max BELOW the
+   current reading (e.g. lower temp_max than the actual
+   temperature) > Save. An alert SMS arrives after the
+   cooldown window (default 5 minutes).
+
+2. HOURLY STATUS
+   SMS Alerts card > "Send Status SMS Now" button
+   (manual trigger), or just wait the configured interval.
+
+3. DEVICE DISCONNECT
+   Unplug / power off the ESP32 for more than 30 seconds >
+   a warning SMS is sent. Plug it back in - it re-arms so
+   future disconnects alert again.
+
+4. MUTE
+    SMS Alerts card > "Mute SMS" > choose how many hours >
+    all SMS are suppressed until it expires. "Unmute SMS"
+    turns alerts back on.
+
+5. DELIVERY CHECK (the proof it works)
+    SMS Alerts card > "View SMS Logs" > the last sends show
+    status badges: queued -> delivered (green) when the phone
+    got the text, failed (red) with the reason, capped (gray)
+    when the daily budget ran out, or pinched/stuck queued
+    "sent" rows from before delivery tracking existed.
+    A banner goes amber if recent failures spike.
+
+
+--------------------------------------------------------
+PHASE F - TROUBLESHOOTING
+--------------------------------------------------------
+- 401 errors in the server console
+    API key is wrong / expired, or belongs to a different
+    httpsms account.
+
+- Nothing received
+    - .env changed but server not restarted
+    - the phone fell asleep (re-check battery settings)
+    - the HttpSms app shows "Disconnected"
+    - HTTPSMS_FROM does not match the gateway SIM number
+
+- Sends show as "failed"
+    Check Settings > SMS Alerts > "View SMS Logs", or the
+    sms_logs table in PostgreSQL. The failure_reason column
+    (and the server console) shows the exact reason.
+
+- A row stays "queued" forever and never becomes delivered
+    The delivery poller marks queued -> delivered/failed via
+    the httpsms messages list. If it never settles, the
+    gateway phone likely went offline mid-delivery - check
+    the HttpSms app's "Connected" state.
+
+- Number rejected when adding a recipient
+    Must be a valid PH mobile: 09XXXXXXXXX (11 digits,
+    easiest) or +639XXXXXXXXX. Spaces/dashes/parens are
+    ignored and it's stored as +639XXXXXXXXX.
+
+
+--------------------------------------------------------
+QUICK NOTES
+--------------------------------------------------------
+- SMS delivery is async/queued by httpsms - not instant,
+  so be patient. The SMS Logs view turns "queued" into a
+  green "delivered" badge once the gateway confirms it.
+- Keep the API key and the gateway phone private. Anyone
+  logged in as admin can send a test SMS and view SMS logs.
+- The account-deletion OTP flow stays EMAIL-ONLY and is
+  untouched by the SMS system.
+- SMS recipient list, mute, per-recipient test, and SMS Logs
+  (delivery history) are all managed from Settings > SMS Alerts.

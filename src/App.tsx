@@ -7,7 +7,6 @@ import { useState, useCallback, useRef, useMemo, lazy, Suspense } from "react";
 import {
   Menu,
   X,
-  Home,
   LayoutDashboard,
   Activity,
   Bell,
@@ -32,7 +31,6 @@ import { FloatingAlertProvider, FloatingAlertContainer } from "./components/Floa
 import { useThresholdAlert } from "./hooks/useThresholdAlert";
 
 // Lazy-loaded pages so heavy deps (recharts, jspdf) download only on demand.
-const HomePage = lazy(() => import("./pages/HomePage"));
 const DashboardPage = lazy(() => import("./pages/DashboardPage"));
 const SensorsPage = lazy(() => import("./pages/SensorsPage"));
 const AlertsPage = lazy(() => import("./pages/AlertsPage"));
@@ -46,12 +44,11 @@ const AnalyticsPage = lazy(() => import("./pages/AnalyticsPage"));
 // NAVIGATION MENU DEFINITION
 // ========================
 const menuDefinitions: { label: MenuKey; icon: React.ReactNode }[] = [
-  { label: "Home", icon: <Home size={18} /> },
   { label: "Dashboard", icon: <LayoutDashboard size={18} /> },
+  { label: "Analytics", icon: <BarChart3 size={18} /> },
   { label: "Sensors", icon: <Activity size={18} /> },
   { label: "Alerts", icon: <Bell size={18} /> },
   { label: "Historical Data", icon: <History size={18} /> },
-  { label: "Analytics", icon: <BarChart3 size={18} /> },
   { label: "Activity Logs", icon: <ClipboardList size={18} /> },
   { label: "Sensor Logs", icon: <FileText size={18} /> },
   { label: "Settings", icon: <Settings size={18} /> },
@@ -66,12 +63,11 @@ const menuDefinitions: { label: MenuKey; icon: React.ReactNode }[] = [
 const ADMIN_MENU_KEYS: MenuKey[] = [...VALID_MENU_KEYS];
 
 const USER_MENU_KEYS: MenuKey[] = [
-  "Home",
   "Dashboard",
+  "Analytics",
   "Sensors",
   "Alerts",
   "Historical Data",
-  "Analytics",
   "Sensor Logs",
 ];
 
@@ -87,7 +83,7 @@ function getInitialMenuDefault(role?: UserRole): MenuKey {
   if (saved && isValidMenuKey(saved) && getAllowedMenuKeys(role).includes(saved)) {
     return saved;
   }
-  return "Home";
+  return "Dashboard";
 }
 
 // ========================
@@ -96,7 +92,7 @@ function getInitialMenuDefault(role?: UserRole): MenuKey {
 function DashboardLayout() {
   const { user, logout } = useAuth();
   const { logActivity } = useActivityLogs();
-  const previousMenuRef = useRef<MenuKey>("Home");
+  const previousMenuRef = useRef<MenuKey>("Dashboard");
   const activeMenuRef = useRef<MenuKey>(getInitialMenuDefault(user?.role));
   const [activeMenu, setActiveMenu] = useState<MenuKey>(getInitialMenuDefault(user?.role));
   const [sidebarOpen, setSidebarOpen] = useState(false);
@@ -128,17 +124,14 @@ function DashboardLayout() {
     let page: React.ReactNode;
 
     switch (activeMenu) {
-      case "Home":
-        page = <HomePage onNavigate={handleNavigate} />;
-        break;
       case "Dashboard":
-        page = <DashboardPage />;
+        page = <DashboardPage onNavigate={handleNavigate} />;
         break;
       case "Sensors":
         page = <SensorsPage />;
         break;
       case "Alerts":
-        page = <AlertsPage />;
+        page = <AlertsPage onNavigate={handleNavigate} />;
         break;
       case "Historical Data":
         page = <HistoricalDataPage />;
@@ -156,7 +149,7 @@ function DashboardLayout() {
         page = <SettingsPage />;
         break;
       default:
-        page = <HomePage onNavigate={handleNavigate} />;
+        page = <DashboardPage />;
         break;
     }
 
@@ -232,12 +225,8 @@ function DashboardLayout() {
         }} />
 
         <div className="p-3 md:p-5">
-          <div className="text-xl md:text-2xl font-extrabold text-gray-800 mb-1 mt-10 md:mt-0">
+          <div className="text-xl md:text-2xl font-extrabold text-gray-800 mb-4 mt-10 md:mt-0">
             {activeMenu}
-          </div>
-
-          <div className="text-xs text-gray-400 mb-4">
-            Current live sensor data and tank overview
           </div>
 
           {renderPage()}

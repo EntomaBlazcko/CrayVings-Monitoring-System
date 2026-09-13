@@ -1,9 +1,10 @@
 // =============================================================================
 // src/pages/HistoricalDataPage.tsx
-// Historical data analysis with time-range filtering and weekly PDF report.
+// Historical data analysis with time-range filtering, trend overlays,
+// window highlights, reading breakdown, and weekly PDF report.
 // =============================================================================
 
-import { useState, useMemo, useEffect, useCallback } from "react";
+import { useState, useMemo, useEffect, useCallback, createElement } from "react";
 import {
   History,
   Thermometer,
@@ -16,14 +17,19 @@ import {
   Calendar,
   Download,
   AlertTriangle,
+  Clock,
+  Zap,
+  Gauge,
 } from "lucide-react";
 import TrendCard from "../components/TrendCard";
 import { ErrorCard } from "../components/Loading";
 import { useSensors } from "../hooks/useSensors";
-import { fetchSensorHistory, fetchWeeklyReport } from "../api/client";
+import { useAuth } from "../contexts/useAuth";
+import { fetchSensorHistory, fetchWeeklyReport, fetchRangeReport } from "../api/client";
 import { isAxiosError } from "axios";
+import { getSettingsThresholds, getThresholdStatus, type ThresholdStatus } from "../types";
 import type { ChartPoint, WeeklyReport } from "../types";
-import { formatFarmTime, formatFarmDateTime } from "../utils/time";
+import { formatFarmTime, formatFarmDate, formatFarmDateTime } from "../utils/time";
 
 // Detects AbortError from AbortController cancellation (native fetch or axios).
 function isAbortError(err: unknown): boolean {
@@ -32,12 +38,39 @@ function isAbortError(err: unknown): boolean {
 }
 
 type TimeRange = "1h" | "6h" | "24h" | "1w" | "all";
+type SensorKey = "temperature" | "water_level" | "ammonia";
+
+const SENSOR_KEYS: SensorKey[] = ["temperature", "water_level", "ammonia"];
+
+const PARAM_META: { label: string; icon: typeof Thermometer; tint: string; stroke: string; unit: string; decimals: number }[] = [
+  { label: "Temperature", icon: Thermometer, tint: "text-orange-500", stroke: "#f97316", unit: "°C", decimals: 1 },
+  { label: "Water Level", icon: Waves, tint: "text-blue-500", stroke: "#2563eb", unit: "%", decimals: 0 },
+  { label: "Ammonia", icon: FlaskConical, tint: "text-emerald-500", stroke: "#10b981", unit: "ppm", decimals: 2 },
+];
+
+const STATUS_PILL: Record<ThresholdStatus, string> = {
+  good: "bg-emerald-100 text-emerald-700",
+  warning: "bg-amber-100 text-amber-700",
+  critical: "bg-red-100 text-red-700",
+};
+
+const STATUS_TEXT: Record<ThresholdStatus, string> = {
+  good: "text-emerald-600",
+  warning: "text-amber-600",
+  critical: "text-red-600",
+};
+
+const STATUS_DOT: Record<ThresholdStatus, string> = {
+  good: "bg-emerald-500",
+  warning: "bg-amber-500",
+  critical: "bg-red-500",
+};
 
 // Calculates min/max/avg stats for each sensor parameter from chart data.
-function getStats(data: { temperature?: number | string | null; water_level?: number | string | null; ammonia?: number | string | null }[]) {
+function getStats(data: ChartPoint[]) {
   if (!data || data.length === 0) return null;
 
-  const calc = (key: "temperature" | "water_level" | "ammonia") => {
+  const calc = (key: SensorKey) => {
     const values = data
       .map(d => d[key])
       .filter((v): v is number => typeof v === "number" && !isNaN(v));
@@ -56,9 +89,49 @@ function getStats(data: { temperature?: number | string | null; water_level?: nu
   };
 }
 
+// Downsamples long series (1w / all ranges) so charts stay responsive.
+function decimate(data: ChartPoint[], maxPoints: number): ChartPoint[] {
+  if (data.length <= maxPoints) return data;
+  const step = Math.ceil(data.length / maxPoints);
+  const sampled: ChartPoint[] = [];
+  for (let i = 0; i < data.length; i += step) sampled.push(data[i]);
+  if (sampled[sampled.length - 1] !== data[data.length - 1]) sampled.push(data[data.length - 1]);
+  return sampled;
+}
+
+// Trailing moving average per point (window of the last N valid values).
+function trailingAverage(data: ChartPoint[], key: SensorKey, window: number): (number | null)[] {
+  return data.map((_, i) => {
+    const lo = Math.max(0, i - window + 1);
+    const slice = data
+      .slice(lo, i + 1)
+      .map((p) => p[key])
+      .filter((v): v is number => typeof v === "number" && Number.isFinite(v));
+    return slice.length > 0 ? slice.reduce((a, b) => a + b, 0) / slice.length : null;
+  });
+}
+
+// Compares the first half of the window against the last half to detect trend.
+function segmentTrend(data: ChartPoint[], key: SensorKey): "up" | "down" | "stable" | null {
+  const values = data
+    .map((p) => p[key])
+    .filter((v): v is number => typeof v === "number" && Number.isFinite(v));
+  if (values.length < 8) return null;
+  const half = Math.floor(values.length / 2);
+  const avg = (arr: number[]) => arr.reduce((a, b) => a + b, 0) / arr.length;
+  const first = avg(values.slice(0, half));
+  const last = avg(values.slice(values.length - half, values.length));
+  const pctChange = Math.abs(last - first) / (Math.abs(first) || 1) * 100;
+  if (pctChange < 1) return "stable";
+  return last > first ? "up" : "down";
+}
+
 export default function HistoricalDataPage() {
-  const { history, loading, connectionStatus, lastUpdate, historyStale, historyLastUpdated } = useSensors();
+  const { history, loading, connectionStatus, lastUpdate, historyStale, historyLastUpdated, settings } = useSensors();
+  const { user } = useAuth();
+  const isAdmin = user?.role === "admin";
   const [timeRange, setTimeRange] = useState<TimeRange>("all");
+  const [showMovingAverage, setShowMovingAverage] = useState(true);
   const [dynamicHistory, setDynamicHistory] = useState<ChartPoint[]>([]);
   const [dynamicLoading, setDynamicLoading] = useState(false);
   const [historyFetchError, setHistoryFetchError] = useState<string | null>(null);
@@ -137,8 +210,8 @@ export default function HistoricalDataPage() {
       .catch((err: unknown) => {
         if (!isAbortError(err)) {
           setWeeklyReportError((err as Error)?.message || 'Failed to load weekly report');
+          setWeeklyReportLoading(false);
         }
-        setWeeklyReportLoading(false);
       });
 
     return () => {
@@ -204,152 +277,319 @@ export default function HistoricalDataPage() {
     return null;
   }, [filteredHistory, activeHistory]);
 
+  const thresholds = useMemo(() => getSettingsThresholds(settings), [settings]);
+
+  // Safe/warning/critical status of the most recent reading per parameter.
+  const latestStatuses = useMemo(() => {
+    const out: Partial<Record<SensorKey, ThresholdStatus>> = {};
+    if (!latestReading) return out;
+    for (const key of SENSOR_KEYS) {
+      const value = latestReading[key];
+      if (typeof value === "number" && Number.isFinite(value)) {
+        const t = thresholds[key];
+        out[key] = getThresholdStatus(value, t.range, t.isMinOnly);
+      }
+    }
+    return out;
+  }, [latestReading, thresholds]);
+
+  // How many readings in the selected window fell outside the safe band.
+  const breachCounts = useMemo(() => {
+    const counts: Record<SensorKey, number> = { temperature: 0, water_level: 0, ammonia: 0 };
+    if (filteredHistory.length === 0) return counts;
+    for (const item of filteredHistory) {
+      for (const key of SENSOR_KEYS) {
+        const value = item[key];
+        if (typeof value !== "number" || !Number.isFinite(value)) continue;
+        const t = thresholds[key];
+        if (getThresholdStatus(value, t.range, t.isMinOnly) !== "good") counts[key] += 1;
+      }
+    }
+    return counts;
+  }, [filteredHistory, thresholds]);
+
+  // First-half vs last-half trend for each parameter within the window.
+  const trends = useMemo(() => {
+    const out: Partial<Record<SensorKey, "up" | "down" | "stable">> = {};
+    for (const key of SENSOR_KEYS) {
+      const trend = segmentTrend(filteredHistory, key);
+      if (trend) out[key] = trend;
+    }
+    return out;
+  }, [filteredHistory]);
+
+  // Highest / lowest reading per parameter with the time it occurred.
+  const windowHighlights = useMemo(() => {
+    const out: Record<SensorKey, { peak: { value: number; time: string } | null; low: { value: number; time: string } | null }> = {
+      temperature: { peak: null, low: null },
+      water_level: { peak: null, low: null },
+      ammonia: { peak: null, low: null },
+    };
+    for (const item of filteredHistory) {
+      for (const key of SENSOR_KEYS) {
+        const v = item[key];
+        if (typeof v !== "number" || !Number.isFinite(v)) continue;
+        const time = item.timestamp ?? "";
+        const entry = { value: v, time };
+        const cur = out[key];
+        if (!cur.peak || v > cur.peak.value) cur.peak = entry;
+        if (!cur.low || v < cur.low.value) cur.low = entry;
+      }
+    }
+    return out;
+  }, [filteredHistory]);
+
+  // Estimation of expected readings (sensors report ~1/min) for coverage %.
+  const expectedReadings = useMemo(() => {
+    if (timeRange === "all") return null;
+    const hours = timeRange === "1h" ? 1 : timeRange === "6h" ? 6 : timeRange === "1w" ? 168 : 24;
+    return hours * 60;
+  }, [timeRange]);
+
+  const coveragePct =
+    expectedReadings && filteredHistory.length > 0
+      ? Math.min(100, Math.round((filteredHistory.length / expectedReadings) * 100))
+      : null;
+
+  // Decimated chart series + optional moving-average overlay series.
+  const chartHistory = useMemo(() => {
+    const base = decimate(filteredHistory, 300);
+    const temp = trailingAverage(base, "temperature", 7);
+    const water = trailingAverage(base, "water_level", 7);
+    const ammonia = trailingAverage(base, "ammonia", 7);
+    return base.map((p, i) => ({
+      ...p,
+      _tempAvg: temp[i],
+      _waterAvg: water[i],
+      _ammoniaAvg: ammonia[i],
+    }));
+  }, [filteredHistory]);
+
   const handleExportPdf = useCallback(async () => {
     if (exportingPdf) return;
 
-    let report = weeklyReport;
+    const isWeekly = timeRange === "1w";
+    let report = isWeekly ? weeklyReport : null;
     if (!report) {
       setExportingPdf(true);
       try {
-        report = await fetchWeeklyReport();
+        report = isWeekly
+          ? await fetchWeeklyReport()
+          : await fetchRangeReport(timeRange === "all" ? null : timeRange === "1h" ? 1 : timeRange === "6h" ? 6 : 24);
       } catch {
-        alert("Failed to fetch weekly report data.");
+        alert("Failed to fetch report data.");
         setExportingPdf(false);
         return;
       }
     }
 
     try {
-    // Lazy-load jspdf (~150kB+) only when user actually exports.
-    const [{ jsPDF }, { default: autoTable }] = await Promise.all([
+      // Lazy-load jspdf (~150kB+) only when user actually exports.
+      const [{ jsPDF }, { default: autoTable }] = await Promise.all([
         import("jspdf"),
         import("jspdf-autotable"),
       ]);
 
       const doc = new jsPDF();
-    const pageWidth = doc.internal.pageSize.getWidth();
-    const pageHeight = doc.internal.pageSize.getHeight();
+      const pageWidth = doc.internal.pageSize.getWidth();
+      const pageHeight = doc.internal.pageSize.getHeight();
 
-    doc.setFontSize(20);
-    doc.setFont("helvetica", "bold");
-    doc.text("CRAYvings Weekly Report", pageWidth / 2, 20, { align: "center" });
-
-    doc.setFontSize(9);
-    doc.setFont("helvetica", "normal");
-    const startDate = new Date(report.period.start).toLocaleDateString();
-    const endDate = new Date(report.period.end).toLocaleDateString();
-    doc.text(`Period: ${startDate} - ${endDate}`, pageWidth / 2, 28, { align: "center" });
-    doc.text(`Generated on ${new Date().toLocaleString()}`, pageWidth / 2, 34, { align: "center" });
-
-    const summary = report.summary;
-    const summaryY = 40;
-    doc.setFontSize(12);
-    doc.setFont("helvetica", "bold");
-    doc.text("Summary", 14, summaryY);
-
-    doc.setFontSize(9);
-    doc.setFont("helvetica", "normal");
-    const s = [
-      `Temperature: Avg ${(summary.temp_avg ?? 0).toFixed(1)}°C, Min ${(summary.temp_min ?? 0).toFixed(1)}°C, Max ${(summary.temp_max ?? 0).toFixed(1)}°C`,
-      `Water Level: Avg ${(summary.water_avg ?? 0).toFixed(0)}%, Min ${(summary.water_min ?? 0).toFixed(0)}%, Max ${(summary.water_max ?? 0).toFixed(0)}%`,
-      `Ammonia: Avg ${(summary.ammonia_avg ?? 0).toFixed(2)} ppm, Min ${(summary.ammonia_min ?? 0).toFixed(2)} ppm, Max ${(summary.ammonia_max ?? 0).toFixed(2)} ppm`,
-      `Total Readings: ${(summary.total_readings ?? 0).toLocaleString()}`,
-      `Total Alerts: ${report.alerts.total ?? 0}`,
-    ];
-    let sy = summaryY + 7;
-    s.forEach(line => { doc.text(line, 14, sy); sy += 5; });
-
-    const tableStartY = sy + 6;
-    autoTable(doc, {
-      startY: tableStartY,
-      head: [["Date", "Temp Avg", "Temp Range", "Water Avg", "Water Range", "Ammonia Avg", "Ammonia Range", "Readings", "Alerts"]],
-      body: report.daily.map(d => [
-        new Date(d.date).toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" }),
-        `${(d.temp_avg ?? 0).toFixed(1)}°C`,
-        `${(d.temp_min ?? 0).toFixed(1)} - ${(d.temp_max ?? 0).toFixed(1)}°C`,
-        `${(d.water_avg ?? 0).toFixed(0)}%`,
-        `${(d.water_min ?? 0).toFixed(0)} - ${(d.water_max ?? 0).toFixed(0)}%`,
-        `${(d.ammonia_avg ?? 0).toFixed(2)} ppm`,
-        `${(d.ammonia_min ?? 0).toFixed(2)} - ${(d.ammonia_max ?? 0).toFixed(2)} ppm`,
-        (d.readings ?? 0).toLocaleString(),
-        String(d.alerts ?? 0),
-      ]),
-      styles: { fontSize: 8, cellPadding: 2.5, valign: "middle" },
-      headStyles: { fillColor: [241, 245, 249], textColor: [30, 41, 59], fontStyle: "bold", halign: "center" },
-      alternateRowStyles: { fillColor: [248, 250, 252] },
-      columnStyles: {
-        0: { cellWidth: 38 },
-        1: { halign: "center" },
-        2: { halign: "center" },
-        3: { halign: "center" },
-        4: { halign: "center" },
-        5: { halign: "center" },
-        6: { halign: "center" },
-        7: { halign: "center" },
-        8: { halign: "center" },
-      },
-      margin: { left: 14, right: 14 },
-      didDrawPage: (data) => {
-        data.doc.setFontSize(8);
-        data.doc.setFont("helvetica", "normal");
-        data.doc.setTextColor(128, 128, 128);
-        data.doc.text(`Page ${data.pageNumber}`, pageWidth / 2, pageHeight - 10, { align: "center" });
-        data.doc.text("CRAYvings Monitoring System", 14, pageHeight - 10);
-        data.doc.text(`Exported: ${new Date().toLocaleDateString()}`, pageWidth - 14, pageHeight - 10, { align: "right" });
-      },
-    });
-
-    // Alert summary on a new page
-    if (Object.keys(report.alerts.by_parameter).length > 0 || Object.keys(report.alerts.by_action).length > 0) {
-      doc.addPage();
-      doc.setFontSize(14);
+      doc.setFontSize(20);
       doc.setFont("helvetica", "bold");
-      doc.text("Alert Summary", 14, 20);
+      doc.text(isWeekly ? "CRAYvings Weekly Report" : "CRAYvings History Report", pageWidth / 2, 20, { align: "center" });
 
       doc.setFontSize(9);
       doc.setFont("helvetica", "normal");
-      let ay = 30;
-      doc.text(`Total Alerts: ${report.alerts.total}`, 14, ay);
-      ay += 7;
+      const fmtPeriod = report.bucket === "hour" ? formatFarmDateTime : formatFarmDate;
+      const startDate = fmtPeriod(report.period.start);
+      const endDate = fmtPeriod(report.period.end);
+      doc.text(`Period: ${startDate} - ${endDate}`, pageWidth / 2, 28, { align: "center" });
+      doc.text(`Generated on ${formatFarmDateTime(new Date())}`, pageWidth / 2, 34, { align: "center" });
 
-      if (Object.keys(report.alerts.by_parameter).length > 0) {
-        doc.setFont("helvetica", "bold");
-        doc.text("By Parameter:", 14, ay);
-        ay += 5;
-        doc.setFont("helvetica", "normal");
-        Object.entries(report.alerts.by_parameter).forEach(([param, count]) => {
-          doc.text(`  ${param}: ${count}`, 14, ay);
-          ay += 5;
-        });
-        ay += 3;
-      }
+      const summary = report.summary;
+      const summaryY = 40;
+      doc.setFontSize(12);
+      doc.setFont("helvetica", "bold");
+      doc.text("Summary", 14, summaryY);
 
-      if (Object.keys(report.alerts.by_action).length > 0) {
-        doc.setFont("helvetica", "bold");
-        doc.text("By Action:", 14, ay);
-        ay += 5;
-        doc.setFont("helvetica", "normal");
-        Object.entries(report.alerts.by_action).forEach(([action, count]) => {
-          doc.text(`  ${action}: ${count}`, 14, ay);
-          ay += 5;
-        });
-      }
-
-      // Footer on alert page
-      doc.setFontSize(8);
+      doc.setFontSize(9);
       doc.setFont("helvetica", "normal");
-      doc.setTextColor(128, 128, 128);
-      doc.text("CRAYvings Monitoring System", 14, pageHeight - 10);
-      doc.text(`Exported: ${new Date().toLocaleDateString()}`, pageWidth - 14, pageHeight - 10, { align: "right" });
-    }
+      const s = [
+        `Temperature: Avg ${(summary.temp_avg ?? 0).toFixed(1)}°C, Min ${(summary.temp_min ?? 0).toFixed(1)}°C, Max ${(summary.temp_max ?? 0).toFixed(1)}°C`,
+        `Water Level: Avg ${(summary.water_avg ?? 0).toFixed(0)}%, Min ${(summary.water_min ?? 0).toFixed(0)}%, Max ${(summary.water_max ?? 0).toFixed(0)}%`,
+        `Ammonia: Avg ${(summary.ammonia_avg ?? 0).toFixed(2)} ppm, Min ${(summary.ammonia_min ?? 0).toFixed(2)} ppm, Max ${(summary.ammonia_max ?? 0).toFixed(2)} ppm`,
+        `Total Readings: ${(summary.total_readings ?? 0).toLocaleString()}`,
+        `Total Alerts: ${report.alerts.total ?? 0}`,
+      ];
+      let sy = summaryY + 7;
+      s.forEach(line => { doc.text(line, 14, sy); sy += 5; });
 
-    doc.save(`CRAYvings_Weekly_Report_${new Date().toISOString().split("T")[0]}.pdf`);
+      const tableStartY = sy + 6;
+
+      // Range exports stay compact: smaller font, capped rows and no separate
+      // alert page, so long windows (e.g. "All Time") fit on 1-2 pages.
+      const cappedBuckets = report.bucket ? report.daily.slice(-60) : report.daily;
+      const capNote =
+        report.daily.length > cappedBuckets.length
+          ? `Showing the last ${cappedBuckets.length} ${report.bucket === "hour" ? "hourly" : "daily"} buckets - the summary above covers the full period.`
+          : null;
+      const unitLabel = report.bucket === "hour" ? "Hour" : "Date";
+      const fmtBucket = report.bucket === "hour" ? formatFarmDateTime : formatFarmDate;
+      const isRange = !!report.bucket;
+
+      autoTable(doc, {
+        startY: tableStartY,
+        head: [[unitLabel, "Temp Avg", "Temp Range", "Water Avg", "Water Range", "Ammonia Avg", "Ammonia Range", "Readings", "Alerts"]],
+        body: cappedBuckets.map(d => [
+          fmtBucket(d.date),
+          `${(d.temp_avg ?? 0).toFixed(1)}°C`,
+          `${(d.temp_min ?? 0).toFixed(1)} - ${(d.temp_max ?? 0).toFixed(1)}°C`,
+          `${(d.water_avg ?? 0).toFixed(0)}%`,
+          `${(d.water_min ?? 0).toFixed(0)} - ${(d.water_max ?? 0).toFixed(0)}%`,
+          `${(d.ammonia_avg ?? 0).toFixed(2)} ppm`,
+          `${(d.ammonia_min ?? 0).toFixed(2)} - ${(d.ammonia_max ?? 0).toFixed(2)} ppm`,
+          (d.readings ?? 0).toLocaleString(),
+          String(d.alerts ?? 0),
+        ]),
+        styles: isRange
+          ? { fontSize: 7.5, cellPadding: 2, valign: "middle" }
+          : { fontSize: 8, cellPadding: 2.5, valign: "middle" },
+        headStyles: { fillColor: [241, 245, 249], textColor: [30, 41, 59], fontStyle: "bold", halign: "center" },
+        alternateRowStyles: { fillColor: [248, 250, 252] },
+        columnStyles: {
+          0: { cellWidth: isRange ? 48 : 38 },
+          1: { halign: "center" },
+          2: { halign: "center" },
+          3: { halign: "center" },
+          4: { halign: "center" },
+          5: { halign: "center" },
+          6: { halign: "center" },
+          7: { halign: "center" },
+          8: { halign: "center" },
+        },
+        margin: { left: 14, right: 14 },
+        didDrawPage: (data) => {
+          data.doc.setFontSize(8);
+          data.doc.setFont("helvetica", "normal");
+          data.doc.setTextColor(128, 128, 128);
+          data.doc.text(`Page ${data.pageNumber}`, pageWidth / 2, pageHeight - 10, { align: "center" });
+          data.doc.text("CRAYvings Monitoring System", 14, pageHeight - 10);
+          data.doc.text(`Exported: ${formatFarmDate(new Date())}`, pageWidth - 14, pageHeight - 10, { align: "right" });
+        },
+      });
+
+      let afterTableY = (doc as unknown as { lastAutoTable?: { finalY?: number } }).lastAutoTable?.finalY ?? tableStartY + 10;
+
+      if (capNote) {
+        afterTableY += 5;
+        doc.setFontSize(7);
+        doc.setFont("helvetica", "italic");
+        doc.setTextColor(107, 114, 128);
+        doc.text(capNote, 14, afterTableY);
+        afterTableY += 4;
+      } else {
+        afterTableY += 2;
+      }
+
+      const hasAlerts =
+        Object.keys(report.alerts.by_parameter).length > 0 || Object.keys(report.alerts.by_action).length > 0;
+
+      if (isRange) {
+        // Range exports merge the alert block inline (no extra page).
+        if (hasAlerts) {
+          let ay = afterTableY + 4;
+          if (ay > pageHeight - 40) {
+            doc.addPage();
+            ay = 20;
+          }
+          doc.setFontSize(11);
+          doc.setFont("helvetica", "bold");
+          doc.text("Alert Summary", 14, ay);
+          ay += 6;
+
+          doc.setFontSize(8);
+          doc.setFont("helvetica", "normal");
+          doc.text(`Total Alerts: ${report.alerts.total}`, 14, ay);
+          ay += 5;
+
+          if (Object.keys(report.alerts.by_parameter).length > 0) {
+            doc.setFont("helvetica", "bold");
+            doc.text("By Parameter:", 14, ay);
+            ay += 4.5;
+            doc.setFont("helvetica", "normal");
+            Object.entries(report.alerts.by_parameter).forEach(([param, count]) => {
+              doc.text(`  ${param}: ${count}`, 14, ay);
+              ay += 4.5;
+            });
+            ay += 2;
+          }
+
+          if (Object.keys(report.alerts.by_action).length > 0) {
+            doc.setFont("helvetica", "bold");
+            doc.text("By Action:", 14, ay);
+            ay += 4.5;
+            doc.setFont("helvetica", "normal");
+            Object.entries(report.alerts.by_action).forEach(([action, count]) => {
+              doc.text(`  ${action}: ${count}`, 14, ay);
+              ay += 4.5;
+            });
+          }
+        }
+      } else if (hasAlerts) {
+        // Weekly keeps its dedicated alert page (existing behavior).
+        doc.addPage();
+        doc.setFontSize(14);
+        doc.setFont("helvetica", "bold");
+        doc.text("Alert Summary", 14, 20);
+
+        doc.setFontSize(9);
+        doc.setFont("helvetica", "normal");
+        let ay = 30;
+        doc.text(`Total Alerts: ${report.alerts.total}`, 14, ay);
+        ay += 7;
+
+        if (Object.keys(report.alerts.by_parameter).length > 0) {
+          doc.setFont("helvetica", "bold");
+          doc.text("By Parameter:", 14, ay);
+          ay += 5;
+          doc.setFont("helvetica", "normal");
+          Object.entries(report.alerts.by_parameter).forEach(([param, count]) => {
+            doc.text(`  ${param}: ${count}`, 14, ay);
+            ay += 5;
+          });
+          ay += 3;
+        }
+
+        if (Object.keys(report.alerts.by_action).length > 0) {
+          doc.setFont("helvetica", "bold");
+          doc.text("By Action:", 14, ay);
+          ay += 5;
+          doc.setFont("helvetica", "normal");
+          Object.entries(report.alerts.by_action).forEach(([action, count]) => {
+            doc.text(`  ${action}: ${count}`, 14, ay);
+            ay += 5;
+          });
+        }
+
+        // Footer on alert page
+        doc.setFontSize(8);
+        doc.setFont("helvetica", "normal");
+        doc.setTextColor(128, 128, 128);
+        doc.text("CRAYvings Monitoring System", 14, pageHeight - 10);
+        doc.text(`Exported: ${formatFarmDate(new Date())}`, pageWidth - 14, pageHeight - 10, { align: "right" });
+      }
+
+      doc.save(
+        isWeekly
+          ? `CRAYvings_Weekly_Report_${new Date().toISOString().split("T")[0]}.pdf`
+          : `CRAYvings_History_Report_${timeRange === "all" ? "All_Time" : timeRange.toUpperCase()}_${new Date().toISOString().split("T")[0]}.pdf`
+      );
     } catch {
       alert("Failed to export the PDF. Please try again.");
     } finally {
       setExportingPdf(false);
     }
-  }, [weeklyReport, exportingPdf]);
+  }, [weeklyReport, exportingPdf, timeRange]);
 
   // Only show loading skeleton on first load; keep previous charts during re-fetch.
   if (activeLoading && (!activeHistory || activeHistory.length === 0)) {
@@ -398,6 +638,12 @@ export default function HistoricalDataPage() {
     );
   }
 
+  const isOnline = connectionStatus === "online";
+  const isConnecting = connectionStatus === "connecting";
+
+  const firstTs = filteredHistory[0]?.timestamp;
+  const lastTs = filteredHistory[filteredHistory.length - 1]?.timestamp;
+
   return (
     <div className="space-y-4">
       {/* Offline warning banner - history is still shown from the database */}
@@ -424,59 +670,107 @@ export default function HistoricalDataPage() {
         </div>
       )}
 
-      {/* Header */}
-      <div className="bg-white rounded-xl border border-gray-100 p-5">
-        <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
-          <div>
-            <h1 className="text-xl font-bold text-gray-800 flex items-center gap-2">
-              <History size={22} className="text-blue-500" />
-              Historical Data
-            </h1>
-            <p className="text-gray-500 text-sm mt-1">
-              View sensor trends over time
-            </p>
+      {/* Hero banner */}
+      <section className="relative overflow-hidden rounded-3xl bg-gradient-to-br from-[#d94b1e] via-[#ef6a2e] to-amber-600 text-white shadow-sm">
+        <div className="relative p-6 lg:p-7 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
+          <div className="flex items-center gap-4">
+            <div className="w-14 h-14 rounded-2xl bg-white/15 border border-white/25 flex items-center justify-center shrink-0">
+              <History size={26} />
+            </div>
+            <div>
+              <h1 className="text-2xl font-bold flex items-center gap-3">
+                Historical Data
+                <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-bold bg-white/20 border border-white/30">
+                  <span className={`w-2 h-2 rounded-full ${isConnecting ? "bg-yellow-300 animate-pulse" : isOnline ? "bg-emerald-300" : "bg-gray-200"}`} />
+                  {isConnecting ? "Polling…" : isOnline ? "Live" : "Offline"}
+                </span>
+              </h1>
+              <p className="text-white/80 text-sm mt-1">
+                Sensor trends and analysis across the farm
+              </p>
+            </div>
           </div>
-          <div className="flex items-center gap-2 flex-wrap">
-            <Filter size={16} className="text-gray-400" />
-            {timeRanges.map((range) => {
-              const unavailable = isRangeUnavailable(range.value);
-              const offlineHours = Math.max(1, Math.floor(offlineForMs / (60 * 60 * 1000)));
-              return (
-                <button
-                  key={range.value}
-                  onClick={() => setTimeRange(range.value)}
-                  disabled={unavailable}
-                  title={
-                    unavailable
-                      ? `Device has been offline for ${offlineHours}h — no readings in this window`
-                      : undefined
-                  }
-                  className={`px-3 py-1.5 rounded-lg text-sm font-medium transition ${
-                    timeRange === range.value
-                      ? "bg-blue-500 text-white shadow-sm"
-                      : unavailable
-                        ? "bg-gray-50 border border-gray-200 text-gray-300 cursor-not-allowed"
-                        : "bg-gray-50 border border-gray-200 text-gray-600 hover:bg-gray-100"
-                  }`}
-                >
-                  {range.label}
-                </button>
-              );
-            })}
-            {timeRange === "1w" && (
-              <button
-                onClick={handleExportPdf}
-                disabled={exportingPdf || weeklyReportLoading}
-                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-semibold bg-[#c2410c] text-white hover:bg-[#a13a0a] disabled:opacity-50 disabled:cursor-not-allowed transition"
-              >
-                <Download size={14} />
-                {exportingPdf ? "Exporting..." : "Export PDF"}
-              </button>
+          <div className="flex items-center gap-3 text-sm">
+            {lastUpdate && (
+              <span className="flex items-center gap-1.5 text-white/90">
+                <Clock size={14} /> Updated {formatFarmTime(lastUpdate)}
+              </span>
             )}
           </div>
         </div>
-        <div className="mt-3 text-sm text-gray-400">
-          Showing {filteredHistory.length} of {history.length} readings
+        <div className="px-6 lg:px-7 pb-5 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-white/85">
+          <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded bg-white/10">
+            {filteredHistory.length.toLocaleString()} of {activeHistory.length.toLocaleString()} readings
+          </span>
+          {firstTs && lastTs && timeRange !== "1w" && (
+            <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded bg-white/10">
+              {formatFarmTime(firstTs)} → {formatFarmTime(lastTs)}
+            </span>
+          )}
+          {timeRange === "1w" && weeklyReport && (
+            <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded bg-white/10">
+              {formatFarmDate(weeklyReport.period.start)} → {formatFarmDate(weeklyReport.period.end)}
+            </span>
+          )}
+          <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded bg-white/10">
+            Coverage {coveragePct != null ? `${coveragePct}%` : "n/a"}
+          </span>
+        </div>
+      </section>
+
+      {/* Range selector + export toolbar */}
+      <div className="bg-white rounded-xl border border-gray-100 p-3 flex flex-col lg:flex-row items-start lg:items-center justify-between gap-3">
+        <div className="flex items-center gap-2 flex-wrap">
+          <Filter size={16} className="text-gray-400 ml-1" />
+          {timeRanges.map((range) => {
+            const unavailable = isRangeUnavailable(range.value);
+            const offlineHours = Math.max(1, Math.floor(offlineForMs / (60 * 60 * 1000)));
+            return (
+              <button
+                key={range.value}
+                onClick={() => setTimeRange(range.value)}
+                disabled={unavailable}
+                title={
+                  unavailable
+                    ? `Device has been offline for ${offlineHours}h — no readings in this window`
+                    : undefined
+                }
+                className={`px-3 py-1.5 rounded-lg text-sm font-medium transition ${
+                  timeRange === range.value
+                    ? "bg-orange-500 text-white shadow-sm"
+                    : unavailable
+                      ? "bg-gray-50 border border-gray-200 text-gray-300 cursor-not-allowed"
+                      : "bg-gray-50 border border-gray-200 text-gray-600 hover:bg-gray-100"
+                }`}
+              >
+                {range.label}
+              </button>
+            );
+          })}
+        </div>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={() => setShowMovingAverage(v => !v)}
+            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-medium transition ${
+              showMovingAverage
+                ? "bg-orange-100 text-orange-700 border border-orange-200"
+                : "bg-gray-50 border border-gray-200 text-gray-500 hover:bg-gray-100"
+            }`}
+            title="Overlay a 7-point moving average on each chart"
+          >
+            <Activity size={14} />
+            Trend overlay
+          </button>
+          {isAdmin && (timeRange === "1w" ? true : filteredHistory.length > 0) && (
+            <button
+              onClick={handleExportPdf}
+              disabled={exportingPdf || (timeRange === "1w" && weeklyReportLoading)}
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-semibold bg-[#c2410c] text-white hover:bg-[#a13a0a] disabled:opacity-50 disabled:cursor-not-allowed transition"
+            >
+            <Download size={14} />
+            {exportingPdf ? "Exporting..." : "Export PDF"}
+            </button>
+          )}
         </div>
       </div>
 
@@ -501,10 +795,15 @@ export default function HistoricalDataPage() {
             <div className="flex items-center gap-2 text-gray-500">
               <Thermometer size={16} className="text-orange-500" />
               <span className="text-xs font-semibold uppercase tracking-wide">Temperature</span>
+              {latestStatuses.temperature && (
+                <span className={`text-[10px] font-bold uppercase tracking-wide px-1.5 py-0.5 rounded-full ${STATUS_PILL[latestStatuses.temperature]}`}>
+                  {latestStatuses.temperature === "good" ? "Safe" : latestStatuses.temperature === "warning" ? "Warning" : "Critical"}
+                </span>
+              )}
             </div>
             {timeRange === "1w" && weeklyReport ? (
               <div className="flex gap-3 text-xs">
-                <span className="text-blue-600" title="Min">
+                <span className="text-orange-600" title="Min">
                   <TrendingDown size={12} className="inline" /> {(weeklyReport.summary.temp_min ?? 0).toFixed(1)}°
                 </span>
                 <span className="text-green-600" title="Average">
@@ -516,7 +815,7 @@ export default function HistoricalDataPage() {
               </div>
             ) : stats?.temperature && (
               <div className="flex gap-3 text-xs">
-                <span className="text-blue-600" title="Min">
+                <span className="text-orange-600" title="Min">
                   <TrendingDown size={12} className="inline" /> {stats.temperature.min.toFixed(1)}°
                 </span>
                 <span className="text-green-600" title="Average">
@@ -528,8 +827,32 @@ export default function HistoricalDataPage() {
               </div>
             )}
           </div>
-          <div className="text-2xl font-bold text-gray-800">
+          <div className={`text-2xl font-bold ${latestStatuses.temperature ? STATUS_TEXT[latestStatuses.temperature] : "text-gray-800"}`}>
             {latestReading?.temperature != null ? Number(latestReading.temperature).toFixed(1) : "--"}<span className="text-base font-normal text-gray-500">°C</span>
+          </div>
+          <div className="flex items-center justify-between mt-1">
+            <div className={`text-[10px] ${breachCounts.temperature > 0 ? "text-amber-600" : "text-gray-400"}`}>
+              {filteredHistory.length === 0
+                ? "No readings in this window"
+                : breachCounts.temperature > 0
+                  ? `${breachCounts.temperature} reading${breachCounts.temperature === 1 ? "" : "s"} out of range`
+                  : "All readings in range"}
+            </div>
+            {trends.temperature && (
+              <span className={`inline-flex items-center gap-0.5 text-[10px] font-semibold px-1.5 py-0.5 rounded-full ${
+                trends.temperature === "up"
+                  ? "text-green-600 bg-green-50"
+                  : trends.temperature === "down"
+                    ? "text-red-600 bg-red-50"
+                    : "text-gray-500 bg-gray-100"
+              }`}>
+                {trends.temperature === "up"
+                  ? <><TrendingUp size={10} /> Rising</>
+                  : trends.temperature === "down"
+                    ? <><TrendingDown size={10} /> Falling</>
+                    : <><Activity size={10} /> Stable</>}
+              </span>
+            )}
           </div>
         </div>
 
@@ -538,10 +861,15 @@ export default function HistoricalDataPage() {
             <div className="flex items-center gap-2 text-gray-500">
               <Waves size={16} className="text-blue-500" />
               <span className="text-xs font-semibold uppercase tracking-wide">Water Level</span>
+              {latestStatuses.water_level && (
+                <span className={`text-[10px] font-bold uppercase tracking-wide px-1.5 py-0.5 rounded-full ${STATUS_PILL[latestStatuses.water_level]}`}>
+                  {latestStatuses.water_level === "good" ? "Safe" : latestStatuses.water_level === "warning" ? "Warning" : "Critical"}
+                </span>
+              )}
             </div>
             {timeRange === "1w" && weeklyReport ? (
               <div className="flex gap-3 text-xs">
-                <span className="text-blue-600" title="Min">
+                <span className="text-orange-600" title="Min">
                   <TrendingDown size={12} className="inline" /> {(weeklyReport.summary.water_min ?? 0).toFixed(0)}%
                 </span>
                 <span className="text-green-600" title="Average">
@@ -553,7 +881,7 @@ export default function HistoricalDataPage() {
               </div>
             ) : stats?.water_level && (
               <div className="flex gap-3 text-xs">
-                <span className="text-blue-600" title="Min">
+                <span className="text-orange-600" title="Min">
                   <TrendingDown size={12} className="inline" /> {stats.water_level.min.toFixed(0)}%
                 </span>
                 <span className="text-green-600" title="Average">
@@ -565,8 +893,32 @@ export default function HistoricalDataPage() {
               </div>
             )}
           </div>
-          <div className="text-2xl font-bold text-gray-800">
+          <div className={`text-2xl font-bold ${latestStatuses.water_level ? STATUS_TEXT[latestStatuses.water_level] : "text-gray-800"}`}>
             {latestReading?.water_level != null ? Number(latestReading.water_level).toFixed(0) : "--"}<span className="text-base font-normal text-gray-500">%</span>
+          </div>
+          <div className="flex items-center justify-between mt-1">
+            <div className={`text-[10px] ${breachCounts.water_level > 0 ? "text-amber-600" : "text-gray-400"}`}>
+              {filteredHistory.length === 0
+                ? "No readings in this window"
+                : breachCounts.water_level > 0
+                  ? `${breachCounts.water_level} reading${breachCounts.water_level === 1 ? "" : "s"} out of range`
+                  : "All readings in range"}
+            </div>
+            {trends.water_level && (
+              <span className={`inline-flex items-center gap-0.5 text-[10px] font-semibold px-1.5 py-0.5 rounded-full ${
+                trends.water_level === "up"
+                  ? "text-green-600 bg-green-50"
+                  : trends.water_level === "down"
+                    ? "text-red-600 bg-red-50"
+                    : "text-gray-500 bg-gray-100"
+              }`}>
+                {trends.water_level === "up"
+                  ? <><TrendingUp size={10} /> Rising</>
+                  : trends.water_level === "down"
+                    ? <><TrendingDown size={10} /> Falling</>
+                    : <><Activity size={10} /> Stable</>}
+              </span>
+            )}
           </div>
         </div>
 
@@ -575,10 +927,15 @@ export default function HistoricalDataPage() {
             <div className="flex items-center gap-2 text-gray-500">
               <FlaskConical size={16} className="text-emerald-500" />
               <span className="text-xs font-semibold uppercase tracking-wide">Ammonia</span>
+              {latestStatuses.ammonia && (
+                <span className={`text-[10px] font-bold uppercase tracking-wide px-1.5 py-0.5 rounded-full ${STATUS_PILL[latestStatuses.ammonia]}`}>
+                  {latestStatuses.ammonia === "good" ? "Safe" : latestStatuses.ammonia === "warning" ? "Warning" : "Critical"}
+                </span>
+              )}
             </div>
             {timeRange === "1w" && weeklyReport ? (
               <div className="flex gap-3 text-xs">
-                <span className="text-blue-600" title="Min">
+                <span className="text-orange-600" title="Min">
                   <TrendingDown size={12} className="inline" /> {(weeklyReport.summary.ammonia_min ?? 0).toFixed(2)}
                 </span>
                 <span className="text-green-600" title="Average">
@@ -590,7 +947,7 @@ export default function HistoricalDataPage() {
               </div>
             ) : stats?.ammonia && (
               <div className="flex gap-3 text-xs">
-                <span className="text-blue-600" title="Min">
+                <span className="text-orange-600" title="Min">
                   <TrendingDown size={12} className="inline" /> {stats.ammonia.min.toFixed(2)}
                 </span>
                 <span className="text-green-600" title="Average">
@@ -602,32 +959,77 @@ export default function HistoricalDataPage() {
               </div>
             )}
           </div>
-          <div className="text-2xl font-bold text-gray-800">
+          <div className={`text-2xl font-bold ${latestStatuses.ammonia ? STATUS_TEXT[latestStatuses.ammonia] : "text-gray-800"}`}>
             {latestReading?.ammonia != null ? Number(latestReading.ammonia).toFixed(2) : "--"}<span className="text-base font-normal text-gray-500"> ppm</span>
+          </div>
+          <div className="flex items-center justify-between mt-1">
+            <div className={`text-[10px] ${breachCounts.ammonia > 0 ? "text-amber-600" : "text-gray-400"}`}>
+              {filteredHistory.length === 0
+                ? "No readings in this window"
+                : breachCounts.ammonia > 0
+                  ? `${breachCounts.ammonia} reading${breachCounts.ammonia === 1 ? "" : "s"} out of range`
+                  : "All readings in range"}
+            </div>
+            {trends.ammonia && (
+              <span className={`inline-flex items-center gap-0.5 text-[10px] font-semibold px-1.5 py-0.5 rounded-full ${
+                trends.ammonia === "up"
+                  ? "text-green-600 bg-green-50"
+                  : trends.ammonia === "down"
+                    ? "text-red-600 bg-red-50"
+                    : "text-gray-500 bg-gray-100"
+              }`}>
+                {trends.ammonia === "up"
+                  ? <><TrendingUp size={10} /> Rising</>
+                  : trends.ammonia === "down"
+                    ? <><TrendingDown size={10} /> Falling</>
+                    : <><Activity size={10} /> Stable</>}
+              </span>
+            )}
           </div>
         </div>
       </div>
 
-      {/* Charts - Vertical layout for better readability */}
+      {/* Charts */}
       {filteredHistory.length > 0 ? (
         <div className="space-y-3">
+          <div className="flex items-center justify-between">
+            <h2 className="text-lg font-bold text-gray-800 flex items-center gap-2">
+              <Gauge size={20} className="text-orange-500" />
+              Sensor Trends
+            </h2>
+            <span className="text-xs text-gray-400">
+              Green band = configured safe range · {showMovingAverage ? "dashed line = 7-pt average" : "hint: enable the trend overlay"}
+            </span>
+          </div>
           <TrendCard
             title="Temperature (°C)"
-            data={filteredHistory}
+            data={chartHistory}
             dataKey="temperature"
             stroke="#f97316"
+            range={thresholds.temperature.range}
+            unit="°C"
+            overlayKey={showMovingAverage ? "_tempAvg" : undefined}
+            overlayName="7-pt avg"
           />
           <TrendCard
             title="Water Level (%)"
-            data={filteredHistory}
+            data={chartHistory}
             dataKey="water_level"
             stroke="#2563eb"
+            range={thresholds.water_level.range}
+            unit="%"
+            overlayKey={showMovingAverage ? "_waterAvg" : undefined}
+            overlayName="7-pt avg"
           />
           <TrendCard
             title="Ammonia (ppm)"
-            data={filteredHistory}
+            data={chartHistory}
             dataKey="ammonia"
             stroke="#10b981"
+            range={thresholds.ammonia.range}
+            unit=" ppm"
+            overlayKey={showMovingAverage ? "_ammoniaAvg" : undefined}
+            overlayName="7-pt avg"
           />
         </div>
       ) : (
@@ -635,6 +1037,134 @@ export default function HistoricalDataPage() {
           <History size={40} className="mx-auto mb-3 text-gray-300" />
           <p className="text-gray-600 font-medium">No data for selected time range</p>
           <p className="text-sm text-gray-400 mt-1">Try selecting a different time range.</p>
+        </div>
+      )}
+
+      {/* Window Highlights */}
+      {filteredHistory.length > 0 && (
+        <div className="bg-white rounded-xl border border-gray-100 p-5">
+          <div className="flex items-center justify-between mb-4 flex-wrap gap-2">
+            <h2 className="text-lg font-bold text-gray-800 flex items-center gap-2">
+              <Zap size={20} className="text-amber-500" />
+              Window Highlights
+            </h2>
+            {coveragePct != null && (
+              <span className="text-xs text-gray-500">
+                Est. coverage {coveragePct}% · ~{expectedReadings?.toLocaleString()} readings expected (1/min)
+              </span>
+            )}
+          </div>
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+            {SENSOR_KEYS.map((key, i) => {
+              const meta = PARAM_META[i];
+              const hl = windowHighlights[key];
+              const t = thresholds[key];
+              const statusOf = (value: number): ThresholdStatus => getThresholdStatus(value, t.range, t.isMinOnly);
+              const fmt = (value: number) => `${value.toFixed(meta.decimals)}${meta.unit}`;
+              return (
+                <div key={key} className="bg-gray-50 rounded-xl p-4">
+                  <div className="flex items-center gap-2 mb-3">
+                    <span className="w-7 h-7 rounded-lg bg-white border border-gray-200 flex items-center justify-center">
+                      {createElement(meta.icon, { size: 15, className: meta.tint })}
+                    </span>
+                    <span className="text-xs font-bold uppercase tracking-wide text-gray-600">{meta.label}</span>
+                    <span className="text-[10px] text-gray-400 ml-auto">
+                      safe {t.range.min}–{t.range.max}{meta.unit}
+                    </span>
+                  </div>
+                  <div className="space-y-1.5">
+                    {[
+                      { label: "Peak", icon: <TrendingUp size={12} className="text-green-500" />, what: hl.peak },
+                      { label: "Lowest", icon: <TrendingDown size={12} className="text-orange-500" />, what: hl.low },
+                    ].map(row => {
+                      const status = row.what ? statusOf(row.what.value) : null;
+                      return (
+                        <div key={row.label}>
+                          <div className="flex items-center justify-between text-sm text-gray-600">
+                            <span className="flex items-center gap-1">{row.icon} {row.label}</span>
+                            <span className="font-semibold text-gray-800 flex items-center gap-1.5">
+                              {row.what ? (
+                                <>
+                                  <span className={`w-1.5 h-1.5 rounded-full ${STATUS_DOT[status!]}`} />
+                                  <span className={status ? STATUS_TEXT[status] : ""}>{fmt(row.what.value)}</span>
+                                </>
+                              ) : "—"}
+                            </span>
+                          </div>
+                          <div className="text-[10px] text-gray-400 text-right mt-0.5">
+                            {row.what?.time ? formatFarmDateTime(row.what.time) : ""}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+      {/* Reading Breakdown - recent readings table for non-weekly ranges */}
+      {timeRange !== "1w" && filteredHistory.length > 0 && (
+        <div className="bg-white rounded-xl border border-gray-100 p-5">
+          <h2 className="text-lg font-bold text-gray-800 flex items-center gap-2 mb-4">
+            <History size={20} className="text-orange-500" />
+            Reading Breakdown
+            <span className="ml-auto text-xs font-semibold text-gray-500">
+              Last {Math.min(filteredHistory.length, 15)} readings
+            </span>
+          </h2>
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="bg-gray-50 border-b border-gray-200">
+                  <th className="px-3 py-2.5 text-left text-xs font-bold text-gray-500 uppercase">Time</th>
+                  {SENSOR_KEYS.map((key) => {
+                    const meta = PARAM_META[SENSOR_KEYS.indexOf(key)];
+                    const t = thresholds[key];
+                    return (
+                      <th
+                        key={key}
+                        className="px-3 py-2.5 text-center text-xs font-bold text-gray-500 uppercase"
+                        title={`Safe range ${t.range.min}-${t.range.max}${meta.unit}`}
+                      >
+                        {meta.label}
+                      </th>
+                    );
+                  })}
+                </tr>
+              </thead>
+              <tbody>
+                {filteredHistory.slice(-15).reverse().map((item, i) => (
+                  <tr key={item.timestamp ?? i} className="border-b border-gray-100 last:border-0 hover:bg-gray-50">
+                    <td className="px-3 py-2 text-gray-600 whitespace-nowrap text-xs">
+                      {formatFarmDateTime(item.timestamp)}
+                    </td>
+                    {SENSOR_KEYS.map((key) => {
+                      const meta = PARAM_META[SENSOR_KEYS.indexOf(key)];
+                      const value = item[key];
+                      const num = typeof value === "number" && Number.isFinite(value) ? value : NaN;
+                      const t = thresholds[key];
+                      const status = Number.isFinite(num) ? getThresholdStatus(num, t.range, t.isMinOnly) : null;
+                      return (
+                        <td key={key} className="px-3 py-2 text-center">
+                          {status && Number.isFinite(num) ? (
+                            <span className="inline-flex items-center gap-1.5 justify-center">
+                              <span className={`w-1.5 h-1.5 rounded-full ${STATUS_DOT[status]}`} />
+                              <span className={STATUS_TEXT[status]}>
+                                {num.toFixed(meta.decimals)}{meta.unit}
+                              </span>
+                            </span>
+                          ) : "--"}
+                        </td>
+                      );
+                    })}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
         </div>
       )}
 
@@ -674,7 +1204,7 @@ export default function HistoricalDataPage() {
                   {weeklyReport.daily.map((day) => (
                     <tr key={day.date} className="border-b border-gray-100 last:border-0 hover:bg-gray-50">
                       <td className="px-3 py-2.5 font-medium text-gray-800 whitespace-nowrap">
-                        {new Date(day.date).toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" })}
+                        {formatFarmDate(day.date)}
                       </td>
                       <td className="px-3 py-2.5 text-center text-gray-600">{(day.temp_avg ?? 0).toFixed(1)}°C</td>
                       <td className="px-3 py-2.5 text-center text-gray-500 text-xs">

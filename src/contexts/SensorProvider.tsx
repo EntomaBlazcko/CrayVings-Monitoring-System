@@ -283,7 +283,12 @@ function useSettingsManager(): SensorSettingsState & { refetch: () => void; save
         settingsLoading: false,
         settingsError: null,
       }));
-    } catch {
+    } catch (error) {
+      // If it's a 401 unauthorized error, let the API interceptor handle it
+      if (isAxiosError(error) && error.response?.status === 401) {
+        // Re-throw to allow the API interceptor to clear tokens and dispatch unauthorized event
+        return Promise.reject(error);
+      }
       setState((prev) => ({
         ...prev,
         settingsLoading: false,
@@ -328,7 +333,12 @@ function useSettingsManager(): SensorSettingsState & { refetch: () => void; save
       savedTimeoutRef.current = setTimeout(() => {
         setState((prev) => ({ ...prev, settingsSaved: false }));
       }, 2000);
-    } catch {
+    } catch (error) {
+      // If it's a 401 unauthorized error, let the API interceptor handle it
+      if (isAxiosError(error) && error.response?.status === 401) {
+        // Re-throw to allow the API interceptor to clear tokens and dispatch unauthorized event
+        return Promise.reject(error);
+      }
       setState((prev) => ({
       ...prev,
       settingsSaving: false,
@@ -397,6 +407,11 @@ function useLogsManager(): LogsState & { refetch: () => void; setPage: (page: nu
       }));
     } catch (error) {
       if (isAxiosError(error) && error.code === "ERR_CANCELED") return;
+      // If it's a 401 unauthorized error, let the API interceptor handle it
+      if (isAxiosError(error) && error.response?.status === 401) {
+        // Re-throw to allow the API interceptor to clear tokens and dispatch unauthorized event
+        return Promise.reject(error);
+      }
       setState((prev) => ({
         ...prev,
         logsLoading: false,
@@ -535,6 +550,11 @@ function useActivityLogsManager() {
       }
     } catch (error) {
       if (isAxiosError(error) && error.code === "ERR_CANCELED") return;
+      // If it's a 401 unauthorized error, let the API interceptor handle it
+      if (isAxiosError(error) && error.response?.status === 401) {
+        // Re-throw to allow the API interceptor to clear tokens and dispatch unauthorized event
+        return Promise.reject(error);
+      }
       if (isMountedRef.current) {
         setState((prev) => ({
           ...prev,

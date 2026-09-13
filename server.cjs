@@ -15,6 +15,7 @@ const { z } = require("zod");
 const crypto = require("crypto");
 const rateLimit = require("express-rate-limit");
 const nodemailer = require("nodemailer");
+const axios = require("axios");
 require("dotenv").config();
 
 // ========================
@@ -250,7 +251,27 @@ function safeEqual(a, b) {
   return crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b));
 }
 
-async function sendOtpEmail(to, code) {
+// Single merged email for account deletion: carries the OTP code AND tells the
+// account owner exactly who requested the deletion and which account is targeted,
+// so no separate after-the-fact notification is needed. OTP_EMAIL determines the
+// recipient; context (actor/target) is embedded from the request.
+async function sendOtpEmail({ to, code, actorUsername, actorName, targetUsername, deletedByOwner }) {
+  const actorLabel = actorName && actorName.trim()
+    ? `${actorName.trim()} (${actorUsername})`
+    : actorUsername;
+
+  const namesText = deletedByOwner
+    ? `Account to be deleted: ${targetUsername}`
+    : `Admin account that requested the deletion: ${actorLabel}
+Account to be deleted: ${targetUsername}
+
+If you did not expect this request, we recommend reviewing recent account activity within the system.`;
+
+  const namesHtmlRows = deletedByOwner
+    ? `<tr style="background:#fef3ec;"><td style="padding:8px 12px;font-weight:bold;">Account to be deleted</td><td style="padding:8px 12px;">${escapeHtml(targetUsername)}</td></tr>`
+    : `<tr style="background:#fef3ec;"><td style="padding:8px 12px;font-weight:bold;">Admin account that requested the deletion</td><td style="padding:8px 12px;">${escapeHtml(actorLabel)}</td></tr>
+        <tr><td style="padding:8px 12px;font-weight:bold;">Account to be deleted</td><td style="padding:8px 12px;">${escapeHtml(targetUsername)}</td></tr>`;
+
   if (!smtpTransporter) {
     // No SMTP configured — dev fallback: log the code, DO NOT return it in JSON.
     const mode = process.env.NODE_ENV !== "production" && process.env.DEV_OTP_CONSOLE_FALLBACK !== "false";
@@ -262,11 +283,93 @@ async function sendOtpEmail(to, code) {
   await smtpTransporter.sendMail({
     from: process.env.SMTP_FROM || process.env.SMTP_USER,
     to,
-    subject: "Your account-deletion confirmation code",
-    text: `Your CRAYvings confirmation code is: ${code}\nIt expires in 10 minutes. Do not share this code with anyone.\nIf you did not request this, ignore this email.`,
-    html: `<p>Your CRAYvings account-deletion confirmation code is:</p><p style="font-size:24px;letter-spacing:6px;font-weight:bold">${code}</p><p>It expires in 10 minutes. Do not share it with anyone.<br/>If you did not request this, ignore this email.</p>`,
+    subject: "Account Deletion Verification — CRAYvings Monitoring System",
+    text: `Dear Administrator,
+
+You are receiving this message because a request was made to permanently delete a user account in the CRAYvings Monitoring System.
+
+${namesText}
+
+To complete this action, please enter the six-digit verification code below:
+
+    ${code}
+
+This code will expire in 10 minutes and is intended for the account owner only. For your security, do not share it with anyone. CRAYvings personnel will never ask you for this code.
+
+If you did not initiate this request, no further action is required. If the request was unexpected, we recommend reviewing recent account activity within the system.
+
+Thank you,
+
+CRAYvings Monitoring System`,
+    html: `<div style="font-family:Arial,Helvetica,sans-serif;max-width:600px;margin:0 auto;color:#374151;font-size:14px;line-height:1.6;">
+  <div style="background:linear-gradient(90deg,#d94b1e,#ef6a2e);color:#ffffff;padding:18px 24px;font-size:18px;font-weight:bold;border-radius:8px 8px 0 0;">
+    CRAYvings Monitoring System
+  </div>
+  <div style="border:1px solid #e5e7eb;border-top:none;padding:24px;border-radius:0 0 8px 8px;">
+    <p>Dear Administrator,</p>
+    <p>You are receiving this message because a request was made to <strong>permanently delete a user account</strong> in the CRAYvings Monitoring System.</p>
+    <table style="width:100%;border-collapse:collapse;margin:16px 0;">
+      ${namesHtmlRows}
+    </table>
+    <p>To complete this action, please enter the six-digit verification code below:</p>
+    <div style="background:#fef3ec;border:2px dashed #d94b1e;border-radius:8px;padding:16px;text-align:center;margin:20px 0;">
+      <span style="font-family:'Courier New',monospace;font-size:32px;font-weight:bold;letter-spacing:8px;color:#d94b1e;">${code}</span>
+    </div>
+    <p style="color:#ef6a2e;font-weight:bold;">This code will expire in 10 minutes and is intended for the account owner only.</p>
+    <p>For your security, do not share this code with anyone. CRAYvings personnel will never ask you for it.</p>
+    ${deletedByOwner ? "" : "<p>If you did not expect this request, we recommend reviewing recent account activity within the system.</p>"}
+    <p>If you did not initiate this request, no further action is required. If the request was unexpected, we recommend reviewing recent account activity within the system.</p>
+    <p>Thank you,</p>
+    <p style="font-weight:bold;">CRAYvings Monitoring System</p>
+  </div>
+</div>`,
   });
   return { delivered: true };
+}
+
+// =============================================================================
+// PROTECTED OWNER ADMIN
+// =============================================================================
+// The owner is the single privileged account (bootstrapped on a fresh DB) and
+// can never be deleted — neither directly nor as "the last admin" — so the
+// system can't accidentally be locked out. Identified purely from env; no
+// credential is hardcoded in source.
+const OWNER_USERNAME = (process.env.ADMIN_USERNAME || "").trim();
+const OWNER_EMAIL = (process.env.ADMIN_EMAIL || "").trim();
+
+// True when the given user IS the owner account (matched on username or email).
+function isOwnerUser(user) {
+  return Boolean(
+    (OWNER_USERNAME && user.username === OWNER_USERNAME) ||
+    (OWNER_EMAIL && user.email === OWNER_EMAIL)
+  );
+}
+
+// Returns an error message when a user must NOT be deleted (the owner, or the
+// last remaining admin), otherwise null. `executor` lets the guard run inside a
+// caller's transaction without leaking reads out of that transaction.
+async function assertUserDeletable(userRow, executor = pool) {
+  if (isOwnerUser(userRow)) {
+    return "The owner account cannot be deleted.";
+  }
+  if (userRow.role === "admin") {
+    const count = await executor.query(
+      "SELECT COUNT(*)::int AS n FROM users WHERE role = 'admin' AND status = 'active'"
+    );
+    if (count.rows[0].n <= 1) return "Cannot delete the last admin account.";
+  }
+  return null;
+}
+
+// Escapes a value for safe embedding inside the HTML email template.
+function escapeHtml(value) {
+  return String(value ?? "").replace(/[&<>"']/g, (ch) => ({
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    '"': "&quot;",
+    "'": "&#39;",
+  })[ch]);
 }
 
 // =============================================================================
@@ -360,6 +463,356 @@ function zodFieldErrors(err) {
 }
 
 // =============================================================================
+// SMS ALERTS (HTTPSMS)
+// =============================================================================
+// Alerts and system-status updates are sent through https://httpsms.com — an
+// Android phone running the HttpSms app acts as the SMS gateway. The gateway
+// SIM's number is HTTPSMS_FROM (E.164, Philippine: +639XXXXXXXXXX). Recipients
+// are the active authorized_recipients rows managed from Settings. Every send
+// attempt (success or failure) is recorded in sms_logs for auditing.
+
+const HTTPSMS_API_KEY = (process.env.HTTPSMS_API_KEY || "").trim();
+const HTTPSMS_FROM = (process.env.HTTPSMS_FROM || "").trim();
+const HTTPSMS_API_URL = "https://api.httpsms.com/v1/messages/send";
+const HTTPSMS_MESSAGES_URL = "https://api.httpsms.com/v1/messages";
+
+// Accepts a Philippine number written the local way (09XXXXXXXXX), the E.164 way
+// (+639XXXXXXXXX), or with a missing leading plus (639XXXXXXXXX) — strips spaces,
+// dashes, and parentheses — and returns the canonical +639XXXXXXXXX, or null when
+// the number does not look like a valid PH mobile number.
+function normalizePhNumber(input) {
+  const n = String(input || "").trim().replace(/[\s\-()]/g, "");
+  if (/^09\d{9}$/.test(n)) return `+63${n.slice(1)}`;   // 09XXXXXXXXX (11 digits)
+  if (/^\+639\d{9}$/.test(n)) return n;                  // already E.164
+  if (/^639\d{9}$/.test(n)) return `+${n}`;              // missing plus
+  return null;
+}
+
+// Cooldown between repeated critical SMS per sensor (ms)
+const SMS_COOLDOWN_MS = parseInt(process.env.SMS_COOLDOWN_MS) || 300000;
+const HOURLY_SMS_ENABLED = process.env.HOURLY_SMS_ENABLED !== "false";
+const HOURLY_SMS_INTERVAL_MS = parseInt(process.env.HOURLY_SMS_INTERVAL_MS) || 3600000;
+const DEVICE_DISCONNECT_ENABLED = process.env.DEVICE_DISCONNECT_ENABLED !== "false";
+const DISCONNECT_STALE_MS = parseInt(process.env.DISCONNECT_STALE_MS) || 30000;
+// After a device recovers (reconnects after a disconnect), it must stay online
+// at least this long before a NEW disconnect SMS becomes eligible again — keeps
+// a briefly-flickering ESP32 from spamming the same alert over and over.
+const DISCONNECT_REARM_MS = parseInt(process.env.DISCONNECT_REARM_MS) || 300000;
+
+// Daily SMS budget: counts every real send today (0 disables the cap). Once the
+// budget is exhausted, producers log "capped" rows instead of sending, so the
+// audit trail stays honest. Manual/test SMS bypass this cap by design.
+const rawSmsCap = parseInt(process.env.SMS_DAILY_CAP, 10);
+const SMS_DAILY_CAP = Number.isFinite(rawSmsCap) && rawSmsCap >= 0 ? rawSmsCap : 100;
+
+// Delivery poller: reconciles "queued" sms_logs rows against the httpsms message
+// list endpoint and marks them delivered/failed. Retries happen inside httpsms
+// (send_attempt_count/max_send_attempts); we only observe the final outcome.
+const SMS_DELIVERY_POLL_MS = parseInt(process.env.SMS_DELIVERY_POLL_MS, 10) || 45000;
+// Only reconcile messages sent within this window — older sends are settled.
+const SMS_POLL_WINDOW_MS = 6 * 60 * 60 * 1000;
+// Purge sms_logs rows older than this many days (0 disables purging)
+const rawRetention = parseInt(process.env.SMS_RETENTION_DAYS, 10);
+const SMS_RETENTION_DAYS = Number.isFinite(rawRetention) && rawRetention >= 0 ? rawRetention : 30;
+
+// In-memory SMS mute (resets on restart) — suppresses all SMS producers.
+let smsMuteUntil = null;
+function isSmsMuted() {
+  if (smsMuteUntil && new Date() >= new Date(smsMuteUntil)) smsMuteUntil = null;
+  return Boolean(smsMuteUntil && new Date() < new Date(smsMuteUntil));
+}
+
+// Per-sensor cooldown map (last critical SMS wall-clock ms) + disconnect dedup
+const lastSmsSent = {};
+const disconnectedDevices = new Set();
+// Wall-clock ms when a device last recovered (fresh reading after a disconnect);
+// used to debounce reconnect-flapping devices.
+const deviceOnlineSince = new Map();
+
+// Formal, farmer-friendly timestamp (Asia/Manila), e.g. "September 13, 2026 8:22 PM".
+function formatSmsTimestamp(value) {
+  const d = value ? new Date(value) : new Date();
+  if (Number.isNaN(d.getTime())) return "unknown time";
+  try {
+    const dateParts = new Intl.DateTimeFormat("en-PH", {
+      month: "long", day: "numeric", year: "numeric",
+      timeZone: "Asia/Manila",
+    }).formatToParts(d);
+    const timeParts = new Intl.DateTimeFormat("en-PH", {
+      hour: "numeric", minute: "2-digit", hour12: true,
+      timeZone: "Asia/Manila",
+    }).formatToParts(d);
+    const pick = (parts, type) => parts.find((p) => p.type === type)?.value ?? "";
+    return `${pick(dateParts, "month")} ${pick(dateParts, "day")}, ${pick(dateParts, "year")} ${pick(timeParts, "hour")}:${pick(timeParts, "minute")} ${pick(timeParts, "dayPeriod")}`;
+  } catch {
+    return d.toLocaleString("en-PH");
+  }
+}
+
+// Same formal format current time.
+function formatSmsTime() {
+  return formatSmsTimestamp(new Date());
+}
+
+// Converts a raw seconds value into a human-readable duration ("45 minutes").
+function formatSmsDuration(seconds) {
+  if (!Number.isFinite(seconds) || seconds <= 0) return "0 seconds";
+  const mins = Math.floor(seconds / 60);
+  if (mins < 1) return `${seconds} seconds`;
+  const hrs = Math.floor(mins / 60);
+  if (hrs < 1) return `${mins} minute${mins === 1 ? "" : "s"}`;
+  const remMins = mins % 60;
+  return remMins > 0 ? `${hrs} hour${hrs === 1 ? "" : "s"} and ${remMins} minute${remMins === 1 ? "" : "s"}` : `${hrs} hour${hrs === 1 ? "" : "s"}`;
+}
+
+function buildSmsMessage(type, body) {
+  return `${type}\n${body}\nDate: ${formatSmsTime()}`;
+}
+
+// POST to httpsms; resolves with the provider's message id (async delivery).
+async function sendHttpsms({ to, content }) {
+  if (!HTTPSMS_API_KEY || !HTTPSMS_FROM) {
+    const err = new Error("HTTPSMS_API_KEY / HTTPSMS_FROM not configured");
+    err.missingConfig = true;
+    throw err;
+  }
+  const response = await axios.post(
+    HTTPSMS_API_URL,
+    { from: HTTPSMS_FROM, to, content },
+    { headers: { "x-api-key": HTTPSMS_API_KEY } }
+  );
+  return response.data?.data?.id || null;
+}
+
+// Records one send attempt in sms_logs; never throws so a logging failure
+// cannot break the SMS flow.
+async function logSms(phone, message, status, error, smsId = null) {
+  try {
+    await pool.query(
+      "INSERT INTO sms_logs (recipient_phone, message, status, error_message, sms_id) VALUES ($1, $2, $3, $4, $5)",
+      [phone, message, status, error || null, smsId || null]
+    );
+  } catch (logErr) {
+    console.error(`[${new Date().toISOString()}] Failed to log SMS:`, logErr.message);
+  }
+}
+
+async function getActiveRecipients() {
+  const result = await pool.query("SELECT phone_number, name FROM authorized_recipients WHERE is_active = true");
+  return result.rows;
+}
+
+// Fans out to every active recipient, logging each attempt. {sent,total}.
+// Honors the daily SMS cap (SMS_DAILY_CAP, 0 = unlimited). Sends are logged as
+// "queued" (accepted by httpsms); the delivery poller reconciles them later.
+async function sendSmsToRecipients(content) {
+  const recipients = await getActiveRecipients();
+  if (recipients.length === 0) {
+    console.warn(`[${new Date().toISOString()}] No active SMS recipients — SMS not sent`);
+    return { sent: 0, total: 0 };
+  }
+  let sent = 0;
+  let usedToday = 0;
+  if (SMS_DAILY_CAP > 0) {
+    const used = await pool.query(
+      "SELECT COUNT(*)::int AS n FROM sms_logs WHERE sent_at >= date_trunc('day', NOW()) AND status <> 'capped'"
+    );
+    usedToday = used.rows[0].n;
+  }
+  for (const recipient of recipients) {
+    if (SMS_DAILY_CAP > 0 && usedToday >= SMS_DAILY_CAP) {
+      await logSms(recipient.phone_number, content, "capped", `Daily SMS cap (${SMS_DAILY_CAP}) reached`, null);
+      continue;
+    }
+    try {
+      const smsId = await sendHttpsms({ to: recipient.phone_number, content });
+      await logSms(recipient.phone_number, content, "queued", null, smsId);
+      sent += 1;
+      usedToday += 1;
+    } catch (err) {
+      console.error(`[${new Date().toISOString()}] SMS failed to ${recipient.phone_number}:`, err.message);
+      await logSms(recipient.phone_number, content, "failed", err.message);
+    }
+  }
+  return { sent, total: recipients.length };
+}
+
+// GET /v1/messages for one contact (owner = gateway SIM, sorted newest first).
+// Returns the httpsms message array, or [] when the call fails.
+async function fetchHttpsmsMessages(contact) {
+  try {
+    const response = await axios.get(HTTPSMS_MESSAGES_URL, {
+      params: { owner: HTTPSMS_FROM, contact, skip: 0, limit: 25 },
+      headers: { "x-api-key": HTTPSMS_API_KEY },
+    });
+    return response.data?.data || [];
+  } catch (err) {
+    console.error(`[${new Date().toISOString()}] httpsms message lookup failed for ${contact}:`, err.message);
+    return [];
+  }
+}
+
+// Reconciles "queued" sms_logs rows against httpsms so each SMS reaches a real
+// terminal state (delivered with delivered_at, or failed with failure_reason).
+async function pollUndeliveredSms() {
+  if (!HTTPSMS_API_KEY || !HTTPSMS_FROM) return;
+  try {
+    const result = await pool.query(
+      `SELECT id, recipient_phone, sms_id FROM sms_logs
+        WHERE status = 'queued' AND sms_id IS NOT NULL
+          AND sent_at >= NOW() - ($1 || ' seconds')::interval
+        ORDER BY id ASC LIMIT 50`,
+      [Math.floor(SMS_POLL_WINDOW_MS / 1000)]
+    );
+    if (result.rows.length === 0) return;
+    // Group by recipient so each contact is queried only once per tick.
+    const rowsByPhone = new Map();
+    for (const row of result.rows) {
+      const list = rowsByPhone.get(row.recipient_phone) || [];
+      list.push(row);
+      rowsByPhone.set(row.recipient_phone, list);
+    }
+    for (const [phone, rows] of rowsByPhone) {
+      const messages = await fetchHttpsmsMessages(phone);
+      if (messages.length === 0) continue;
+      const byId = new Map(messages.map((m) => [String(m.id), m]));
+      for (const row of rows) {
+        const msg = byId.get(String(row.sms_id));
+        if (!msg) continue; // not yet queryable — stays queued
+        try {
+          if (msg.delivered_at) {
+            await pool.query(
+              "UPDATE sms_logs SET status = 'delivered', delivered_at = $1, failure_reason = NULL WHERE id = $2",
+              [new Date(msg.delivered_at).toISOString(), row.id]
+            );
+          } else if (msg.failed_at || msg.status === "failed" || msg.failure_reason) {
+            await pool.query(
+              "UPDATE sms_logs SET status = 'failed', failure_reason = $1 WHERE id = $2",
+              [msg.failure_reason || msg.status || "failed", row.id]
+            );
+          }
+        } catch (updateErr) {
+          console.error(`[${new Date().toISOString()}] Error updating sms_logs row ${row.id}:`, updateErr.message);
+        }
+      }
+    }
+  } catch (err) {
+    console.error(`[${new Date().toISOString()}] SMS delivery poller error:`, err.message);
+  }
+}
+
+// Periodic housekeeping: prunes stale in-memory cooldown/rearm state and purges
+// old sms_logs rows beyond the retention window.
+function runSmsMaintenance() {
+  const cutoff = Date.now() - 12 * 60 * 60 * 1000;
+  for (const key of Object.keys(lastSmsSent)) {
+    if (lastSmsSent[key] < cutoff) delete lastSmsSent[key];
+  }
+  for (const [deviceId, sinceOnline] of deviceOnlineSince) {
+    if (sinceOnline < cutoff) deviceOnlineSince.delete(deviceId);
+  }
+  if (SMS_RETENTION_DAYS > 0) {
+    pool
+      .query("DELETE FROM sms_logs WHERE sent_at < NOW() - ($1 || ' days')::interval", [SMS_RETENTION_DAYS])
+      .catch((err) => console.error(`[${new Date().toISOString()}] SMS retention cleanup error:`, err.message));
+  }
+}
+
+// Latest sensor readings + per-sensor threshold status, or null when no data.
+async function buildStatusSms() {
+  try {
+    const sensorResult = await pool.query("SELECT * FROM sensors ORDER BY timestamp DESC LIMIT 1");
+    if (sensorResult.rows.length === 0) return null;
+    const settingsResult = await pool.query("SELECT * FROM sensor_settings LIMIT 1");
+    const settings = settingsResult.rows[0] || { temp_min: 20, temp_max: 31, water_level_min: 10, water_level_max: 100, ammonia_min: 0.25, ammonia_max: 1 };
+    const row = sensorResult.rows[0];
+    const temp = row.temperature !== undefined ? Number(row.temperature) : null;
+    const water = row.water_level !== undefined ? Number(row.water_level) : null;
+    const ammonia = row.ammonia !== undefined ? Number(row.ammonia) : null;
+
+    const tempStatus = temp !== null && temp >= 0.0001 ? getThresholdStatus(temp, Number(settings.temp_min), Number(settings.temp_max)) : null;
+    const waterStatus = water !== null && water >= 0 ? getThresholdStatus(water, Number(settings.water_level_min), Number(settings.water_level_max)) : null;
+    const ammoniaStatus = ammonia !== null && ammonia >= 0 ? getThresholdStatus(ammonia, Number(settings.ammonia_min), Number(settings.ammonia_max)) : null;
+
+    const statusLabel = (s) => (s === "good" ? "NORMAL" : s === "warning" ? "WARNING" : "CRITICAL");
+
+    const lines = [
+      "CRAYVINGS AQUACULTURE MONITORING",
+      "HOURLY STATUS REPORT",
+      formatSmsTime(),
+      "",
+      `Temperature: ${temp !== null && temp >= 0.0001 ? `${temp}°C` : "Not available"} ${tempStatus ? `(${statusLabel(tempStatus)})` : ""}`,
+      `Water Level: ${water !== null && water >= 0 ? `${water}%` : "Not available"} ${waterStatus ? `(${statusLabel(waterStatus)})` : ""}`,
+      `Ammonia: ${ammonia !== null && ammonia >= 0 ? `${ammonia} ppm` : "Not available"} ${ammoniaStatus ? `(${statusLabel(ammoniaStatus)})` : ""}`,
+      "",
+      "SAFE RANGES",
+      `Temperature: ${settings.temp_min}°C - ${settings.temp_max}°C`,
+      `Water Level: ${settings.water_level_min}% - ${settings.water_level_max}%`,
+      `Ammonia: ${settings.ammonia_min} - ${settings.ammonia_max} ppm`,
+      "",
+    ];
+
+    const breached = [tempStatus, waterStatus, ammoniaStatus].filter((s) => s && s !== "good");
+    if (breached.length === 0) {
+      lines.push("STATUS: All readings are within safe ranges.");
+    } else {
+      lines.push(`STATUS: Attention required — ${breached.length} reading(s) out of range.`);
+    }
+    lines.push("Crayvings Monitoring System");
+    return lines.join("\n");
+  } catch (err) {
+    console.error(`[${new Date().toISOString()}] Error building status SMS:`, err.message);
+    return null;
+  }
+}
+
+// Scheduled hourly status update (skips when muted or no recent readings).
+async function sendHourlyStatusUpdate() {
+  if (isSmsMuted()) return { sent: 0, total: 0, muted: true };
+  const content = await buildStatusSms();
+  if (!content) return { sent: 0, total: 0 };
+  return sendSmsToRecipients(content);
+}
+
+// Monitors devices.last_seen; notifies once per disconnect, re-arms on reconnect.
+async function checkDeviceDisconnects() {
+  if (!DEVICE_DISCONNECT_ENABLED || isSmsMuted()) return;
+  try {
+    const staleSeconds = Math.max(5, Math.floor(DISCONNECT_STALE_MS / 1000));
+    const result = await pool.query(
+      `SELECT device_id, last_seen FROM devices WHERE last_seen < NOW() - ($1 || ' seconds')::interval`,
+      [staleSeconds]
+    );
+    for (const row of result.rows) {
+      if (disconnectedDevices.has(row.device_id)) continue;
+      // Skip devices whose recovery was too recent: a briefly-flapping ESP32
+      // must stay online steadily for DISCONNECT_REARM_MS before a new
+      // disconnect SMS is allowed, otherwise every blip re-fires the alert.
+      const sinceOnline = deviceOnlineSince.get(row.device_id);
+      if (sinceOnline !== undefined && Date.now() - sinceOnline < DISCONNECT_REARM_MS) continue;
+      disconnectedDevices.add(row.device_id);
+      const content = buildSmsMessage(
+        "CRAYVINGS AQUACULTURE MONITORING — DEVICE ALERT",
+        [
+          `Device "${row.device_id}" is OFFLINE.`,
+          `No sensor data received for approximately ${formatSmsDuration(staleSeconds)}.`,
+          `Last reading was received at ${formatSmsTimestamp(row.last_seen)}.`,
+          "",
+          "Please check the device power and network connection.",
+        ].join("\n")
+      );
+      await sendSmsToRecipients(content);
+      await pool.query(
+        "INSERT INTO system_logs (action, parameter, old_value, new_value) VALUES ($1, $2, $3, $4)",
+        ["Device Disconnect", String(row.device_id), "last_seen stale", `> ${staleSeconds}s`]
+      );
+    }
+  } catch (err) {
+    console.error(`[${new Date().toISOString()}] Error checking device disconnects:`, err.message);
+  }
+}
+
+// =============================================================================
 // THRESHOLD STATUS EVALUATION
 // =============================================================================
 // "good" within [min,max]; "warning" outside but within 15% of range size;
@@ -410,8 +863,14 @@ const ALERT_COOLDOWN_MS = 120000;
     // Session token expiry (24-hour expiration)
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS token_expires_at TIMESTAMP`);
 
+    // Alert acknowledgement (Confirm / Allow) tracked directly on each alert row
+    await pool.query(`ALTER TABLE system_logs ADD COLUMN IF NOT EXISTS ack_status VARCHAR(20)`);
+    await pool.query(`ALTER TABLE system_logs ADD COLUMN IF NOT EXISTS acknowledged_at TIMESTAMP`);
+    await pool.query(`ALTER TABLE system_logs ADD COLUMN IF NOT EXISTS acknowledged_by VARCHAR(100)`);
+
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_system_logs_timestamp ON system_logs (timestamp DESC)`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_system_logs_action ON system_logs (action)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_system_logs_ack_status ON system_logs (ack_status)`);
     
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_sensors_timestamp ON sensors (timestamp DESC)`);
     
@@ -510,6 +969,11 @@ app.post("/sensor", async (req, res) => {
       `INSERT INTO devices (device_id, last_seen) VALUES ($1, $2) ON CONFLICT (device_id) DO UPDATE SET last_seen = $2`,
       [device_id, ts]
     );
+    // A fresh reading means the device is online again: re-arm its disconnect
+    // alert and timestamp the recovery so reconnecting flaps don't re-alert.
+    if (disconnectedDevices.delete(device_id)) {
+      deviceOnlineSince.set(device_id, Date.now());
+    }
     const result = await pool.query(
       `INSERT INTO sensors (device_id, temperature, water_level, ammonia, timestamp) VALUES ($1, $2, $3, $4, $5) RETURNING *`,
       [device_id, Number(temperature ?? 0), Number(water_level ?? 0), Number(ammonia ?? 0), ts]
@@ -569,6 +1033,31 @@ app.post("/sensor", async (req, res) => {
           // Log the alert to system_logs
           await pool.query(`INSERT INTO system_logs (action, parameter, old_value, new_value) VALUES ($1, $2, $3, $4)`,
             ["Alert", sensor.key, direction, sensor.val]);
+
+          // Critical readings fan out an SMS alert (cooldown- and mute-aware)
+          if (status === "critical" && !isSmsMuted()) {
+            const smsKey = `${device_id}:${sensor.key}`;
+            if (nowTs - (lastSmsSent[smsKey] || 0) >= SMS_COOLDOWN_MS) {
+              lastSmsSent[smsKey] = nowTs;
+              const unit = sensor.key === "Temperature" ? "°C" : sensor.key === "Water Level" ? "%" : " ppm";
+              const breachedLimit = sensor.val < sensor.min ? sensor.min : sensor.max;
+              const smsContent = buildSmsMessage(
+                "CRAYVINGS AQUACULTURE MONITORING — CRITICAL ALERT",
+                [
+                  `CRITICAL: ${sensor.key} is critically ${direction === "Low" ? "LOW" : "HIGH"}.`,
+                  `Device: ${device_id}`,
+                  `Current Reading: ${sensor.val}${unit}`,
+                  `Safe Range: ${sensor.min}${unit} to ${sensor.max}${unit}`,
+                  `Breached Limit: ${breachedLimit}${unit}`,
+                  "",
+                  "Immediate action is recommended to protect your stock.",
+                ].join("\n")
+              );
+              sendSmsToRecipients(smsContent).catch((smsErr) =>
+                console.error(`[${new Date().toISOString()}] Critical SMS error:`, smsErr.message)
+              );
+            }
+          }
 
           // Update last_alerts (upsert) and in-memory dedup state
           await pool.query(
@@ -767,6 +1256,184 @@ app.get("/report/weekly", requireAuth, async (req, res) => {
 });
 
 // ========================
+// RANGE REPORT ENDPOINT
+// ========================
+
+// GET /report/range - aggregated report for a custom window.
+// ?hours=N (positive int) -> last N hours (hourly buckets when N <= 24);
+// omitted/0 -> all time (daily buckets). Exact DB aggregates, admin gated.
+app.get("/report/range", requireAdmin, async (req, res) => {
+  try {
+    const parsedHours = parseInt(req.query.hours);
+    const hasHours = Number.isFinite(parsedHours) && parsedHours > 0;
+    const hours = hasHours ? parsedHours : null;
+    const bucket = hasHours && hours <= 24 ? "hour" : "day";
+    const timeFilter = hasHours ? `WHERE timestamp >= NOW() - INTERVAL '${hours} hours'` : "";
+    const logTimeFilter = hasHours
+      ? ` AND timestamp >= NOW() - INTERVAL '${hours} hours'`
+      : "";
+
+    const bucketExpr =
+      bucket === "hour"
+        ? `to_char(date_trunc('hour', timestamp), 'YYYY-MM-DD"T"HH24:00')`
+        : `to_char(date_trunc('day', timestamp), 'YYYY-MM-DD')`;
+
+    let summaryResult;
+    try {
+      summaryResult = await pool.query(`
+        SELECT
+          COALESCE(AVG(temperature) FILTER (WHERE temperature > 0), 0)::float AS temp_avg,
+          COALESCE(MIN(temperature) FILTER (WHERE temperature > 0), 0)::float AS temp_min,
+          COALESCE(MAX(temperature) FILTER (WHERE temperature > 0), 0)::float AS temp_max,
+          COALESCE(AVG(water_level) FILTER (WHERE water_level >= 0), 0)::float AS water_avg,
+          COALESCE(MIN(water_level) FILTER (WHERE water_level >= 0), 0)::float AS water_min,
+          COALESCE(MAX(water_level) FILTER (WHERE water_level >= 0), 0)::float AS water_max,
+          COALESCE(AVG(ammonia) FILTER (WHERE ammonia >= 0), 0)::float AS ammonia_avg,
+          COALESCE(MIN(ammonia) FILTER (WHERE ammonia >= 0), 0)::float AS ammonia_min,
+          COALESCE(MAX(ammonia) FILTER (WHERE ammonia >= 0), 0)::float AS ammonia_max,
+          COUNT(*) AS total_readings
+        FROM sensors
+        ${timeFilter}
+      `);
+    } catch (err) {
+      console.error(`[${new Date().toISOString()}] Range summary query failed:`, err.message);
+      summaryResult = { rows: [{ temp_avg: 0, temp_min: 0, temp_max: 0, water_avg: 0, water_min: 0, water_max: 0, ammonia_avg: 0, ammonia_min: 0, ammonia_max: 0, total_readings: 0 }] };
+    }
+
+    let bucketsResult;
+    try {
+      bucketsResult = await pool.query(`
+        SELECT
+          ${bucketExpr} AS label,
+          COALESCE(AVG(temperature) FILTER (WHERE temperature > 0), 0)::float AS temp_avg,
+          COALESCE(MIN(temperature) FILTER (WHERE temperature > 0), 0)::float AS temp_min,
+          COALESCE(MAX(temperature) FILTER (WHERE temperature > 0), 0)::float AS temp_max,
+          COALESCE(AVG(water_level) FILTER (WHERE water_level >= 0), 0)::float AS water_avg,
+          COALESCE(MIN(water_level) FILTER (WHERE water_level >= 0), 0)::float AS water_min,
+          COALESCE(MAX(water_level) FILTER (WHERE water_level >= 0), 0)::float AS water_max,
+          COALESCE(AVG(ammonia) FILTER (WHERE ammonia >= 0), 0)::float AS ammonia_avg,
+          COALESCE(MIN(ammonia) FILTER (WHERE ammonia >= 0), 0)::float AS ammonia_min,
+          COALESCE(MAX(ammonia) FILTER (WHERE ammonia >= 0), 0)::float AS ammonia_max,
+          COUNT(*) AS readings
+        FROM sensors
+        ${timeFilter}
+        GROUP BY label
+        ORDER BY label DESC
+        LIMIT 1000
+      `);
+    } catch (err) {
+      console.error(`[${new Date().toISOString()}] Range buckets query failed:`, err.message);
+      bucketsResult = { rows: [] };
+    }
+
+    // Per-bucket alert counts from system_logs (matches bucket label format).
+    let bucketAlertsMap = {};
+    try {
+      const bucketAlertsResult = await pool.query(`
+        SELECT ${bucketExpr} AS label, COUNT(*) AS count
+        FROM system_logs
+        WHERE action = 'Alert'${logTimeFilter}
+        GROUP BY label
+      `);
+      bucketAlertsResult.rows.forEach(row => {
+        bucketAlertsMap[row.label] = parseInt(row.count) || 0;
+      });
+    } catch (err) {
+      console.error(`[${new Date().toISOString()}] Range bucket alerts query failed:`, err.message);
+      bucketAlertsMap = {};
+    }
+
+    let byParameter = {};
+    try {
+      const alertsByParamResult = await pool.query(`
+        SELECT parameter, COUNT(*) AS count
+        FROM system_logs
+        WHERE action = 'Alert'${logTimeFilter}
+        GROUP BY parameter
+      `);
+      alertsByParamResult.rows.forEach(row => { byParameter[row.parameter] = parseInt(row.count) || 0; });
+    } catch (err) {
+      console.error(`[${new Date().toISOString()}] Range alerts by param query failed:`, err.message);
+      byParameter = {};
+    }
+
+    let byAction = {};
+    try {
+      const logActionsResult = await pool.query(`
+        SELECT action, COUNT(*)::int AS count
+        FROM system_logs
+        WHERE 1=1${logTimeFilter}
+        GROUP BY action
+      `);
+      logActionsResult.rows.forEach(row => { byAction[row.action] = row.count; });
+    } catch (err) {
+      console.error(`[${new Date().toISOString()}] Range log actions query failed:`, err.message);
+      byAction = {};
+    }
+
+    const now = new Date();
+    let startIso = hasHours ? new Date(now.getTime() - hours * 60 * 60 * 1000).toISOString() : null;
+    if (!startIso) {
+      try {
+        const earliest = await pool.query("SELECT MIN(timestamp) AS first_ts FROM sensors");
+        const firstTs = earliest.rows[0] && earliest.rows[0].first_ts;
+        startIso = firstTs ? new Date(firstTs).toISOString() : now.toISOString();
+      } catch {
+        startIso = now.toISOString();
+      }
+    }
+
+    // Cap to the most recent 1000 buckets ascending (ORDER BY label DESC above).
+    const daily = (bucketsResult.rows || [])
+      .slice()
+      .reverse()
+      .map((row) => ({
+        date: row.label,
+        temp_avg: Number(row.temp_avg) || 0,
+        temp_min: Number(row.temp_min) || 0,
+        temp_max: Number(row.temp_max) || 0,
+        water_avg: Number(row.water_avg) || 0,
+        water_min: Number(row.water_min) || 0,
+        water_max: Number(row.water_max) || 0,
+        ammonia_avg: Number(row.ammonia_avg) || 0,
+        ammonia_min: Number(row.ammonia_min) || 0,
+        ammonia_max: Number(row.ammonia_max) || 0,
+        readings: parseInt(row.readings) || 0,
+        alerts: bucketAlertsMap[row.label] || 0,
+      }));
+
+    const summary = summaryResult.rows[0] || {};
+    const totalAlerts = Object.values(byParameter).reduce((sum, c) => sum + c, 0);
+
+    res.json({
+      period: { start: startIso, end: now.toISOString() },
+      bucket,
+      summary: {
+        temp_avg: Number(summary.temp_avg) || 0,
+        temp_min: Number(summary.temp_min) || 0,
+        temp_max: Number(summary.temp_max) || 0,
+        water_avg: Number(summary.water_avg) || 0,
+        water_min: Number(summary.water_min) || 0,
+        water_max: Number(summary.water_max) || 0,
+        ammonia_avg: Number(summary.ammonia_avg) || 0,
+        ammonia_min: Number(summary.ammonia_min) || 0,
+        ammonia_max: Number(summary.ammonia_max) || 0,
+        total_readings: parseInt(summary.total_readings) || 0,
+      },
+      daily,
+      alerts: {
+        total: totalAlerts,
+        by_parameter: byParameter,
+        by_action: byAction,
+      },
+    });
+  } catch (err) {
+    console.error(`[${new Date().toISOString()}] Error fetching range report:`, err.message);
+    res.status(500).json({ message: "Error fetching range report", error: err.message });
+  }
+});
+
+// ========================
 // AUTHENTICATION ENDPOINTS
 // ========================
 
@@ -800,7 +1467,7 @@ app.post("/auth/login", loginLimiter, async (req, res) => {
 
     res.json({
       message: "Login successful",
-      user: { id: user.id, username: user.username, email: user.email, role: user.role, name: user.name },
+      user: { id: user.id, username: user.username, email: user.email, role: user.role, name: user.name, owner: isOwnerUser(user), protected: isOwnerUser(user) },
       token,
       tokenExpiresAt: tokenExpiresAt.toISOString(),
     });
@@ -820,11 +1487,20 @@ app.post("/auth/logout", requireAuth, async (req, res) => {
   }
 });
 
-// GET /auth/users (Admin only) - list all users, newest first
+// GET /auth/users (Admin only) - list all users, newest first, with a
+// `protected` flag so the UI can disable deletion for the owner + last admin
+// exactly the same way the server enforces it.
 app.get("/auth/users", requireAdmin, async (req, res) => {
   try {
     const result = await pool.query("SELECT id, name, username, email, role, created_at FROM users ORDER BY created_at DESC");
-    res.json(result.rows);
+    const adminCount = await pool.query("SELECT COUNT(*)::int AS n FROM users WHERE role = 'admin' AND status = 'active'");
+    const nAdmins = adminCount.rows[0].n;
+    const rows = result.rows.map((u) => ({
+      ...u,
+      owner: isOwnerUser(u),
+      protected: isOwnerUser(u) || (u.role === "admin" && nAdmins <= 1),
+    }));
+    res.json(rows);
   } catch (err) {
     res.status(500).json({ message: "Error fetching users", error: err.message });
   }
@@ -871,15 +1547,28 @@ app.post("/auth/users/:id/deletion-request", requireAdmin, async (req, res) => {
     if (!password) return res.status(400).json({ message: "Current password required" });
 
     const targetResult = await pool.query(
-      "SELECT id, username, email FROM users WHERE id = $1 AND status = 'active'",
+      "SELECT id, username, email, role FROM users WHERE id = $1 AND status = 'active'",
       [req.params.id]
     );
     if (targetResult.rows.length === 0) return res.status(404).json({ message: "Target user not found" });
     const target = targetResult.rows[0];
-    if (!target.email) return res.status(400).json({ message: "Target user has no email address; cannot send an OTP." });
+
+    // The owner and the last remaining admin can never be deleted — reject the
+    // request here (before any OTP is generated) so protected accounts don't
+    // even reach the mailbox step.
+    const guardError = await assertUserDeletable(target);
+    if (guardError) return res.status(400).json({ message: guardError });
+
+    // OTP recipient: OTP_EMAIL overrides the target user's own address so the
+    // confirmation code always lands in the owner's inbox (the mailbox the farm
+    // admin actually checks), falling back to the target account's email.
+    const otpRecipient = (process.env.OTP_EMAIL || "").trim() || target.email;
+    if (!otpRecipient) {
+      return res.status(400).json({ message: "No OTP recipient email configured and the target user has no email address." });
+    }
 
     const passwordOk = verifyPassword(password, req.adminUser.password_hash);
-    if (!passwordOk) return res.status(401).json({ message: "Incorrect password" });
+    if (!passwordOk) return res.status(403).json({ message: "Incorrect password" });
 
     const code = generateOtpCode();
     const { digest, salt } = hashOtpCode(code);
@@ -903,19 +1592,30 @@ app.post("/auth/users/:id/deletion-request", requireAdmin, async (req, res) => {
       ]
     );
 
-    const emailResult = await sendOtpEmail(target.email, code.raw ?? code);
-
-    await pool.query(
-      `UPDATE user_deletion_requests SET status = $2 WHERE id = $1`,
-      [created.rows[0].id, emailResult.delivered ? "PENDING_OTP" : "PENDING_OTP"]
-    );
+    let emailResult;
+    try {
+      emailResult = await sendOtpEmail({
+        to: otpRecipient,
+        code,
+        actorUsername: req.adminUser.username,
+        actorName: req.adminUser.name || req.adminUser.username,
+        targetUsername: target.username,
+        deletedByOwner: isOwnerUser(req.adminUser),
+      });
+    } catch (emailErr) {
+      // SMTP down / auth failure: the OTP never left the server, so remove the
+      // just-created request row — no phantom PENDING_OTP may linger.
+      await pool.query("DELETE FROM user_deletion_requests WHERE id = $1", [created.rows[0].id]);
+      throw emailErr;
+    }
 
     res.status(201).json({
       message: emailResult.delivered
-        ? "Confirmation code sent to the user's email"
+        ? `Confirmation code sent to ${otpRecipient}`
         : "Confirmation code generated (dev mode — SMTP not configured). Check server console.",
       request_id: created.rows[0].id,
       otp_sent: emailResult.delivered,
+      email_to: otpRecipient,
       dev_fallback: emailResult.devFallback || false,
     });
   } catch (err) {
@@ -945,6 +1645,23 @@ app.post("/auth/users/:id/deletion-verify", requireAdmin, async (req, res) => {
     }
     const row = reqResult.rows[0];
 
+    // Re-verify the target is deletable even with a valid OTP in hand — guards
+    // against a stale/malicious request created before the account became the
+    // owner or the last admin. Rolled back cleanly so no attempt is consumed.
+    const targetUser = await client.query(
+      "SELECT id, username, email, role FROM users WHERE id = $1 AND status = 'active'",
+      [req.params.id]
+    );
+    if (targetUser.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ message: "User not found" });
+    }
+    const guardError = await assertUserDeletable(targetUser.rows[0], client);
+    if (guardError) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ message: guardError });
+    }
+
     const now = Date.now();
     if (row.otp_attempts >= OTP_MAX_ATTEMPTS || (row.otp_expires_at && new Date(row.otp_expires_at).getTime() < now)) {
       await client.query(`UPDATE user_deletion_requests SET status = 'EXPIRED' WHERE id = $1`, [row.id]);
@@ -960,7 +1677,7 @@ app.post("/auth/users/:id/deletion-verify", requireAdmin, async (req, res) => {
       );
       await client.query("COMMIT");
       const attempts = row.otp_attempts + 1;
-      return res.status(401).json({
+      return res.status(403).json({
         message: attempts >= OTP_MAX_ATTEMPTS ? "Too many incorrect codes — request invalidated" : `Incorrect code (${attempts}/${OTP_MAX_ATTEMPTS})`,
         remaining_attempts: Math.max(0, OTP_MAX_ATTEMPTS - attempts),
       });
@@ -993,6 +1710,7 @@ app.post("/auth/users/:id/deletion-verify", requireAdmin, async (req, res) => {
     );
 
     await client.query("COMMIT");
+
     res.json({ message: "User deleted", username: userDel.rows[0].username });
   } catch (err) {
     await client.query("ROLLBACK");
@@ -1122,6 +1840,231 @@ app.post("/settings/reset", requireAdmin, async (req, res) => {
 });
 
 // ========================
+// SMS RECIPIENT ENDPOINTS
+// ========================
+
+// GET /settings/recipients (Admin) - list SMS recipients
+app.get("/settings/recipients", requireAdmin, async (req, res) => {
+  try {
+    const result = await pool.query("SELECT id, phone_number, name, is_active, created_at FROM authorized_recipients ORDER BY created_at DESC");
+    res.json(result.rows);
+  } catch (err) {
+    console.error(`[${new Date().toISOString()}] Error fetching SMS recipients:`, err.message);
+    res.status(500).json({ message: "Error fetching SMS recipients", error: err.message });
+  }
+});
+
+// POST /settings/recipients (Admin) - add a recipient (PH format, e.g. 09XXXXXXXXX
+// or +639XXXXXXXXX — stored normalized as +639XXXXXXXXX)
+app.post("/settings/recipients", requireAdmin, async (req, res) => {
+  try {
+    const name = String(req.body?.name || "").trim();
+    const normalizedPhone = normalizePhNumber(req.body?.phone_number);
+    if (!normalizedPhone) {
+      return res.status(400).json({ message: "Phone number must be a valid PH mobile: 09XXXXXXXXX or +639XXXXXXXXX" });
+    }
+    const result = await pool.query(
+      "INSERT INTO authorized_recipients (name, phone_number) VALUES ($1, $2) RETURNING id, phone_number, name, is_active, created_at",
+      [name, normalizedPhone]
+    );
+    await pool.query(
+      "INSERT INTO activity_logs (user_name, action_type, description, module) VALUES ($1, 'SMS_RECIPIENT_ADDED', $2, 'settings')",
+      [req.adminUser.username, `Added SMS recipient ${normalizedPhone}`]
+    );
+    res.status(201).json(result.rows[0]);
+  } catch (err) {
+    if (err.code === "23505") return res.status(400).json({ message: "Phone number already exists" });
+    console.error(`[${new Date().toISOString()}] Error adding SMS recipient:`, err.message);
+    res.status(500).json({ message: "Error adding SMS recipient", error: err.message });
+  }
+});
+
+// PUT /settings/recipients/:id (Admin) - rename and/or toggle recipient on/off
+app.put("/settings/recipients/:id", requireAdmin, async (req, res) => {
+  try {
+    const { name, is_active } = req.body;
+    if (name !== undefined && name !== null && typeof name !== "string") {
+      return res.status(400).json({ message: "name must be a string" });
+    }
+    if (is_active !== undefined && is_active !== null && typeof is_active !== "boolean") {
+      return res.status(400).json({ message: "is_active must be a boolean" });
+    }
+    const result = await pool.query(
+      `UPDATE authorized_recipients
+          SET name = COALESCE($1, name),
+              is_active = COALESCE($2, is_active),
+              updated_at = NOW()
+        WHERE id = $3
+        RETURNING id, phone_number, name, is_active, created_at`,
+      [name !== undefined ? name.trim() : null, is_active !== undefined ? is_active : null, req.params.id]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ message: "Recipient not found" });
+    await pool.query(
+      "INSERT INTO activity_logs (user_name, action_type, description, module) VALUES ($1, 'SMS_RECIPIENT_UPDATED', $2, 'settings')",
+      [req.adminUser.username, `Updated SMS recipient ${result.rows[0].phone_number}`]
+    );
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error(`[${new Date().toISOString()}] Error updating SMS recipient:`, err.message);
+    res.status(500).json({ message: "Error updating SMS recipient", error: err.message });
+  }
+});
+
+// DELETE /settings/recipients/:id (Admin) - remove a recipient
+app.delete("/settings/recipients/:id", requireAdmin, async (req, res) => {
+  try {
+    const result = await pool.query("DELETE FROM authorized_recipients WHERE id = $1 RETURNING phone_number", [req.params.id]);
+    if (result.rows.length === 0) return res.status(404).json({ message: "Recipient not found" });
+    await pool.query(
+      "INSERT INTO activity_logs (user_name, action_type, description, module) VALUES ($1, 'SMS_RECIPIENT_REMOVED', $2, 'settings')",
+      [req.adminUser.username, `Removed SMS recipient ${result.rows[0].phone_number}`]
+    );
+    res.json({ message: "SMS recipient removed" });
+  } catch (err) {
+    console.error(`[${new Date().toISOString()}] Error removing SMS recipient:`, err.message);
+    res.status(500).json({ message: "Error removing SMS recipient", error: err.message });
+  }
+});
+
+// POST /settings/recipients/test/:id (Admin) - send a test SMS to ONE recipient
+app.post("/settings/recipients/test/:id", requireAdmin, async (req, res) => {
+  try {
+    const result = await pool.query("SELECT id, phone_number, name FROM authorized_recipients WHERE id = $1", [req.params.id]);
+    if (result.rows.length === 0) return res.status(404).json({ message: "Recipient not found" });
+    const recipient = result.rows[0];
+    const content = [
+      "CRAYVINGS AQUACULTURE MONITORING — TEST MESSAGE",
+      `Date: ${formatSmsTime()}`,
+      "",
+      "This is a test SMS from the Crayvings Monitoring System.",
+      `If you received this message, the contact ${recipient.name || recipient.phone_number} is configured correctly.`,
+      "",
+      "No action is required.",
+    ].join("\n");
+    try {
+      const smsId = await sendHttpsms({ to: recipient.phone_number, content });
+      await logSms(recipient.phone_number, content, "queued", null, smsId);
+      return res.json({ success: true, message: "Test SMS sent", recipient: recipient.name || recipient.phone_number });
+    } catch (err) {
+      await logSms(recipient.phone_number, content, "failed", err.message);
+      return res.status(500).json({ message: "Failed to send test SMS", error: err.message });
+    }
+  } catch (err) {
+    console.error(`[${new Date().toISOString()}] Error sending test SMS:`, err.message);
+    res.status(500).json({ message: "Error sending test SMS", error: err.message });
+  }
+});
+
+// POST /alert/status (Admin) - send the status update SMS immediately (manual trigger)
+app.post("/alert/status", requireAdmin, async (req, res) => {
+  try {
+    if (isSmsMuted()) return res.status(429).json({ message: "SMS alerts are muted" });
+    const content = await buildStatusSms();
+    if (!content) return res.status(409).json({ message: "No sensor data available yet" });
+    const { sent, total } = await sendSmsToRecipients(content);
+    res.json({ sent, total });
+  } catch (err) {
+    console.error(`[${new Date().toISOString()}] Error sending status SMS:`, err.message);
+    res.status(500).json({ message: "Error sending status SMS", error: err.message });
+  }
+});
+
+// POST /alert/mute (Admin) - suppress all SMS for N hours (0 = unmute)
+app.post("/alert/mute", requireAdmin, async (req, res) => {
+  try {
+    const hours = parseInt(req.body?.hours) || 0;
+    if (hours <= 0) {
+      smsMuteUntil = null;
+      return res.json({ muted: false, muteExpires: null, message: "SMS alerts unmuted" });
+    }
+    smsMuteUntil = new Date(Date.now() + hours * 60 * 60 * 1000).toISOString();
+    await pool.query(
+      "INSERT INTO activity_logs (user_name, action_type, description, module) VALUES ($1, 'SMS_MUTED', $2, 'settings')",
+      [req.adminUser.username, `SMS muted for ${hours}h until ${smsMuteUntil}`]
+    );
+    res.json({ muted: true, muteExpires: smsMuteUntil, message: `SMS alerts muted for ${hours} hours` });
+  } catch (err) {
+    console.error(`[${new Date().toISOString()}] Error setting SMS mute:`, err.message);
+    res.status(500).json({ message: "Error setting SMS mute", error: err.message });
+  }
+});
+
+// GET /alert/mute-status - current mute state (any signed-in user)
+app.get("/alert/mute-status", requireAuth, async (req, res) => {
+  try {
+    if (smsMuteUntil && new Date() >= new Date(smsMuteUntil)) smsMuteUntil = null;
+    const muted = Boolean(smsMuteUntil && new Date() < new Date(smsMuteUntil));
+    res.json(muted ? { muted: true, muteExpires: smsMuteUntil } : { muted: false, muteExpires: null });
+  } catch (err) {
+    console.error(`[${new Date().toISOString()}] Error fetching SMS mute status:`, err.message);
+    res.status(500).json({ message: "Error fetching SMS mute status", error: err.message });
+  }
+});
+
+// GET /alert/sms-health - SMS delivery health snapshot (any signed-in user)
+app.get("/alert/sms-health", requireAuth, async (req, res) => {
+  try {
+    const counts = await pool.query(`
+      SELECT COUNT(*) FILTER (WHERE status IN ('queued', 'delivered')) AS processed,
+             COUNT(*) FILTER (WHERE status = 'failed')               AS failed,
+             COUNT(*) FILTER (WHERE status = 'capped')               AS capped,
+             COUNT(*) FILTER (WHERE status = 'queued' AND sent_at < NOW() - INTERVAL '1 hour') AS stuck_queued
+      FROM sms_logs
+      WHERE sent_at >= NOW() - INTERVAL '24 hours'
+    `);
+    const latestFailed = await pool.query(`
+      SELECT id, recipient_phone, message, error_message, failure_reason, sent_at
+      FROM sms_logs WHERE status = 'failed' ORDER BY id DESC LIMIT 1
+    `);
+    const sentToday = await pool.query(`
+      SELECT COUNT(*)::int AS n FROM sms_logs
+      WHERE sent_at >= date_trunc('day', NOW()) AND status <> 'capped'
+    `);
+    res.json({
+      configured: Boolean(HTTPSMS_API_KEY && HTTPSMS_FROM),
+      from: HTTPSMS_FROM || null,
+      smsToday: sentToday.rows[0].n,
+      smsCap: SMS_DAILY_CAP,
+      last24h: {
+        processed: Number(counts.rows[0].processed),
+        failed: Number(counts.rows[0].failed),
+        capped: Number(counts.rows[0].capped),
+        stuckQueued: Number(counts.rows[0].stuck_queued),
+      },
+      degraded: Number(counts.rows[0].failed) > 0 || Number(counts.rows[0].stuck_queued) > 0,
+      latestFailure: latestFailed.rows[0] || null,
+    });
+  } catch (err) {
+    console.error(`[${new Date().toISOString()}] Error fetching SMS health:`, err.message);
+    res.status(500).json({ message: "Error fetching SMS health", error: err.message });
+  }
+});
+
+// GET /sms-logs (Admin) - paginated SMS history; ?page, ?pageSize, ?status
+app.get("/sms-logs", requireAdmin, async (req, res) => {
+  try {
+    const page = Math.max(1, parseInt(req.query.page) || 1);
+    const pageSize = Math.min(100, Math.max(1, parseInt(req.query.pageSize) || 20));
+    const status = String(req.query.status || "").trim();
+    const where = status ? "WHERE status = $1" : "";
+    const params = status ? [status] : [];
+    const total = await pool.query(`SELECT COUNT(*)::int AS n FROM sms_logs ${where}`, params);
+    const result = await pool.query(
+      `SELECT id, recipient_phone, message, status, error_message, failure_reason, sms_id, sent_at, delivered_at
+         FROM sms_logs
+         ${where}
+         ORDER BY id DESC
+         LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
+      [...params, pageSize, (page - 1) * pageSize]
+    );
+    res.json({ rows: result.rows, total: total.rows[0].n, page, pageSize });
+  } catch (err) {
+    console.error(`[${new Date().toISOString()}] Error fetching SMS logs:`, err.message);
+    res.status(500).json({ message: "Error fetching SMS logs", error: err.message });
+  }
+});
+
+// ========================
 // SYSTEM LOGS ENDPOINTS
 // ========================
 
@@ -1137,6 +2080,30 @@ app.post("/logs", async (req, res) => {
     res.status(201).json({ message: "Logged", data: result.rows[0] });
   } catch (err) {
     res.status(500).json({ message: "Error logging", error: err.message });
+  }
+});
+
+// POST /logs/:id/ack - mark an alert log as Confirmed (done) or Allowed (approved).
+// Stored directly on the alert row so each alert keeps its own acknowledgement.
+app.post("/logs/:id/ack", requireAuth, async (req, res) => {
+  try {
+    const { status } = req.body;
+    if (status !== "confirmed" && status !== "allowed") {
+      return res.status(400).json({ message: "status must be 'confirmed' or 'allowed'" });
+    }
+    const actor = req.user?.username || req.user?.name || "admin";
+    const result = await pool.query(
+      `UPDATE system_logs
+         SET ack_status = $1, acknowledged_at = NOW(), acknowledged_by = $2
+       WHERE id = $3
+       RETURNING *`,
+      [status, actor, req.params.id]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ message: "Log entry not found" });
+    res.json({ message: "Alert acknowledged", data: result.rows[0] });
+  } catch (err) {
+    console.error(`[${new Date().toISOString()}] Error acknowledging alert:`, err.message);
+    res.status(500).json({ message: "Error acknowledging alert", error: err.message });
   }
 });
 
@@ -1608,10 +2575,13 @@ async function startServer() {
     try {
       console.log(`[${new Date().toISOString()}] PostgreSQL connected`);
 
-      // Create default admin if none exists; ADMIN_INITIAL_PASSWORD is REQUIRED
-      // so a known default credential is never shipped. The plaintext is never logged.
-      const adminExists = await client.query("SELECT id FROM users WHERE username = $1", ["admin"]);
-      if (adminExists.rows.length === 0) {
+      // Bootstrap the owner admin if NO admin-role user exists yet. Identity
+      // comes entirely from env (ADMIN_USERNAME / ADMIN_EMAIL / OTP_EMAIL /
+      // SMTP_USER) — there is no hardcoded default account. ADMIN_INITIAL_PASSWORD
+      // is REQUIRED so a known default credential is never shipped with a fresh
+      // database; the plaintext is never logged.
+      const adminCount = await client.query("SELECT COUNT(*)::int AS n FROM users WHERE role = 'admin'");
+      if (adminCount.rows[0].n === 0) {
         const initialAdminPassword = process.env.ADMIN_INITIAL_PASSWORD;
         if (!initialAdminPassword) {
           const msg = `[${new Date().toISOString()}] No admin account exists and ADMIN_INITIAL_PASSWORD is not set. Set ADMIN_INITIAL_PASSWORD in .env to create the initial admin, then restart.`;
@@ -1619,11 +2589,14 @@ async function startServer() {
           process.exit(1);
         }
         const adminPassword = hashPassword(initialAdminPassword);
+        const adminUsername = (process.env.ADMIN_USERNAME || "owner").trim();
+        const adminEmail = (process.env.ADMIN_EMAIL || process.env.SMTP_USER || "").trim();
+        const adminName = process.env.ADMIN_NAME || "Owner";
         await client.query(
-          `INSERT INTO users (name, username, email, password_hash, role) VALUES ('Administrator', 'admin', 'admin@crayvings.com', $1, 'admin')`,
-          [adminPassword]
+          `INSERT INTO users (name, username, email, password_hash, role) VALUES ($1, $2, $3, $4, 'admin')`,
+          [adminName, adminUsername, adminEmail, adminPassword]
         );
-        console.log(`[${new Date().toISOString()}] Default admin account created. Change its password after first login.`);
+        console.log(`[${new Date().toISOString()}] Owner admin account "${adminUsername}" created. Change its password after first login.`);
       } else {
         console.log(`[${new Date().toISOString()}] Admin account exists`);
       }
@@ -1645,13 +2618,42 @@ async function startServer() {
         lastAmmoniaReading[row.device_id] = Number(row.ammonia);
       }
       console.log(`[${new Date().toISOString()}] Loaded ammonia baseline for ${lastAmmoniaResult.rows.length} device(s) from DB`);
+
+      // SMS alerts: report config state and start the scheduled producers.
+      if (HTTPSMS_API_KEY && HTTPSMS_FROM) {
+        console.log(`[${new Date().toISOString()}] httpsms SMS configured (gateway ${HTTPSMS_FROM})`);
+        setInterval(() => pollUndeliveredSms().catch(() => {}), SMS_DELIVERY_POLL_MS);
+        console.log(`[${new Date().toISOString()}] SMS delivery poller scheduled (every ${Math.round(SMS_DELIVERY_POLL_MS / 1000)}s)`);
+        runSmsMaintenance();
+      } else {
+        console.warn(`[${new Date().toISOString()}] WARNING: HTTPSMS_API_KEY / HTTPSMS_FROM are not set — SMS alerts will not be sent. Add them to .env and restart.`);
+      }
+      if (HOURLY_SMS_ENABLED) {
+        setInterval(() => sendHourlyStatusUpdate().catch(() => {}), HOURLY_SMS_INTERVAL_MS);
+        console.log(`[${new Date().toISOString()}] Hourly SMS status update scheduled (every ${Math.round(HOURLY_SMS_INTERVAL_MS / 60000)} min)`);
+      }
+      if (DEVICE_DISCONNECT_ENABLED) {
+        // Pre-seed already-stale devices so the first poll does NOT fire a
+        // disconnect SMS for downtime that happened before this server booted.
+        const bootStaleSeconds = Math.max(5, Math.floor(DISCONNECT_STALE_MS / 1000));
+        const bootStale = await client.query(
+          "SELECT device_id FROM devices WHERE last_seen < NOW() - ($1 || ' seconds')::interval",
+          [bootStaleSeconds]
+        );
+        for (const row of bootStale.rows) disconnectedDevices.add(row.device_id);
+        if (bootStale.rows.length > 0) {
+          console.log(`[${new Date().toISOString()}] Pre-seeded ${bootStale.rows.length} disconnected device(s) at boot — no SMS will fire for them`);
+        }
+        setInterval(checkDeviceDisconnects, DISCONNECT_STALE_MS);
+        console.log(`[${new Date().toISOString()}] Device-disconnect SMS monitor scheduled (stale after ${bootStaleSeconds}s, rearm after ${Math.round(DISCONNECT_REARM_MS / 1000)}s)`);
+      }
     } finally {
       client.release();
     }
 
     // Listen for HTTP requests on all network interfaces
-    app.listen(PORT, "0.0.0.0", () => {
-      console.log(`[${new Date().toISOString()}] Server running on http://0.0.0.0:${PORT}`);
+    app.listen(PORT, "::", () => {
+      console.log(`[${new Date().toISOString()}] Server running on port ${PORT} (dual-stack)`);
     });
   } catch (err) {
     console.error(`[${new Date().toISOString()}] Server startup error:`, err.message);
