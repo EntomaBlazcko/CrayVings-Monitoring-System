@@ -35,6 +35,19 @@ session tokens.
   updated_at        TIMESTAMP    DEFAULT CURRENT_TIMESTAMP
   token_expires_at  TIMESTAMP                             24-hour session token
                                                           expiry
+  status            VARCHAR(20)  NOT NULL DEFAULT 'active' active, pending_deletion,
+                                                          or deleted (soft-delete
+                                                          lifecycle)
+  deleted_at        TIMESTAMPTZ                           Set when the account
+                                                          is hard-deleted
+  pending_deletion_at        TIMESTAMPTZ                  When a deletion request
+                                                          was made (account kept
+                                                          working until approval)
+  pending_deletion_requested_by VARCHAR(100)              Username of the admin
+                                                          who requested deletion
+
+Indexes:
+  idx_users_status  (status)
 
 ================================================================================
 TABLE: devices
@@ -109,6 +122,11 @@ and PDF export). Standalone -- stores human-readable strings, no foreign keys.
                                        Low/High/status
   new_value VARCHAR(50)                 New value or status
                                        (good, warning, critical)
+  ack_status     VARCHAR(20)            confirmed or allowed
+                                       (set when an alert is
+                                       acknowledged)
+  acknowledged_at TIMESTAMP             When acknowledged
+  acknowledged_by VARCHAR(100)          Username of the acknowledger
   timestamp TIMESTAMP     DEFAULT CURRENT_TIMESTAMP
 
 Indexes:
@@ -144,8 +162,11 @@ device connect/disconnect, login/logout).
   Column       Type         Constraints                          Notes
   ------------  -----------  -----------------------------------  --------------------
   id           SERIAL       PRIMARY KEY
-  user_name    VARCHAR(100) DEFAULT 'Admin',                     Username of acting user
-                            FK -> users.username
+  user_name    VARCHAR(100) NULLABLE,                            Username of acting
+                           FK -> users.username                  user; NULL once the
+                                                                 account is deleted
+                                                                 (audit row kept via
+                                                                 ON DELETE SET NULL)
   action_type  VARCHAR(50)  NOT NULL                             e.g. navigation,
                                                                  settings_change,
                                                                  device_connect,
@@ -161,7 +182,68 @@ Indexes:
   idx_activity_logs_timestamp   (timestamp DESC)
   idx_activity_logs_action_type (action_type)
 
-================================================================================
+===============================================================================
+TABLE: user_deletion_requests
+===============================================================================
+
+Audit chain for the secure account-deletion flow: WHO requested, WHO the OTP
+was sent to, WHO verified it, WHO approved, and WHO executed the hard delete.
+Set up by migration 001.
+
+  Column                     Type         Constraints            Notes
+  --------------------------  -----------  ----------------------  ------------------
+  id                         SERIAL       PRIMARY KEY
+  user_id                    INTEGER      NOT NULL                Target user id
+  user_username              VARCHAR(100) NOT NULL                Target username
+  requester_username         VARCHAR(100) NOT NULL                Admin who requested
+  requester_email            VARCHAR(255) NOT NULL                Admin's email (OTP
+                                                                  destination)
+  status                     VARCHAR(20)  NOT NULL DEFAULT 'pending_otp'  PENDING_OTP,
+                                                                 EXPIRED, COMPLETED
+  reason                     TEXT                                 Deletion reason
+  otp_hash                   VARCHAR(64)                          SHA-256 hash of OTP
+  otp_salt                   VARCHAR(32)                          Per-row salt
+  otp_expires_at             TIMESTAMPTZ                          OTP validity window
+  otp_attempts               INTEGER      NOT NULL DEFAULT 0       Brute-force counter
+  otp_verified_at            TIMESTAMPTZ
+  otp_verified_by            VARCHAR(100)
+  requested_at               TIMESTAMPTZ  DEFAULT NOW()
+  approver                   VARCHAR(100)
+  approved_at                TIMESTAMPTZ
+  executed_by                VARCHAR(100)
+  executed_at                TIMESTAMPTZ
+  status_history             JSONB        NOT NULL DEFAULT '[]'::JSONB  Full state log
+
+Indexes:
+  idx_deletion_requests_status  (status)
+  idx_deletion_requests_user    (user_id)
+
+===============================================================================
+TABLE: email_otps
+===============================================================================
+
+Second-factor store for deletion OTPs. The code is stored HASHED (SHA-256 with
+a per-row salt), never in plaintext; expires after 10 minutes; capped at 5
+attempts. No FK to users so it still works for an account already marked
+pending. Set up by migration 001.
+
+  Column       Type         Constraints                     Notes
+  ------------  -----------  -------------------------------  --------------------
+  id           SERIAL       PRIMARY KEY
+  email        VARCHAR(255) NOT NULL                         Recipient email
+  code_hash    VARCHAR(64)  NOT NULL                         SHA-256 of the code
+  code_salt    VARCHAR(32)  NOT NULL                         Per-row salt
+  expires_at   TIMESTAMPTZ  NOT NULL
+  attempts     INTEGER      NOT NULL DEFAULT 0
+  max_attempts INTEGER      NOT NULL DEFAULT 5
+  used_at      TIMESTAMPTZ
+  created_at   TIMESTAMPTZ  DEFAULT NOW()
+
+Indexes:
+  idx_email_otps_email   (email)
+  idx_email_otps_expires (expires_at)
+
+===============================================================================
 TABLE: system_state
 ================================================================================
 
@@ -195,8 +277,9 @@ SMS recipients allowed to receive alert notifications.
 TABLE: sms_logs
 ================================================================================
 
-Audit trail of every SMS send attempt (sent/failed/muted) including
-SkySMS message IDs.
+Audit trail of every SMS send attempt (queued/delivered/failed/capped).
+"queued" rows are reconciled by the delivery poller against httpsms, which
+nails down delivered_at / failure_reason so every SMS reaches a terminal state.
 
   Column          Type        Constraints                     Notes
   ---------------  ----------  ------------------------------  --------------------
@@ -205,10 +288,14 @@ SkySMS message IDs.
                               FK -> authorized_recipients
                               .phone_number
   message         TEXT        NOT NULL                        Full message body
-  status          VARCHAR(20) NOT NULL                        sent, failed, muted
+  status          VARCHAR(20) NOT NULL                        queued, delivered,
+                                                              failed, or capped
   error_message   TEXT                                        Failure reason
-  sms_id          VARCHAR(100)                               SkySMS message identifier
-  sent_at         TIMESTAMP   DEFAULT CURRENT_TIMESTAMP
+  sms_id          VARCHAR(100)                               httpsms message identifier
+  delivered_at    TIMESTAMPTZ                                Set when the delivery
+                                                              poller confirms receipt
+  failure_reason  TEXT                                        Delivery failure reason
+  sent_at         TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
 
 Indexes:
   idx_sms_logs_sent_at (sent_at DESC)
@@ -218,18 +305,22 @@ Indexes:
 FOREIGN KEY RELATIONSHIPS (enforced)
 ================================================================================
 
-  Constraint               Column(s)                References                    Delete rule
+Constraint               Column(s)                References                    Delete rule
   -----------------------  -----------------------  ----------------------------  ----------------------
-  fk_activity_logs_user    activity_logs.user_name   users.username                RESTRICT (update CASCADE)
+  fk_activity_logs_user    activity_logs.user_name   users.username                SET NULL (update CASCADE)
   fk_sms_logs_recipient    sms_logs.recipient_phone  authorized_recipients         CASCADE
-                                                          .phone_number
+                                                           .phone_number
   fk_sensors_device        sensors.device_id         devices.device_id             NO ACTION
   fk_lastalerts_device     last_alerts.device_id     devices.device_id             NO ACTION
 
 Notes:
-  - activity_logs.user_name is derived from the session token server-side
-    for an accurate audit trail; falls back to the built-in admin account
-    when no token is present.
+  - activity_logs.user_name is derived from the session token server-side.
+    The FK is ON DELETE SET NULL so an audit row survives the account being
+    deleted (user_name becomes NULL); ON UPDATE CASCADE keeps it in sync when
+    a username is renamed (owner admin rename in migration 002).
+  - user_deletion_requests and email_otps deliberately define NO foreign key
+    constraints so the request/OTP pipeline still works after the target
+    account is hard-deleted.
   - last_alerts is keyed by (device_id, sensor_key) so each device keeps
     its own alert state; derived from the latest sensors reading by the
     alert engine.
@@ -240,12 +331,14 @@ Notes:
 
 ================================================================================
 DATA RETENTION
-================================================================================
+===============================================================================
 
-  - system_logs and sms_logs older than 30 days are automatically purged
-    (cleanup runs on server startup and daily).
+  - system_logs older than 30 days are purged and sms_logs older than
+    SMS_RETENTION_DAYS (default 30) are purged; cleanup runs on server
+    startup and periodically (see runSmsMaintenance in server.cjs).
   - The alert engine enforces SMS cooldowns (warning vs critical intervals)
-    stored in the server config.
+    and a daily SMS cap (SMS_DAILY_CAP, 0 = unlimited) stored in the server
+    config.
 
 ================================================================================
 NOTES
@@ -254,13 +347,26 @@ NOTES
   - Schema creation: Tables are created outside this repository (e.g.,
     manual setup in pgAdmin / SQL shell). The server only creates
     system_state and applies additive migrations (ADD COLUMN IF NOT EXISTS)
-    for columns like ammonia, ammonia_min/max, and token_expires_at.
+    for columns like ammonia, ammonia_min/max, token_expires_at, and the
+    alert ack columns. Structural changes ship as idempotent migration
+    scripts in db/migrations/:
+      001_user_deletion.cjs  - users soft-delete columns + indexes,
+                               user_deletion_requests, email_otps,
+                               activity_logs.user_name nullable + FK
+                               ON DELETE SET NULL
+      002_owner_admin.cjs    - activity_logs FK ON UPDATE CASCADE;
+                               converts legacy 'admin' account into the
+                               owner; seeds owner from env on fresh DBs
+      003_sms_integration.cjs- authorized_recipients + sms_logs tables
+      004_sms_delivery.cjs   - sms_logs.delivered_at, failure_reason
+                               (delivery-polling support)
 
   - Hash format: password_hash = PBKDF2_ITERATIONS:salt_hex:hash_hex
     (sha512, 600,000 iterations, 64-byte key).
 
-  - Default admin: seeded via seed-admin.cjs
-    (Administrator / admin / admin@crayvings.com).
+  - Owner/root admin: seeded by db/migrations/002_owner_admin.cjs from
+    ADMIN_USERNAME / ADMIN_EMAIL / ADMIN_INITIAL_PASSWORD (no hardcoded
+    default admin).
 
   - Device auto-registration: the backend upserts devices on every sensor
     ingest so unknown ESP32 device_ids never violate fk_sensors_device.
@@ -282,6 +388,14 @@ Copy the block below into https://dbdiagram.io to render the full diagram.
     created_at timestamp [default: `now()`]
     updated_at timestamp [default: `now()`]
     token_expires_at timestamp
+    status varchar(20) [not null, default: "'active'"]
+    deleted_at timestamp
+    pending_deletion_at timestamp
+    pending_deletion_requested_by varchar(100)
+
+    Indexes {
+      (status) [name: 'idx_users_status']
+    }
   }
 
   Table devices {
@@ -323,6 +437,9 @@ Copy the block below into https://dbdiagram.io to render the full diagram.
     parameter varchar(100) [not null]
     old_value varchar(50)
     new_value varchar(50)
+    ack_status varchar(20)
+    acknowledged_at timestamp
+    acknowledged_by varchar(100)
     timestamp timestamp [default: `now()`]
 
     Indexes {
@@ -341,7 +458,7 @@ Copy the block below into https://dbdiagram.io to render the full diagram.
 
   Table activity_logs {
     id int [pk, increment]
-    user_name varchar(100) [default: "'Admin'"]
+    user_name varchar(100)
     action_type varchar(50) [not null]
     description text
     module varchar(100)
@@ -350,6 +467,50 @@ Copy the block below into https://dbdiagram.io to render the full diagram.
     Indexes {
       (timestamp) [name: 'idx_activity_logs_timestamp']
       (action_type) [name: 'idx_activity_logs_action_type']
+    }
+  }
+
+  Table user_deletion_requests {
+    id int [pk, increment]
+    user_id int [not null]
+    user_username varchar(100) [not null]
+    requester_username varchar(100) [not null]
+    requester_email varchar(255) [not null]
+    status varchar(20) [not null, default: "'pending_otp'"]
+    reason text
+    otp_hash varchar(64)
+    otp_salt varchar(32)
+    otp_expires_at timestamp
+    otp_attempts int [not null, default: 0]
+    otp_verified_at timestamp
+    otp_verified_by varchar(100)
+    requested_at timestamp [default: `now()`]
+    approver varchar(100)
+    approved_at timestamp
+    executed_by varchar(100)
+    executed_at timestamp
+    status_history json [not null, default: "'[]'"]
+
+    Indexes {
+      (status) [name: 'idx_deletion_requests_status']
+      (user_id) [name: 'idx_deletion_requests_user']
+    }
+  }
+
+  Table email_otps {
+    id int [pk, increment]
+    email varchar(255) [not null]
+    code_hash varchar(64) [not null]
+    code_salt varchar(32) [not null]
+    expires_at timestamp [not null]
+    attempts int [not null, default: 0]
+    max_attempts int [not null, default: 5]
+    used_at timestamp
+    created_at timestamp [default: `now()`]
+
+    Indexes {
+      (email) [name: 'idx_email_otps_email']
+      (expires_at) [name: 'idx_email_otps_expires']
     }
   }
 
@@ -374,6 +535,8 @@ Copy the block below into https://dbdiagram.io to render the full diagram.
     status varchar(20) [not null]
     error_message text
     sms_id varchar(100)
+    delivered_at timestamp
+    failure_reason text
     sent_at timestamp [default: `now()`]
 
     Indexes {

@@ -128,8 +128,8 @@ export default function ActivityLogsPage() {
     setLastRefreshed(new Date());
   }, [refetchActivityLogs]);
 
-  const startItem = (activityLogsPage - 1) * 20 + 1;
-  const endItem = Math.min(activityLogsPage * 20, activityLogsTotal);
+  const startItem = (activityLogsPage - 1) * 10 + 1;
+  const endItem = Math.min(activityLogsPage * 10, activityLogsTotal);
 
   // Per-action breakdown for the currently loaded page.
   const actionCounts = useMemo(() => {

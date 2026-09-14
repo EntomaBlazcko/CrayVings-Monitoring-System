@@ -442,37 +442,185 @@ export default function HistoricalDataPage() {
       const pageWidth = doc.internal.pageSize.getWidth();
       const pageHeight = doc.internal.pageSize.getHeight();
 
-      doc.setFontSize(20);
-      doc.setFont("helvetica", "bold");
-      doc.text(isWeekly ? "CRAYvings Weekly Report" : "CRAYvings History Report", pageWidth / 2, 20, { align: "center" });
+      // ---- Design tokens (mirrors the dashboard's warm orange brand palette) ----
+      const INK: number[] = [30, 41, 59];
+      const GRAY: number[] = [107, 114, 128];
+      const WHITE: number[] = [255, 255, 255];
+      const BRAND: number[] = [217, 75, 30];
+      const BRAND_MID: number[] = [234, 88, 12];
+      const AMBER: number[] = [245, 158, 11];
+      const CARD_FILL: number[] = [255, 250, 245];
+      const CARD_LINE: number[] = [253, 230, 210];
+      const ZEBRA: number[] = [255, 249, 243];
+      const LINE: number[] = [226, 232, 240];
+      const PARAM: Record<string, number[]> = {
+        temperature: [249, 115, 22],
+        water_level: [37, 99, 235],
+        ammonia: [16, 185, 129],
+      };
 
-      doc.setFontSize(9);
-      doc.setFont("helvetica", "normal");
+      const margin = 12;
+      const contentW = pageWidth - margin * 2;
+
+      const setFill = (c: number[]) => doc.setFillColor(c[0], c[1], c[2]);
+      const setText = (c: number[]) => doc.setTextColor(c[0], c[1], c[2]);
+      const lerp = (a: number[], b: number[], t: number) =>
+        [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t].map(Math.round);
+
+      // Warm vertical gradient that brands the top of the first page.
+      const drawHeaderBand = (h: number) => {
+        const steps = 32;
+        for (let i = 0; i < steps; i++) {
+          const t = i / (steps - 1);
+          const c =
+            t < 0.5
+              ? lerp([196, 50, 17], BRAND_MID, t * 2)
+              : lerp(BRAND_MID, AMBER, (t - 0.5) * 2);
+          doc.setFillColor(c[0], c[1], c[2]);
+          doc.rect(0, (h / steps) * i, pageWidth, h / steps + 1, "F");
+        }
+      };
+
+      // Slim branded strip reused on every page after the first.
+      const drawSlimHeader = () => {
+        setFill([199, 62, 25]);
+        doc.rect(0, 0, pageWidth, 11, "F");
+        setFill(AMBER);
+        doc.rect(0, 11, pageWidth, 1.4, "F");
+        doc.setFont("helvetica", "bold");
+        doc.setFontSize(6.8);
+        setText(WHITE);
+        doc.text(`CRAYvings  ·  ${isWeekly ? "Weekly Report" : "History Report"}`, margin, 7.5);
+      };
+
+      const drawFooter = (pageNumber: number) => {
+        doc.setDrawColor(226, 232, 240);
+        doc.setLineWidth(0.5);
+        doc.line(margin, pageHeight - 15, pageWidth - margin, pageHeight - 15);
+        doc.setFont("helvetica", "normal");
+        doc.setFontSize(7);
+        doc.setTextColor(148, 163, 184);
+        doc.text("CRAYvings Monitoring System", margin, pageHeight - 7);
+        doc.text(`Page ${pageNumber}`, pageWidth / 2, pageHeight - 7, { align: "center" });
+        doc.text(`Exported: ${formatFarmDate(new Date())}`, pageWidth - margin, pageHeight - 7, { align: "right" });
+      };
+
+      const drawSectionTitle = (text: string, y: number): number => {
+        setFill(BRAND);
+        doc.roundedRect(margin, y - 3.4, 3.6, 6.8, 0.9, 0.9, "F");
+        doc.setFont("helvetica", "bold");
+        doc.setFontSize(10.5);
+        setText(INK);
+        doc.text(text, margin + 8, y);
+        return y + 6.5;
+      };
+
+      const addBrandedPage = (): number => {
+        doc.addPage();
+        const p = doc.getNumberOfPages();
+        drawSlimHeader();
+        drawFooter(p);
+        return p;
+      };
+
       const fmtPeriod = report.bucket === "hour" ? formatFarmDateTime : formatFarmDate;
       const startDate = fmtPeriod(report.period.start);
       const endDate = fmtPeriod(report.period.end);
-      doc.text(`Period: ${startDate} - ${endDate}`, pageWidth / 2, 28, { align: "center" });
-      doc.text(`Generated on ${formatFarmDateTime(new Date())}`, pageWidth / 2, 34, { align: "center" });
+      const title = isWeekly ? "CRAYvings Weekly Report" : "CRAYvings History Report";
+
+      // ---- Header band ----
+      const bandH = 52;
+      drawHeaderBand(bandH);
+      setFill(AMBER);
+      doc.rect(0, bandH, pageWidth, 2.2, "F");
+      doc.setFont("helvetica", "bold");
+      doc.setFontSize(18);
+      setText(WHITE);
+      doc.text(title, pageWidth / 2, 20, { align: "center" });
+      doc.setFont("helvetica", "normal");
+      doc.setFontSize(8.5);
+      doc.text("Smart Aquaculture · Water Quality Monitoring", pageWidth / 2, 30, { align: "center" });
+      doc.text(`Period: ${startDate} - ${endDate}`, pageWidth / 2, 40, { align: "center" });
+      doc.setFontSize(7.5);
+      doc.setTextColor(255, 231, 213);
+      doc.text(`Generated on ${formatFarmDateTime(new Date())}`, pageWidth / 2, 48, { align: "center" });
 
       const summary = report.summary;
-      const summaryY = 40;
-      doc.setFontSize(12);
-      doc.setFont("helvetica", "bold");
-      doc.text("Summary", 14, summaryY);
 
-      doc.setFontSize(9);
-      doc.setFont("helvetica", "normal");
-      const s = [
-        `Temperature: Avg ${(summary.temp_avg ?? 0).toFixed(1)}°C, Min ${(summary.temp_min ?? 0).toFixed(1)}°C, Max ${(summary.temp_max ?? 0).toFixed(1)}°C`,
-        `Water Level: Avg ${(summary.water_avg ?? 0).toFixed(0)}%, Min ${(summary.water_min ?? 0).toFixed(0)}%, Max ${(summary.water_max ?? 0).toFixed(0)}%`,
-        `Ammonia: Avg ${(summary.ammonia_avg ?? 0).toFixed(2)} ppm, Min ${(summary.ammonia_min ?? 0).toFixed(2)} ppm, Max ${(summary.ammonia_max ?? 0).toFixed(2)} ppm`,
-        `Total Readings: ${(summary.total_readings ?? 0).toLocaleString()}`,
-        `Total Alerts: ${report.alerts.total ?? 0}`,
+      // ---- Summary cards (one per monitored parameter) ----
+      const cardY = 64;
+      const cardH = 46;
+      const gap = 6;
+      const cardW = (contentW - gap * 2) / 3;
+      const cards: { label: string; color: number[]; avg: string; minmax: string }[] = [
+        {
+          label: "Temperature",
+          color: PARAM.temperature,
+          avg: `${(summary.temp_avg ?? 0).toFixed(1)}°C`,
+          minmax: `Min ${(summary.temp_min ?? 0).toFixed(1)} · Max ${(summary.temp_max ?? 0).toFixed(1)}`,
+        },
+        {
+          label: "Water Level",
+          color: PARAM.water_level,
+          avg: `${(summary.water_avg ?? 0).toFixed(0)}%`,
+          minmax: `Min ${(summary.water_min ?? 0).toFixed(0)} · Max ${(summary.water_max ?? 0).toFixed(0)}`,
+        },
+        {
+          label: "Ammonia",
+          color: PARAM.ammonia,
+          avg: `${(summary.ammonia_avg ?? 0).toFixed(2)} ppm`,
+          minmax: `Min ${(summary.ammonia_min ?? 0).toFixed(2)} · Max ${(summary.ammonia_max ?? 0).toFixed(2)}`,
+        },
       ];
-      let sy = summaryY + 7;
-      s.forEach(line => { doc.text(line, 14, sy); sy += 5; });
+      cards.forEach((c, i) => {
+        const x = margin + i * (cardW + gap);
+        setFill(CARD_FILL);
+        doc.setDrawColor(CARD_LINE[0], CARD_LINE[1], CARD_LINE[2]);
+        doc.setLineWidth(0.5);
+        doc.roundedRect(x, cardY, cardW, cardH, 3.5, 3.5, "FD");
+        setFill(c.color);
+        doc.roundedRect(x, cardY + 8, 3, cardH - 16, 1, 1, "F");
+        doc.setFont("helvetica", "bold");
+        doc.setFontSize(7.5);
+        setText(c.color);
+        doc.text(c.label.toUpperCase(), x + 8.5, cardY + 13);
+        doc.setFontSize(14);
+        setText(INK);
+        doc.text(c.avg, x + 8.5, cardY + 30);
+        doc.setFont("helvetica", "normal");
+        doc.setFontSize(6.8);
+        setText(GRAY);
+        doc.text(c.minmax, x + 8.5, cardY + 41);
+      });
 
-      const tableStartY = sy + 6;
+      // ---- Totals chips ----
+      const chipY = cardY + cardH + 9;
+      const chipH = 22;
+      const chipW = (contentW - gap) / 2;
+      const totals: { label: string; value: string; valueColor: number[] }[] = [
+        { label: "Total Readings", value: (summary.total_readings ?? 0).toLocaleString(), valueColor: INK },
+        {
+          label: "Total Alerts",
+          value: String(report.alerts.total ?? 0),
+          valueColor: (report.alerts.total ?? 0) > 0 ? [217, 68, 30] : [16, 185, 129],
+        },
+      ];
+      totals.forEach((t, i) => {
+        const x = margin + i * (chipW + gap);
+        setFill([248, 250, 252]);
+        doc.setDrawColor(LINE[0], LINE[1], LINE[2]);
+        doc.setLineWidth(0.4);
+        doc.roundedRect(x, chipY, chipW, chipH, 3, 3, "FD");
+        doc.setFont("helvetica", "bold");
+        doc.setFontSize(6.8);
+        setText(GRAY);
+        doc.text(t.label.toUpperCase(), x + 10, chipY + 9);
+        doc.setFontSize(11.5);
+        setText(t.valueColor);
+        doc.text(t.value, x + 10, chipY + 17.5);
+      });
+
+      const tableStartY = chipY + chipH + 10;
 
       // Range exports stay compact: smaller font, capped rows and no separate
       // alert page, so long windows (e.g. "All Time") fit on 1-2 pages.
@@ -499,13 +647,25 @@ export default function HistoricalDataPage() {
           (d.readings ?? 0).toLocaleString(),
           String(d.alerts ?? 0),
         ]),
-        styles: isRange
-          ? { fontSize: 7.5, cellPadding: 2, valign: "middle" }
-          : { fontSize: 8, cellPadding: 2.5, valign: "middle" },
-        headStyles: { fillColor: [241, 245, 249], textColor: [30, 41, 59], fontStyle: "bold", halign: "center" },
-        alternateRowStyles: { fillColor: [248, 250, 252] },
+        theme: "grid",
+        styles: {
+          fontSize: isRange ? 7.2 : 7.6,
+          cellPadding: isRange ? 1.7 : 2,
+          valign: "middle",
+          textColor: INK as [number, number, number],
+          lineColor: LINE as [number, number, number],
+          lineWidth: 0.25,
+        },
+        headStyles: {
+          fillColor: BRAND as [number, number, number],
+          textColor: WHITE as [number, number, number],
+          fontStyle: "bold",
+          halign: "center",
+          fontSize: 7.6,
+        },
+        alternateRowStyles: { fillColor: ZEBRA as [number, number, number] },
         columnStyles: {
-          0: { cellWidth: isRange ? 48 : 38 },
+          0: { cellWidth: isRange ? 46 : 34, halign: "left" },
           1: { halign: "center" },
           2: { halign: "center" },
           3: { halign: "center" },
@@ -515,144 +675,123 @@ export default function HistoricalDataPage() {
           7: { halign: "center" },
           8: { halign: "center" },
         },
-        margin: { left: 14, right: 14 },
-        didDrawPage: (data) => {
-          data.doc.setFontSize(8);
-          data.doc.setFont("helvetica", "normal");
-          data.doc.setTextColor(128, 128, 128);
-          data.doc.text(`Page ${data.pageNumber}`, pageWidth / 2, pageHeight - 10, { align: "center" });
-          data.doc.text("CRAYvings Monitoring System", 14, pageHeight - 10);
-          data.doc.text(`Exported: ${formatFarmDate(new Date())}`, pageWidth - 14, pageHeight - 10, { align: "right" });
+        margin: { left: margin, right: margin },
+        didDrawPage: ({ pageNumber }) => {
+          drawFooter(pageNumber);
+          if (pageNumber > 1) drawSlimHeader();
         },
       });
 
       let afterTableY = (doc as unknown as { lastAutoTable?: { finalY?: number } }).lastAutoTable?.finalY ?? tableStartY + 10;
 
       if (capNote) {
-        afterTableY += 5;
-        doc.setFontSize(7);
+        const boxY = afterTableY + 5;
+        const noteH = 12;
+        setFill([255, 247, 237]);
+        doc.setDrawColor(254, 215, 170);
+        doc.setLineWidth(0.4);
+        doc.roundedRect(margin, boxY, contentW, noteH, 2.5, 2.5, "FD");
         doc.setFont("helvetica", "italic");
-        doc.setTextColor(107, 114, 128);
-        doc.text(capNote, 14, afterTableY);
-        afterTableY += 4;
+        doc.setFontSize(7);
+        setText(GRAY);
+        doc.text(capNote, margin + 6, boxY + 8);
+        afterTableY = boxY + noteH + 4;
       } else {
-        afterTableY += 2;
+        afterTableY += 3;
       }
 
       const hasAlerts =
         Object.keys(report.alerts.by_parameter).length > 0 || Object.keys(report.alerts.by_action).length > 0;
       let currentY = afterTableY;
 
+      // ---- Alert panel ----
+      const alertLines: { text: string; kind: "head" | "sub" | "item" }[] = [];
+      alertLines.push({ text: `Total Alerts: ${report.alerts.total ?? 0}`, kind: "head" });
+      const byParam = Object.entries(report.alerts.by_parameter);
+      const byAction = Object.entries(report.alerts.by_action);
+      if (byParam.length > 0) {
+        alertLines.push({ text: "By Parameter", kind: "sub" });
+        byParam.forEach(([p, c]) => alertLines.push({ text: `${p}: ${c}`, kind: "item" }));
+      }
+      if (byAction.length > 0) {
+        alertLines.push({ text: "By Action", kind: "sub" });
+        byAction.forEach(([a, c]) => alertLines.push({ text: `${a}: ${c}`, kind: "item" }));
+      }
+      if (!hasAlerts) alertLines.push({ text: "No alerts were recorded in this period.", kind: "item" });
+      const alertH = Math.max(34, 14 + alertLines.length * 6.2);
+
+      const drawAlertSection = (topY: number): number => {
+        const titleY = drawSectionTitle("Alert Summary", topY + 8);
+        const panelTop = titleY + 1;
+        setFill(hasAlerts ? [255, 244, 230] : [240, 253, 244]);
+        const alertBorder = hasAlerts ? [253, 186, 116] : [167, 243, 208];
+        doc.setDrawColor(alertBorder[0], alertBorder[1], alertBorder[2]);
+        doc.setLineWidth(0.4);
+        doc.roundedRect(margin, panelTop, contentW, alertH, 3, 3, "FD");
+        let ly = panelTop + 11;
+        alertLines.forEach((line) => {
+          if (line.kind === "head") {
+            doc.setFont("helvetica", "bold");
+            doc.setFontSize(9);
+            setText(INK);
+            doc.text(line.text, margin + 8, ly);
+          } else if (line.kind === "sub") {
+            ly += 2;
+            doc.setFont("helvetica", "bold");
+            doc.setFontSize(7.8);
+            setText(BRAND);
+            doc.text(line.text, margin + 8, ly);
+          } else {
+            doc.setFont("helvetica", "normal");
+            doc.setFontSize(8);
+            setText(GRAY);
+            doc.text(`  ·  ${line.text}`, margin + 8, ly);
+          }
+          ly += 6.2;
+        });
+        return panelTop + alertH + 4;
+      };
+
       if (isRange) {
-        // Range exports merge the alert block inline (no extra page).
         if (hasAlerts) {
-          let ay = currentY + 4;
-          if (ay > pageHeight - 40) {
-            doc.addPage();
-            ay = 20;
+          if (currentY + 50 + alertH > pageHeight - 60) {
+            currentY = 24;
+            addBrandedPage();
           }
-          doc.setFontSize(11);
-          doc.setFont("helvetica", "bold");
-          doc.text("Alert Summary", 14, ay);
-          ay += 6;
-
-          doc.setFontSize(8);
-          doc.setFont("helvetica", "normal");
-          doc.text(`Total Alerts: ${report.alerts.total}`, 14, ay);
-          ay += 5;
-
-          if (Object.keys(report.alerts.by_parameter).length > 0) {
-            doc.setFont("helvetica", "bold");
-            doc.text("By Parameter:", 14, ay);
-            ay += 4.5;
-            doc.setFont("helvetica", "normal");
-            Object.entries(report.alerts.by_parameter).forEach(([param, count]) => {
-              doc.text(`  ${param}: ${count}`, 14, ay);
-              ay += 4.5;
-            });
-            ay += 2;
-          }
-
-          if (Object.keys(report.alerts.by_action).length > 0) {
-            doc.setFont("helvetica", "bold");
-            doc.text("By Action:", 14, ay);
-            ay += 4.5;
-            doc.setFont("helvetica", "normal");
-            Object.entries(report.alerts.by_action).forEach(([action, count]) => {
-              doc.text(`  ${action}: ${count}`, 14, ay);
-              ay += 4.5;
-            });
-          }
-          currentY = ay;
+          currentY = drawAlertSection(currentY);
         }
       } else if (hasAlerts) {
         // Weekly keeps its dedicated alert page (existing behavior).
-        doc.addPage();
-        doc.setFontSize(14);
-        doc.setFont("helvetica", "bold");
-        doc.text("Alert Summary", 14, 20);
-
-        doc.setFontSize(9);
-        doc.setFont("helvetica", "normal");
-        let ay = 30;
-        doc.text(`Total Alerts: ${report.alerts.total}`, 14, ay);
-        ay += 7;
-
-        if (Object.keys(report.alerts.by_parameter).length > 0) {
-          doc.setFont("helvetica", "bold");
-          doc.text("By Parameter:", 14, ay);
-          ay += 5;
-          doc.setFont("helvetica", "normal");
-          Object.entries(report.alerts.by_parameter).forEach(([param, count]) => {
-            doc.text(`  ${param}: ${count}`, 14, ay);
-            ay += 5;
-          });
-          ay += 3;
-        }
-
-        if (Object.keys(report.alerts.by_action).length > 0) {
-          doc.setFont("helvetica", "bold");
-          doc.text("By Action:", 14, ay);
-          ay += 5;
-          doc.setFont("helvetica", "normal");
-          Object.entries(report.alerts.by_action).forEach(([action, count]) => {
-            doc.text(`  ${action}: ${count}`, 14, ay);
-            ay += 5;
-          });
-        }
-
-        // Footer on alert page
-        doc.setFontSize(8);
-        doc.setFont("helvetica", "normal");
-        doc.setTextColor(128, 128, 128);
-        doc.text("CRAYvings Monitoring System", 14, pageHeight - 10);
-        doc.text(`Exported: ${formatFarmDate(new Date())}`, pageWidth - 14, pageHeight - 10, { align: "right" });
-        currentY = ay;
+        currentY = 24;
+        addBrandedPage();
+        currentY = drawAlertSection(currentY);
       }
 
-      // Plain-language recommendations derived from the period averages/alerts.
+      // ---- Recommendations panel ----
       const suggestions = buildReportSuggestions(report, thresholds);
-      let ry = currentY + 6;
-      if (ry > pageHeight - 100) {
-        doc.addPage();
-        ry = 20;
+      const recW = contentW - 24;
+      const recPanelH = 14 + suggestions.reduce((acc, s) => acc + doc.splitTextToSize(s, recW).length * 5.6 + 4, 0);
+      if (currentY + 40 + recPanelH > pageHeight - 40) {
+        currentY = 24;
+        addBrandedPage();
       }
-      doc.setFontSize(11);
-      doc.setFont("helvetica", "bold");
-      doc.setTextColor(0, 0, 0);
-      doc.text("Recommendations", 14, ry);
-      ry += 6;
-      doc.setFontSize(8.5);
-      doc.setFont("helvetica", "normal");
-      for (const line of suggestions) {
-        const wrapped = doc.splitTextToSize(`- ${line}`, pageWidth - 28);
-        doc.text(wrapped, 14, ry);
-        ry += wrapped.length * 5 + 2;
-        if (ry > pageHeight - 30) {
-          doc.addPage();
-          ry = 20;
-        }
-      }
+      const recTitleY = drawSectionTitle("Recommendations", currentY + 8);
+      const recPanelTop = recTitleY + 1;
+      setFill(CARD_FILL);
+      doc.setDrawColor(CARD_LINE[0], CARD_LINE[1], CARD_LINE[2]);
+      doc.setLineWidth(0.4);
+      doc.roundedRect(margin, recPanelTop, contentW, recPanelH, 3, 3, "FD");
+      let ly = recPanelTop + 12;
+      suggestions.forEach((s) => {
+        const wrapped = doc.splitTextToSize(s, recW) as string[];
+        setFill(BRAND_MID);
+        doc.circle(margin + 13, ly - 1.4, 1.1, "F");
+        doc.setFont("helvetica", "normal");
+        doc.setFontSize(8.2);
+        setText(INK);
+        doc.text(wrapped, margin + 20, ly);
+        ly += wrapped.length * 5.6 + 4;
+      });
 
       doc.save(
         isWeekly

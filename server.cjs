@@ -2190,7 +2190,7 @@ app.post("/activity-logs", async (req, res) => {
 app.get("/activity-logs", requireAdmin, async (req, res) => {
   try {
     const page = Math.max(1, parseInt(req.query.page) || 1);
-    const limit = 20;
+    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 10));
     const offset = (page - 1) * limit;
     const search = req.query.search || "";
     const sortBy = req.query.sortBy === "oldest" ? "ASC" : "DESC";
