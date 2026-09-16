@@ -170,7 +170,7 @@ Dashboard opens at http://localhost:5173
 
 ### 5. Connect ESP32
 
-Flash the ESP32 with `esp32code/esp32code.ino`. On boot it first tries the saved network; if that fails it automatically opens the "Aquaculture-Setup" WiFi access point so you can configure credentials (and backend server IP/port/device ID) via the captive portal at http://192.168.4.1 (or serial command `W`, or triple-tap the top-left corner). The firmware's default backend address is `192.168.100.152:3000` (`SERVER_IP_DEFAULT` in `esp32code.ino`) — set it to your backend machine's LAN IP if it differs.
+Flash the ESP32 with `water_monitoring_system/water_monitoring_system.ino`. On boot it first tries the saved network; if that fails it automatically opens the "Aquaculture-Setup" WiFi access point so you can configure credentials (and backend server IP/port/device ID) via the captive portal at http://192.168.4.1 (or serial command `W`, or triple-tap the top-left corner). The firmware's default backend address is `192.168.100.152:3000` (`SERVER_IP_DEFAULT` in `water_monitoring_system.ino`) — set it to your backend machine's LAN IP if it differs.
 
 ---
 
@@ -244,7 +244,7 @@ src/
 ├── main.tsx
 └── index.css
 server.cjs                     # Express backend
-esp32code/esp32code.ino        # ESP32 firmware (WiFiManager)
+water_monitoring_system/water_monitoring_system.ino        # ESP32 firmware (WiFiManager)
 ```
 
 ---

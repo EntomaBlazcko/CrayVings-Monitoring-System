@@ -861,7 +861,7 @@ const ALERT_COOLDOWN_MS = 120000;
     await pool.query(`ALTER TABLE sensor_settings ADD COLUMN IF NOT EXISTS ammonia_max DECIMAL(5,2) DEFAULT 1.00`);
 
     // Session token expiry (24-hour expiration)
-    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS token_expires_at TIMESTAMP`);
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS token_expires_at TIMESTAMPTZ`);
 
     // Alert acknowledgement (Confirm / Allow) tracked directly on each alert row
     await pool.query(`ALTER TABLE system_logs ADD COLUMN IF NOT EXISTS ack_status VARCHAR(20)`);

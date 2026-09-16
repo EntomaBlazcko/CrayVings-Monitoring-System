@@ -1,6 +1,6 @@
 // =============================================================================
 // src/pages/SettingsPage.tsx
-// Settings page: alert thresholds, and user management.
+// Settings page: alert thresholds, user management, and firmware flasher.
 // =============================================================================
 
 import { useState, useCallback, useMemo, useEffect } from "react";
@@ -37,6 +37,7 @@ import {
   ScrollText,
   ChevronLeft,
   ChevronRight,
+  Usb,
 } from "lucide-react";
 import type { SensorSettings } from "../types";
 import { DEFAULT_SETTINGS, getSettingsThresholds } from "../types";
@@ -62,6 +63,7 @@ import {
   fetchSmsHealth,
 } from "../api/client";
 import type { UserEntry, SmsRecipient, MuteStatus, SmsLogEntry, SmsHealth } from "../api/client";
+import FirmwareFlasher from "../components/FirmwareFlasher";
 
 const getApiError = (err: unknown): string => {
   if (isAxiosError(err)) return err.response?.data?.message ?? err.message;
@@ -1468,6 +1470,19 @@ export default function SettingsPage() {
                 </div>
               </div>
             )}
+          </div>
+
+          <div className="space-y-4 border-t border-gray-100 pt-6">
+            <div>
+              <h3 className="text-lg font-bold text-gray-800 flex items-center gap-2 flex-wrap">
+                <Usb size={20} className="text-orange-500" />
+                Firmware Flasher
+              </h3>
+              <p className="text-sm text-gray-500">
+                Update the ESP32 device firmware directly from the browser (owner &amp; admin only)
+              </p>
+            </div>
+            <FirmwareFlasher />
           </div>
         </div>
       )}

@@ -1,0 +1,16 @@
+{
+  "name": "CRAYvings Monitoring System",
+  "version": "1.0.0",
+  "chipFamily": "ESP32",
+  "builds": [
+    {
+      "name": "CRAYvings v1.0",
+      "description": "Latest stable firmware for CRAYvings aquaculture monitor",
+      "files": [
+        { "path": "/firmware/water_monitoring_system.ino.bootloader.bin", "offset": 4096 },
+        { "path": "/firmware/water_monitoring_system.ino.partitions.bin", "offset": 32768 },
+        { "path": "/firmware/water_monitoring_system.ino.bin", "offset": 65536 }
+      ]
+    }
+  ]
+}

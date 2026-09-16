@@ -83,7 +83,7 @@ Features:
     (not poll time)
 
 NOTE: Ammonia is measured as real NH3 gas concentration in ppm using the
-MQ-137 chemiresistor (readAmmonia() in esp32code/esp32code.ino). The
+MQ-137 chemiresistor (readAmmonia() in water_monitoring_system/water_monitoring_system.ino). The
 firmware computes Rs/R0 from the module's analog output and converts it
 to ppm with the datasheet NH3 curve. R0 is calibrated in clean air on
 first boot (and persisted to NVS); triple-tap the top-right corner of
@@ -603,7 +603,7 @@ NETWORK REQUIREMENTS
   - Port 3000 accessible
   - Static IP recommended for server
   - The HTTP POST runs on a background FreeRTOS task (sendSensorTask in
-    esp32code.ino) with a 1-second connect timeout and 1-second response
+    water_monitoring_system.ino) with a 1-second connect timeout and 1-second response
     timeout. The main loop only sets a sendPending/sendBusy flag every
     SEND_INTERVAL (1000 ms), so even when the backend IP is wrong/unreachable
     the POST stalls the background task only -- the screen and touch keep
@@ -633,7 +633,7 @@ with a XPT2046 resistive touch panel on the HSPI bus:
     (Aquaculture-Setup AP, http://192.168.4.1)
   - Triple-tap top-right corner: re-runs the MQ-137 clean-air R0 calibration
   - Touch mapping: raw XPT2046 coordinates are scaled to screen pixels with
-    hardcoded map constants (RAW_X_MIN/MAX, RAW_Y_MIN/MAX in esp32code.ino)
+    hardcoded map constants (RAW_X_MIN/MAX, RAW_Y_MIN/MAX in water_monitoring_system.ino)
   - Press detection: pressure threshold MIN_PRESSURE (default 40) with a
     Z1/Z2 validity range guard (readings outside ~0-4000 are ignored)
 
@@ -690,8 +690,8 @@ PROJECT STRUCTURE
   +-- main.tsx
   +-- index.css
   server.cjs                         Express backend
-  esp32code/
-  +-- esp32code.ino                  ESP32 firmware (WiFiManager)
+  water_monitoring_system/
+  +-- water_monitoring_system.ino                  ESP32 firmware (WiFiManager)
 
 
 ================================================================================
@@ -710,12 +710,12 @@ RUNNING THE APPLICATION
 
 3. ESP32
 
-  Flash the ESP32 with esp32code/esp32code.ino. On boot it first tries the
+  Flash the ESP32 with water_monitoring_system/water_monitoring_system.ino. On boot it first tries the
   saved network; if that fails it automatically opens the "Aquaculture-Setup"
   WiFi access point so you can configure your network (and backend server IP,
   port, and device ID) via the captive portal at http://192.168.4.1. The
   firmware default backend address is 192.168.100.152:3000
-  (SERVER_IP_DEFAULT in esp32code.ino); set it to your backend machine's
+  (SERVER_IP_DEFAULT in water_monitoring_system.ino); set it to your backend machine's
   LAN IP if it differs.
 
 
@@ -789,8 +789,8 @@ SENSOR SETTINGS TABLE
     temp_max DECIMAL(5,2) DEFAULT 31.0,
     water_level_min DECIMAL(5,2) DEFAULT 10.0,
     water_level_max DECIMAL(5,2) DEFAULT 100.0,
-    ammonia_min DECIMAL(5,2) DEFAULT 0.0,
-    ammonia_max DECIMAL(5,2) DEFAULT 25.0,
+    ammonia_min DECIMAL(5,2) DEFAULT 0.25,
+    ammonia_max DECIMAL(5,2) DEFAULT 1.00,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   );
 
@@ -828,7 +828,7 @@ SMS LOGS TABLE
     status VARCHAR(20) NOT NULL,
     error_message TEXT,
     sms_id VARCHAR(100),
-    sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    sent_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
   );
 
 

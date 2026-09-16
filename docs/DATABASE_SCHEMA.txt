@@ -33,8 +33,10 @@ session tokens.
   token             VARCHAR(255)                          Active session token
   created_at        TIMESTAMP    DEFAULT CURRENT_TIMESTAMP
   updated_at        TIMESTAMP    DEFAULT CURRENT_TIMESTAMP
-  token_expires_at  TIMESTAMP                             24-hour session token
-                                                          expiry
+  token_expires_at  TIMESTAMPTZ                           24-hour session token
+                                                          expiry (timezone-aware
+                                                          so new Date() checks
+                                                          are unambiguous)
   status            VARCHAR(20)  NOT NULL DEFAULT 'active' active, pending_deletion,
                                                           or deleted (soft-delete
                                                           lifecycle)
@@ -360,6 +362,13 @@ NOTES
       003_sms_integration.cjs- authorized_recipients + sms_logs tables
       004_sms_delivery.cjs   - sms_logs.delivered_at, failure_reason
                                (delivery-polling support)
+      005_schema_consistency.cjs - aligns the live schema with this doc:
+                               sensor_settings.ammonia_min/max defaults
+                               0.25/1.00; drops stray last_alerts.device_id
+                               and activity_logs.user_name defaults;
+                               users.password_hash -> TEXT; makes
+                               users.token_expires_at + sms_logs.sent_at
+                               TIMESTAMPTZ
 
   - Hash format: password_hash = PBKDF2_ITERATIONS:salt_hex:hash_hex
     (sha512, 600,000 iterations, 64-byte key).
@@ -387,7 +396,7 @@ Copy the block below into https://dbdiagram.io to render the full diagram.
     token varchar(255)
     created_at timestamp [default: `now()`]
     updated_at timestamp [default: `now()`]
-    token_expires_at timestamp
+    token_expires_at timestamptz
     status varchar(20) [not null, default: "'active'"]
     deleted_at timestamp
     pending_deletion_at timestamp
@@ -489,7 +498,7 @@ Copy the block below into https://dbdiagram.io to render the full diagram.
     approved_at timestamp
     executed_by varchar(100)
     executed_at timestamp
-    status_history json [not null, default: "'[]'"]
+    status_history jsonb [not null, default: "'[]'"]
 
     Indexes {
       (status) [name: 'idx_deletion_requests_status']
@@ -537,7 +546,7 @@ Copy the block below into https://dbdiagram.io to render the full diagram.
     sms_id varchar(100)
     delivered_at timestamp
     failure_reason text
-    sent_at timestamp [default: `now()`]
+    sent_at timestamptz [default: `now()`]
 
     Indexes {
       (sent_at) [name: 'idx_sms_logs_sent_at']

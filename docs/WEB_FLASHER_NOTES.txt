@@ -1,0 +1,621 @@
+================================================================================
+ ESP32 WEB FLASHER - Implementation Notes
+ CRAYvings Monitoring System - Capstone Group 8
+================================================================================
+
+Date: September 16, 2026
+Status: IMPLEMENTED but BLOCKED on an unresolved connection issue - "The port
+        is already open" when connecting the ESP32 (see Section 18). Web flasher
+        lives inside the Settings page (admin/owner only), at
+        src/components/FirmwareFlasher.tsx, rendered by SettingsPage.tsx.
+
+Revision history:
+  - 2026-09-09  Created (commit d6eaede).
+  - 2026-09-14  Deleted during refactor as "outdated implementation notes"
+                (commit cab1ec4).
+  - 2026-09-16  Restored from git history and updated to match the current
+                codebase, then revised again after moving the flasher out of
+                the sidebar into the Settings page (admin/owner only).
+  - 2026-09-16  Formal error cards added (classifyFlashError in useEspFlasher).
+                Auto-recovery for stale ports added (close-then-reopen retry
+                loop). binfile/ removed - compiled .bin files now live only in
+                public/firmware/.
+
+================================================================================
+1. OVERVIEW
+================================================================================
+
+A web flasher allows end-users to flash/update ESP32 firmware directly from
+the browser using the Web Serial API. No Arduino IDE, no Python, no CLI tools
+required. The user simply connects the ESP32 via USB, selects firmware, and
+clicks "Flash."
+
+This is designed for end-user convenience - aquaculture operators who may not
+be technical can update their ESP32 devices from the dashboard.
+
+================================================================================
+2. TECHNOLOGY STACK
+================================================================================
+
+Core Library:
+  - esptool-js (Espressif's official JS flasher library)
+  - npm package: esptool-js
+  - License: Apache-2.0
+  - GitHub: https://github.com/espressif/esptool-js
+  - Stars: 510+ (actively maintained by Espressif)
+  - Weekly downloads: 33,000+
+
+Browser API:
+  - Web Serial API (W3C standard)
+  - Enables JavaScript to communicate with serial ports via USB
+
+Install command:
+  npm install esptool-js
+
+  NOTE: esptool-js is already installed (see package.json "dependencies",
+        alongside @types/w3c-web-serial). It is a plain client-side JS library
+        and works with the current stack (React 19, Vite 8, Tailwind 4,
+        TypeScript 5.9) with no extra build configuration.
+
+================================================================================
+3. BROWSER REQUIREMENTS
+================================================================================
+
+  SUPPORTED:                      NOT SUPPORTED:
+  - Google Chrome 89+             - Mozilla Firefox
+  - Microsoft Edge 89+            - Safari (macOS/iOS)
+  - Opera 75+
+  - Brave, Vivaldi (Chromium-based)
+
+  SECURITY CONTEXT:
+  - HTTPS required (production)
+  - HTTP localhost allowed (development)
+  - Web Serial API is blocked in insecure HTTP contexts
+
+  NOTE: This is a browser limitation, not something we can work around.
+  The UI must show a clear compatibility check on page load.
+
+================================================================================
+4. PREREQUISITES (MANUAL STEPS BEFORE IMPLEMENTATION)
+================================================================================
+
+The ESP32 firmware (water_monitoring_system/water_monitoring_system.ino) must be compiled into .bin files
+before the web flasher can use them.
+
+Step 1: Open water_monitoring_system/water_monitoring_system.ino in Arduino IDE
+
+Step 2: Select Board
+  - Tools > Board > ESP32 Arduino > "DOIT ESP32 DEVKIT V1"
+  - (Or match your exact ESP32 DevKit board variant)
+
+Step 3: Select Port (any COM port is fine for compiling)
+
+Step 4: Compile
+  - Sketch > Verify/Compile
+  - Fix any compilation errors
+
+Step 5: Export Compiled Binary
+  - Sketch > Export Compiled Binary
+  - This saves 3 files to the sketch folder:
+      water_monitoring_system.ino.bootloader.bin    (offset: 0x1000)
+      water_monitoring_system.ino.partitions.bin    (offset: 0x8000)
+      water_monitoring_system.ino.bin               (offset: 0x10000)
+
+Step 6: Copy the 3 .bin files into:
+  public/firmware/
+
+Step 7: Create public/firmware/manifest.json (see Section 8)
+
+================================================================================
+5. ESP32 FLASH MEMORY LAYOUT
+================================================================================
+
+The ESP32 uses a partitioned flash memory. The web flasher must write each
+binary to the correct memory offset:
+
+  Offset      Size       File                          Description
+  ----------  ---------  ----------------------------  -------------------
+  0x1000      ~28 KB     water_monitoring_system.ino.bootloader.bin  Bootloader
+  0x8000      ~4 KB      water_monitoring_system.ino.partitions.bin  Partition table
+  0x10000     ~1.3 MB    water_monitoring_system.ino.bin             Application firmware
+
+  TOTAL: ~1.4 MB per flash
+
+  NOTE: These offsets are for standard ESP32 (not ESP32-S2/S3/C3).
+        The ESP32 DevKit V1 uses the standard ESP32 chip.
+
+================================================================================
+6. IMPLEMENTATION PLAN
+================================================================================
+
+The steps below are written against the CURRENT codebase (react 19, Vite 8,
+Tailwind 4). All file / line references were verified on 2026-09-16.
+
+Step 1: Install esptool-js
+  File: package.json
+  Command: npm install esptool-js
+  Verify: "esptool-js" appears under "dependencies".
+
+Step 2: Create the embeddable flasher component
+  File: src/components/FirmwareFlasher.tsx (NEW)
+  The flasher is a card component (not a sidebar page) so it can live inside
+  the Settings page. It is a default export: export default function
+  FirmwareFlasher(). See Sections 7 and 16 for the UI.
+
+Step 3: Register the component in the Settings page (admin/owner only)
+  File: src/pages/SettingsPage.tsx
+  Changes:
+    - Import the Usb icon from lucide-react.
+    - Import the component: import FirmwareFlasher from "../components/FirmwareFlasher";
+    - Inside the existing {isAdmin && (...)} admin block (which already wraps
+      User Management and SMS Alerts), add a section after the SMS Alerts
+      block (near the end of the admin section, before it closes):
+        <div className="space-y-4 border-t border-gray-100 pt-6">
+          <div>
+            <h3 className="text-lg font-bold text-gray-800 flex items-center gap-2">
+              <Usb size={20} className="text-orange-500" />
+              Firmware Flasher
+            </h3>
+            <p className="text-sm text-gray-500">...</p>
+          </div>
+          <FirmwareFlasher />
+        </div>
+  NOTE: No sidebar entry, no menu key, no App.tsx route. The Settings page
+  already gates the whole admin section behind isAdmin (admin OR owner). There
+  is a MODIFY step in src/App.tsx instead: REMOVE any leftover "Firmware
+  Flasher" lazy import / menu entry / renderPage() case from the earlier
+  standalone-page approach (the "Firmware Flasher" menu key was removed from
+  VALID_MENU_KEYS in src/types/index.ts).
+
+Step 4: Remove the old standalone page wiring (already done)
+  Files: src/types/index.ts, src/App.tsx, src/pages/FlasherPage.tsx
+  The "Firmware Flasher" entry was removed from VALID_MENU_KEYS, the Usb icon
+  import, lazy import, menuDefinitions entry, and renderPage() case were
+  removed from App.tsx, and src/pages/FlasherPage.tsx was deleted. Flashing
+  firmware is a privileged action and must stay admin/owner-only. (Server-side
+  access is not required since flashing is fully client-side, see Section 15.)
+
+Step 5: Wire up activity logging
+  Use the existing logActivity() helper from useActivityLogs() (provided by
+  the SensorProvider context in App.tsx):
+    - After a successful flash:  logActivity("device_disconnect",
+        "ESP32 firmware updated", "Firmware Flasher")
+    - After connecting a port:   logActivity("device_connect",
+        "Connected ESP32 serial port", "Firmware Flasher")
+  ActivityActionType in src/types/index.ts already includes "device_connect"
+  and "device_disconnect" - no type changes required.
+
+Step 6: Create the useEspFlasher hook
+  File: src/hooks/useEspFlasher.ts (NEW)
+  Purpose: Encapsulate all esptool-js logic in a React hook (see Section 9).
+
+Step 7: Create the flasher UI
+  File: src/components/FirmwareFlasher.tsx (from Step 2)
+  Purpose: Embeddable flasher interface (see Sections 7 and 16).
+
+Step 8: Create the firmware directory and manifest
+  Files:
+    public/firmware/ (NEW directory - Vite serves it at /firmware/)
+    public/firmware/manifest.json (NEW - see Section 8)
+    public/firmware/*.bin (NEW - user provides after compiling, Section 4)
+
+================================================================================
+7. FLASHER UI LAYOUT
+================================================================================
+
+The flasher card should have these sections:
+
+  NOTE: The card is embedded in the Settings page (src/components/
+        FirmwareFlasher.tsx) - it is NOT a standalone page, so there is NO
+        hero banner. Its own header row shows the title + live status badge.
+        Build the UI with the existing conventions (Tailwind 4, lucide-react
+        icons, white rounded-xl cards) - see Section 16.
+
++-----------------------------------------------------------+
+|  Firmware Flasher                                          |
+|  Flash your ESP32 device directly from your browser        |
++-----------------------------------------------------------+
+|                                                            |
+|  [Browser Check]                                           |
+|  +-----------------------------------------------------+  |
+|  | Web Serial API: Supported / Not Supported            |  |
+|  | Browser: Chrome 120 (example)                        |  |
+|  +-----------------------------------------------------+  |
+|                                                            |
+|  [Step 1: Connect Device]                                  |
+|  +-----------------------------------------------------+  |
+|  |  [ Connect Device ]                                   |  |
+|  |  Status: Disconnected / Connected (ESP32 detected)    |  |
+|  |  Chip: ESP32 (v0xc00) | Flash: 4MB                    |  |
+|  +-----------------------------------------------------+  |
+|                                                            |
+|  [Step 2: Select Firmware]                                 |
+|  +-----------------------------------------------------+  |
+|  | (o) CRAYvings v1.0 - Latest stable                   |  |
+|  | ( ) Custom firmware upload (.bin file)                |  |
+|  +-----------------------------------------------------+  |
+|                                                            |
+|  [Step 3: Flash]                                           |
+|  +-----------------------------------------------------+  |
+|  |  [ Flash Firmware ]                                   |  |
+|  |  +-----------------------------------------------+   |  |
+|  |  | ████████████████████░░░░░░░░░░  65%           |   |  |
+|  |  +-----------------------------------------------+   |  |
+|  |  Status: Writing bootloader...                       |  |
+|  +-----------------------------------------------------+  |
+|                                                            |
+|  [Terminal Output]                                         |
+|  +-----------------------------------------------------+  |
+|  | Connecting to ESP32...                                |  |
+|  | Chip: ESP32 v0xc00 | Flash: 4MB | Freq: 40MHz        |  |
+|  | Erasing flash...                                     |  |
+|  | Writing bootloader... 100%                            |  |
+|  | Writing partitions... 100%                            |  |
+|  | Writing application... 100%                           |  |
+|  | Hard resetting device...                              |  |
+|  +-----------------------------------------------------+  |
++-----------------------------------------------------------+
+
+================================================================================
+8. FIRMWARE MANIFEST
+================================================================================
+
+File: public/firmware/manifest.json
+
+{
+  "name": "CRAYvings Monitoring System",
+  "version": "1.0.0",
+  "chipFamily": "ESP32",
+  "builds": [
+    {
+      "name": "CRAYvings v1.0",
+      "description": "Latest stable firmware for CRAYvings aquaculture monitor",
+      "files": [
+        { "path": "/firmware/water_monitoring_system.ino.bootloader.bin", "offset": 4096 },
+        { "path": "/firmware/water_monitoring_system.ino.partitions.bin", "offset": 32768 },
+        { "path": "/firmware/water_monitoring_system.ino.bin", "offset": 65536 }
+      ]
+    }
+  ]
+}
+
+NOTE: Offsets in decimal (4096 = 0x1000, 32768 = 0x8000, 65536 = 0x10000)
+
+================================================================================
+ 9. useEspFlasher HOOK API
+================================================================================
+
+The custom hook will expose:
+
+  NOTE: esptool-js is callback-driven (ESPLoader writeFlash, Transport). The
+        hook wraps these in Promise-based helpers and forwards onProgress /
+        onConsole callbacks into the React state above.
+
+  States:
+    - status: "idle" | "connecting" | "connected" | "flashing" | "done" | "error"
+    - progress: number (0-100)
+    - logMessages: string[] (terminal output lines)
+    - error: string | null
+    - isSupported: boolean (WebSerial available)
+    - chipInfo: { name: string, flashSize: string } | null
+
+  Functions:
+    - checkBrowserSupport(): boolean
+        Returns true if Web Serial API is available
+
+    - connect(): Promise<void>
+        Opens the browser's serial port picker
+        Connects to ESP32 ROM bootloader
+        Reads chip info
+
+    - flash(manifest): Promise<void>
+        Erases flash (if selected)
+        Writes bootloader to 0x1000
+        Writes partitions to 0x8000
+        Writes application to 0x10000
+        Resets device
+
+    - disconnect(): void
+        Closes serial port cleanly
+
+    - abort(): void
+        Cancels ongoing flash operation (AbortController)
+
+  Import:
+    import { ESPLoader, Transport } from "esptool-js";
+
+================================================================================
+10. USER FLOW
+================================================================================
+
+  1. User logs into CRAYvings dashboard
+  2. User (admin or owner) opens Settings > Firmware Flasher
+  3. Page loads and checks browser compatibility
+     - If unsupported: show error + link to Chrome/Edge
+     - If supported: show green checkmark
+  4. User connects ESP32 via USB cable
+  5. User clicks "Connect Device"
+     - Browser shows serial port picker popup
+     - User selects the ESP32 port (e.g., "USB-SERIAL CH340")
+     - ESP32 connects and chip info is displayed
+  6. User selects firmware (pre-built CRAYvings v1.0)
+  7. User clicks "Flash Firmware"
+     - Progress bar appears
+     - Terminal output shows real-time progress
+  8. If connection fails immediately:
+     - UI shows instructions to enter download mode:
+       "Hold the BOOT button on your ESP32, press and release
+        the RST button, then release BOOT."
+  9. Flash completes
+     - Status: "Flash complete! Device is restarting."
+     - Device automatically resets and starts running new firmware
+
+================================================================================
+11. ERROR HANDLING
+================================================================================
+
+  Error                           User-Facing Message / Action
+  ------------------------------  ------------------------------------------------
+  Browser not supported           "Web Serial API is not supported in your
+                                  browser. Please use Chrome, Edge, or Opera."
+
+  User cancels serial picker      "No device selected. Please try again."
+
+  ESP32 not in download mode      "Could not connect to ESP32. Please hold the
+                                  BOOT button, press and release RST, then
+                                  release BOOT. Then try again."
+
+  Serial port busy/locked         "Serial port is in use. Close any other
+                                  programs using the port (Arduino IDE Serial
+                                  Monitor, PuTTY, etc.) and try again."
+
+  Firmware file invalid           "Invalid firmware file. Please select a
+                                  valid ESP32 firmware binary."
+
+  Chip mismatch                   "Expected ESP32 but detected {chipName}.
+                                  Please select the correct firmware."
+
+  Flash verification failed       "Flash verification failed. The device may
+                                  not boot correctly. Try flashing again."
+
+  USB cable issue                 "Could not detect device. Make sure you are
+                                  using a data USB cable (not power-only)."
+
+  Connection timeout              "Connection timed out. Check that the ESP32
+                                  is properly connected and in download mode."
+
+================================================================================
+12. CONSTRAINTS
+================================================================================
+
+  - ESP32 DevKit V1 only (standard CP2102 or CH340 USB-to-UART chip)
+  - USB cable required (not wireless/OTA)
+  - Pre-compiled .bin files must exist in public/firmware/ before implementation
+  - Chromium browser required (Chrome, Edge, Opera, Brave)
+  - HTTPS required in production (Web Serial security requirement)
+  - User must physically press BOOT button to enter download mode
+  - No multi-device flashing (one ESP32 at a time)
+  - Arduino IDE is needed for initial compilation (not for end users)
+
+================================================================================
+13. ALTERNATIVE APPROACHES CONSIDERED
+================================================================================
+
+  Option A: ESP Web Tools (esphome.github.io/esp-web-tools/)
+    - Pros: Simplest to implement, uses <esp-web-install-button> web component
+    - Pros: Automatic chip detection, manifest-based firmware selection
+    - Cons: Limited UI customization, designed for ESPHome-style installs
+    - Verdict: Too opinionated for custom firmware
+
+  Option B: espcdcflash (USB CDC only)
+    - Pros: Focused, clean API
+    - Cons: ESP32-S3 only, does not support standard ESP32
+    - Verdict: Wrong chip family for this project
+
+  Option C: esptool-js (SELECTED)
+    - Pros: Official Espressif library, full ESP32 support
+    - Pros: Full control over UI and flashing behavior
+    - Pros: Active maintenance, large community
+    - Cons: More code to write for UI
+    - Verdict: Best fit for custom React integration
+
+  Option D: Standalone ESP-32-WebFlasher
+    - Pros: Pre-built, works out of the box
+    - Cons: Separate app, not integrated into dashboard
+    - Cons: Hardcoded firmware list
+    - Verdict: Not integrated enough for end-user experience
+
+================================================================================
+14. FILES TO CREATE/MODIFY
+================================================================================
+
+  File                                Action    Description
+  ----------------------------------  --------  --------------------------------
+  package.json                        MODIFY    Add esptool-js dependency
+  src/components/FirmwareFlasher.tsx  NEW       Embeddable flasher card (admin)
+  src/pages/SettingsPage.tsx          MODIFY    Import Usb icon + FirmwareFlasher,
+                                                add "Firmware Flasher" section in
+                                                the {isAdmin && ...} block
+  src/types/index.ts                  MODIFY    Remove leftover "Firmware Flasher"
+                                                menu key from VALID_MENU_KEYS
+  src/App.tsx                         MODIFY    Remove leftover FlasherPage lazy
+                                                import, Usb icon, menu entry,
+                                                renderPage() case
+  src/pages/FlasherPage.tsx           DELETE    Superseded by the component above
+  src/hooks/useEspFlasher.ts          NEW       esptool-js React hook
+  public/firmware/manifest.json       NEW       Firmware metadata
+  public/firmware/*.bin               NEW       Compiled ESP32 binaries (user)
+
+================================================================================
+15. DEPLOYMENT CONSIDERATIONS
+================================================================================
+
+  - The web flasher is served from the same React app (Vite build)
+  - The firmware .bin files go in public/ and are served as static assets at
+    /firmware/ by Vite
+  - No backend changes required (flashing is entirely client-side)
+  - HTTPS is mandatory in production (Web Serial API security requirement)
+  - Total firmware download size: ~1.4 MB (not a bandwidth concern)
+  - The flasher is embedded in the Settings page and only rendered inside the
+    {isAdmin && ...} block, so it is admin/owner-only. There is NO sidebar menu
+    entry and no dedicated route (role-based UI access control, no extra server
+    auth needed)
+
+================================================================================
+16. FRONTEND CONVENTIONS TO FOLLOW
+===============================================================================
+
+FirmwareFlasher should match the look and feel of the Settings page cards.
+Key patterns drawn from the User Management and SMS Alerts sections of
+SettingsPage.tsx:
+
+  COMPONENT IMPORTS:
+    import { ..., Usb } from "lucide-react";
+    import { useEspFlasher } from "../hooks/useEspFlasher";
+    import type { FirmwareManifest, FlashStatus } from "../hooks/useEspFlasher";
+    import { Spinner } from "../components/Loading";
+    import { useActivityLogs } from "../contexts/SensorContext";
+
+  NO HERO BANNER / NO PAGE TITLE:
+    The flasher is a section card inside Settings, so it does NOT render the
+    CRAYvings hero banner or a page <h1>. Its own header row shows:
+      <span className="w-9 h-9 rounded-xl bg-orange-100 text-orange-600
+        flex items-center justify-center"><Usb size={18} /></span>
+      <h3 className="text-sm font-bold ...">Firmware Flasher</h3>
+      + a live status badge (rounded-full, colored by FlashStatus).
+
+  ROLE CHECKS:
+    The component itself performs NO role check. SettingsPage renders it only
+    inside the {isAdmin && ...} block, where:
+      const isAdmin = user?.role === "admin";
+    (Owners have role "admin", so "admin" covers owner+admin.)
+
+  LOADING / ERROR STATES:
+    - The manifest fetch shows an inline <Spinner size={14} /> while loading
+      and an amber "No firmware available yet" box with the error message.
+    - Flash errors show a red inline box with the BOOT/RST download-mode tip.
+
+  ACTIVITY LOGGING:
+    Use logActivity() from useActivityLogs() (SensorProvider context):
+      - After connecting a port:  logActivity("device_connect",
+          "Connected ESP32 serial port for firmware flash", "Firmware Flasher")
+      - After a successful flash: logActivity("device_disconnect",
+          "ESP32 firmware updated via web flasher", "Firmware Flasher")
+    ActivityActionType in src/types/index.ts already includes "device_connect"
+    and "device_disconnect" - no type changes required.
+
+  NOTE: The component is a default export (export default function
+        FirmwareFlasher()).
+
+================================================================================
+17. BUILD & VERIFICATION
+================================================================================
+
+After completing the steps above, verify the build:
+
+  1. npm run lint
+     - Passes with no errors.
+  2. npm run build
+     - TypeScript compiles; Vite produces dist/.
+  3. npm run dev
+     - Open http://localhost:5173
+     - Log in as admin (or owner).
+     - Open Settings > Firmware Flasher - the flasher card is visible.
+     - Verify it does NOT appear for a regular user (non-admin role) - the
+       whole section is hidden.
+     - Verify the browser support check and the 3-step UI render.
+  4. Verify manifest serves correctly:
+     - Open http://localhost:5173/firmware/manifest.json in the browser
+       (or check that the "Select Firmware" step lists "CRAYvings v1.0").
+
+================================================================================
+18. KNOWN ISSUE - "The port is already open" (UNRESOLVED as of 2026-09-16)
+================================================================================
+
+SYMPTOM:
+  Settings > Firmware Flasher > Connect Device fails with:
+    "Failed to execute 'open' on 'SerialPort': The port is already open."
+  The formal error card shows:
+    Title: "Serial port unavailable" / "Serial port still open"
+    Message: "The computer could not open the selected serial port..." or
+             "The selected port is still open from an earlier connection..."
+
+ENVIRONMENT:
+  - OS: Windows 10/11 (win32)
+  - Browser: Brave (Chromium-based) - only ONE tab open, no other tabs/programs
+    use the serial port.
+  - Boards: DOIT ESP32 DEVKIT V1 (production) + spare NodeMCU-32S (ESP32).
+  - Backend (server.cjs) does NOT open any serial port - confirmed by grep for
+    serialport/COM in server.cjs. This is purely a browser-level conflict.
+
+OBSERVED SEQUENCE:
+  1. First attempt: "Failed to open serial port" (OS refused) - user had other
+     programs/tabs and/or old Brave session holding the port.
+  2. After closing other tabs/programs: "The port is already open" - the port
+     is still flagged open inside Brave's browser process (stale Web Serial
+     state that survives tab reload; only survives a FULL browser restart).
+  3. Test not yet repeated after a full Brave restart (2026-09-16).
+
+WHAT WAS ALREADY TRIED / IMPLEMENTED (in useEspFlasher.ts + FirmwareFlasher.tsx):
+  - Formal error cards via classifyFlashError() - maps raw Web Serial errors to
+    friendly, actionable guidance (no port selected / port unavailable / port
+    still open / no communication / unexpected).
+  - Auto-recovery in connect():
+      a) Closes any transport this page already holds before picking a device
+         (a finished flash keeps the port open after hard_reset).
+      b) If the picked port is already open (readable/writable != null), closes
+         it first.
+      c) Retries port.open() up to 5 times with a 200ms delay when "already
+         open" is thrown (async stream release race).
+  - closeTransport() now force-releases the underlying SerialPort (transport
+    .disconnect() plus device.close()) so a stale connection can't block
+    reconnects.
+  - Known-error detail is also mirrored into the Terminal Output log.
+
+REMAINING HYPOTHESES IF "ALREADY OPEN" PERSISTS AFTER A FULL BROWSER RESTART:
+  1. Chromium serial-state bug - the port stays flagged open in the browser
+     process even after page unload; only closing the whole browser clears it.
+     TEST: Close Brave completely (Task Manager -> end all brave.exe), reopen,
+           reconnect the board, retry.
+  2. Wrong port picked - the user may be selecting the production unit's port
+     (or the picker lists a port that is actually in use by something else).
+     TEST: In Device Manager > Ports (COM & LPT), note which COM is the
+           NodeMCU-32S (CH340/CP2102) and pick exactly that one.
+  3. Driver issue - missing/incompatible CH340 or CP2102 driver still leaves
+     the port ownerless/confused at OS level. TEST: reinstall driver, reboot.
+  4. Multiple Origin entries - if the dashboard is served over http://localhost
+     AND the LAN IP/HTTPS simultaneously, Brave tracks ports per-origin; a
+     second origin connection would conflict. TEST: use only ONE URL.
+  5. port.close() not fully awaited - if retries (5x) still race, increase the
+     retry delay to 500ms or call esptool-js Transport.waitForUnlock() after
+     close.
+
+NEXT TIME YOU TACKLE THIS:
+  1. First reproduce after a FULL Brave restart (see hypothesis 1).
+  2. Check navigator.serial.getPorts() from the browser console - it lists all
+     ports Brave still considers "already connected" for this origin.
+  3. If getPorts() shows the port open with no tab using it, it is the browser
+     bug in hypothesis 1 - document and add a "restart your browser" hint to the
+     error tip.
+  4. If it only happens on one specific COM port, chase hypothesis 2/3.
+  5. Consider pre-routing: call navigator.serial.getPorts() before requestPort()
+     and close any held ports before opening.
+
+================================================================================
+19. BIN FILE LOCATION (final - 2026-09-16)
+================================================================================
+
+  The compiled firmware binaries now live ONLY in public/firmware/ (their
+  designated location, served by Vite at /firmware/):
+
+    public/firmware/manifest.json
+    public/firmware/water_monitoring_system.ino.bootloader.bin  (23488 bytes)
+    public/firmware/water_monitoring_system.ino.partitions.bin  (3072 bytes)
+    public/firmware/water_monitoring_system.ino.bin            (1202288 bytes)
+
+  The temporary binfile/ folder was deleted - its contents were byte-identical
+  (MD5 verified) to the files above.
+
+================================================================================
+ END OF WEB FLASHER NOTES
+================================================================================
