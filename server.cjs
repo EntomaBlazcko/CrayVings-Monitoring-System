@@ -141,7 +141,7 @@ function requireAdmin(req, res, next) {
   const token = req.headers.authorization?.replace("Bearer ", "");
   if (!token) return res.status(401).json({ message: "Authentication required" });
 
-  pool.query("SELECT * FROM users WHERE token = $1", [token])
+  pool.query("SELECT * FROM users WHERE token = $1 AND status = 'active'", [token])
     .then(async result => {
       if (result.rows.length === 0) return res.status(403).json({ message: "Invalid token" });
       const user = result.rows[0];
@@ -159,11 +159,11 @@ function requireAdmin(req, res, next) {
 // Validates the token and attaches the user to req.adminUser (admin role required)
 // Used by all admin-gated routes.
 app._deleteUserHard = async (userId, actorUsername) => {
-  // Deferred hard-delete with audit: called only after email-OTP approval.
-  // activity_logs.user_name was relaxed to SET NULL by migration 001, so the
-  // audit rows survive even after the user row is removed.
+  // Soft-delete (archive) with audit: called only after email-OTP approval.
+  // The row is kept so it can be restored later; status flips to 'archived'.
   const reqResult = await pool.query(
-    `DELETE FROM users WHERE id = $1 RETURNING id, username`,
+    `UPDATE users SET status = 'archived', deleted_at = NOW(), pending_deletion_at = NULL
+      WHERE id = $1 RETURNING id, username`,
     [userId]
   );
   if (reqResult.rows.length === 0) {
@@ -177,7 +177,7 @@ function requireAuth(req, res, next) {
   const token = req.headers.authorization?.replace("Bearer ", "");
   if (!token) return res.status(401).json({ message: "Authentication required" });
 
-  pool.query("SELECT * FROM users WHERE token = $1", [token])
+  pool.query("SELECT * FROM users WHERE token = $1 AND status = 'active'", [token])
     .then(async result => {
       if (result.rows.length === 0) return res.status(403).json({ message: "Invalid token" });
       const user = result.rows[0];
@@ -598,7 +598,7 @@ async function logSms(phone, message, status, error, smsId = null) {
 }
 
 async function getActiveRecipients() {
-  const result = await pool.query("SELECT phone_number, name FROM authorized_recipients WHERE is_active = true");
+  const result = await pool.query("SELECT phone_number, name FROM authorized_recipients WHERE is_active = true AND archived_at IS NULL");
   return result.rows;
 }
 
@@ -1443,7 +1443,7 @@ app.post("/auth/login", loginLimiter, async (req, res) => {
     const { username, password } = req.body;
     if (!username || !password) return res.status(400).json({ message: "Username and password required" });
 
-    const result = await pool.query("SELECT * FROM users WHERE username = $1", [username]);
+    const result = await pool.query("SELECT * FROM users WHERE username = $1 AND status = 'active'", [username]);
     if (result.rows.length === 0) return res.status(401).json({ message: "Invalid credentials" });
 
     const user = result.rows[0];
@@ -1492,7 +1492,7 @@ app.post("/auth/logout", requireAuth, async (req, res) => {
 // exactly the same way the server enforces it.
 app.get("/auth/users", requireAdmin, async (req, res) => {
   try {
-    const result = await pool.query("SELECT id, name, username, email, role, created_at FROM users ORDER BY created_at DESC");
+    const result = await pool.query("SELECT id, name, username, email, role, created_at, status FROM users WHERE status <> 'archived' ORDER BY created_at DESC");
     const adminCount = await pool.query("SELECT COUNT(*)::int AS n FROM users WHERE role = 'admin' AND status = 'active'");
     const nAdmins = adminCount.rows[0].n;
     const rows = result.rows.map((u) => ({
@@ -1503,6 +1503,112 @@ app.get("/auth/users", requireAdmin, async (req, res) => {
     res.json(rows);
   } catch (err) {
     res.status(500).json({ message: "Error fetching users", error: err.message });
+  }
+});
+
+// =============================================================================
+// ARCHIVED USER ACCOUNTS (soft-delete + restore)
+// =============================================================================
+// Deletion is now a soft archive: the row stays in `users` with
+// status='archived' + deleted_at=NOW() so the audit trail (activity_logs,
+// user_deletion_requests) keeps pointing at a real account and the account can
+// be restored. Archived accounts cannot log in (auth filters status='active').
+
+// GET /auth/users/archived (Admin only) - list restorable archived accounts
+app.get("/auth/users/archived", requireAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT id, name, username, email, role, created_at, status, deleted_at
+         FROM users WHERE status = 'archived'
+        ORDER BY deleted_at DESC`
+    );
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ message: "Error fetching archived users", error: err.message });
+  }
+});
+
+// POST /auth/users/:id/restore (Admin only) - bring an archived account back
+app.post("/auth/users/:id/restore", requireAdmin, async (req, res) => {
+  let client;
+  try {
+    client = await pool.connect();
+    await client.query("BEGIN");
+
+    const found = await client.query(
+      "SELECT id, username, email, role FROM users WHERE id = $1 AND status = 'archived' FOR UPDATE",
+      [req.params.id]
+    );
+    if (found.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ message: "No archived user with this id" });
+    }
+    const archived = found.rows[0];
+
+    // The owner can never be archived by the guards, but double-check anyway.
+    if (isOwnerUser(archived)) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ message: "The owner account cannot be restored (it was never archived)." });
+    }
+
+    // Restoring conflicts with a LIVE account sharing the username or email.
+    const conflict = await client.query(
+      `SELECT username, email FROM users
+        WHERE id <> $1 AND status IS DISTINCT FROM 'archived'
+          AND (username = $2 OR email = $3)
+        LIMIT 1`,
+      [archived.id, archived.username, archived.email]
+    );
+    if (conflict.rows.length > 0) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({
+        message:
+          "Cannot restore: the username or email is already taken by an active account.",
+        conflict: conflict.rows[0],
+      });
+    }
+
+    const restored = await client.query(
+      `UPDATE users SET status = 'active', deleted_at = NULL
+        WHERE id = $1 RETURNING id, name, username, email, role, created_at`,
+      [archived.id]
+    );
+
+    await client.query(
+      `INSERT INTO activity_logs (user_name, action_type, description, module)
+       VALUES ($1, 'USER_RESTORED', $2, 'settings')`,
+      [req.adminUser.username, `Restored user account "${archived.username}" from archive`]
+    );
+
+    await client.query("COMMIT");
+    res.json({ message: "User restored", data: restored.rows[0] });
+  } catch (err) {
+    if (client) await client.query("ROLLBACK");
+    console.error(`[${new Date().toISOString()}] Error restoring user:`, err.message);
+    res.status(500).json({ message: "Error restoring user", error: err.message });
+  } finally {
+    if (client) client.release();
+  }
+});
+
+// DELETE /auth/users/archived/:id (Admin only) - permanently purge an archived
+// user. Cascade-deletes user_deletion_requests; activity_logs.user_name is SET NULL.
+app.delete("/auth/users/archived/:id", requireAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(
+      "DELETE FROM users WHERE id = $1 AND status = 'archived' RETURNING username",
+      [req.params.id]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ message: "Archived user not found" });
+    await pool.query(
+      `INSERT INTO activity_logs (user_name, action_type, description, module)
+       VALUES ($1, 'USER_PURGED', $2, 'settings')`,
+      [req.adminUser.username, `Permanently purged archived user "${result.rows[0].username}"`]
+    );
+    res.json({ message: "User permanently deleted", username: result.rows[0].username });
+  } catch (err) {
+    console.error(`[${new Date().toISOString()}] Error purging archived user:`, err.message);
+    res.status(500).json({ message: "Error purging archived user", error: err.message });
   }
 });
 
@@ -1625,7 +1731,9 @@ app.post("/auth/users/:id/deletion-request", requireAdmin, async (req, res) => {
 });
 
 // POST /auth/users/:id/deletion-verify (Admin only)
-// Verifies the emailed OTP (constant-time) and hard-deletes the user + audit chain.
+// Verifies the emailed OTP (constant-time) and soft-deletes (archives) the user
+// + audit chain. The account row is kept with status='archived' so it can be
+// restored via POST /auth/users/:id/restore.
 app.post("/auth/users/:id/deletion-verify", requireAdmin, async (req, res) => {
   const client = await pool.connect();
   try {
@@ -1684,7 +1792,8 @@ app.post("/auth/users/:id/deletion-verify", requireAdmin, async (req, res) => {
     }
 
     const userDel = await client.query(
-      "DELETE FROM users WHERE id = $1 RETURNING username",
+      `UPDATE users SET status = 'archived', deleted_at = NOW(), pending_deletion_at = NULL
+        WHERE id = $1 RETURNING username`,
       [req.params.id]
     );
     if (userDel.rows.length === 0) {
@@ -1705,13 +1814,13 @@ app.post("/auth/users/:id/deletion-verify", requireAdmin, async (req, res) => {
     );
     await client.query(
       `INSERT INTO activity_logs (user_name, action_type, description, module)
-       VALUES ($1, 'USER_DELETED', $2, 'settings')`,
-      [actor, `Deleted user account "${userDel.rows[0].username}" via OTP verification`]
+       VALUES ($1, 'USER_ARCHIVED', $2, 'settings')`,
+      [actor, `Archived user account "${userDel.rows[0].username}" via OTP verification (restorable)`]
     );
 
     await client.query("COMMIT");
 
-    res.json({ message: "User deleted", username: userDel.rows[0].username });
+    res.json({ message: "User archived (restorable)", username: userDel.rows[0].username });
   } catch (err) {
     await client.query("ROLLBACK");
     console.error(`[${new Date().toISOString()}] Error verifying deletion OTP:`, err.message);
@@ -1863,7 +1972,7 @@ app.post("/settings/reset", requireAdmin, async (req, res) => {
 // GET /settings/recipients (Admin) - list SMS recipients
 app.get("/settings/recipients", requireAdmin, async (req, res) => {
   try {
-    const result = await pool.query("SELECT id, phone_number, name, is_active, created_at FROM authorized_recipients ORDER BY created_at DESC");
+    const result = await pool.query("SELECT id, phone_number, name, is_active, created_at FROM authorized_recipients WHERE archived_at IS NULL ORDER BY created_at DESC");
     res.json(result.rows);
   } catch (err) {
     console.error(`[${new Date().toISOString()}] Error fetching SMS recipients:`, err.message);
@@ -1911,7 +2020,7 @@ app.put("/settings/recipients/:id", requireAdmin, async (req, res) => {
           SET name = COALESCE($1, name),
               is_active = COALESCE($2, is_active),
               updated_at = NOW()
-        WHERE id = $3
+        WHERE id = $3 AND archived_at IS NULL
         RETURNING id, phone_number, name, is_active, created_at`,
       [name !== undefined ? name.trim() : null, is_active !== undefined ? is_active : null, req.params.id]
     );
@@ -1927,26 +2036,130 @@ app.put("/settings/recipients/:id", requireAdmin, async (req, res) => {
   }
 });
 
-// DELETE /settings/recipients/:id (Admin) - remove a recipient
+// DELETE /settings/recipients/:id (Admin) - archive a recipient (soft-delete,
+// reversible via POST /settings/recipients/:id/restore)
 app.delete("/settings/recipients/:id", requireAdmin, async (req, res) => {
   try {
-    const result = await pool.query("DELETE FROM authorized_recipients WHERE id = $1 RETURNING phone_number", [req.params.id]);
+    const result = await pool.query(
+      `UPDATE authorized_recipients SET archived_at = NOW()
+        WHERE id = $1 AND archived_at IS NULL
+        RETURNING phone_number`,
+      [req.params.id]
+    );
     if (result.rows.length === 0) return res.status(404).json({ message: "Recipient not found" });
     await pool.query(
-      "INSERT INTO activity_logs (user_name, action_type, description, module) VALUES ($1, 'SMS_RECIPIENT_REMOVED', $2, 'settings')",
-      [req.adminUser.username, `Removed SMS recipient ${result.rows[0].phone_number}`]
+      "INSERT INTO activity_logs (user_name, action_type, description, module) VALUES ($1, 'SMS_RECIPIENT_ARCHIVED', $2, 'settings')",
+      [req.adminUser.username, `Archived SMS recipient ${result.rows[0].phone_number} (restorable)`]
     );
-    res.json({ message: "SMS recipient removed" });
+    res.json({ message: "SMS recipient archived (restorable)", phone_number: result.rows[0].phone_number });
   } catch (err) {
-    console.error(`[${new Date().toISOString()}] Error removing SMS recipient:`, err.message);
-    res.status(500).json({ message: "Error removing SMS recipient", error: err.message });
+    console.error(`[${new Date().toISOString()}] Error archiving SMS recipient:`, err.message);
+    res.status(500).json({ message: "Error archiving SMS recipient", error: err.message });
+  }
+});
+
+// =============================================================================
+// ARCHIVED SMS RECIPIENTS (soft-delete + restore + purge)
+// =============================================================================
+
+// GET /settings/recipients/archived (Admin) - list archived recipients
+app.get("/settings/recipients/archived", requireAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT id, phone_number, name, is_active, created_at, archived_at
+         FROM authorized_recipients WHERE archived_at IS NOT NULL
+        ORDER BY archived_at DESC`
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error(`[${new Date().toISOString()}] Error fetching archived SMS recipients:`, err.message);
+    res.status(500).json({ message: "Error fetching archived SMS recipients", error: err.message });
+  }
+});
+
+// POST /settings/recipients/:id/archive (Admin) - explicit archive
+app.post("/settings/recipients/:id/archive", requireAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `UPDATE authorized_recipients SET archived_at = NOW()
+        WHERE id = $1 AND archived_at IS NULL
+        RETURNING phone_number`,
+      [req.params.id]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ message: "Recipient not found" });
+    await pool.query(
+      "INSERT INTO activity_logs (user_name, action_type, description, module) VALUES ($1, 'SMS_RECIPIENT_ARCHIVED', $2, 'settings')",
+      [req.adminUser.username, `Archived SMS recipient ${result.rows[0].phone_number} (restorable)`]
+    );
+    res.json({ message: "SMS recipient archived (restorable)", phone_number: result.rows[0].phone_number });
+  } catch (err) {
+    console.error(`[${new Date().toISOString()}] Error archiving SMS recipient:`, err.message);
+    res.status(500).json({ message: "Error archiving SMS recipient", error: err.message });
+  }
+});
+
+// POST /settings/recipients/:id/restore (Admin) - bring an archived recipient back
+app.post("/settings/recipients/:id/restore", requireAdmin, async (req, res) => {
+  try {
+    const found = await pool.query(
+      "SELECT id, phone_number FROM authorized_recipients WHERE id = $1 AND archived_at IS NOT NULL",
+      [req.params.id]
+    );
+    if (found.rows.length === 0) return res.status(404).json({ message: "No archived recipient with this id" });
+
+    // A live recipient may already occupy the phone number.
+    const conflict = await pool.query(
+      "SELECT id FROM authorized_recipients WHERE phone_number = $1 AND archived_at IS NULL",
+      [found.rows[0].phone_number]
+    );
+    if (conflict.rows.length > 0) {
+      return res.status(409).json({
+        message: "Cannot restore: an active recipient already uses this phone number.",
+      });
+    }
+
+    const result = await pool.query(
+      `UPDATE authorized_recipients SET archived_at = NULL, updated_at = NOW()
+        WHERE id = $1
+        RETURNING id, phone_number, name, is_active, created_at`,
+      [req.params.id]
+    );
+    await pool.query(
+      "INSERT INTO activity_logs (user_name, action_type, description, module) VALUES ($1, 'SMS_RECIPIENT_RESTORED', $2, 'settings')",
+      [req.adminUser.username, `Restored SMS recipient ${result.rows[0].phone_number} from archive`]
+    );
+    res.json({ message: "SMS recipient restored", data: result.rows[0] });
+  } catch (err) {
+    console.error(`[${new Date().toISOString()}] Error restoring SMS recipient:`, err.message);
+    res.status(500).json({ message: "Error restoring SMS recipient", error: err.message });
+  }
+});
+
+// DELETE /settings/recipients/archived/:id (Admin) - permanent purge of an
+// archived recipient (the only irreversible operation; archived users are never
+// purged by the API).
+app.delete("/settings/recipients/archived/:id", requireAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(
+      "DELETE FROM authorized_recipients WHERE id = $1 AND archived_at IS NOT NULL RETURNING phone_number",
+      [req.params.id]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ message: "Archived recipient not found" });
+    await pool.query(
+      "INSERT INTO activity_logs (user_name, action_type, description, module) VALUES ($1, 'SMS_RECIPIENT_PURGED', $2, 'settings')",
+      [req.adminUser.username, `Permanently purged SMS recipient ${result.rows[0].phone_number}`]
+    );
+    res.json({ message: "SMS recipient permanently deleted", phone_number: result.rows[0].phone_number });
+  } catch (err) {
+    console.error(`[${new Date().toISOString()}] Error purging SMS recipient:`, err.message);
+    res.status(500).json({ message: "Error purging SMS recipient", error: err.message });
   }
 });
 
 // POST /settings/recipients/test/:id (Admin) - send a test SMS to ONE recipient
 app.post("/settings/recipients/test/:id", requireAdmin, async (req, res) => {
   try {
-    const result = await pool.query("SELECT id, phone_number, name FROM authorized_recipients WHERE id = $1", [req.params.id]);
+    const result = await pool.query("SELECT id, phone_number, name FROM authorized_recipients WHERE id = $1 AND archived_at IS NULL", [req.params.id]);
     if (result.rows.length === 0) return res.status(404).json({ message: "Recipient not found" });
     const recipient = result.rows[0];
     const content = [

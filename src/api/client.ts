@@ -21,6 +21,8 @@ export interface UserEntry {
   created_at: string;
   owner?: boolean;
   protected?: boolean;
+  status?: string;
+  deleted_at?: string | null;
 }
 
 // ========================
@@ -488,8 +490,9 @@ export async function requestUserDeletion(
   return response.data;
 }
 
-// STEP 2 - Admin submits the emailed OTP; on success the user row is hard-deleted
-// and the full audit chain (requester -> OTP -> executor -> activity log) is written.
+// STEP 2 - Admin submits the emailed OTP; on success the user row is soft-deleted
+// (archived) and the full audit chain (requester -> OTP -> executor -> activity log)
+// is written. The account can be restored via /auth/users/:id/restore.
 export async function verifyUserDeletion(
   userId: number,
   request_id: number,
@@ -508,6 +511,30 @@ export async function verifyUserDeletion(
 export async function fetchDeletionRequests(signal?: AbortSignal): Promise<DeletionRequestEntry[]> {
   const response = await client.get<DeletionRequestEntry[]>("/auth/users/deletion-requests", { signal });
   return response.data;
+}
+
+// GET /auth/users/archived (Admin) - list restorable archived accounts
+export async function fetchArchivedUsers(signal?: AbortSignal): Promise<UserEntry[]> {
+  const response = await client.get<UserEntry[]>("/auth/users/archived", { signal });
+  return response.data;
+}
+
+// POST /auth/users/:id/restore (Admin) - bring an archived account back to active
+export async function restoreUser(
+  userId: number,
+  signal?: AbortSignal
+): Promise<{ message: string; data: UserEntry }> {
+  const response = await client.post<{ message: string; data: UserEntry }>(
+    `/auth/users/${userId}/restore`,
+    {},
+    { signal }
+  );
+  return response.data;
+}
+
+// DELETE /auth/users/archived/:id (Admin) - permanently purge an archived user
+export async function purgeUser(userId: number, signal?: AbortSignal): Promise<void> {
+  await client.delete(`/auth/users/archived/${userId}`, { signal });
 }
 
 // DELETE /auth/users/:id (Admin only) - legacy direct delete (kept for compatibility)
@@ -536,6 +563,7 @@ export interface SmsRecipient {
   name: string;
   is_active: boolean;
   created_at: string;
+  archived_at?: string | null;
 }
 
 export interface MuteStatus {
@@ -568,9 +596,46 @@ export async function updateSmsRecipient(
   return response.data;
 }
 
-// DELETE /settings/recipients/:id (Admin) - remove a recipient
+// DELETE /settings/recipients/:id (Admin) - archive a recipient (soft-delete)
 export async function deleteSmsRecipient(id: number, signal?: AbortSignal): Promise<void> {
   await client.delete(`/settings/recipients/${id}`, { signal });
+}
+
+// GET /settings/recipients/archived (Admin) - list archived recipients
+export async function fetchArchivedRecipients(signal?: AbortSignal): Promise<SmsRecipient[]> {
+  const response = await client.get<SmsRecipient[]>("/settings/recipients/archived", { signal });
+  return response.data;
+}
+
+// POST /settings/recipients/:id/archive (Admin) - archive a recipient
+export async function archiveSmsRecipient(
+  id: number,
+  signal?: AbortSignal
+): Promise<{ message: string; phone_number?: string }> {
+  const response = await client.post<{ message: string; phone_number?: string }>(
+    `/settings/recipients/${id}/archive`,
+    {},
+    { signal }
+  );
+  return response.data;
+}
+
+// POST /settings/recipients/:id/restore (Admin) - bring an archived recipient back
+export async function restoreSmsRecipient(
+  id: number,
+  signal?: AbortSignal
+): Promise<{ message: string; data: SmsRecipient }> {
+  const response = await client.post<{ message: string; data: SmsRecipient }>(
+    `/settings/recipients/${id}/restore`,
+    {},
+    { signal }
+  );
+  return response.data;
+}
+
+// DELETE /settings/recipients/archived/:id (Admin) - permanent purge (irreversible)
+export async function purgeSmsRecipient(id: number, signal?: AbortSignal): Promise<void> {
+  await client.delete(`/settings/recipients/archived/${id}`, { signal });
 }
 
 // POST /settings/recipients/test/:id (Admin) - deliver a test SMS to one recipient

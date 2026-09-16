@@ -46,6 +46,7 @@ This can help reduce risks caused by poor water conditions and improve overall m
 - **Custom alert sounds** - Audio alerts via Web Audio API
 - **PDF export** - Export system logs to PDF (LogsPage) and weekly reports to PDF (Historical Data)
 - **Activity logging** - Track user interactions including device connect/disconnect events
+- **Browser-based firmware flasher** - Flash or update the ESP32 firmware directly from the browser via Web Serial (Settings > Firmware Flasher, owner/admin only)
 - **WiFiManager** - ESP32 firmware uses captive portal for WiFi config (no hardcoded credentials)
 - **Touchscreen UI** - 480x320 TFT with XPT2046 resistive touch (HSPI); on-screen left/right page arrows and triple-tap gestures
 - **Non-blocking data send** - HTTP POST runs on a background FreeRTOS task, so a slow/unreachable backend never freezes the UI or touch input
@@ -65,7 +66,7 @@ This can help reduce risks caused by poor water conditions and improve overall m
 - **Historical Data** - Trend charts with time filtering (1h, 6h, 24h, 1 week, all time) and weekly report PDF export
 - **Activity Logs** - User activity tracking including device connect/disconnect events
 - **Logs** - System event logs with parameter filtering and PDF export
-- **Settings** - Configure thresholds, manage SMS recipients, mute/sleep SMS alerts, user management
+- **Settings** - Configure thresholds, manage SMS recipients, mute/sleep SMS alerts, user management, flash ESP32 firmware (owner/admin)
 
 ---
 
@@ -93,6 +94,7 @@ This can help reduce risks caused by poor water conditions and improve overall m
 | Connection Pool | pg | 8.20 |
 | Validation | Zod | 4.3 |
 | SMS Service | SkySMS API | - |
+| Web Flasher | esptool-js | 0.6 |
 
 ---
 
@@ -172,6 +174,9 @@ Dashboard opens at http://localhost:5173
 
 Flash the ESP32 with `water_monitoring_system/water_monitoring_system.ino`. On boot it first tries the saved network; if that fails it automatically opens the "Aquaculture-Setup" WiFi access point so you can configure credentials (and backend server IP/port/device ID) via the captive portal at http://192.168.4.1 (or serial command `W`, or triple-tap the top-left corner). The firmware's default backend address is `192.168.100.152:3000` (`SERVER_IP_DEFAULT` in `water_monitoring_system.ino`) — set it to your backend machine's LAN IP if it differs.
 
+#### Updating firmware without a wire → use the web flasher
+Prefer the **browser-based flasher** for updates: Settings > Firmware Flasher (owner/admin only). Plug the ESP32 in via USB, click Connect Device, pick a firmware build, and Flash — no Arduino IDE needed. Compiled binaries and the manifest live in `public/firmware/`; see `docs/WEB_FLASHER_NOTES.txt` for the full guide.
+
 ---
 
 ## Configuration
@@ -220,12 +225,14 @@ While muted, disconnect alerts still show as popups and are logged, but SMS is n
 src/
 ├── api/client.ts              # API client functions
 ├── components/
+│   ├── FirmwareFlasher.tsx   # Browser-based ESP32 web flasher card (Settings)
 │   ├── FloatingAlert.tsx      # Popup alerts with mute options
 │   └── DeviceConnectionMonitor.tsx  # ESP32 connect/disconnect monitoring
 ├── contexts/
 │   ├── SensorContext.tsx
 │   └── SensorProvider.tsx     # Data polling + stale detection
 ├── hooks/
+│   ├── useEspFlasher.ts
 │   ├── useSensors.ts
 │   ├── useThresholdAlert.ts
 │   └── useFloatingAlerts.ts
@@ -245,6 +252,7 @@ src/
 └── index.css
 server.cjs                     # Express backend
 water_monitoring_system/water_monitoring_system.ino        # ESP32 firmware (WiFiManager)
+public/firmware/               # Pre-compiled firmware + manifest for web flasher
 ```
 
 ---
@@ -280,6 +288,7 @@ water_monitoring_system/water_monitoring_system.ino        # ESP32 firmware (WiF
 | No data showing | Verify ESP32 is connected to same WiFi network |
 | CORS error | Add frontend port to ALLOWED_ORIGINS |
 | "Device offline" | Check ESP32 WiFi connection (use WiFiManager portal) |
+| Firmware flasher: "The port is already open" | Close all tabs using the serial port, fully restart the browser, then retry. Ensure you're picking the correct COM port in the dialog. See `docs/WEB_FLASHER_NOTES.txt` Section 18 for full troubleshooting steps. |
 | SMS not sending | Verify SKYSMS_API_KEY in .env |
 | AudioContext warning | Click anywhere on the page to unlock audio |
 
@@ -311,4 +320,4 @@ ISC
 
 ## Support
 
-For detailed documentation see docs/HOW_IT_WORKS.txt. For SMS configuration see docs/SMS_HOWTO.txt.
+For detailed documentation see docs/HOW_IT_WORKS.txt. For the ESP32 web flasher see docs/WEB_FLASHER_NOTES.txt. For SMS configuration see docs/SMS_HOWTO.txt.

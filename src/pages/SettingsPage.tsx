@@ -37,7 +37,11 @@ import {
   ScrollText,
   ChevronLeft,
   ChevronRight,
+  ChevronDown,
   Usb,
+  Clock,
+  Archive,
+  RotateCcw,
 } from "lucide-react";
 import type { SensorSettings } from "../types";
 import { DEFAULT_SETTINGS, getSettingsThresholds } from "../types";
@@ -55,6 +59,12 @@ import {
   addSmsRecipient,
   updateSmsRecipient,
   deleteSmsRecipient,
+  fetchArchivedUsers,
+  restoreUser,
+  purgeUser,
+  fetchArchivedRecipients,
+  restoreSmsRecipient,
+  purgeSmsRecipient,
   sendTestSms,
   sendStatusSms,
   setSmsMute,
@@ -226,6 +236,10 @@ export default function SettingsPage() {
   const [isResetting, setIsResetting] = useState(false);
 
   const [users, setUsers] = useState<UserEntry[]>([]);
+  const [archivedUsers, setArchivedUsers] = useState<UserEntry[]>([]);
+  const [showArchivedUsers, setShowArchivedUsers] = useState(false);
+  const [archivedUsersLoading, setArchivedUsersLoading] = useState(false);
+  const [purgeUserConfirm, setPurgeUserConfirm] = useState<{ id: number; username: string } | null>(null);
   const [isLoadingUsers, setIsLoadingUsers] = useState(true);
   const [showCreateForm, setShowCreateForm] = useState(false);
   const [showPassword, setShowPassword] = useState(false);
@@ -343,8 +357,9 @@ export default function SettingsPage() {
 
   const loadUsers = useCallback(async () => {
     try {
-      const data = await fetchUsers();
+      const [data, archived] = await Promise.all([fetchUsers(), fetchArchivedUsers()]);
       setUsers(data);
+      setArchivedUsers(archived);
     } catch {
       showToast("Failed to load users", "error");
     } finally {
@@ -356,8 +371,9 @@ export default function SettingsPage() {
     if (isAdmin) {
       const loadInitialUsers = async () => {
         try {
-          const data = await fetchUsers();
+          const [data, archived] = await Promise.all([fetchUsers(), fetchArchivedUsers()]);
           setUsers(data);
+          setArchivedUsers(archived);
         } catch {
           showToast("Failed to load users", "error");
         } finally {
@@ -407,6 +423,12 @@ export default function SettingsPage() {
       }
     }
   }, [form, validateForm, showToast, loadUsers]);
+
+  const resetCreateForm = useCallback(() => {
+    setShowCreateForm(false);
+    setFormErrors({});
+    setForm({ name: "", username: "", email: "", password: "", role: "user" });
+  }, []);
 
   const handleRequestDeletion = useCallback(async () => {
     if (!deleteConfirm || !deletionPassword) return;
@@ -496,6 +518,10 @@ export default function SettingsPage() {
   const [smsLogsPageSize] = useState(10);
   const [smsLogsFilter, setSmsLogsFilter] = useState("");
   const [smsHealth, setSmsHealth] = useState<SmsHealth | null>(null);
+  const [archivedRecipients, setArchivedRecipients] = useState<SmsRecipient[]>([]);
+  const [showArchivedRecipients, setShowArchivedRecipients] = useState(false);
+  const [archivedRecipientsLoading, setArchivedRecipientsLoading] = useState(false);
+  const [purgeRecipientConfirm, setPurgeRecipientConfirm] = useState<{ id: number; phone: string } | null>(null);
 
   const refreshSmsHealth = useCallback(async () => {
     try {
@@ -554,9 +580,14 @@ export default function SettingsPage() {
 
   const loadSmsSettings = useCallback(async () => {
     try {
-      const [recipientData, muteData] = await Promise.all([fetchSmsRecipients(), fetchSmsMuteStatus()]);
+      const [recipientData, muteData, archivedData] = await Promise.all([
+        fetchSmsRecipients(),
+        fetchSmsMuteStatus(),
+        fetchArchivedRecipients(),
+      ]);
       setRecipients(recipientData);
       setSmsMuteStatus(muteData);
+      setArchivedRecipients(archivedData);
     } catch {
       showToast("Failed to load SMS settings", "error");
     } finally {
@@ -568,9 +599,14 @@ export default function SettingsPage() {
     if (isAdmin) {
       const loadInitialSms = async () => {
         try {
-          const [recipientData, muteData] = await Promise.all([fetchSmsRecipients(), fetchSmsMuteStatus()]);
+          const [recipientData, muteData, archivedData] = await Promise.all([
+            fetchSmsRecipients(),
+            fetchSmsMuteStatus(),
+            fetchArchivedRecipients(),
+          ]);
           setRecipients(recipientData);
           setSmsMuteStatus(muteData);
+          setArchivedRecipients(archivedData);
         } catch {
           showToast("Failed to load SMS settings", "error");
         } finally {
@@ -655,7 +691,7 @@ export default function SettingsPage() {
     setSmsActionLoading(`del-${r.id}`);
     try {
       await deleteSmsRecipient(r.id);
-      showToast("SMS recipient removed", "success");
+      showToast("SMS recipient archived (restorable)", "success");
       await loadSmsSettings();
     } catch (err: unknown) {
       showToast(getApiError(err), "error");
@@ -663,6 +699,82 @@ export default function SettingsPage() {
       setSmsActionLoading(null);
     }
   }, [loadSmsSettings, showToast]);
+
+  const loadArchivedUsers = useCallback(async () => {
+    setArchivedUsersLoading(true);
+    try {
+      setArchivedUsers(await fetchArchivedUsers());
+    } catch {
+      showToast("Failed to load archived users", "error");
+    } finally {
+      setArchivedUsersLoading(false);
+    }
+  }, [showToast]);
+
+  const handleRestoreUser = useCallback(async (u: UserEntry) => {
+    setActionLoading(`restore-${u.id}`);
+    try {
+      await restoreUser(u.id);
+      showToast(`"${u.username}" restored to active`, "success");
+      await loadUsers();
+      await loadArchivedUsers();
+    } catch (err: unknown) {
+      showToast(getApiError(err), "error");
+    } finally {
+      setActionLoading(null);
+    }
+  }, [loadUsers, loadArchivedUsers, showToast]);
+
+  const handlePurgeUser = useCallback(async (u: UserEntry) => {
+    setActionLoading(`purge-${u.id}`);
+    try {
+      await purgeUser(u.id);
+      showToast(`"${u.username}" permanently deleted`, "success");
+      await loadArchivedUsers();
+    } catch (err: unknown) {
+      showToast(getApiError(err), "error");
+    } finally {
+      setActionLoading(null);
+    }
+  }, [loadArchivedUsers, showToast]);
+
+  const loadArchivedRecipients = useCallback(async () => {
+    setArchivedRecipientsLoading(true);
+    try {
+      setArchivedRecipients(await fetchArchivedRecipients());
+    } catch {
+      showToast("Failed to load archived recipients", "error");
+    } finally {
+      setArchivedRecipientsLoading(false);
+    }
+  }, [showToast]);
+
+  const handleRestoreRecipient = useCallback(async (r: SmsRecipient) => {
+    setSmsActionLoading(`restore-${r.id}`);
+    try {
+      await restoreSmsRecipient(r.id);
+      showToast("SMS recipient restored", "success");
+      await loadSmsSettings();
+      await loadArchivedRecipients();
+    } catch (err: unknown) {
+      showToast(getApiError(err), "error");
+    } finally {
+      setSmsActionLoading(null);
+    }
+  }, [loadSmsSettings, loadArchivedRecipients, showToast]);
+
+  const handlePurgeRecipient = useCallback(async (r: SmsRecipient) => {
+    setSmsActionLoading(`purge-${r.id}`);
+    try {
+      await purgeSmsRecipient(r.id);
+      showToast("SMS recipient permanently deleted", "success");
+      await loadArchivedRecipients();
+    } catch (err: unknown) {
+      showToast(getApiError(err), "error");
+    } finally {
+      setSmsActionLoading(null);
+    }
+  }, [loadArchivedRecipients, showToast]);
 
   const handleSendStatusNow = useCallback(async () => {
     setSmsActionLoading("status");
@@ -743,8 +855,8 @@ export default function SettingsPage() {
           </div>
         </div>
         <div className="px-6 lg:px-7 pb-5 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-white/85">
-          <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded bg-white/10">3 alert parameters</span>
-          <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded bg-white/10">6 thresholds</span>
+          <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded bg-white/10">{Object.keys(KEY_MAPPING).length} alert parameter{Object.keys(KEY_MAPPING).length === 1 ? "" : "s"}</span>
+          <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded bg-white/10">{SETTINGS_FIELDS.length} thresholds</span>
           {isAdmin && (
             <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded bg-white/10">
               {users.length} user{users.length === 1 ? "" : "s"}
@@ -755,20 +867,6 @@ export default function SettingsPage() {
 
       {/* Summary tiles */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-        <div className="bg-white rounded-xl border border-gray-100 p-4">
-          <div className="flex items-center gap-1.5 text-xs text-gray-500">
-            <SlidersHorizontal size={12} /> Alert Parameters
-          </div>
-          <div className="text-2xl font-bold text-gray-800 mt-1">3</div>
-          <div className="text-[10px] text-gray-400">temperature, water, ammonia</div>
-        </div>
-        <div className="bg-white rounded-xl border border-gray-100 p-4">
-          <div className="flex items-center gap-1.5 text-xs text-gray-500">
-            <SlidersHorizontal size={12} className="text-orange-500" /> Thresholds
-          </div>
-          <div className="text-2xl font-bold text-orange-600 mt-1">6</div>
-          <div className="text-[10px] text-gray-400">min/max per parameter</div>
-        </div>
         {isAdmin ? (
           <>
             <div className="bg-white rounded-xl border border-gray-100 p-4">
@@ -776,14 +874,30 @@ export default function SettingsPage() {
                 <Users size={12} className="text-orange-500" /> User Accounts
               </div>
               <div className="text-2xl font-bold text-orange-600 mt-1">{users.length}</div>
-              <div className="text-[10px] text-gray-400">on the system</div>
+              <div className="text-[11px] text-gray-400">on the system</div>
             </div>
             <div className="bg-white rounded-xl border border-gray-100 p-4">
               <div className="flex items-center gap-1.5 text-xs text-gray-500">
                 <Shield size={12} className="text-amber-500" /> Admins
               </div>
               <div className="text-2xl font-bold text-amber-600 mt-1">{adminCount}</div>
-              <div className="text-[10px] text-gray-400">administrator accounts</div>
+              <div className="text-[11px] text-gray-400">administrator accounts</div>
+            </div>
+            <div className="bg-white rounded-xl border border-gray-100 p-4">
+              <div className="flex items-center gap-1.5 text-xs text-gray-500">
+                <Archive size={12} className="text-sky-500" /> Archived
+              </div>
+              <div className="text-2xl font-bold text-sky-600 mt-1">{archivedUsers.length + archivedRecipients.length}</div>
+              <div className="text-[11px] text-gray-400">
+                {archivedUsers.length} account{archivedUsers.length === 1 ? "" : "s"} · {archivedRecipients.length} number{archivedRecipients.length === 1 ? "" : "s"} restorable
+              </div>
+            </div>
+            <div className="bg-white rounded-xl border border-gray-100 p-4">
+              <div className="flex items-center gap-1.5 text-xs text-gray-500">
+                <SlidersHorizontal size={12} className="text-orange-500" /> Thresholds
+              </div>
+              <div className="text-2xl font-bold text-orange-600 mt-1">{SETTINGS_FIELDS.length}</div>
+              <div className="text-[11px] text-gray-400">min/max per parameter</div>
             </div>
           </>
         ) : (
@@ -793,35 +907,37 @@ export default function SettingsPage() {
                 <Lock size={12} className="text-gray-500" /> Access
               </div>
               <div className="text-2xl font-bold text-gray-800 mt-1">View</div>
-              <div className="text-[10px] text-gray-400">read-only access</div>
+              <div className="text-[11px] text-gray-400">read-only access</div>
             </div>
             <div className="bg-white rounded-xl border border-gray-100 p-4">
               <div className="flex items-center gap-1.5 text-xs text-gray-500">
                 <AlertTriangle size={12} className="text-amber-500" /> Alerts Active
               </div>
               <div className="text-2xl font-bold text-amber-600 mt-1">Yes</div>
-              <div className="text-[10px] text-gray-400">thresholds enforced</div>
+              <div className="text-[11px] text-gray-400">thresholds enforced</div>
             </div>
           </>
         )}
       </div>
 
-      <div className="bg-white rounded-xl border border-gray-100 p-4 shadow-sm">
-        <div className="flex items-center gap-2 mb-1">
-          <AlertTriangle className="text-orange-600" size={18} />
-          <div className="text-xs font-bold text-gray-500 uppercase tracking-wide">
-            Alert Thresholds
+      <div className="space-y-4">
+        <div className="flex items-center justify-between flex-wrap gap-3">
+          <div>
+            <h2 className="text-lg font-bold text-gray-800 flex items-center gap-2 flex-wrap">
+              <AlertTriangle size={20} className="text-orange-500" />
+              Alert Thresholds
+              {dirty && isAdmin && (
+                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-bold bg-amber-100 text-amber-700">
+                  <span className="w-1.5 h-1.5 rounded-full bg-amber-500 animate-pulse" />
+                  Unsaved changes
+                </span>
+              )}
+            </h2>
+            <p className="text-sm text-gray-500 mb-4">Alerts are logged when a sensor value falls outside the green safe band.</p>
           </div>
-          {dirty && isAdmin && (
-            <span className="ml-1 inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold bg-amber-100 text-amber-700">
-              <span className="w-1.5 h-1.5 rounded-full bg-amber-500 animate-pulse" />
-              Unsaved changes
-            </span>
-          )}
         </div>
-        <p className="text-xs text-gray-400 mb-4">
-          Alerts are logged when a sensor value falls outside the green safe band.
-        </p>
+
+        <div className="bg-white rounded-xl border border-gray-100 p-4 shadow-sm">
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
           {(Object.keys(KEY_MAPPING) as Array<keyof typeof KEY_MAPPING>).map((key) => {
             const threshold = thresholdConfig[key];
@@ -853,7 +969,7 @@ export default function SettingsPage() {
                 </div>
                 <div className="grid grid-cols-2 gap-2">
                   <div>
-                    <label className="block text-[10px] text-gray-500 mb-0.5">Min</label>
+                    <label className="block text-[11px] text-gray-500 mb-0.5">Min</label>
                     <input
                       type="number"
                       step="0.1"
@@ -875,7 +991,7 @@ export default function SettingsPage() {
                     )}
                   </div>
                   <div>
-                    <label className="block text-[10px] text-gray-500 mb-0.5">Max</label>
+                    <label className="block text-[11px] text-gray-500 mb-0.5">Max</label>
                     <input
                       type="number"
                       step="0.1"
@@ -898,7 +1014,7 @@ export default function SettingsPage() {
                   bounds={bounds}
                   invalid={rangeInvalid}
                 />
-                <div className="text-[10px] text-gray-400">
+                <div className="text-[11px] text-gray-400">
                   Permitted bounds: {bounds.min} to {bounds.max} {threshold.unit}
                   {rangeInvalid && (
                     <span className="ml-1 text-red-500 font-semibold">min must be less than max</span>
@@ -908,6 +1024,7 @@ export default function SettingsPage() {
             );
           })}
         </div>
+        </div>
       </div>
 
       <div className="flex items-center gap-3">
@@ -916,7 +1033,7 @@ export default function SettingsPage() {
             <button
               onClick={handleSave}
               disabled={settingsSaving || Object.keys(validationErrors).length > 0}
-              className="flex items-center gap-2 px-4 py-2 bg-orange-600 hover:bg-orange-700 disabled:bg-orange-400 text-white rounded-lg text-sm font-medium transition-colors"
+              className="flex items-center gap-2 bg-gradient-to-r from-[#d94b1e] to-[#ef6a2e] px-4 py-2 text-white rounded-lg text-sm font-medium hover:from-[#c2410c] hover:to-[#d94b1e] transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
             >
               <Save size={16} />
               {settingsSaving ? "Saving..." : "Save Settings"}
@@ -966,20 +1083,20 @@ export default function SettingsPage() {
           </div>
 
           {showCreateForm && (
-            <div className="bg-white rounded-lg shadow p-6">
-              <div className="flex items-center justify-between mb-4">
-                <h3 className="text-md font-bold text-gray-800">Create New Account</h3>
-                <button
-                  onClick={() => {
-                    setShowCreateForm(false);
-                    setFormErrors({});
-                    setForm({ name: "", username: "", email: "", password: "", role: "user" });
-                  }}
-                  className="text-gray-400 hover:text-gray-600"
-                >
-                  <X size={20} />
-                </button>
-              </div>
+            <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4" onClick={resetCreateForm}>
+              <div className="bg-white rounded-xl shadow-xl max-w-lg w-full p-6 max-h-[90vh] overflow-y-auto" onClick={(e) => e.stopPropagation()}>
+                <div className="flex items-center gap-3 mb-4">
+                  <div className="w-10 h-10 rounded-full bg-orange-100 flex items-center justify-center">
+                    <UserPlus className="text-orange-600" size={20} />
+                  </div>
+                  <div className="flex-1">
+                    <h3 className="text-lg font-bold text-gray-800">Create New Account</h3>
+                    <p className="text-sm text-gray-500">Add a new system account with role-based access</p>
+                  </div>
+                  <button onClick={resetCreateForm} className="text-gray-400 hover:text-gray-600">
+                    <X size={20} />
+                  </button>
+                </div>
 
               <form onSubmit={handleCreateUser} className="space-y-4" noValidate>
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
@@ -1122,11 +1239,7 @@ export default function SettingsPage() {
                 <div className="flex gap-2 justify-end pt-2">
                   <button
                     type="button"
-                    onClick={() => {
-                      setShowCreateForm(false);
-                      setFormErrors({});
-                      setForm({ name: "", username: "", email: "", password: "", role: "user" });
-                    }}
+                    onClick={resetCreateForm}
                     className="px-4 py-2 border border-gray-300 rounded-lg text-sm font-semibold text-gray-700 hover:bg-gray-50 transition-colors"
                   >
                     Cancel
@@ -1145,16 +1258,17 @@ export default function SettingsPage() {
                   </button>
                 </div>
               </form>
+              </div>
             </div>
           )}
 
           {isLoadingUsers ? (
-            <div className="bg-white rounded-lg shadow p-8 text-center">
+            <div className="bg-white rounded-xl border border-gray-100 shadow-sm p-8 text-center">
               <Loader2 size={32} className="animate-spin mx-auto text-gray-400" />
               <p className="text-sm text-gray-500 mt-2">Loading users...</p>
             </div>
           ) : (
-            <div className="bg-white rounded-lg shadow overflow-hidden">
+            <div className="bg-white rounded-xl border border-gray-100 shadow-sm overflow-hidden">
               <div className="overflow-x-auto">
                 <table className="w-full">
                   <thead>
@@ -1233,6 +1347,102 @@ export default function SettingsPage() {
               </div>
             </div>
           )}
+
+          <div className="bg-sky-50 border border-sky-200 rounded-xl overflow-hidden">
+          <button
+            onClick={() => {
+              setShowArchivedUsers(!showArchivedUsers);
+              if (!showArchivedUsers) void loadArchivedUsers();
+            }}
+            aria-expanded={showArchivedUsers}
+            title={archivedUsers.length === 1 ? "1 archived account" : `${archivedUsers.length} archived accounts`}
+            className="w-full flex items-center justify-between gap-3 px-4 py-3 hover:bg-sky-100/70 transition-colors text-left"
+          >
+            <div className="flex items-center gap-3">
+              <span className="w-9 h-9 rounded-lg bg-sky-100 text-sky-600 flex items-center justify-center shrink-0">
+                <Archive size={18} />
+              </span>
+              <div>
+                <p className="text-sm font-bold text-gray-800 leading-tight">Archived Accounts</p>
+                <p className="text-xs text-gray-500">Restore or permanently delete archived accounts</p>
+              </div>
+            </div>
+            <div className="flex items-center gap-2 shrink-0">
+              <span
+                title={`${archivedUsers.length} archived account${archivedUsers.length === 1 ? "" : "s"}`}
+                className={`text-xs font-bold px-2.5 py-1 rounded-full ${
+                  archivedUsers.length > 0 ? "bg-sky-500 text-white" : "bg-sky-100 text-sky-700"
+                }`}
+              >
+                {archivedUsers.length} account{archivedUsers.length === 1 ? "" : "s"}
+              </span>
+              <ChevronDown size={18} className={`text-sky-600 transition-transform duration-200 ${showArchivedUsers ? "rotate-180" : ""}`} />
+            </div>
+          </button>
+            <div className={`overflow-hidden transition-all duration-300 ${showArchivedUsers ? "max-h-[640px] opacity-100" : "max-h-0 opacity-0"}`}>
+              <div className="border-t border-sky-200 bg-white">
+                {archivedUsersLoading ? (
+                  <div className="p-6 text-center">
+                    <Loader2 size={24} className="animate-spin mx-auto text-gray-400" />
+                  </div>
+                ) : archivedUsers.length === 0 ? (
+                  <p className="p-4 text-sm text-gray-500 text-center">No archived accounts.</p>
+                ) : (
+                  <div className="overflow-y-auto max-h-[640px]">
+                  <table className="w-full">
+                    <thead>
+                      <tr className="bg-gray-50 border-b border-gray-200">
+                        <th className="text-left px-4 py-2 text-xs font-semibold text-gray-500 uppercase">User</th>
+                        <th className="text-left px-4 py-2 text-xs font-semibold text-gray-500 uppercase">Username</th>
+                        <th className="text-left px-4 py-2 text-xs font-semibold text-gray-500 uppercase">Archived</th>
+                        <th className="text-right px-4 py-2 pr-6 text-xs font-semibold text-gray-500 uppercase">Actions</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-gray-100">
+                      {archivedUsers.map((u) => (
+                        <tr key={u.id} className="hover:bg-gray-50 transition-colors">
+                          <td className="px-4 py-2">
+                            <span className="text-sm text-gray-800">{u.name}</span>
+                          </td>
+                          <td className="px-4 py-2 text-sm text-gray-600 font-mono">{u.username}</td>
+                          <td className="px-4 py-2 text-xs text-gray-500 flex items-center gap-1">
+                            <Clock size={12} />
+                            {u.deleted_at ? formatFarmDate(u.deleted_at) : "—"}
+                          </td>
+                          <td className="px-4 py-2 pr-6 text-right">
+                            <div className="flex items-center justify-end gap-1.5">
+                              <button
+                                onClick={() => void handleRestoreUser(u)}
+                                disabled={actionLoading === `restore-${u.id}`}
+                                className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-emerald-700 bg-emerald-50 border border-emerald-200 rounded-lg hover:bg-emerald-100 transition disabled:opacity-50"
+                              >
+                                {actionLoading === `restore-${u.id}` ? (
+                                  <Loader2 size={13} className="animate-spin" />
+                                ) : (
+                                  <RotateCcw size={13} />
+                                )}
+                                Restore
+                              </button>
+                              <button
+                                onClick={() => setPurgeUserConfirm({ id: u.id, username: u.username })}
+                                disabled={actionLoading === `purge-${u.id}`}
+                                title="Permanently delete — cannot be undone"
+                                className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium text-red-500 hover:text-red-700 hover:bg-red-50 rounded-lg transition disabled:opacity-50"
+                              >
+                                <Trash2 size={13} />
+                                Delete Permanently
+                              </button>
+                            </div>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
 
           <div className="space-y-4 border-t border-gray-100 pt-6">
             <div className="flex items-center justify-between flex-wrap gap-3">
@@ -1472,6 +1682,99 @@ export default function SettingsPage() {
             )}
           </div>
 
+          <div className="bg-sky-50 border border-sky-200 rounded-xl overflow-hidden">
+          <button
+            onClick={() => {
+              setShowArchivedRecipients(!showArchivedRecipients);
+              if (!showArchivedRecipients) void loadArchivedRecipients();
+            }}
+            aria-expanded={showArchivedRecipients}
+            title={archivedRecipients.length === 1 ? "1 archived number" : `${archivedRecipients.length} archived numbers`}
+            className="w-full flex items-center justify-between gap-3 px-4 py-3 hover:bg-sky-100/70 transition-colors text-left"
+          >
+            <div className="flex items-center gap-3">
+              <span className="w-9 h-9 rounded-lg bg-sky-100 text-sky-600 flex items-center justify-center shrink-0">
+                <Archive size={18} />
+              </span>
+              <div>
+                <p className="text-sm font-bold text-gray-800 leading-tight">Archived Numbers</p>
+                <p className="text-xs text-gray-500">Restore or permanently delete archived numbers</p>
+              </div>
+            </div>
+            <div className="flex items-center gap-2 shrink-0">
+              <span
+                title={`${archivedRecipients.length} archived number${archivedRecipients.length === 1 ? "" : "s"}`}
+                className={`text-xs font-bold px-2.5 py-1 rounded-full ${
+                  archivedRecipients.length > 0 ? "bg-sky-500 text-white" : "bg-sky-100 text-sky-700"
+                }`}
+              >
+                {archivedRecipients.length} number{archivedRecipients.length === 1 ? "" : "s"}
+              </span>
+              <ChevronDown size={18} className={`text-sky-600 transition-transform duration-200 ${showArchivedRecipients ? "rotate-180" : ""}`} />
+            </div>
+          </button>
+            <div className={`overflow-hidden transition-all duration-300 ${showArchivedRecipients ? "max-h-[640px] opacity-100" : "max-h-0 opacity-0"}`}>
+              <div className="border-t border-sky-200 bg-white">
+                {archivedRecipientsLoading ? (
+                  <div className="p-6 text-center">
+                    <Loader2 size={24} className="animate-spin mx-auto text-gray-400" />
+                  </div>
+                ) : archivedRecipients.length === 0 ? (
+                  <p className="p-4 text-sm text-gray-500 text-center">No archived numbers.</p>
+                ) : (
+                  <div className="overflow-y-auto max-h-[640px]">
+                  <table className="w-full">
+                    <thead>
+                      <tr className="bg-gray-50 border-b border-gray-200">
+                        <th className="text-left px-4 py-2 text-xs font-semibold text-gray-500 uppercase">Name</th>
+                        <th className="text-left px-4 py-2 text-xs font-semibold text-gray-500 uppercase">Phone Number</th>
+                        <th className="text-left px-4 py-2 text-xs font-semibold text-gray-500 uppercase">Archived</th>
+                        <th className="text-right px-4 py-2 pr-6 text-xs font-semibold text-gray-500 uppercase">Actions</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-gray-100">
+                      {archivedRecipients.map((r) => (
+                        <tr key={r.id} className="hover:bg-gray-50 transition-colors">
+                          <td className="px-4 py-2 text-sm text-gray-800">{r.name || "—"}</td>
+                          <td className="px-4 py-2 text-sm text-gray-600 font-mono">{r.phone_number}</td>
+                          <td className="px-4 py-2 text-xs text-gray-500 flex items-center gap-1">
+                            <Clock size={12} />
+                            {r.archived_at ? formatFarmDate(r.archived_at) : "—"}
+                          </td>
+                          <td className="px-4 py-2 pr-6 text-right">
+                            <div className="flex items-center justify-end gap-1.5">
+                              <button
+                                onClick={() => void handleRestoreRecipient(r)}
+                                disabled={smsActionLoading === `restore-${r.id}`}
+                                className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-emerald-700 bg-emerald-50 border border-emerald-200 rounded-lg hover:bg-emerald-100 transition disabled:opacity-50"
+                              >
+                                {smsActionLoading === `restore-${r.id}` ? (
+                                  <Loader2 size={13} className="animate-spin" />
+                                ) : (
+                                  <RotateCcw size={13} />
+                                )}
+                                Restore
+                              </button>
+                              <button
+                                onClick={() => setPurgeRecipientConfirm({ id: r.id, phone: r.phone_number })}
+                                title="Permanently delete — cannot be undone"
+                                className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium text-red-500 hover:text-red-700 hover:bg-red-50 rounded-lg transition"
+                              >
+                                <Trash2 size={13} />
+                                Delete Permanently
+                              </button>
+                            </div>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+
           <div className="space-y-4 border-t border-gray-100 pt-6">
             <div>
               <h3 className="text-lg font-bold text-gray-800 flex items-center gap-2 flex-wrap">
@@ -1640,8 +1943,17 @@ export default function SettingsPage() {
       {resetModal && (
         <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4" onClick={() => setResetModal(null)}>
           <div className="bg-white rounded-xl shadow-xl max-w-sm w-full p-6" onClick={(e) => e.stopPropagation()}>
-            <h3 className="text-lg font-bold text-gray-800 mb-1">Reset Password</h3>
-            <p className="text-sm text-gray-500 mb-4">Enter new password for <span className="font-semibold">{resetModal.name}</span></p>
+            <div className="flex items-center gap-3 mb-4">
+              <div className="w-10 h-10 rounded-full bg-orange-100 flex items-center justify-center">
+                <KeyRound className="text-orange-600" size={20} />
+              </div>
+              <div>
+                <h3 className="text-lg font-bold text-gray-800">Reset Password</h3>
+                <p className="text-sm text-gray-500">
+                  Enter new password for <span className="font-semibold">{resetModal.name}</span>
+                </p>
+              </div>
+            </div>
 
             <div className="mb-4">
               <input
@@ -1775,6 +2087,91 @@ onClick={() => { setDeleteConfirm(null); setDeletionStep(null); setDeletionPassw
                   Request Deletion
                 </button>
               )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {purgeUserConfirm && (
+        <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4" onClick={() => setPurgeUserConfirm(null)}>
+          <div className="bg-white rounded-xl shadow-xl max-w-sm w-full p-6" onClick={(e) => e.stopPropagation()}>
+            <div className="flex items-center gap-3 mb-4">
+              <div className="w-10 h-10 rounded-full bg-red-100 flex items-center justify-center">
+                <Trash2 className="text-red-600" size={20} />
+              </div>
+              <div>
+                <h3 className="text-lg font-bold text-gray-800">Permanently Delete Account</h3>
+                <p className="text-sm text-gray-500">
+                  This will permanently erase <span className="font-semibold">{purgeUserConfirm.username}</span> and its
+                  deletion history from the system.
+                </p>
+              </div>
+            </div>
+            <p className="text-xs text-red-500 mb-4">This action cannot be undone.</p>
+            <div className="flex gap-2 justify-end">
+              <button
+                onClick={() => setPurgeUserConfirm(null)}
+                className="px-4 py-2 border border-gray-300 rounded-lg text-sm font-semibold text-gray-700 hover:bg-gray-50 transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={() => {
+                  void handlePurgeUser({ id: purgeUserConfirm.id, username: purgeUserConfirm.username } as UserEntry);
+                  setPurgeUserConfirm(null);
+                }}
+                disabled={actionLoading === `purge-${purgeUserConfirm.id}`}
+                className="flex items-center gap-2 px-4 py-2 bg-red-600 text-white rounded-lg text-sm font-semibold hover:bg-red-700 transition-colors disabled:opacity-50"
+              >
+                {actionLoading === `purge-${purgeUserConfirm.id}` ? (
+                  <Loader2 size={16} className="animate-spin" />
+                ) : (
+                  <Trash2 size={16} />
+                )}
+                Delete Permanently
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {purgeRecipientConfirm && (
+        <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4" onClick={() => setPurgeRecipientConfirm(null)}>
+          <div className="bg-white rounded-xl shadow-xl max-w-sm w-full p-6" onClick={(e) => e.stopPropagation()}>
+            <div className="flex items-center gap-3 mb-4">
+              <div className="w-10 h-10 rounded-full bg-red-100 flex items-center justify-center">
+                <Trash2 className="text-red-600" size={20} />
+              </div>
+              <div>
+                <h3 className="text-lg font-bold text-gray-800">Permanently Delete Number</h3>
+                <p className="text-sm text-gray-500">
+                  This will permanently erase <span className="font-semibold font-mono">{purgeRecipientConfirm.phone}</span> from the system.
+                </p>
+              </div>
+            </div>
+            <p className="text-xs text-red-500 mb-4">This action cannot be undone.</p>
+            <div className="flex gap-2 justify-end">
+              <button
+                onClick={() => setPurgeRecipientConfirm(null)}
+                className="px-4 py-2 border border-gray-300 rounded-lg text-sm font-semibold text-gray-700 hover:bg-gray-50 transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={() => {
+                  void handlePurgeRecipient({ id: purgeRecipientConfirm.id, phone_number: purgeRecipientConfirm.phone } as SmsRecipient);
+                  setPurgeRecipientConfirm(null);
+                }}
+                disabled={smsActionLoading === `purge-${purgeRecipientConfirm.id}`}
+                className="flex items-center gap-2 px-4 py-2 bg-red-600 text-white rounded-lg text-sm font-semibold hover:bg-red-700 transition-colors disabled:opacity-50"
+              >
+                {smsActionLoading === `purge-${purgeRecipientConfirm.id}` ? (
+                  <Loader2 size={16} className="animate-spin" />
+                ) : (
+                  <Trash2 size={16} />
+                )}
+                Delete Permanently
+              </button>
             </div>
           </div>
         </div>
