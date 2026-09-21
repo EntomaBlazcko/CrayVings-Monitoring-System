@@ -480,7 +480,8 @@ bool loadMq137R0()
 }
 
 // Persists the last-known-good sensor snapshot to NVS so Safe Mode can show
-// the last real values after a watchdog reset. Cheap enough to run every read.
+// the last real values after a watchdog reset. Call only when a value has
+// actually changed (see readAllSensors) to keep NVS flash writes minimal.
 void saveLastKnownValues()
 {
     Preferences prefs;
@@ -803,11 +804,26 @@ void readAllSensors()
     Serial.println("========================================");
 
     // Keep the last-good snapshot for Safe Mode recovery after a watchdog reset.
+    // Persisted to NVS only when a value actually changes (change-only), so the
+    // flash does not wear out from writing every read cycle (~86k writes/day).
+    const float prevTemp = lastGoodTemperature;
+    const float prevLevel = lastGoodWaterLevel;
+    const float prevAmmonia = lastGoodAmmonia;
+
     if (temperature != -127.0) lastGoodTemperature = temperature;
     if (waterLevel >= 0.0)     lastGoodWaterLevel = waterLevel;
     if (ammoniaReady)          lastGoodAmmonia = ammoniaPpm;
     lastGoodMillis = millis();
-    saveLastKnownValues();
+
+    const bool snapshotChanged =
+        fabsf(lastGoodTemperature - prevTemp) > 0.01f ||
+        fabsf(lastGoodWaterLevel - prevLevel) > 0.01f ||
+        fabsf(lastGoodAmmonia - prevAmmonia) > 0.01f;
+
+    if (snapshotChanged)
+    {
+        saveLastKnownValues();
+    }
 }
 
 // =============================================================================
