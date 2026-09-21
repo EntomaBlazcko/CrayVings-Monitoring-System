@@ -1,0 +1,33 @@
+Verify alignment of water_monitoring_system.ino with embedded-c-c-expert & senior-architect skills:
+
+=== CRITICAL SAFETY CHECKS ===
+[ ] Buffer overflows fixed: NO `strcpy(dest, src)`
+    (Check lines 999-1001, 1089-1091 → use strncpy + null termination)
+[ ] Watchdog active: `esp_task_wdt_init(30, true);` in setup()
+    + `esp_task_wdt_reset(); vTaskDelay(1/portTICK_PERIOD_MS);` in loop()
+[ ] NO blocking delay(1) in loop() (line 1696)
+
+=== REAL-TIME & CONCURRENCY ===
+[ ] Shared sensor vars (temp, distance, etc.) protected by mutex OR single-context access
+    (Check lines 126-128, 113-119 + usage in display/comms functions)
+[ ] Consider replacing blocking pulseIn() (lines 371-385) with timer/interrupt approach
+
+=== HEAP & ARCHITECTURE ===
+[ ] HTTP comms use static char buffers + snprintf (NO String concatenation)
+    (Check lines 1414-1418, 1428-1433)
+[ ] Clear layer separation visible:
+    * Sensor acquisition (read* functions)
+    * Display/UI (drawOverview, updateOverview, etc.)
+    * Communication (sendSensorData, WiFi handling)
+    * Configuration/persistence (Preferences/NVS)
+[ ] NO register-level touch reads mixed with high-level display logic
+    (e.g., lines 205-225 should be encapsulated)
+
+=== FAILURE HANDLING (OPTIONAL DEMO ENHANCEMENT) ===
+[ ] WiFi reconnection attempted before declaring failure
+[ ] Sensor error states tracked beyond -127.0 (e.g., failure counters)
+
+=== VERIFICATION NOTES ===
+- Prioritize: Buffer safety → Watchdog → Blocking delays → Shared state
+- To test watchdog: Temporarily add `while(1);` in loop() → should auto-reset
+- To test buffer safety: Try copying 31+ char string → should truncate safely

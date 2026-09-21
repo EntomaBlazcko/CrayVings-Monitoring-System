@@ -16,6 +16,8 @@ import type { AlertGuidance } from "../utils/alertGuidance";
 import { FixLegendPanel, FixLegendModal } from "../components/FixLegend";
 import { getIsSoundEnabled, setSoundEnabled } from "../utils/playAlertSound";
 import TrendCard from "../components/TrendCard";
+import TankSelector from "../components/TankSelector";
+import FleetGrid from "../components/FleetGrid";
 
 type Props = {
   onNavigate?: (menu: MenuKey) => void;
@@ -70,7 +72,7 @@ function StatCard({ title, value, description, gradient, icon, loading = false, 
 }
 
 export default function DashboardPage({ onNavigate }: Props) {
-  const { data, history, connectionStatus, lastUpdate, settings, loading, historyStale, historyLastUpdated, refetch } = useSensors();
+  const { data, history, connectionStatus, lastUpdate, settings, loading, historyStale, historyLastUpdated, refetch, devices, selectedDeviceId } = useSensors();
   const { user } = useAuth();
   const isAdmin = user?.role === "admin";
   const [alertsDismissed, setAlertsDismissed] = useState(false);
@@ -79,6 +81,13 @@ export default function DashboardPage({ onNavigate }: Props) {
   const [alertsSoundEnabled, setAlertsSoundEnabled] = useState<boolean>(() => getIsSoundEnabled());
 
   const thresholds = useMemo(() => getSettingsThresholds(settings), [settings]);
+
+  // Currently selected tank (drives data + history scoping).
+  const currentTank = useMemo(
+    () => devices.find((d) => d.device_id === selectedDeviceId) ?? null,
+    [devices, selectedDeviceId]
+  );
+  const currentTankLabel = currentTank?.tank_name || currentTank?.name || selectedDeviceId;
 
   const isOnline = connectionStatus === "online";
   const isConnecting = connectionStatus === "connecting";
@@ -279,6 +288,11 @@ export default function DashboardPage({ onNavigate }: Props) {
 
   return (
     <div className="space-y-6">
+      {/* Tank selector: switch which tank the dashboard is monitoring */}
+      <section>
+        <TankSelector />
+      </section>
+
       {isOfflineWithData && (
         <div className="bg-yellow-50 border border-yellow-200 rounded-xl p-3 flex items-center gap-2">
           <AlertTriangle size={16} className="text-yellow-600 shrink-0" />
@@ -303,6 +317,12 @@ export default function DashboardPage({ onNavigate }: Props) {
                 Smart Aquaculture Dashboard
               </span>
               {getStatusBadge()}
+              {currentTankLabel && (
+                <span className="inline-flex items-center gap-1.5 text-xs text-gray-500">
+                  <span className={`w-2 h-2 rounded-full ${getConnectionStatusDot()}`} />
+                  {currentTankLabel}
+                </span>
+              )}
               <span className="inline-flex items-center gap-1.5 text-xs text-gray-500">
                 <span className={`w-2 h-2 rounded-full ${getConnectionStatusDot()}`} />
                 {isOnline ? "Connected" : isConnecting ? "Connecting..." : isOfflineWithData ? "Offline" : "Disconnected"}
@@ -444,6 +464,11 @@ export default function DashboardPage({ onNavigate }: Props) {
             unit=" ppm"
           />
         </div>
+      </section>
+
+      {/* Fleet status - one card per registered tank */}
+      <section>
+        <FleetGrid />
       </section>
 
       {/* Quick controls + key metrics */}

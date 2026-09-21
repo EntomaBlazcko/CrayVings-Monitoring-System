@@ -36,6 +36,7 @@ import {
   ResponsiveContainer,
 } from "recharts";
 import { LoadingCard, ErrorCard } from "./Loading";
+import TankSelector from "./TankSelector";
 import { fetchAnalyticsOverview, fetchAnalyticsDaily, fetchAnalyticsInsights } from "../api/client";
 import { useSensors } from "../hooks/useSensors";
 import { isAxiosError } from "axios";
@@ -251,16 +252,20 @@ export default function AnalyticsSection() {
   const [error, setError] = useState<string | null>(null);
   const [retry, setRetry] = useState(0);
   const [focused, setFocused] = useState<ParamKey | null>(null);
-  const { settings } = useSensors();
+  const { settings, selectedDeviceId } = useSensors();
 
-  // Fetch all three datasets for the selected range (abortable).
+  // Fetch all three datasets for the selected range (abortable). Overview is
+  // scoped to the selected tank; daily aggregates + insights stay farm-wide.
   useEffect(() => {
     const controller = new AbortController();
     // eslint-disable-next-line react-hooks/set-state-in-effect
     setLoading(true);
     setError(null);
 
-    Promise.all([fetchAnalyticsOverview(range, controller.signal), fetchAnalyticsDaily(range, controller.signal)])
+    Promise.all([
+      fetchAnalyticsOverview(range, selectedDeviceId, controller.signal),
+      fetchAnalyticsDaily(range, controller.signal),
+    ])
       .then(([ov, dailyRes]) => {
         setOverview(ov);
         setDaily(dailyRes.daily || []);
@@ -280,7 +285,7 @@ export default function AnalyticsSection() {
       });
 
     return () => controller.abort();
-  }, [range, retry]);
+  }, [range, retry, selectedDeviceId]);
 
   const thresholds = useMemo(() => getSettingsThresholds(settings), [settings]);
 
@@ -396,6 +401,8 @@ const tooltipSeriesFilter = (payload: readonly TooltipEntry[]): TooltipEntry[] =
 
   return (
     <div className="space-y-4">
+      {/* Tank selector: scopes the overview summary to one tank */}
+      <TankSelector />
       {/* Header */}
       <div className="bg-white rounded-xl border border-gray-100 p-5">
         <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">

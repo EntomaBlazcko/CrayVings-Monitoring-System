@@ -141,6 +141,35 @@ export function getSettingsThresholds(settings: SensorSettings | null): Record<s
 }
 
 // ========================
+// DEVICE / TANK TYPES
+// ========================
+// Fleet registry entries as returned by GET /devices, plus the live payload of
+// each ESP32's GET /status endpoint (server -> device, health/diagnostics only).
+
+export type DeviceEntry = {
+  device_id: string;
+  name: string | null;
+  tank_name: string | null;
+  tank_location: string | null;
+  ip_address: string | null;
+  is_active: boolean;
+  last_seen: string | null;
+  last_health_seen: string | null;
+  online: boolean;
+};
+
+export type DeviceStatus = {
+  device_id: string;
+  ip: string;
+  uptime_ms: number;
+  wifi_rssi: number;
+  free_heap: number;
+  temperature: number;
+  water_level: number;
+  ammonia: number;
+};
+
+// ========================
 // THRESHOLD STATUS EVALUATION
 // ========================
 // Frontend mirror of server.cjs getThresholdStatus() with same 15% margin logic.

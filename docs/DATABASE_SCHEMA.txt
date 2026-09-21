@@ -77,19 +77,38 @@ TABLE: devices
 ================================================================================
 
 Canonical registry of ESP32 devices. Referenced by sensors and last_alerts.
+Star-topology: each device maps to one tank; the central server also records
+the device's static IP (used to poll GET /status) and last health check.
 
-  Column     Type         Constraints              Notes
-  ----------  -----------  -----------------------  --------------------
-  device_id  VARCHAR(50)  PRIMARY KEY               ESP32 device identifier
-  name       VARCHAR(100)                           Optional friendly name
-  is_active  BOOLEAN      NOT NULL DEFAULT true     Whether the device
-                                                    is enabled
-  created_at TIMESTAMP    DEFAULT CURRENT_TIMESTAMP Device first seen
-  last_seen  TIMESTAMP                             Latest reading timestamp
+  Column           Type         Constraints              Notes
+  ----------------  -----------  -----------------------  --------------------
+  device_id        VARCHAR(50)  PRIMARY KEY               ESP32 device identifier
+  name             VARCHAR(100)                           Optional friendly name
+  is_active        BOOLEAN      NOT NULL DEFAULT true     Whether the device
+                                                          is enabled
+  created_at       TIMESTAMPTZ  DEFAULT CURRENT_TIMESTAMP Device first seen
+                                                          (migration 007)
+  last_seen        TIMESTAMPTZ                            Latest reading timestamp
+                                                          (migration 007)
+  ip_address       TEXT                                   Static LAN IP of the
+                                                          device (e.g.
+                                                          192.168.4.101); needed
+                                                          by the device poller
+                                                          to reach GET /status
+  tank_name        VARCHAR(100)                           Friendly tank label
+                                                          (e.g. "Tank 3 -
+                                                          Bayside")
+  tank_location    VARCHAR(100)                           Physical location / zone
+  last_health_seen TIMESTAMPTZ                            Last successful GET
+                                                          /status poll (health
+                                                          only; sensors rows are
+                                                          not written by the
+                                                          poller)
 
 Devices are auto-registered server-side on first sensor ingest
 (INSERT INTO devices ... ON CONFLICT ... UPDATE) so the sensors.device_id
-FK never fails.
+FK never fails. tank_name / tank_location / ip_address are static registry
+metadata and should be set once (admin-side), not overwritten by ingests.
 
 ================================================================================
 TABLE: sensors
@@ -102,13 +121,19 @@ Time-series log of ESP32 sensor readings. One row per reading.
   id           SERIAL        PRIMARY KEY
   device_id    VARCHAR(50)   NOT NULL, FK -> devices.device_id   ESP32 device identifier
   temperature  DECIMAL(5,2)  DEFAULT 0                           Degrees Celsius
-  water_level  DECIMAL(5,2)  DEFAULT 0                           Percent (%)
+  water_level  DECIMAL(5,2)  DEFAULT 0                           Percent (%), or -1
+                                                                sentinel when the
+                                                                HC-SR04 read failed
   ammonia      DECIMAL(5,3)  DEFAULT 0                           ppm (MQ-137 sensor)
-  timestamp    TIMESTAMP     DEFAULT CURRENT_TIMESTAMP           Reading time
+  timestamp    TIMESTAMPTZ   DEFAULT CURRENT_TIMESTAMP           Reading time
+                                                                (migration 007)
 
 Indexes:
-  idx_sensors_timestamp   (timestamp DESC)
-  idx_sensors_device_id   (device_id)
+  idx_sensors_timestamp      (timestamp DESC)
+  idx_sensors_device_id      (device_id)
+  idx_sensors_device_timestamp (device_id, timestamp DESC)       per-tank history /
+                                                                trend queries
+                                                                (migration 007)
 
 ================================================================================
 TABLE: sensor_settings
@@ -150,7 +175,8 @@ and PDF export). Standalone -- stores human-readable strings, no foreign keys.
                                        acknowledged)
   acknowledged_at TIMESTAMP             When acknowledged
   acknowledged_by VARCHAR(100)          Username of the acknowledger
-  timestamp TIMESTAMP     DEFAULT CURRENT_TIMESTAMP
+  timestamp TIMESTAMPTZ     DEFAULT CURRENT_TIMESTAMP
+                                        (migration 007)
 
 Indexes:
   idx_system_logs_timestamp  (timestamp DESC)
@@ -408,11 +434,18 @@ NOTES
                                users.password_hash -> TEXT; makes
                                users.token_expires_at + sms_logs.sent_at
                                TIMESTAMPTZ
-      006_archive_restore.cjs - soft-delete (archive) + restore: users
-                               status='archived' reuse + partial unique
-                               indexes on username/email;
-                               authorized_recipients.archived_at column +
-                               partial unique index on phone_number
+006_archive_restore.cjs - soft-delete (archive) + restore: users
+                                status='archived' reuse + partial unique
+                                indexes on username/email;
+                                authorized_recipients.archived_at column +
+                                partial unique index on phone_number
+       007_multi_device.cjs   - multi-tank/star-topology support:
+                                devices.ip_address/tank_name/tank_location/
+                                last_health_seen; devices, sensors &
+                                system_logs timestamps -> TIMESTAMPTZ;
+                                composite index
+                                idx_sensors_device_timestamp
+                                (device_id, timestamp DESC)
 
   - Hash format: password_hash = PBKDF2_ITERATIONS:salt_hex:hash_hex
     (sha512, 600,000 iterations, 64-byte key).
@@ -459,8 +492,12 @@ Copy the block below into https://dbdiagram.io to render the full diagram.
     device_id varchar(50) [pk]
     name varchar(100)
     is_active boolean [not null, default: true]
-    created_at timestamp [default: `now()`]
-    last_seen timestamp
+    created_at timestamptz [default: `now()`]
+    last_seen timestamptz
+    ip_address text
+    tank_name varchar(100)
+    tank_location varchar(100)
+    last_health_seen timestamptz
   }
 
   Table sensors {
@@ -469,11 +506,12 @@ Copy the block below into https://dbdiagram.io to render the full diagram.
     temperature decimal(5,2) [default: 0]
     water_level decimal(5,2) [default: 0]
     ammonia decimal(5,3) [default: 0]
-    timestamp timestamp [default: `now()`]
+    timestamp timestamptz [default: `now()`]
 
     Indexes {
       (timestamp) [name: 'idx_sensors_timestamp']
       (device_id) [name: 'idx_sensors_device_id']
+      (device_id, timestamp) [name: 'idx_sensors_device_timestamp']
     }
   }
 
@@ -497,7 +535,7 @@ Copy the block below into https://dbdiagram.io to render the full diagram.
     ack_status varchar(20)
     acknowledged_at timestamp
     acknowledged_by varchar(100)
-    timestamp timestamp [default: `now()`]
+    timestamp timestamptz [default: `now()`]
 
     Indexes {
       (timestamp) [name: 'idx_system_logs_timestamp']

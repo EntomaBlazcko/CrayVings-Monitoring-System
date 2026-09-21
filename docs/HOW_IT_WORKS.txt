@@ -12,6 +12,46 @@ from sensors and displays it through a responsive web dashboard. The system
 consists of three main layers: hardware (ESP32 + sensors), backend
 (Express + PostgreSQL), and frontend (React dashboard).
 
+MULTI-TANK / STAR TOPOLOGY
+
+One dedicated ESP32 per tank (up to six in the current fleet) reports to a
+single central server on the same LAN, 192.168.4.0/24:
+
+  192.168.4.10   central server (backend + dashboard)
+  192.168.4.1    access point / router (gateway + DHCP)
+  192.168.4.100  ESP32 - Tank 1 (device_id tank01)
+  192.168.4.101  ESP32 - Tank 2 (device_id tank02)
+  ...            ...
+  192.168.4.105  ESP32 - Tank 6 (device_id tank06)
+
+Each ESP32:
+  - PUSHES readings to POST /sensor every 1000ms (the live data path; a
+    firmware drop-proof ring buffer queues up to 600 readings when the
+    server/network is down and flushes them oldest-first on recovery).
+  - EXPOSES a read-only GET /status endpoint (ESPAsyncWebServer on port 80)
+    with diagnostics: device_id, ip, uptime_ms, wifi_rssi, free_heap, and the
+    current sensor values.
+  - Sends the X-Device-Secret header when a device_secret is configured in
+    the config portal.
+
+The central server:
+  - PERSISTS readings to PostgreSQL (change-only / delta logging keeps the
+    table small).
+  - POLLS each device's GET /status every ~5s (services/devicePoller.cjs) for
+    health/diagnostics only -- it NEVER writes sensors rows. The poller
+    records devices.last_health_seen and marks the device offline after 3
+    consecutive failures.
+  - TRACKS the fleet registry (device_id, ip_address, tank_name,
+    tank_location, last_health_seen) in the devices table (migration 007).
+  - SERVES the fleet to the frontend via GET /devices (with online flags) and
+    GET /devices/:id/status (live on-demand query of one device).
+
+The dashboard reads the fleet through a single global "selected tank". The
+1-second live poll and every history/analytics query are scoped to that tank
+via the device_id query parameter; a 5-second fleet poll drives the tank
+selector chips and the Fleet Status grid (with an on-demand "Live check" per
+device).
+
 ================================================================================
 TECHNOLOGY STACK
 ================================================================================
@@ -40,23 +80,26 @@ ARCHITECTURE DIAGRAM
   +-----------------------------------------------------------------------+
   |                                                                       |
   |  +----------+     +--------------+     +-------------+     +--------+ |
-  |  |  ESP32   |---->|  Express API |---->|  PostgreSQL  |---->| React  | |
-  |  | Hardware |     |  Backend     |     |  Database    |     | Dash-  | |
-  |  +----------+     +--------------+     +-------------+     | board  | |
-  |       |                |                   |               +--------+ |
-  |       |     +----------+                   +------------+      |      |
-  |       |     |  Alert Generation |     Data Polling (1s) |      |      |
-  |       |     +--------------------+------------------------+      |      |
-  |       |                                                         |      |
-  |  Sensors:                                                       Pages: |
-  |  - DS18B20 (Temperature)                                   - Home     |
-  |  - Ultrasonic (Water Level)                                - Dashboard|
-  |  - Ammonia (MQ-137 NH3 ppm)                               - Sensors  |
-  |                                                             - Alerts  |
-  |                                                             -Historical|
-  |                                                             - Settings |
-  |                                                             - Logs     |
-  |                                                             - Activity |
+  |  | ESP32 x6 |     |  Express API |     |  PostgreSQL  |---->| React  | |
+  |  | (1/tank) |---->|  Backend     |-----|  Database    |     | Dash-  | |
+  |  |  push    |     |     +        |     +-------------+     | board  | |
+  |  +----------+     | Device Poller|     |  devices      |    +--------+ |
+  |      |  |  |      +--------------+     |  (registry +  |        |      |
+  |      |  |  |--GET /status (5s)-->|     |   health)     |        |      |
+  |      |  |  |        |                |  sensors (1Hz  |        |      |
+  |      |  |  |     +-------------------+  pushes, delta |        |      |
+  |      |  +-----+  | Alert / SMS     |  logged)        |        |      |
+  |      +--------+  | Generation      | last_alerts     |        |      |
+  |                 +-------------------+ system_logs    |        |      |
+  |                                                                       |
+  |  Each ESP32 (Tank 1..6) at 192.168.4.100..105:                        |
+  |  Sensors:                                                 Pages:      |
+  |  - DS18B20 (Temperature)            POST /sensor (1s)       Dashboard|
+  |  - Ultrasonic (water level %)       GET  /status (async)    Sensors  |
+  |  - Ammonia (MQ-137 NH3 ppm)         config portal (WiFiMgr)  Alerts   |
+  |                                                             Historical|
+  |                                                             Analytics |
+  |                                                             Settings  |
   +-----------------------------------------------------------------------+
 
 ================================================================================
@@ -234,19 +277,36 @@ DATA FLOW
     - Ammonia: MQ-137 chemiresistor measuring real NH3 gas concentration (ppm)
 
 2. DATA TRANSMISSION
-  The ESP32 sends a POST request to the backend server via Wi-Fi:
+  Each ESP32 pushes a POST request to the backend server via Wi-Fi:
 
-    POST http://192.168.100.152:3000/sensor
+    POST http://192.168.4.10:3000/sensor
     Content-Type: application/json
     X-Device-Secret: your_shared_secret
-      (required only if DEVICE_SECRET is set on the server)
+      (sent when device_secret is configured on the device; required only
+      if DEVICE_SECRET is set on the server)
 
     {
-      "device_id": "ESP32_01",
+      "device_id": "tank01",
       "temperature": 25.5,
       "water_level": 80.0,
       "ammonia": 4.5
     }
+
+  Unlimited success payloads that add no new values are skipped server-side
+  by delta logging, so the device pushes at 1 Hz but the database only grows
+  when something changes.
+
+  Each ESP32 ALSO runs an HTTP server (port 80) answering GET /status with
+  JSON diagnostics ({ device_id, ip, uptime_ms, wifi_rssi, free_heap,
+  temperature, water_level, ammonia }). The backend devicePoller queries it
+  every ~5s to build fleet health -- read-only, never stored as sensor rows.
+
+  Static IP: the firmware applies a static IP from NVS (WiFi config portal
+  fields static_ip / static_gateway / static_subnet) right after connecting
+  to the network, so each tank consistently sits at 192.168.4.100..105. If
+  the router instead uses DHCP address reservations, configure those a la
+  carte -- whichever approach is chosen should put every device on the
+  192.168.4.0/24 subnet where the central server listens.
 
 3. BACKEND PROCESSING
   The Express server (server.cjs) performs these operations:
@@ -281,11 +341,12 @@ CONNECTION & OFFLINE HANDLING
 
 HOW CONNECTION STATUS WORKS
 
-The frontend polls GET /sensor/latest every 1 second. The connection status
-is determined by the recv_at heartbeat (the receive time of the latest POST,
-always newer than the data's stored timestamp). With change-only (delta)
-logging enabled, unchanged readings are skipped so the data timestamp would
-otherwise go stale -- recv_at is bumped on every single POST.
+The frontend polls GET /sensor/latest every 1 second, scoped to the currently
+selected tank (&device_id=...). The connection status is determined by the
+recv_at heartbeat (the receive time of the latest POST, always newer than the
+data's stored timestamp). With change-only (delta) logging enabled, unchanged
+readings are skipped so the data timestamp would otherwise go stale -- recv_at
+is bumped on every single POST.
 
   lastUpdate = new Date(latest.recv_at || latest.timestamp)
   gap = Date.now() - lastUpdate.getTime()
@@ -398,6 +459,11 @@ WATCHDOG ARMING
   - loop() feeds the watchdog on every tick with esp_task_wdt_reset() followed
     by a vTaskDelay(1). Safe Mode's LED blink is millis()-based precisely so the
     watchdog is never starved by a blocking delay.
+  - Exception: the WiFi configuration portal intentionally blocks the loop task
+    for up to 3 minutes (setConfigPortalTimeout(180)). Because that would trip
+    the 30s watchdog, startWifiConfigPortal() suspends this task's WDT
+    subscription (esp_task_wdt_delete) around wm.startConfigPortal() and
+    re-arms it (esp_task_wdt_add) when the portal returns.
 
 SAFE MODE START (auto-detected on boot)
 
@@ -603,8 +669,17 @@ COMPLETE API REFERENCE
                                           X-Device-Secret when
                                           DEVICE_SECRET is set)
   /sensor                        GET      Get history (limit: 1-1000)
+                                          with optional device_id filter
+                                          (per-tank)
   /sensor/latest                 GET      Get latest reading (incl. recv_at
-                                          heartbeat)
+                                          heartbeat) with optional
+                                          device_id filter (per-tank)
+  /devices                       GET      Fleet registry + online flags
+                                          (device_id, name, tank_name,
+                                          tank_location, ip_address,
+                                          last_health_seen, is_active)
+  /devices/:deviceId/status      GET      Live poll of one ESP32's
+                                          GET /status (3s timeout; 502/504)
   /report/weekly                 GET      Weekly report (summary, daily
                                           breakdown, alert counts)
   /settings                      GET      Get thresholds
@@ -672,7 +747,8 @@ COMPONENT HIERARCHY
 
   App
   +-- SensorProvider
-  |   +-- useSensorDataPolling (1s interval)
+  |   +-- useSensorDataPolling (1s latest for selected tank,
+  |   |                         30s history, 5s fleet poll)
   |   +-- useSettingsManager
   |   +-- useLogsManager (5s interval)
   |   +-- useActivityLogsManager
@@ -683,19 +759,25 @@ COMPONENT HIERARCHY
   +-- Sidebar
   +-- Pages
       +-- HomePage
-      +-- DashboardPage
+      +-- DashboardPage        <-- TankSelector + FleetGrid
       +-- SensorsPage
       +-- AlertsPage
-      +-- HistoricalDataPage
+      +-- HistoricalDataPage   <-- TankSelector
       +-- SettingsPage
       +-- LogsPage
       +-- ActivityLogsPage
+  +-- Components
+      +-- TankSelector         Tank chips w/ online dots (all pages)
+      +-- FleetGrid            2-3 col fleet cards + per-device
+                              on-demand "Live check" (Dashboard only)
 
 STATE MANAGEMENT
 
 React Context with custom hooks:
 
-  1. SensorDataContext: Real-time sensor data, history, connection status
+  1. SensorDataContext: Real-time sensor data, history, connection status,
+     fleet registry (devices + online flags), and selectedDeviceId / setter.
+     The selected tank is lifted to the provider so it persists across pages.
   2. SensorSettingsContext: Threshold configuration
   3. LogsContext: System logs with pagination
   4. ActivityLogsContext: User activity tracking
@@ -732,30 +814,42 @@ ESP32 COMMUNICATION PROTOCOL
   Method: POST
   Content-Type: application/json
   Device auth: X-Device-Secret header (when a device secret is configured)
-  URL: http://192.168.100.152:3000/sensor (default SERVER_IP_DEFAULT)
+  URL: http://192.168.4.10:3000/sensor (default SERVER_IP_DEFAULT)
   Send interval: 1000 ms (same as sensor read interval)
   Send location: background FreeRTOS task (never blocks the touch/UI loop)
   Serial monitor: 115200 baud (diagnostics only)
   WiFi: WiFiManager captive portal (auto-opens when the saved network fails)
 
-The firmware posts only device_id, temperature, water_level, and ammonia in
-the JSON body -- it does not currently attach the X-Device-Secret header,
-so leave DEVICE_SECRET unset on the server or the POST will be rejected.
+The firmware posts device_id, temperature, water_level, and ammonia in the
+JSON body. It also sends the X-Device-Secret header (configured in the WiFi
+config portal as device_secret) whenever one is set, so DEVICE_SECRET can be
+enabled on the server. If the server enforces a secret and the device has none
+configured, the POST is rejected with 401.
 
 NETWORK REQUIREMENTS
 
+  - LAN subnet 192.168.4.0/24 (the ESP32 SoftAP default range); the access
+    point/router acts as gateway 192.168.4.1
+  - Central server at 192.168.4.10 (static IP); all ESP32s at
+    192.168.4.100-105
   - WiFi network (2.4GHz recommended for ESP32)
   - WiFiManager captive portal for easy credential configuration
-  - Server on same local network
-  - Port 3000 accessible
-  - Static IP recommended for server
+  - Port 3000 accessible (POST /sensor); port 80 on each ESP32 for the
+    server's GET /status health poll
+  - Devices use NVS-configured static IPs by default (WiFi config portal
+    fields static_ip / static_gateway / static_subnet); DHCP address
+    reservations are an alternative so long as the subnet stays 192.168.4.0/24
   - The HTTP POST runs on a background FreeRTOS task (sendSensorTask in
     water_monitoring_system.ino) with a 1-second connect timeout and 1-second response
     timeout. The main loop only sets a sendPending/sendBusy flag every
     SEND_INTERVAL (1000 ms), so even when the backend IP is wrong/unreachable
     the POST stalls the background task only -- the screen and touch keep
     running at full responsiveness. Keep SERVER_IP_DEFAULT (or the portal's
-    server_ip) pointed at the real backend machine (default: 192.168.100.152)
+    server_ip) pointed at the real backend machine (default: 192.168.4.10).
+
+  ESP32 libraries required in Arduino IDE:
+    - ESPAsyncWebServer (serves GET /status on port 80)
+    - AsyncTCP        (its underlying TCP library)
 
 SENSOR TYPES & MEASUREMENT RANGES
 
@@ -860,10 +954,13 @@ RUNNING THE APPLICATION
   Flash the ESP32 with water_monitoring_system/water_monitoring_system.ino. On boot it first tries the
   saved network; if that fails it automatically opens the "Aquaculture-Setup"
   WiFi access point so you can configure your network (and backend server IP,
-  port, and device ID) via the captive portal at http://192.168.4.1. The
-  firmware default backend address is 192.168.100.152:3000
-  (SERVER_IP_DEFAULT in water_monitoring_system.ino); set it to your backend machine's
-  LAN IP if it differs.
+  port, device ID, device secret, tank height, and static IP) via the captive
+  portal at http://192.168.4.1. The firmware default backend address is
+  192.168.4.10:3000 (SERVER_IP_DEFAULT in water_monitoring_system.ino); set it
+  to your backend machine's LAN IP if it differs. Each tank must also be given
+  its own device_id (e.g. tank01..tank06) and, if desired, a static IP in
+  192.168.4.100-105. Requires the ESPAsyncWebServer + AsyncTCP libraries
+  installed in Arduino IDE.
 
 
 ================================================================================
@@ -1030,7 +1127,11 @@ PERFORMANCE METRICS
 
   Metric                          Value
   ------------------------------  ----------------------
-  Polling interval                1 second
+  Polling interval (selected tank) 1 second
+  Fleet poll interval             5 seconds
+  Device poller interval          5 seconds (GET /status health checks)
+  Device poller concurrency       3 devices at once (2s request timeout)
+  Device offline threshold        3 consecutive failures / ~15s
   Logs polling interval           5 seconds
   History polling interval        30 seconds
   Request timeout                 10 seconds
@@ -1088,7 +1189,9 @@ FUTURE ENHANCEMENT POSSIBILITIES
 
   1. Mobile App - Native iOS/Android apps
   2. Push Notifications - Firebase or similar
-  3. Multi-Pond Support - Multiple tank monitoring
+  3. Per-Tank Fleet Optimizations - the six-tank star topology is in place;
+     next steps could include per-tank alert thresholds, tank grouping, and
+     fleet-wide color-coded farm maps
   4. Data Analysis - ML-based predictions
   5. WebSocket - Real-time updates instead of polling
   6. Multi-user - Role-based access

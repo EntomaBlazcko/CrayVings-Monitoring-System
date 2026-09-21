@@ -5,7 +5,7 @@
 // =============================================================================
 
 import axios, { isAxiosError, type AxiosError } from "axios";
-import type { SensorEntry, ChartPoint, LogEntry, SensorSettings, ActivityLog, ActivityLogEntry, AuthResponse, WeeklyReport, AnalyticsOverview, AnalyticsDailyResponse, AnalyticsInsightsResponse } from "../types";
+import type { SensorEntry, ChartPoint, LogEntry, SensorSettings, ActivityLog, ActivityLogEntry, AuthResponse, WeeklyReport, AnalyticsOverview, AnalyticsDailyResponse, AnalyticsInsightsResponse, DeviceEntry, DeviceStatus } from "../types";
 import { API_BASE } from "../types";
 import { formatFarmTime } from "../utils/time";
 
@@ -133,10 +133,13 @@ export class ApiError extends Error {
 // SENSOR DATA ENDPOINTS
 // ========================
 
-// GET /sensor/latest - fetch latest reading; null when none/canceled
-export async function fetchLatestSensor(signal?: AbortSignal): Promise<SensorEntry | null> {
+// GET /sensor/latest - fetch latest reading; optional device_id scopes to one tank
+export async function fetchLatestSensor(deviceId?: string | null, signal?: AbortSignal): Promise<SensorEntry | null> {
   try {
-    const response = await client.get<SensorEntry>("/sensor/latest", { signal });
+    const response = await client.get<SensorEntry>("/sensor/latest", {
+      params: deviceId ? { device_id: deviceId } : undefined,
+      signal,
+    });
     return response.data;
   } catch (error) {
     if (isAxiosError(error) && error.code === "ERR_CANCELED") {
@@ -149,10 +152,11 @@ export async function fetchLatestSensor(signal?: AbortSignal): Promise<SensorEnt
   }
 }
 
-// GET /sensor - fetch sensor history sorted oldest-first as ChartPoints for charts
-export async function fetchSensorHistory(limit = 1000, signal?: AbortSignal): Promise<ChartPoint[]> {
+// GET /sensor - fetch sensor history sorted oldest-first as ChartPoints for charts.
+// Optional deviceId scopes the query to one tank.
+export async function fetchSensorHistory(limit = 1000, deviceId?: string | null, signal?: AbortSignal): Promise<ChartPoint[]> {
   const response = await client.get<SensorEntry[]>("/sensor", {
-    params: { limit },
+    params: deviceId ? { limit, device_id: deviceId } : { limit },
     signal,
   });
   
@@ -181,6 +185,25 @@ export async function fetchSensorHistory(limit = 1000, signal?: AbortSignal): Pr
 }
 
 // ========================
+// DEVICE / TANK ENDPOINTS
+// ========================
+
+// GET /devices - fleet registry with online flags (drives the tank selector
+// and fleet grid; polled on an interval, not per second).
+export async function fetchDevices(signal?: AbortSignal): Promise<DeviceEntry[]> {
+  const response = await client.get<DeviceEntry[]>("/devices", { signal });
+  return response.data || [];
+}
+
+// GET /devices/:id/status - live on-demand read of one ESP32's GET /status.
+// Only call on user action (e.g. opening a device details panel), never in a
+// tight poll loop - each call can take up to 3s if the device is slow.
+export async function fetchDeviceStatus(deviceId: string, signal?: AbortSignal): Promise<DeviceStatus> {
+  const response = await client.get<DeviceStatus>(`/devices/${encodeURIComponent(deviceId)}/status`, { signal });
+  return response.data;
+}
+
+// ========================
 // WEEKLY REPORT ENDPOINT
 // ========================
 
@@ -202,10 +225,11 @@ export async function fetchRangeReport(hours: number | null, signal?: AbortSigna
 // ANALYTICS ENDPOINTS
 // ========================
 
-// GET /analytics/overview - period summary, trends, alerts, uptime stats
-export async function fetchAnalyticsOverview(days = 7, signal?: AbortSignal): Promise<AnalyticsOverview> {
+// GET /analytics/overview - period summary, trends, alerts, uptime stats.
+// Optional deviceId scopes the summary/uptime to one tank.
+export async function fetchAnalyticsOverview(days = 7, deviceId?: string | null, signal?: AbortSignal): Promise<AnalyticsOverview> {
   const response = await client.get<AnalyticsOverview>("/analytics/overview", {
-    params: { days },
+    params: deviceId ? { days, device_id: deviceId } : { days },
     signal,
   });
   return response.data;

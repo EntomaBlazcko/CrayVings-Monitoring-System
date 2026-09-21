@@ -21,6 +21,7 @@ require("dotenv").config();
 // SMS gateway circuit breaker (services/smsService.cjs) - stops hammering the
 // HTTPSMS gateway after repeated failures and exposes state via sms-health.
 const { smsCircuitBreaker, sendSmsWithBreaker } = require("./services/smsService.cjs");
+const { startDevicePoller } = require("./services/devicePoller.cjs");
 
 // ========================
 // EXPRESS APP SETUP
@@ -1129,11 +1130,24 @@ app.post("/sensor", async (req, res) => {
   }
 });
 
-// GET /sensor - sensor history, newest first; ?limit (default 300, max 1000)
+// GET /sensor - sensor history, newest first; ?limit (default 300, max 1000),
+// optional ?device_id to scope to one tank, optional ?from & ?to (ISO dates)
 app.get("/sensor", requireAuth, async (req, res) => {
   try {
     const limit = Math.min(1000, Math.max(1, parseInt(req.query.limit) || 300));
-    const result = await pool.query("SELECT * FROM sensors ORDER BY timestamp DESC LIMIT $1", [limit]);
+    const deviceId = req.query.device_id ? String(req.query.device_id) : null;
+    const from = req.query.from ? new Date(String(req.query.from)) : null;
+    const to = req.query.to ? new Date(String(req.query.to)) : null;
+    const result = await pool.query(
+      `SELECT * FROM sensors
+        WHERE ($1::text IS NULL OR device_id = $1)
+          AND ($2::timestamptz IS NULL OR timestamp >= $2)
+          AND ($3::timestamptz IS NULL OR timestamp <= $3)
+        ORDER BY timestamp DESC
+        LIMIT $4`,
+      [deviceId, from && !isNaN(from.getTime()) ? from : null,
+       to && !isNaN(to.getTime()) ? to : null, limit]
+    );
     res.json(result.rows);
   } catch (err) {
     console.error(`[${new Date().toISOString()}] Error fetching sensors:`, err.message);
@@ -1141,21 +1155,70 @@ app.get("/sensor", requireAuth, async (req, res) => {
   }
 });
 
-// GET /sensor/latest - most recent reading; 404 when none exist
+// GET /sensor/latest - most recent reading (optionally ?device_id); 404 when none exist
 app.get("/sensor/latest", requireAuth, async (req, res) => {
   try {
+    const deviceId = req.query.device_id ? String(req.query.device_id) : null;
     const result = await pool.query(
       `SELECT s.*, d.last_seen AS recv_at
        FROM sensors s
        LEFT JOIN devices d ON d.device_id = s.device_id
+       WHERE ($1::text IS NULL OR s.device_id = $1)
        ORDER BY s.timestamp DESC
-       LIMIT 1`
+       LIMIT 1`,
+      [deviceId]
     );
     if (result.rows.length === 0) return res.status(404).json({ message: "No sensor data found" });
     res.json(result.rows[0]);
   } catch (err) {
     console.error(`[${new Date().toISOString()}] Error fetching latest:`, err.message);
     res.status(500).json({ message: "Error", error: err.message });
+  }
+});
+
+// ========================
+// DEVICE REGISTRY ENDPOINTS
+// ========================
+
+// GET /devices - fleet registry with online flag (scoped to the sensor-path
+// heartbeat, matching the disconnect monitor's staleness window)
+app.get("/devices", requireAuth, async (req, res) => {
+  try {
+    const staleSeconds = Math.max(5, Math.floor(DISCONNECT_STALE_MS / 1000));
+    const result = await pool.query(
+      `SELECT device_id, name, tank_name, tank_location, ip_address, is_active,
+              last_seen, last_health_seen,
+              (last_seen > NOW() - ($1 || ' seconds')::interval) AS online
+         FROM devices
+        ORDER BY device_id`,
+      [staleSeconds]
+    );
+    res.json(result.rows.map((row) => ({ ...row, online: !!row.online })));
+  } catch (err) {
+    console.error(`[${new Date().toISOString()}] Error fetching devices:`, err.message);
+    res.status(500).json({ message: "Error fetching devices", error: err.message });
+  }
+});
+
+// GET /devices/:id/status - live on-demand poll of one ESP32's GET /status.
+// Diagnostic endpoint (not the data path); 3s timeout, 502/504 on failure.
+app.get("/devices/:deviceId/status", requireAuth, async (req, res) => {
+  try {
+    const device = await pool.query(
+      "SELECT device_id, ip_address FROM devices WHERE device_id = $1",
+      [req.params.deviceId]
+    );
+    if (device.rows.length === 0) return res.status(404).json({ message: "Device not found" });
+    const ip = device.rows[0].ip_address;
+    if (!ip || ip === "") return res.status(400).json({ message: "Device has no IP address configured" });
+
+    const response = await axios.get(`http://${ip}/status`, { timeout: 3000 });
+    res.json(response.data);
+  } catch (err) {
+    if (err.code === "ECONNABORTED") {
+      return res.status(504).json({ message: "Device timed out" });
+    }
+    res.status(502).json({ message: "Device unreachable", error: err.message });
   }
 });
 
@@ -2359,7 +2422,7 @@ app.get("/sms-logs", requireAdmin, async (req, res) => {
 // ========================
 
 // POST /logs - create a system log entry (action + parameter required)
-app.post("/logs", async (req, res) => {
+app.post("/logs", requireAuth, async (req, res) => {
   try {
     const { action, parameter, old_value, new_value } = req.body;
     if (!action || !parameter) return res.status(400).json({ message: "action and parameter required" });
@@ -2433,7 +2496,7 @@ app.get("/system-logs", requireAuth, async (req, res) => {
 // ========================
 
 // POST /activity-logs - record a user activity event for the audit trail
-app.post("/activity-logs", async (req, res) => {
+app.post("/activity-logs", requireAuth, async (req, res) => {
   try {
     const { action_type, description, module } = req.body;
     if (!action_type) return res.status(400).json({ message: "action_type required" });
@@ -2518,7 +2581,8 @@ function analyticsDays(req) {
 }
 
 // Aggregated min/avg/max over a sensor window; invalid sentinels filtered out.
-async function queryPeriodStats(startTs) {
+// Optional deviceId scopes the aggregation to one tank.
+async function queryPeriodStats(startTs, deviceId = null) {
   const result = await pool.query(
     `SELECT
        COALESCE(AVG(temperature) FILTER (WHERE temperature > 0), 0)::float AS temp_avg,
@@ -2532,8 +2596,9 @@ async function queryPeriodStats(startTs) {
        COALESCE(MAX(ammonia) FILTER (WHERE ammonia >= 0), 0)::float AS ammonia_max,
        COUNT(*) AS total_readings
      FROM sensors
-     WHERE timestamp >= $1`,
-    [startTs]
+     WHERE timestamp >= $1
+       AND ($2::text IS NULL OR device_id = $2)`,
+    [startTs, deviceId]
   );
   const r = result.rows[0] || {};
   return {
@@ -2597,17 +2662,18 @@ function buildTrend(current, previous) {
 app.get("/analytics/overview", requireAuth, async (req, res) => {
   try {
     const days = analyticsDays(req);
+    const deviceId = req.query.device_id ? String(req.query.device_id) : null;
     const currentStart = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
     const prevStart = new Date(currentStart.getTime() - days * 24 * 60 * 60 * 1000);
 
     const [currentStats, prevStats, alerts, readings, gapEvents, latest, deviceHeartbeat] = await Promise.all([
-      queryPeriodStats(currentStart),
-      queryPeriodStats(prevStart),
+      queryPeriodStats(currentStart, deviceId),
+      queryPeriodStats(prevStart, deviceId),
       queryAlertStats(currentStart),
-      pool.query("SELECT COUNT(*)::int AS c FROM sensors WHERE timestamp >= $1", [currentStart]),
+      pool.query("SELECT COUNT(*)::int AS c FROM sensors WHERE timestamp >= $1 AND ($2::text IS NULL OR device_id = $2)", [currentStart, deviceId]),
       queryGapEvents(currentStart),
-      pool.query("SELECT timestamp FROM sensors ORDER BY timestamp DESC LIMIT 1"),
-      pool.query("SELECT MAX(last_seen) AS last_seen FROM devices"),
+      pool.query("SELECT timestamp FROM sensors WHERE ($1::text IS NULL OR device_id = $1) ORDER BY timestamp DESC LIMIT 1", [deviceId]),
+      pool.query("SELECT MAX(last_seen) AS last_seen FROM devices WHERE ($1::text IS NULL OR device_id = $1)", [deviceId]),
     ]);
 
     const lastReading = latest.rows[0]?.timestamp ? new Date(latest.rows[0].timestamp) : null;
@@ -2958,6 +3024,9 @@ async function startServer() {
     app.listen(PORT, "::", () => {
       console.log(`[${new Date().toISOString()}] Server running on port ${PORT} (dual-stack)`);
     });
+
+    // Star topology: poll the registered ESP32 /status endpoints for health.
+    startDevicePoller(pool);
   } catch (err) {
     console.error(`[${new Date().toISOString()}] Server startup error:`, err.message);
     process.exit(1);

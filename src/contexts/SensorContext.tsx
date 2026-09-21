@@ -5,7 +5,7 @@
 // =============================================================================
 
 import { createContext, useContext } from "react";
-import type { SensorEntry, ChartPoint, LogEntry, SensorSettings, ActivityLog, ActivityActionType } from "../types";
+import type { SensorEntry, ChartPoint, LogEntry, SensorSettings, ActivityLog, ActivityActionType, DeviceEntry } from "../types";
 
 // ========================
 // CONNECTION STATUS TYPE
@@ -27,6 +27,10 @@ export interface SensorDataContextValue {
   consecutiveFailures: number;         // consecutive failed polls
   historyStale: boolean;               // true if last history fetch failed
   historyLastUpdated: Date | null;
+  devices: DeviceEntry[];              // fleet registry, polled every ~5s
+  devicesLoading: boolean;
+  selectedDeviceId: string | null;     // currently viewed tank
+  setSelectedDeviceId: (deviceId: string | null) => void;
   refetch: () => void;
 }
 

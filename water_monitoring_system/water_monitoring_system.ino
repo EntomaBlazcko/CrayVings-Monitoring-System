@@ -7,6 +7,8 @@
 #include <WiFi.h>
 #include <WiFiManager.h>
 #include <HTTPClient.h>
+#include <ESPAsyncWebServer.h>
+#include <AsyncTCP.h>
 #include <math.h>
 #include <Preferences.h>
 #include <esp_task_wdt.h>
@@ -64,6 +66,8 @@ DallasTemperature sensors(&oneWire);
 #define ECHO_PIN 27
 
 #define TANK_HEIGHT_CM 36.0
+
+float tankHeightCm = TANK_HEIGHT_CM;
 
 // HC-SR04 filtering: the module needs ~60ms between pings, so we do NOT sample
 // back-to-back (that causes echo crosstalk / false readings). Instead we fire one
@@ -194,13 +198,30 @@ unsigned long lastPageChange = 0;
 // =============================================================================
 
 #define DEVICE_ID_DEFAULT "ESP32_01"
-#define SERVER_IP_DEFAULT "192.168.100.152"
+
+// Backend IP when no portal override has been saved. If serverIP is still this
+// placeholder after the device connects to WiFi, autoDeriveServerIp() rewrites
+// it to the WiFi subnet + SERVER_IP_HOST_OCTET (e.g. on 192.168.1.x it becomes
+// 192.168.1.10). Change SERVER_IP_HOST_OCTET to your server's host octet, or
+// enter the real IP in the config portal.
+#define SERVER_IP_DEFAULT "192.168.4.10"
+#define SERVER_IP_HOST_OCTET 20
+
 #define SERVER_PORT_DEFAULT "3000"
-#define SEND_INTERVAL 1000  
+#define SEND_INTERVAL 1000
 
 char serverIP[50] = SERVER_IP_DEFAULT;
 char serverPort[10] = SERVER_PORT_DEFAULT;
 char deviceId[50] = DEVICE_ID_DEFAULT;
+char deviceSecret[100] = "";
+
+// Optional static IP config (192.168.4.x star topology). When configured the
+// values are persisted to NVS ("config" namespace) and applied with
+// WiFi.config() before the connection attempt. Blank portal fields = DHCP.
+IPAddress staticIp;
+IPAddress staticGateway;
+IPAddress staticSubnet;
+bool staticIpConfigured = false;
 
 unsigned long lastSendTime = 0;
 bool wifiConnected = false;
@@ -212,6 +233,209 @@ volatile bool sendBusy = false;
 
 // Flag to trigger WiFi configuration
 bool wifiConfigRequested = false;
+
+// Drop-proofing: past readings that fail to POST are held in a ring buffer
+// and flushed oldest-first once the link / server is back (~10 min at 1 Hz).
+#define SEND_BUFFER_CAP 600
+
+typedef struct
+{
+    float temp;
+    float level;
+    float ammonia;
+} BufferedReading;
+
+BufferedReading sendBuf[SEND_BUFFER_CAP];
+int sendBufWrite = 0;
+int sendBufRead = 0;
+int sendBufCount = 0;
+
+bool sendBufPush(float temp, float level, float ammonia)
+{
+    if (sendBufCount >= SEND_BUFFER_CAP)
+    {
+        // Full ring: drop the oldest so the freshest readings survive.
+        sendBufRead = (sendBufRead + 1) % SEND_BUFFER_CAP;
+        sendBufCount--;
+    }
+
+    sendBuf[sendBufWrite].temp = temp;
+    sendBuf[sendBufWrite].level = level;
+    sendBuf[sendBufWrite].ammonia = ammonia;
+    sendBufWrite = (sendBufWrite + 1) % SEND_BUFFER_CAP;
+    sendBufCount++;
+    return true;
+}
+
+bool sendBufPop(BufferedReading &out)
+{
+    if (sendBufCount == 0)
+    {
+        return false;
+    }
+
+    out = sendBuf[sendBufRead];
+    sendBufRead = (sendBufRead + 1) % SEND_BUFFER_CAP;
+    sendBufCount--;
+    return true;
+}
+
+// =============================================================================
+// NVS SYSTEM CONFIG (persisted so portal values survive reboots)
+// =============================================================================
+
+void loadStaticIpConfig()
+{
+    Preferences prefs;
+    prefs.begin("config", true);
+    if (prefs.getBool("static_cfg", false))
+    {
+        staticIp = IPAddress(prefs.getUInt("static_ip", 0));
+        staticGateway = IPAddress(prefs.getUInt("static_gw", 0));
+        staticSubnet = IPAddress(prefs.getUInt("static_mask", 0));
+        staticIpConfigured = true;
+    }
+    prefs.end();
+}
+
+void saveStaticIpConfig(bool enabled, IPAddress ip, IPAddress gw, IPAddress mask)
+{
+    Preferences prefs;
+    prefs.begin("config", false);
+    prefs.putBool("static_cfg", enabled);
+    if (enabled)
+    {
+        prefs.putUInt("static_ip", (uint32_t)ip);
+        prefs.putUInt("static_gw", (uint32_t)gw);
+        prefs.putUInt("static_mask", (uint32_t)mask);
+    }
+    prefs.end();
+}
+
+void applyStaticIpConfig()
+{
+    if (staticIpConfigured)
+    {
+        WiFi.config(staticIp, staticGateway, staticSubnet);
+        Serial.print("[WIFI] Static IP applied: ");
+        Serial.println(WiFi.localIP());
+    }
+}
+
+void loadSystemConfig()
+{
+    Preferences prefs;
+    prefs.begin("config", true);
+
+    String val = prefs.getString("server_ip", SERVER_IP_DEFAULT);
+    strncpy(serverIP, val.c_str(), sizeof(serverIP) - 1);
+    serverIP[sizeof(serverIP) - 1] = '\0';
+
+    val = prefs.getString("server_port", SERVER_PORT_DEFAULT);
+    strncpy(serverPort, val.c_str(), sizeof(serverPort) - 1);
+    serverPort[sizeof(serverPort) - 1] = '\0';
+
+    val = prefs.getString("device_id", DEVICE_ID_DEFAULT);
+    strncpy(deviceId, val.c_str(), sizeof(deviceId) - 1);
+    deviceId[sizeof(deviceId) - 1] = '\0';
+
+    val = prefs.getString("device_secret", "");
+    strncpy(deviceSecret, val.c_str(), sizeof(deviceSecret) - 1);
+    deviceSecret[sizeof(deviceSecret) - 1] = '\0';
+
+    tankHeightCm = prefs.getFloat("tank_height", TANK_HEIGHT_CM);
+
+    prefs.end();
+    loadStaticIpConfig();
+
+    Serial.printf("[CONFIG] server=%s:%s device_id=%s tank_height=%.1f static_ip=%s\n",
+                  serverIP, serverPort, deviceId, tankHeightCm,
+                  staticIpConfigured ? "yes" : "no");
+}
+
+void saveSystemConfig()
+{
+    Preferences prefs;
+    prefs.begin("config", false);
+    prefs.putString("server_ip", serverIP);
+    prefs.putString("server_port", serverPort);
+    prefs.putString("device_id", deviceId);
+    prefs.putString("device_secret", deviceSecret);
+    prefs.putFloat("tank_height", tankHeightCm);
+    prefs.end();
+}
+
+// If the backend IP has never been set through the config portal (serverIP is
+// still the SERVER_IP_DEFAULT placeholder), derive it from the network the ESP32
+// actually connected to: same subnet as the device's WiFi IP, host octet
+// SERVER_IP_HOST_OCTET. This makes the firmware "just work" on any LAN where the
+// server sits at <wifi-subnet>.10 (192.168.4.10, 192.168.1.10, 10.0.0.10, ...).
+// A portal-saved explicit IP always wins because serverIP no longer equals the
+// placeholder.
+void autoDeriveServerIp()
+{
+    if (strcmp(serverIP, SERVER_IP_DEFAULT) != 0)
+    {
+        return;
+    }
+
+    IPAddress local = WiFi.localIP();
+    if (local == IPAddress(0, 0, 0, 0))
+    {
+        return;
+    }
+
+    snprintf(serverIP, sizeof(serverIP), "%d.%d.%d.%d",
+             local[0], local[1], local[2], SERVER_IP_HOST_OCTET);
+    Serial.printf("[WIFI] Backend IP auto-derived from WiFi: %s\n", serverIP);
+}
+
+// =============================================================================
+// VIRTUAL TANK / HEADLESS MODE
+// Runtime flags (persisted in NVS "config" namespace), toggled with Serial
+// Monitor commands:
+//   S = simulate (virtual tank): report synthetic readings instead of reading
+//                                the real sensors. Use on a bare board with no
+//                                DS18B20/HC-SR04/MQ-137 attached.
+//   H = headless: skip TFT + touch init and all screen drawing. Use on a bare
+//                 dev kit with no display, so a floating touch panel can never
+//                 register phantom taps or launch the config portal.
+// Both flags default OFF (real sensors + full UI) so an ordinary flash of the
+// real tank stays identical.
+// =============================================================================
+
+bool simulateDevice = false; // true = virtual tank (no sensors attached)
+bool headlessMode = false;   // true = no TFT / touch attached (skip display UI)
+
+// Synthetic reading state for the virtual tank. The random-walk step sizes are
+// chosen to exceed the server's delta-logging tolerances (0.1C / 1% / 0.05ppm)
+// so the dashboard charts keep collecting live rows, while the values stay
+// inside safe thresholds so no false alerts fire.
+float simTemp = 27.0;
+float simLevel = 75.0;
+float simAmmonia = 0.5;
+
+void loadDeviceModes()
+{
+    Preferences prefs;
+    prefs.begin("config", true);
+    simulateDevice = prefs.getBool("simulate", false);
+    headlessMode = prefs.getBool("headless", false);
+    prefs.end();
+
+    Serial.printf("[MODE] simulate=%s headless=%s\n",
+                  simulateDevice ? "ON (virtual tank)" : "OFF (real sensors)",
+                  headlessMode ? "ON (no display)" : "OFF");
+}
+
+void saveDeviceModes()
+{
+    Preferences prefs;
+    prefs.begin("config", false);
+    prefs.putBool("simulate", simulateDevice);
+    prefs.putBool("headless", headlessMode);
+    prefs.end();
+}
 
 // =============================================================================
 // DISPLAY
@@ -367,6 +591,15 @@ bool getTouchPosition(
 
 void readTemperature()
 {
+    if (simulateDevice)
+    {
+        // Virtual tank: random walk around ~27C within the 20-31C safe band.
+        simTemp += ((int)esp_random() % 211 - 105) / 100.0f; // ~ +/-1.05C
+        simTemp = constrain(simTemp, 20.0f, 31.0f);
+        temperature = simTemp;
+        return;
+    }
+
     sensors.requestTemperatures();
     float value = sensors.getTempCByIndex(0);
 
@@ -390,6 +623,15 @@ void readTemperature()
 
 void readWaterLevel()
 {
+    if (simulateDevice)
+    {
+        // Virtual tank: random walk around ~75% within the 10-100% band.
+        simLevel += ((int)esp_random() % 31 - 15) / 10.0f; // ~ +/-1.5%
+        simLevel = constrain(simLevel, 10.0f, 100.0f);
+        waterLevel = simLevel;
+        return;
+    }
+
     digitalWrite(TRIG_PIN, LOW);
     delayMicroseconds(2);
     digitalWrite(TRIG_PIN, HIGH);
@@ -402,7 +644,7 @@ void readWaterLevel()
     {
         filteredDistance = -1.0;
         distance = -1.0;
-        waterLevel = 0.0;
+        waterLevel = -1.0;
         return;
     }
 
@@ -432,19 +674,19 @@ void readWaterLevel()
 
     distance = filteredDistance;
 
-    float waterHeight = TANK_HEIGHT_CM - distance;
+    float waterHeight = tankHeightCm - distance;
 
     if (waterHeight < 0)
     {
         waterHeight = 0;
     }
 
-    if (waterHeight > TANK_HEIGHT_CM)
+    if (waterHeight > tankHeightCm)
     {
-        waterHeight = TANK_HEIGHT_CM;
+        waterHeight = tankHeightCm;
     }
 
-    float level = (waterHeight / TANK_HEIGHT_CM) * 100.0;
+    float level = (waterHeight / tankHeightCm) * 100.0;
     level = constrain(level, 0.0, 100.0);
 
     // Deadband: keep showing the last level until a real change of at least
@@ -643,6 +885,21 @@ void calibrateMq137R0()
 
 void readAmmonia()
 {
+    if (simulateDevice)
+    {
+        // Virtual tank: random walk around ~0.5 ppm (floor 0.2), safe range.
+        simAmmonia += ((int)esp_random() % 21 - 10) / 100.0f; // ~ +/-0.1 ppm
+        if (simAmmonia < 0.2f)
+        {
+            simAmmonia = 0.2f;
+        }
+        simAmmonia = constrain(simAmmonia, 0.0f, 25.0f);
+        ammoniaPpm = simAmmonia;
+        ammoniaReady = true;
+        lastShownPpm = simAmmonia;
+        return;
+    }
+
     // Multi-sample ADC averaging to reduce electrical noise
     uint32_t adcSum = 0;
     uint32_t mvSum = 0;
@@ -954,7 +1211,16 @@ void updateOverview()
 
     tft.fillRect(260, 102, 195, 35, TFT_WHITE);
     char levelText[30];
-    snprintf(levelText, sizeof(levelText), "%.1f %%", waterLevel);
+
+    if (waterLevel < 0.0)
+    {
+        strcpy(levelText, "ERROR");
+    }
+    else
+    {
+        snprintf(levelText, sizeof(levelText), "%.1f %%", waterLevel);
+    }
+
     tft.drawString(levelText, 265, 105, 4);
 
     tft.fillRect(25, 192, 195, 35, TFT_WHITE);
@@ -974,7 +1240,11 @@ void updateOverview()
     tft.fillRect(260, 192, 195, 35, TFT_WHITE);
     const char *status;
 
-    if (waterLevel < 20.0)
+    if (waterLevel < 0.0)
+    {
+        status = "ERROR";
+    }
+    else if (waterLevel < 20.0)
     {
         status = "LOW";
     }
@@ -1047,7 +1317,16 @@ void drawWaterLevelPage()
     tft.setTextDatum(MC_DATUM);
     tft.setTextColor(TFT_BLUE, TFT_WHITE);
     char levelText[30];
-    snprintf(levelText, sizeof(levelText), "%.1f %%", waterLevel);
+
+    if (waterLevel < 0.0)
+    {
+        strcpy(levelText, "ERROR");
+    }
+    else
+    {
+        snprintf(levelText, sizeof(levelText), "%.1f %%", waterLevel);
+    }
+
     tft.drawString(levelText, 240, 205, 6);
 
     tft.setTextColor(TFT_BLACK, TFT_WHITE);
@@ -1061,7 +1340,15 @@ void drawWaterLevelPage()
 void updateWaterLevelPage()
 {
     char levelText[30];
-    snprintf(levelText, sizeof(levelText), "%.1f %%", waterLevel);
+
+    if (waterLevel < 0.0)
+    {
+        strcpy(levelText, "ERROR");
+    }
+    else
+    {
+        snprintf(levelText, sizeof(levelText), "%.1f %%", waterLevel);
+    }
 
     if (strcmp(lastLevelText, levelText) != 0)
     {
@@ -1364,23 +1651,26 @@ void startWifiConfigPortal()
     Serial.println("[WIFI] 3) Open a browser and visit http://192.168.4.1 to configure.");
     Serial.println("[WIFI] If no page loads, reconnect to the AP and try again.");
 
-    tft.fillScreen(TFT_WHITE);
-    tft.setTextDatum(TL_DATUM);
-    tft.setTextColor(TFT_BLACK, TFT_WHITE);
-    tft.drawString("WiFi Setup Mode", 20, 30, 4);
-    tft.setTextColor(TFT_DARKGREY, TFT_WHITE);
-    tft.drawString("1. Open Wi-Fi settings", 20, 82, 2);
-    tft.drawString("   on your phone/device", 20, 104, 2);
-    tft.setTextColor(TFT_ORANGE, TFT_WHITE);
-    tft.drawString("2. Connect to the access point:", 20, 142, 2);
-    tft.setTextColor(TFT_BLUE, TFT_WHITE);
-    tft.drawString("   Aquaculture-Setup", 20, 166, 3);
-    tft.setTextColor(TFT_DARKGREY, TFT_WHITE);
-    tft.drawString("3. Open a browser and visit:", 20, 212, 2);
-    tft.setTextColor(TFT_BLUE, TFT_WHITE);
+    if (!headlessMode)
+    {
+        tft.fillScreen(TFT_WHITE);
+        tft.setTextDatum(TL_DATUM);
+        tft.setTextColor(TFT_BLACK, TFT_WHITE);
+        tft.drawString("WiFi Setup Mode", 20, 30, 4);
+        tft.setTextColor(TFT_DARKGREY, TFT_WHITE);
+        tft.drawString("1. Open Wi-Fi settings", 20, 82, 2);
+        tft.drawString("   on your phone/device", 20, 104, 2);
+        tft.setTextColor(TFT_ORANGE, TFT_WHITE);
+        tft.drawString("2. Connect to the access point:", 20, 142, 2);
+        tft.setTextColor(TFT_BLUE, TFT_WHITE);
+        tft.drawString("   Aquaculture-Setup", 20, 166, 3);
+        tft.setTextColor(TFT_DARKGREY, TFT_WHITE);
+        tft.drawString("3. Open a browser and visit:", 20, 212, 2);
+        tft.setTextColor(TFT_BLUE, TFT_WHITE);
     tft.drawString("   http://192.168.4.1", 20, 236, 3);
-    tft.setTextColor(TFT_RED, TFT_WHITE);
-    tft.drawString("Timeout: 3 minutes", 20, 292, 2);
+        tft.setTextColor(TFT_RED, TFT_WHITE);
+        tft.drawString("Timeout: 3 minutes", 20, 292, 2);
+    }
 
     WiFi.mode(WIFI_AP_STA);
     WiFiManager wm;
@@ -1406,9 +1696,62 @@ void startWifiConfigPortal()
         50
     );
 
+    char tankHeightText[10];
+    snprintf(tankHeightText, sizeof(tankHeightText), "%.1f", tankHeightCm);
+
+    char staticIpText[20] = "";
+    char staticGwText[20] = "";
+    char staticMaskText[20] = "";
+    if (staticIpConfigured)
+    {
+        strcpy(staticIpText, staticIp.toString().c_str());
+        strcpy(staticGwText, staticGateway.toString().c_str());
+        strcpy(staticMaskText, staticSubnet.toString().c_str());
+    }
+
+    WiFiManagerParameter deviceSecretParam(
+        "device_secret",
+        "Device Secret (X-Device-Secret header)",
+        deviceSecret,
+        100
+    );
+
+    WiFiManagerParameter tankHeightParam(
+        "tank_height_cm",
+        "Tank Height (cm)",
+        tankHeightText,
+        9
+    );
+
+    WiFiManagerParameter staticIpParam(
+        "static_ip",
+        "Static IP (blank = DHCP)",
+        staticIpText,
+        16
+    );
+
+    WiFiManagerParameter staticGwParam(
+        "static_gateway",
+        "Gateway (blank = DHCP)",
+        staticGwText,
+        16
+    );
+
+    WiFiManagerParameter staticMaskParam(
+        "static_subnet",
+        "Subnet mask (blank = DHCP)",
+        staticMaskText,
+        16
+    );
+
     wm.addParameter(&serverIPParam);
     wm.addParameter(&serverPortParam);
     wm.addParameter(&deviceIdParam);
+    wm.addParameter(&deviceSecretParam);
+    wm.addParameter(&tankHeightParam);
+    wm.addParameter(&staticIpParam);
+    wm.addParameter(&staticGwParam);
+    wm.addParameter(&staticMaskParam);
 
     wm.setConfigPortalTimeout(180);
     wm.setConnectTimeout(10);
@@ -1418,7 +1761,15 @@ void startWifiConfigPortal()
     // already connected, so the on-screen "connect your phone" steps wouldn't
     // work). The phone/device joins the "Aquaculture-Setup" AP, then opens
     // http://192.168.4.1 to enter the Wi-Fi and backend details.
+    //
+    // NOTE: the portal blocks this task for up to ConfigPortalTimeout (180s),
+    // which would trip the 30s task watchdog armed in setup() and reset the
+    // chip every 30s in an endless loop. Suspend this task's WDT subscription
+    // while the portal runs, and re-arm it once the portal returns.
+    esp_task_wdt_delete(NULL);
     bool wifiResult = wm.startConfigPortal("Aquaculture-Setup");
+    esp_task_wdt_add(NULL);
+    Serial.println("[WDT] Task watchdog re-armed after config portal");
 
     if (wifiResult)
     {
@@ -1435,6 +1786,50 @@ void startWifiConfigPortal()
         serverPort[sizeof(serverPort) - 1] = '\0';
         deviceId[sizeof(deviceId) - 1] = '\0';
 
+        // If the portal field still holds the placeholder IP, fall back to the
+        // auto-derived <wifi-subnet>.10 address instead of the stale default.
+        autoDeriveServerIp();
+
+        strncpy(deviceSecret, deviceSecretParam.getValue(), sizeof(deviceSecret) - 1);
+        deviceSecret[sizeof(deviceSecret) - 1] = '\0';
+
+        tankHeightCm = atof(tankHeightParam.getValue());
+        if (tankHeightCm < 5.0 || tankHeightCm > 200.0)
+        {
+            tankHeightCm = TANK_HEIGHT_CM;
+        }
+
+        const bool hasStaticFields =
+            strlen(staticIpParam.getValue()) > 0 &&
+            strlen(staticGwParam.getValue()) > 0 &&
+            strlen(staticMaskParam.getValue()) > 0;
+
+        if (hasStaticFields)
+        {
+            IPAddress ip, gw, mask;
+            if (ip.fromString(staticIpParam.getValue()) &&
+                gw.fromString(staticGwParam.getValue()) &&
+                mask.fromString(staticMaskParam.getValue()))
+            {
+                saveStaticIpConfig(true, ip, gw, mask);
+                staticIpConfigured = true;
+                staticIp = ip;
+                staticGateway = gw;
+                staticSubnet = mask;
+                WiFi.config(ip, gw, mask);
+                Serial.print("[WIFI] Static IP set: ");
+                Serial.println(WiFi.localIP());
+            }
+        }
+        else if (staticIpConfigured)
+        {
+            saveStaticIpConfig(false, IPAddress(), IPAddress(), IPAddress());
+            staticIpConfigured = false;
+            Serial.println("[WIFI] Static IP cleared (DHCP)");
+        }
+
+        saveSystemConfig();
+
         Serial.print("[WIFI] Backend: ");
         Serial.print(serverIP);
         Serial.print(":");
@@ -1442,36 +1837,121 @@ void startWifiConfigPortal()
         Serial.print("[WIFI] Device ID: ");
         Serial.println(deviceId);
 
-        tft.fillScreen(TFT_WHITE);
-        tft.setTextDatum(MC_DATUM);
-        tft.setTextColor(TFT_BLACK, TFT_WHITE);
-        tft.drawString("WiFi Connected!", 240, 100, 4);
-        tft.drawString("IP: " + String(WiFi.localIP().toString()), 240, 150, 2);
-        delay(2000);
+        if (!headlessMode)
+        {
+            tft.fillScreen(TFT_WHITE);
+            tft.setTextDatum(MC_DATUM);
+            tft.setTextColor(TFT_BLACK, TFT_WHITE);
+            tft.drawString("WiFi Connected!", 240, 100, 4);
+            tft.drawString("IP: " + String(WiFi.localIP().toString()), 240, 150, 2);
+            delay(2000);
+        }
     }
     else
     {
         wifiConnected = false;
         Serial.println("[WIFI] Timeout or failed. Running offline.");
 
-        tft.fillScreen(TFT_WHITE);
-        tft.setTextDatum(MC_DATUM);
-        tft.setTextColor(TFT_BLACK, TFT_WHITE);
-        tft.drawString("WiFi Setup Failed", 240, 100, 4);
-        tft.drawString("Running in offline mode", 240, 150, 2);
-        delay(2000);
+        if (!headlessMode)
+        {
+            tft.fillScreen(TFT_WHITE);
+            tft.setTextDatum(MC_DATUM);
+            tft.setTextColor(TFT_BLACK, TFT_WHITE);
+            tft.drawString("WiFi Setup Failed", 240, 100, 4);
+            tft.drawString("Running in offline mode", 240, 150, 2);
+            delay(2000);
+        }
     }
 
     wifiConfigRequested = false;
-    tft.fillScreen(TFT_WHITE);
-    drawCurrentPage();
+    if (!headlessMode)
+    {
+        tft.fillScreen(TFT_WHITE);
+        drawCurrentPage();
+    }
+}
+
+// =============================================================================
+// STATUS HTTP SERVER (star topology: central server polls us over LAN)
+// =============================================================================
+
+AsyncWebServer statusServer(80);
+
+String buildStatusJson()
+{
+    String json = "{";
+    json += "\"device_id\":\"" + String(deviceId) + "\",";
+    json += "\"ip\":\"" + WiFi.localIP().toString() + "\",";
+    json += "\"uptime_ms\":" + String(millis()) + ",";
+    json += "\"wifi_rssi\":" + String(WiFi.RSSI()) + ",";
+    json += "\"free_heap\":" + String(ESP.getFreeHeap()) + ",";
+    json += "\"temperature\":" + String((temperature == -127.0) ? -1.0 : temperature, 2) + ",";
+    json += "\"water_level\":" + String(waterLevel, 1) + ",";
+    json += "\"ammonia\":" + String(ammoniaReady ? ammoniaPpm : -1.0, 3);
+    json += "}";
+    return json;
+}
+
+void startStatusServer()
+{
+    statusServer.on("/status", HTTP_GET, [](AsyncWebServerRequest *request)
+    {
+        request->send(200, "application/json", buildStatusJson());
+    });
+
+    statusServer.on("/", HTTP_GET, [](AsyncWebServerRequest *request)
+    {
+        request->send(200, "application/json", buildStatusJson());
+    });
+
+    statusServer.begin();
+    Serial.println("[HTTP] Status server on port 80 (GET /status | /)");
+}
+
+// One POST attempt for a single reading; returns the HTTP response code
+// (>0 success, otherwise a negative/timeout indicator).
+int postReading(const String &url, float tempToSend, float levelToSend, float ammoniaToSend)
+{
+    HTTPClient http;
+    http.begin(url);
+    http.setConnectTimeout(1000);
+    http.setTimeout(1000);
+    http.addHeader("Content-Type", "application/json");
+    if (strlen(deviceSecret) > 0)
+    {
+        http.addHeader("X-Device-Secret", deviceSecret);
+    }
+
+    String payload = "{";
+    payload += "\"device_id\":\"" + String(deviceId) + "\",";
+    payload += "\"temperature\":" + String(tempToSend, 2) + ",";
+    payload += "\"water_level\":" + String(levelToSend, 1) + ",";
+    payload += "\"ammonia\":" + String(ammoniaToSend, 3);
+    payload += "}";
+
+    Serial.print("[HTTP] POST ");
+    Serial.println(url);
+    Serial.print("[HTTP] Payload: ");
+    Serial.println(payload);
+
+    int code = http.POST(payload);
+    http.end();
+    return code;
 }
 
 void sendSensorData()
 {
+    float tempToSend = (temperature == -127.0) ? -1.0 : temperature;
+    float levelToSend = waterLevel;
+    float ammoniaToSend = ammoniaReady ? ammoniaPpm : -1.0;
+
     if (WiFi.status() != WL_CONNECTED)
     {
         wifiConnected = false;
+
+        // Buffer the reading so a WiFi outage never loses samples; the buffer
+        // is flushed oldest-first once the link and server are reachable.
+        sendBufPush(tempToSend, levelToSend, ammoniaToSend);
 
         // Exponential-backoff reconnection: 1s, 2s, 4s, ... capped at 5 min.
         // Avoids hammering the AP while coverage/power is down and gives the
@@ -1490,6 +1970,7 @@ void sendSensorData()
     }
 
     wifiConnected = true;
+    autoDeriveServerIp();
     if (wifiFailStreak > 0)
     {
         Serial.printf("[WIFI] Reconnected - fail streak %d cleared, backoff reset\n", wifiFailStreak);
@@ -1497,34 +1978,47 @@ void sendSensorData()
         wifiBackoffMs = 1000;
     }
 
-    HTTPClient http;
-    String url = "http://";
-    url += serverIP;
-    url += ":";
-    url += serverPort;
-    url += "/sensor";
+    String baseUrl = "http://";
+    baseUrl += serverIP;
+    baseUrl += ":";
+    baseUrl += serverPort;
+    baseUrl += "/sensor";
 
-    http.begin(url);
-    http.setConnectTimeout(1000);
-    http.setTimeout(1000);
-    http.addHeader("Content-Type", "application/json");
+    // Flush any buffered readings, bounded per call so a long backlog never
+    // delays live data for many seconds.
+    if (sendBufCount > 0)
+    {
+        int flushed = 0;
+        while (sendBufCount > 0 && flushed < 10)
+        {
+            BufferedReading r;
+            if (!sendBufPop(r))
+            {
+                break;
+            }
 
-    float tempToSend = (temperature == -127.0) ? -1.0 : temperature;
-    float ammoniaToSend = ammoniaReady ? ammoniaPpm : -1.0;
+            int code = postReading(baseUrl, r.temp, r.level, r.ammonia);
+            if (code > 0)
+            {
+                flushed++;
+            }
+            else
+            {
+                // Put it back at the head for the next flush attempt.
+                sendBufRead = (sendBufRead - 1 + SEND_BUFFER_CAP) % SEND_BUFFER_CAP;
+                sendBufCount++;
+                break;
+            }
+            vTaskDelay(25 / portTICK_PERIOD_MS);
+        }
 
-    String payload = "{";
-    payload += "\"device_id\":\"" + String(deviceId) + "\",";
-    payload += "\"temperature\":" + String(tempToSend, 2) + ",";
-    payload += "\"water_level\":" + String(waterLevel, 1) + ",";
-    payload += "\"ammonia\":" + String(ammoniaToSend, 3);
-    payload += "}";
+        if (flushed > 0)
+        {
+            Serial.printf("[SEND] Flushed %d buffered reading(s), %d remaining\n", flushed, sendBufCount);
+        }
+    }
 
-    Serial.print("[HTTP] POST ");
-    Serial.println(url);
-    Serial.print("[HTTP] Payload: ");
-    Serial.println(payload);
-
-    int httpResponseCode = http.POST(payload);
+    int httpResponseCode = postReading(baseUrl, tempToSend, levelToSend, ammoniaToSend);
 
     if (httpResponseCode > 0)
     {
@@ -1543,12 +2037,11 @@ void sendSensorData()
     else
     {
         Serial.print("[HTTP] Error: ");
-        Serial.println(http.errorToString(httpResponseCode));
+        Serial.println(String(httpResponseCode));
 
         wifiConnected = false;
+        sendBufPush(tempToSend, levelToSend, ammoniaToSend);
     }
-
-    http.end();
 }
 
 // Runs the slow HTTP POST off the main loop. Polls for pending sends so the
@@ -1556,6 +2049,7 @@ void sendSensorData()
 // longer freeze touch input for up to a second or two.
 void sendSensorTask(void *pvParameters)
 {
+    esp_task_wdt_add(NULL);
     while (true)
     {
         if (sendPending && !sendBusy)
@@ -1565,6 +2059,7 @@ void sendSensorTask(void *pvParameters)
             sendSensorData();
             sendBusy = false;
         }
+        esp_task_wdt_reset();
         vTaskDelay(50 / portTICK_PERIOD_MS);
     }
 }
@@ -1590,6 +2085,12 @@ void enterSafeMode()
                   lastGoodTemperature, lastGoodWaterLevel, lastGoodAmmonia);
     Serial.println("================================================");
 
+    if (headlessMode)
+    {
+        Serial.println("[SAFE MODE] Headless mode - screen drawing skipped");
+        return;
+    }
+
     tft.fillScreen(TFT_WHITE);
     tft.setTextDatum(MC_DATUM);
     tft.setTextColor(TFT_RED, TFT_WHITE);
@@ -1612,6 +2113,14 @@ void setup()
 {
     Serial.begin(115200);
     delay(1000);
+
+    // Load persisted device config (server IP/port, device id, secret, tank
+    // height, static IP) so a reboot keeps the portal settings.
+    loadSystemConfig();
+
+    // Load the runtime simulate/headless flags (Serial commands S / H).
+    loadDeviceModes();
+    randomSeed(esp_random());
 
     // Application watchdog: reset the chip if the main loop ever stalls for
     // 30s (e.g. a fatal while(1) loop). On reset, esp_reset_reason() is checked
@@ -1676,18 +2185,25 @@ void setup()
 #endif
     Serial.println("[OK] MQ-137 -> GPIO34 (11dB attenuation explicitly set)");
 
-    pinMode(TOUCH_CS, OUTPUT);
-    digitalWrite(TOUCH_CS, HIGH);
-    touchSPI.begin(TOUCH_CLK, TOUCH_MISO, TOUCH_MOSI, TOUCH_CS);
-    Serial.println("[OK] XPT2046 Touch initialized");
+    if (headlessMode)
+    {
+        Serial.println("[DISPLAY] Headless mode - TFT/touch init skipped");
+    }
+    else
+    {
+        pinMode(TOUCH_CS, OUTPUT);
+        digitalWrite(TOUCH_CS, HIGH);
+        touchSPI.begin(TOUCH_CLK, TOUCH_MISO, TOUCH_MOSI, TOUCH_CS);
+        Serial.println("[OK] XPT2046 Touch initialized");
 
-    tft.init();
-    tft.setRotation(1);
-    tft.fillScreen(TFT_WHITE);
-    Serial.print("[DISPLAY] Width = ");
-    Serial.println(tft.width());
-    Serial.print("[DISPLAY] Height = ");
-    Serial.println(tft.height());
+        tft.init();
+        tft.setRotation(1);
+        tft.fillScreen(TFT_WHITE);
+        Serial.print("[DISPLAY] Width = ");
+        Serial.println(tft.width());
+        Serial.print("[DISPLAY] Height = ");
+        Serial.println(tft.height());
+    }
 
     // WiFi: attempt the saved network for 15s, restoring the past working
     // version's visible boot screens. A "Connecting to saved network..." screen
@@ -1695,15 +2211,21 @@ void setup()
     // the config portal (AP: Aquaculture-Setup) automatically opens on failure
     // so the phone/device can connect and enter the Wi-Fi + backend details.
     Serial.println("[WIFI] Attempting to connect to saved network...");
-    tft.fillScreen(TFT_WHITE);
-    tft.setTextDatum(MC_DATUM);
-    tft.setTextColor(TFT_BLACK, TFT_WHITE);
-    tft.drawString("WiFi Setup", 240, 80, 4);
-    tft.drawString("Connecting to saved network...", 240, 130, 2);
-    tft.drawString("Tap top-left corner 3x to config", 240, 200, 2);
+    if (!headlessMode)
+    {
+        tft.fillScreen(TFT_WHITE);
+        tft.setTextDatum(MC_DATUM);
+        tft.setTextColor(TFT_BLACK, TFT_WHITE);
+        tft.drawString("WiFi Setup", 240, 80, 4);
+        tft.drawString("Connecting to saved network...", 240, 130, 2);
+        tft.drawString("Tap top-left corner 3x to config", 240, 200, 2);
+    }
 
     WiFi.mode(WIFI_STA);
     WiFi.begin();
+
+    // Apply the persisted static IP (192.168.4.x) if configured.
+    applyStaticIpConfig();
 
     unsigned long startAttemptTime = millis();
     bool connected = false;
@@ -1721,16 +2243,20 @@ void setup()
     if (connected)
     {
         wifiConnected = true;
+        autoDeriveServerIp();
         Serial.println("[WIFI] Connected to saved network!");
         Serial.print("[WIFI] IP: ");
         Serial.println(WiFi.localIP());
 
-        tft.fillScreen(TFT_WHITE);
-        tft.setTextDatum(MC_DATUM);
-        tft.setTextColor(TFT_BLACK, TFT_WHITE);
-        tft.drawString("WiFi Connected!", 240, 100, 4);
-        tft.drawString("IP: " + String(WiFi.localIP().toString()), 240, 150, 2);
-        delay(1500);
+        if (!headlessMode)
+        {
+            tft.fillScreen(TFT_WHITE);
+            tft.setTextDatum(MC_DATUM);
+            tft.setTextColor(TFT_BLACK, TFT_WHITE);
+            tft.drawString("WiFi Connected!", 240, 100, 4);
+            tft.drawString("IP: " + String(WiFi.localIP().toString()), 240, 150, 2);
+            delay(1500);
+        }
     }
     else
     {
@@ -1747,6 +2273,9 @@ void setup()
         }
     }
 
+    // Expose GET /status (and /) so the central server can read this device.
+    startStatusServer();
+
     // One full initial sensor read so the UI shows live values right away.
     readAllSensors();
 
@@ -1755,7 +2284,13 @@ void setup()
     // refreshMq137R0Once() forces one fresh calibration the first boot after a
     // firmware update, so an R0 stored under the old RL value is thrown away
     // instead of being loaded silently.
-    if (refreshMq137R0Once() || !loadMq137R0())
+    if (simulateDevice)
+    {
+        // Virtual tank: no MQ-137 module attached, so there is nothing to
+        // calibrate (a floating pin would produce a garbage/failed R0).
+        Serial.println("[MQ-137] Simulation mode - skipping R0 calibration");
+    }
+    else if (refreshMq137R0Once() || !loadMq137R0())
     {
         Serial.println("[MQ-137] No valid R0 - starting clean-air calibration...");
         calibrateMq137R0();
@@ -1766,7 +2301,10 @@ void setup()
     }
 
     currentPage = PAGE_OVERVIEW;
-    drawCurrentPage();
+    if (!headlessMode)
+    {
+        drawCurrentPage();
+    }
 
     if (safeModeActive)
     {
@@ -1776,7 +2314,7 @@ void setup()
     // Send sensor data on a background task so the blocking HTTP POST (which
     // can stall for ~1-2s on a slow/unreachable server) never freezes touch
     // or the display.
-    xTaskCreate(sendSensorTask, "sendSensor", 4096, NULL, 1, NULL);
+    xTaskCreate(sendSensorTask, "sendSensor", 8192, NULL, 1, NULL);
 
     Serial.println();
     Serial.println("[SYSTEM] READY");
@@ -1784,7 +2322,7 @@ void setup()
     Serial.println("[SYSTEM] Tap LEFT arrow  = Previous Page");
     Serial.println("[SYSTEM] Tap top-left corner 3x = WiFi Config");
     Serial.println("[SYSTEM] Tap top-right corner 3x = MQ-137 Recalibrate");
-    Serial.println("[SERIAL] Commands: 'C' = MQ-137 calibrate, 'T' = touch raw test, 'R' = read sensors, 'W' = WiFi portal");
+    Serial.println("[SERIAL] Commands: 'C' = MQ-137 calibrate, 'T' = touch raw test, 'R' = read sensors, 'W' = WiFi portal, 'S' = toggle simulate, 'H' = toggle headless");
     Serial.println();
 }
 
@@ -1832,15 +2370,29 @@ void checkSerialCommands()
     {
         case 'c':
         case 'C':
-            Serial.println("[CMD] MQ-137 calibration requested (clean air required)...");
-            calibrateMq137R0();
-            tft.fillScreen(TFT_WHITE);
-            drawCurrentPage();
+            if (headlessMode || simulateDevice)
+            {
+                Serial.println("[CMD] MQ-137 calibration is not available in headless/simulation mode.");
+            }
+            else
+            {
+                Serial.println("[CMD] MQ-137 calibration requested (clean air required)...");
+                calibrateMq137R0();
+                tft.fillScreen(TFT_WHITE);
+                drawCurrentPage();
+            }
             break;
 
         case 't':
         case 'T':
-            touchRawDump();
+            if (headlessMode)
+            {
+                Serial.println("[CMD] Touch raw test is not available in headless mode.");
+            }
+            else
+            {
+                touchRawDump();
+            }
             break;
 
         case 'r':
@@ -1858,8 +2410,25 @@ void checkSerialCommands()
             startWifiConfigPortal();
             break;
 
+        case 's':
+        case 'S':
+            simulateDevice = !simulateDevice;
+            saveDeviceModes();
+            Serial.printf("[CMD] Simulation mode %s (virtual tank)\n",
+                          simulateDevice ? "ON" : "OFF");
+            readAllSensors();
+            break;
+
+        case 'h':
+        case 'H':
+            headlessMode = !headlessMode;
+            saveDeviceModes();
+            Serial.printf("[CMD] Headless mode %s (takes effect on next boot)\n",
+                          headlessMode ? "ON" : "OFF");
+            break;
+
         default:
-            Serial.println("[CMD] Unknown. Commands: C=calibrate MQ-137, T=touch raw test, R=read sensors, W=WiFi portal");
+            Serial.println("[CMD] Unknown. Commands: C=calibrate MQ-137, T=touch raw test, R=read sensors, W=WiFi portal, S=toggle simulate, H=toggle headless");
             break;
     }
 }
@@ -1869,8 +2438,12 @@ void loop()
     unsigned long now = millis();
 
     // Touch is serviced FIRST on every tick so a tap never waits behind
-    // sensor reads, screen redraws, or Wi-Fi sends.
-    handleTouch();
+    // sensor reads, screen redraws, or Wi-Fi sends. Skipped in headless mode
+    // (no touch panel attached - a floating CS pin can register phantom taps).
+    if (!headlessMode)
+    {
+        handleTouch();
+    }
 
     // Safe Mode recovery: blink the LED (millis-based, never blocks), keep
     // reading sensors for NVS, and redraw the normal UI once the first POST
@@ -1888,9 +2461,12 @@ void loop()
     {
         safeModeRecovered = false;
         Serial.println("[SAFE MODE] Normal UI restored");
-        tft.fillScreen(TFT_WHITE);
-        currentPage = PAGE_OVERVIEW;
-        drawCurrentPage();
+        if (!headlessMode)
+        {
+            tft.fillScreen(TFT_WHITE);
+            currentPage = PAGE_OVERVIEW;
+            drawCurrentPage();
+        }
     }
 
     if (now - lastSensorRead >= SENSOR_INTERVAL)
@@ -1898,7 +2474,7 @@ void loop()
         lastSensorRead = now;
         readAllSensors();
 
-        if (!safeModeActive)
+        if (!safeModeActive && !headlessMode)
         {
             updateCurrentPage();
         }

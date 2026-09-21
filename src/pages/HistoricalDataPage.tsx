@@ -23,6 +23,7 @@ import {
 } from "lucide-react";
 import TrendCard from "../components/TrendCard";
 import { ErrorCard } from "../components/Loading";
+import TankSelector from "../components/TankSelector";
 import { useSensors } from "../hooks/useSensors";
 import { useAuth } from "../contexts/useAuth";
 import { fetchSensorHistory, fetchWeeklyReport, fetchRangeReport } from "../api/client";
@@ -175,7 +176,7 @@ function buildReportSuggestions(
 }
 
 export default function HistoricalDataPage() {
-  const { history, loading, connectionStatus, lastUpdate, historyStale, historyLastUpdated, settings } = useSensors();
+  const { history, loading, connectionStatus, lastUpdate, historyStale, historyLastUpdated, settings, selectedDeviceId } = useSensors();
   const { user } = useAuth();
   const isAdmin = user?.role === "admin";
   const [timeRange, setTimeRange] = useState<TimeRange>("all");
@@ -209,11 +210,12 @@ export default function HistoricalDataPage() {
   };
 
   // Always fetches from server (DB), so it works offline. Provider history is only seed.
+  // Scoped to the currently selected tank so each chart reflects one device.
   const fetchDynamicData = useCallback(async (range: TimeRange, signal: AbortSignal) => {
     const limit = getLimitForRange(range);
-    const data = await fetchSensorHistory(limit, signal);
+    const data = await fetchSensorHistory(limit, selectedDeviceId, signal);
     return data;
-  }, []);
+  }, [selectedDeviceId]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -843,11 +845,14 @@ export default function HistoricalDataPage() {
 
   if (!activeHistory || activeHistory.length === 0) {
     return (
-      <div className="bg-white rounded-xl border border-gray-100 p-8 text-center">
-        <History size={40} className="mx-auto mb-3 text-gray-300" />
-        <h2 className="text-lg font-bold text-gray-800 mb-1">Historical Data</h2>
-        <p className="text-gray-500">No historical data available yet.</p>
-        <p className="text-sm text-gray-400 mt-2">Data will appear here once sensors start reporting.</p>
+      <div className="space-y-4">
+        <TankSelector />
+        <div className="bg-white rounded-xl border border-gray-100 p-8 text-center">
+          <History size={40} className="mx-auto mb-3 text-gray-300" />
+          <h2 className="text-lg font-bold text-gray-800 mb-1">Historical Data</h2>
+          <p className="text-gray-500">No historical data available yet.</p>
+          <p className="text-sm text-gray-400 mt-2">Data will appear here once sensors start reporting.</p>
+        </div>
       </div>
     );
   }
@@ -860,6 +865,9 @@ export default function HistoricalDataPage() {
 
   return (
     <div className="space-y-4">
+      {/* Tank selector: switch which tank's history is shown */}
+      <TankSelector />
+
       {/* Offline warning banner - history is still shown from the database */}
       {connectionStatus === "offline" && (
         <div className="bg-amber-50 border border-amber-200 text-amber-800 rounded-xl p-3 text-sm flex items-center gap-2">

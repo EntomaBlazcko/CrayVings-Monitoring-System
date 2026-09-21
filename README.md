@@ -32,6 +32,7 @@ This can help reduce risks caused by poor water conditions and improve overall m
 
 ### Core Features
 - **Authentication & roles** - Login-based access control (owner/admin/user) with session tokens and 24-hour expiry
+- **Multi-tank star topology** - One ESP32 per tank (up to 6) pushing to a central server; the server health-polls each device's `GET /status`, and the dashboard scopes live/history/analytics to a selected tank with a tank-selector chip bar and fleet grid
 - **Real-time sensor monitoring** - Temperature, water level, and ammonia (3 parameters via ESP32)
 - **ESP32-based data collection** - Wireless sensor data transmission with WiFiManager captive portal
 - **Web dashboard** - Responsive React UI with icon-based navigation
@@ -62,11 +63,11 @@ This can help reduce risks caused by poor water conditions and improve overall m
 | Ammonia | MQ-137 (NH3 gas) | 0.25 - 1.0 ppm |
 
 ### Dashboard Pages
-- **Dashboard** - Overview, quick stats, connection status, system alerts
-- **Analytics** - Period overview, trends, daily breakdowns, and insights
+- **Dashboard** - Tank selector, fleet grid (per-device "Live check"), overview, quick stats, connection status, system alerts
+- **Analytics** - Period overview, trends, daily breakdowns, and insights (farm-wide or selected tank)
 - **Sensors** - Individual sensor details with threshold info and connection status
 - **Alerts** - Alert history with filtering (Alert/Change) and acknowledgment
-- **Historical Data** - Trend charts with time filtering (1h, 6h, 24h, 1 week, all time) and weekly report PDF export
+- **Historical Data** - Selected-tank trend charts with time filtering (1h, 6h, 24h, 1 week, all time) and weekly report PDF export
 - **Activity Logs** - User activity tracking including device connect/disconnect events
 - **Sensor Logs** - System event logs with parameter filtering and PDF export
 - **Settings** - Thresholds, SMS recipients and mute/sleep, SMS logs, user management (owner/admin)
@@ -105,11 +106,16 @@ Admins see all pages; regular users are restricted to the monitoring pages (Dash
 ## System Architecture
 
 ```
-Sensors → ESP32 → Wi-Fi → Express API → PostgreSQL → React Dashboard
-                     │                              │
-                     ▼                              ▼
-                SMS via HTTPSMS ←───── Alert System (popup + sound + activity log)
+Tanks (ESP32 x6) ──POST /sensor (1s)──► Express API ──► PostgreSQL
+       │                                   │
+       └──GET /status ◄─ device poller (5s)└── React Dashboard (fleet + selected tank)
+                                             │
+                                        SMS via HTTPSMS ←──── Alert System
 ```
+
+One ESP32 per tank at `192.168.4.100-105`, central server at `192.168.4.10`
+(LAN `192.168.4.0/24`). The poller only reads diagnostics — sensor rows come
+exclusively from the device push.
 
 ### Data Flow
 1. **Sensors** read environmental data
@@ -195,7 +201,7 @@ Dashboard opens at http://localhost:5173
 
 ### 6. Connect ESP32
 
-Flash the ESP32 with `water_monitoring_system/water_monitoring_system.ino`. On boot it first tries the saved network; if that fails it automatically opens the "Aquaculture-Setup" WiFi access point so you can configure credentials (and backend server IP/port/device ID) via the captive portal at http://192.168.4.1 (or serial command `W`, or triple-tap the top-left corner). The firmware's default backend address is `192.168.100.152:3000` (`SERVER_IP_DEFAULT` in `water_monitoring_system.ino`) — set it to your backend machine's LAN IP if it differs. If you set `DEVICE_SECRET` in `.env`, enter the same value on the device so the backend accepts its readings.
+Flash the ESP32 with `water_monitoring_system/water_monitoring_system.ino`. On boot it first tries the saved network; if that fails it automatically opens the "Aquaculture-Setup" WiFi access point so you can configure credentials, backend server IP/port/device ID, device secret, tank height, and the device's static IP via the captive portal at http://192.168.4.1 (or serial command `W`, or triple-tap the top-left corner). The firmware's default backend address is `192.168.4.10:3000` (`SERVER_IP_DEFAULT` in `water_monitoring_system.ino`) — set it to your backend machine's LAN IP if it differs. If you set `DEVICE_SECRET` in `.env`, enter the same value on the device so the backend accepts its readings. The firmware now requires the **ESPAsyncWebServer** and **AsyncTCP** libraries (it serves read-only `GET /status` on port 80 for fleet health checks). Apply the multi-tank DB migration once (`node db/migrations/007_multi_device.cjs`) and give each device its own `device_id` (e.g. `tank01`).
 
 ---
 
@@ -245,8 +251,10 @@ While muted, disconnect alerts still show as popups and are logged, but SMS is n
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/sensor` | POST | Submit sensor data (device secret required when `DEVICE_SECRET` is set) |
-| `/sensor/latest` | GET | Get latest reading (`recv_at` = live device heartbeat) |
-| `/sensor` | GET | Get history (`limit`: 1-1000) |
+| `/sensor/latest` | GET | Get latest reading (`recv_at` = live device heartbeat; optional `device_id` filter) |
+| `/sensor` | GET | Get history (`limit`: 1-1000; optional `device_id` filter, per-tank) |
+| `/devices` | GET | Fleet registry + online flags (name, tank_name, tank_location, ip_address, last_health_seen) |
+| `/devices/:deviceId/status` | GET | Live on-demand poll of one ESP32's `GET /status` (3s timeout) |
 | `/report/weekly` | GET | Weekly report (summary, daily breakdown, alert counts) |
 | `/report/range` | GET | Aggregated report for `?hours=N` (hourly buckets when ≤24h, daily otherwise; admin) |
 
@@ -294,10 +302,12 @@ While muted, disconnect alerts still show as popups and are logged, but SMS is n
 ```
 src/
 ├── api/client.ts              # API client functions
-├── components/
-│   ├── AnalyticsSection.tsx   # Analytics summary cards + insights
-│   ├── DeviceConnectionMonitor.tsx  # ESP32 connect/disconnect monitoring
-│   ├── FixLegend.tsx          # Alert guidance legend
+- Components/
+  │   ├── AnalyticsSection.tsx   # Analytics summary cards + insights
+  │   ├── TankSelector.tsx       # Tank chip bar (online dots, X/Y online)
+  │   ├── FleetGrid.tsx          # Fleet cards + on-demand "Live check"
+  │   ├── DeviceConnectionMonitor.tsx  # ESP32 connect/disconnect monitoring
+  │   ├── FixLegend.tsx          # Alert guidance legend
 │   ├── FloatingAlert.tsx      # Popup alerts with mute options
 │   ├── Header.tsx             # Top bar with user info + logout
 │   ├── Loading.tsx            # Loading/error cards
@@ -340,10 +350,11 @@ db/migrations/                 # Structural SQL migrations (run manually)
 ## Connection & Offline Handling
 
 ### How Connection Status Works
-- Frontend polls `GET /sensor/latest` every 1 second
+- Frontend polls `GET /sensor/latest` every 1 second **for the selected tank**; a separate poll every 5 seconds refreshes the fleet registry (`GET /devices`), and the backend rides on it to mark each device online/offline
 - `lastUpdate` uses the `recv_at` **heartbeat** (device receive time, refreshed even when delta logging skips a row)
 - If no heartbeat is received within 15 seconds → status = **offline**
 - After 5 consecutive failed API requests → status = **offline**
+- Device readings are per-tank; selecting a different tank re-scopes latest/history/analytics, while the fleet grid shows every device's online state
 
 ### Change-Only (Delta) Logging
 - `POST /sensor` writes a new row only when a parameter differs from the last stored reading beyond its per-sensor tolerance (defaults: temp ±0.1°C, water level ±1.0%, ammonia ±0.05 ppm)

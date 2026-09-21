@@ -549,9 +549,20 @@ the same network (or from the internet via the tunnel URL).
 ================================================================================
 
 LAN-only (Option A / C at the farm)
-    - The ESP32 firmware holds SERVER_IP + SERVER_PORT. Point them at the
-      Pi/spare-PC's LAN IP (e.g. 192.168.100.152:3000).
-    - Keep the router DHCP reservation so the IP never changes, and
+    - The star topology expects its own LAN in the 192.168.4.0/24 range:
+        192.168.4.1     access point / router (gateway + DHCP server)
+        192.168.4.10    central server (backend + dashboard) - static IP
+        192.168.4.100+  the ESP32 tanks (tank01..tank06)
+    - Configure the router's LAN to that subnet BEFORE flashing any ESP32;
+      the default ESP32 SoftAP range is 192.168.4.x, so using it for the LAN
+      means the ESP32s never need NAT tricks.
+    - Point the firmware at http://192.168.4.10:3000 (default) and give each
+      tank its own device_id + optional static IP via the config portal.
+    - Static IP method: the firmware's NVS static-IP fields (static_ip /
+      static_gateway / static_subnet in the config portal) pin each device to
+      192.168.4.100-105. Router DHCP reservations are an equivalent
+      alternative - pick one per deployment and verify with GET /status.
+    - Keep the DHCP reservation (if used) so the IP never changes, and
       remember to update the firmware if you change it.
 
 Cloud (Option B)
@@ -563,7 +574,22 @@ Cloud (Option B)
 
 Device secret
     - Set DEVICE_SECRET (same value) in .env and in the firmware's
-      X-Device-Secret, otherwise the server refuses the POST.
+      X-Device-Secret (via the config portal field device_secret), otherwise
+      the server refuses the POST.
+
+Multi-tank / star-topology checklist (add to the LAN flow)
+    [ ] Migration 007 applied: node db/migrations/007_multi_device.cjs
+    [ ] devices.ip_address / tank_name / tank_location filled in for each ESP32
+    [ ] ESPAsyncWebServer + AsyncTCP libraries installed in Arduino IDE
+    [ ] Firmware flashed with per-tank device_id (tank01) + static IP + secret
+    [ ] Router LAN = 192.168.4.0/24, gateway 192.168.4.1, server IP reserved .10
+    [ ] GET /devices lists every tank; per-tank online flags flip correctly
+    [ ] GET /devices/:id/status returns the device's live diagnostics
+    [ ] Disconnect one tank -> its chip shows offline within ~15s and
+        devices.last_health_seen stops advancing (server log: poller failure
+        after 3 attempts); reconnect -> back to online
+    [ ] Kill the server while a tank is running -> firmware buffer queues;
+        restart the server -> queued readings flush oldest-first
 
 ================================================================================
 QUICK RECAP OF THE $0 MONTHLY STACK

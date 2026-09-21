@@ -26,6 +26,7 @@ import type {
   SensorSettings,
   ActivityLog,
   ActivityActionType,
+  DeviceEntry,
 } from "../types";
 import {
   fetchLatestSensor,
@@ -33,6 +34,7 @@ import {
   fetchLogs,
   fetchSettings,
   fetchActivityLogs,
+  fetchDevices,
   logActivity as apiLogActivity,
   saveSettings as apiSaveSettings,
 } from "../api/client";
@@ -42,6 +44,7 @@ import {
 // ========================
 const POLL_INTERVAL = 1000;             // 1s sensor data (matches ESP32 send rate)
 const HISTORY_POLL_INTERVAL = 30000;     // 30s chart history (heavy query)
+const DEVICES_POLL_INTERVAL = 5000;      // 5s fleet registry/online flags
 const OFFLINE_THRESHOLD = 15000;         // 15s without data = offline
 const MAX_CONSECUTIVE_FAILURES = 5;      // After 5 failures, mark offline
 const LOGS_POLL_INTERVAL = 5000;         // 5s system logs
@@ -61,6 +64,8 @@ interface SensorDataState {
   consecutiveFailures: number;
   historyStale: boolean;
   historyLastUpdated: Date | null;
+  devices: DeviceEntry[];
+  devicesLoading: boolean;
 }
 
 interface SensorSettingsState {
@@ -103,10 +108,15 @@ function computeConnectionStatus(
 // ========================
 // HOOK 1: SENSOR DATA POLLING
 // ========================
-// Polls sensor data every 1s + history every 30s. Tracks connection status via
-// consecutive failures and stale timestamps. Uses request IDs (not AbortController)
-// to drop superseded responses without canceling in-flight requests.
-function useSensorDataPolling(): SensorDataState & { refetch: () => void } {
+// Polls sensor data every 1s + history every 30s, both scoped to the selected
+// device (null = all tanks). Polls the fleet registry every 5s for online flags.
+// Tracks connection status via consecutive failures and stale timestamps.
+// Uses request IDs (not AbortController) to drop superseded responses without
+// canceling in-flight requests.
+function useSensorDataPolling(
+  selectedDeviceId: string | null,
+  onDevicesLoaded: (devices: DeviceEntry[]) => void
+): SensorDataState & { refetch: () => void } {
   const [state, setState] = useState<SensorDataState>({
     data: null,
     history: [],
@@ -117,26 +127,32 @@ function useSensorDataPolling(): SensorDataState & { refetch: () => void } {
     consecutiveFailures: 0,
     historyStale: false,
     historyLastUpdated: null,
+    devices: [],
+    devicesLoading: true,
   });
 
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const historyIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const devicesIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const latestAbortRef = useRef<AbortController | null>(null);
   const historyAbortRef = useRef<AbortController | null>(null);
+  const devicesAbortRef = useRef<AbortController | null>(null);
   // Request IDs: drop superseded responses without aborting (aborting caused
   // ERR_CANCELED to bypass the failure counter, freezing status at "online").
   const latestReqIdRef = useRef(0);
   const historyReqIdRef = useRef(0);
+  const devicesReqIdRef = useRef(0);
   const consecutiveFailuresRef = useRef(0);
 
-  // Fetches latest sensor reading (every 1s). Connection status derived from timestamp.
+  // Fetches latest sensor reading for the selected device (every 1s).
+  // Connection status derived from timestamp.
   const fetchLatest = useCallback(async () => {
     // Bump id so any in-flight response from a prior poll is ignored.
     const reqId = ++latestReqIdRef.current;
     latestAbortRef.current = new AbortController();
 
     try {
-      const latest = await fetchLatestSensor(latestAbortRef.current.signal);
+      const latest = await fetchLatestSensor(selectedDeviceId, latestAbortRef.current.signal);
       if (reqId !== latestReqIdRef.current) return; // superseded by a newer poll
 
       if (latest && latest.timestamp) {
@@ -188,15 +204,16 @@ function useSensorDataPolling(): SensorDataState & { refetch: () => void } {
         }));
       }
     }
-  }, []);
+  }, [selectedDeviceId]);
 
-  // Fetches chart history (every 30s). Errors swallowed; last good data stays on screen.
+  // Fetches chart history for the selected device (every 30s). Errors swallowed;
+  // last good data stays on screen.
   const fetchHistory = useCallback(async () => {
     const reqId = ++historyReqIdRef.current;
     historyAbortRef.current = new AbortController();
 
     try {
-      const historyData = await fetchSensorHistory(1000, historyAbortRef.current.signal);
+      const historyData = await fetchSensorHistory(1000, selectedDeviceId, historyAbortRef.current.signal);
       if (reqId !== historyReqIdRef.current) return;
       setState((prev) => ({ ...prev, history: historyData, historyStale: false, historyLastUpdated: new Date() }));
     } catch (error) {
@@ -206,14 +223,36 @@ function useSensorDataPolling(): SensorDataState & { refetch: () => void } {
         setState((prev) => ({ ...prev, historyStale: true }));
       }
     }
-  }, []);
+  }, [selectedDeviceId]);
+
+  // Fetches the fleet registry + online flags (every 5s). Drives the tank
+  // selector and fleet grid; lightweight compared to per-second polling.
+  const fetchDevicesList = useCallback(async () => {
+    const reqId = ++devicesReqIdRef.current;
+    devicesAbortRef.current = new AbortController();
+
+    try {
+      const devices = await fetchDevices(devicesAbortRef.current.signal);
+      if (reqId !== devicesReqIdRef.current) return;
+      setState((prev) => ({ ...prev, devices, devicesLoading: false }));
+      onDevicesLoaded(devices);
+    } catch (error) {
+      if (isAxiosError(error) && error.code === "ERR_CANCELED") return;
+      if (reqId === devicesReqIdRef.current) {
+        // Keep last known fleet; only surface loading state so UI retries quietly.
+        setState((prev) => ({ ...prev, devicesLoading: false }));
+      }
+    }
+  }, [onDevicesLoaded]);
 
   const refetch = useCallback(() => {
     fetchLatest();
     fetchHistory();
-  }, [fetchLatest, fetchHistory]);
+    fetchDevicesList();
+  }, [fetchLatest, fetchHistory, fetchDevicesList]);
 
-  // Start polling on mount; both pause while the tab is hidden.
+  // Start polling on mount (and restart when the selected tank changes); both
+  // pause while the tab is hidden.
   useEffect(() => {
     refetch();
     intervalRef.current = setInterval(() => {
@@ -238,6 +277,23 @@ function useSensorDataPolling(): SensorDataState & { refetch: () => void } {
       }
     };
   }, [refetch, fetchLatest, fetchHistory]);
+
+  // Fleet registry poll: independent of selection, runs for app lifetime.
+  useEffect(() => {
+    fetchDevicesList();
+    devicesIntervalRef.current = setInterval(() => {
+      if (!document.hidden) fetchDevicesList();
+    }, DEVICES_POLL_INTERVAL);
+
+    return () => {
+      if (devicesIntervalRef.current) {
+        clearInterval(devicesIntervalRef.current);
+      }
+      if (devicesAbortRef.current) {
+        devicesAbortRef.current.abort();
+      }
+    };
+  }, [fetchDevicesList]);
 
   const computedConnectionStatus = useMemo(
     () => computeConnectionStatus(state.loading, state.lastUpdate, state.consecutiveFailures),
@@ -628,7 +684,21 @@ function useActivityLogsManager() {
 // ========================
 // Combines all four hooks into a single provider tree.
 export function SensorProvider({ children }: { children: ReactNode }) {
-  const sensorData = useSensorDataPolling();
+  // Selected tank is lifted here so it persists across pages (Dashboard ->
+  // Historical Data -> Analytics). Defaults to the first registered device,
+  // set once by the fleet poll callback (not an effect — avoids cascading renders).
+  const [selectedDeviceId, setSelectedDeviceId] = useState<string | null>(null);
+
+  const handleDevicesLoaded = useCallback((devices: DeviceEntry[]) => {
+    setSelectedDeviceId((current) => {
+      if (current !== null) return current;
+      if (!devices || devices.length === 0) return current;
+      const first = [...devices].sort((a, b) => a.device_id.localeCompare(b.device_id))[0];
+      return first.device_id;
+    });
+  }, []);
+
+  const sensorData = useSensorDataPolling(selectedDeviceId, handleDevicesLoaded);
   const settingsState = useSettingsManager();
   const logsState = useLogsManager();
   const activityLogsState = useActivityLogsManager();
@@ -644,9 +714,13 @@ export function SensorProvider({ children }: { children: ReactNode }) {
       consecutiveFailures: sensorData.consecutiveFailures,
       historyStale: sensorData.historyStale,
       historyLastUpdated: sensorData.historyLastUpdated,
+      devices: sensorData.devices,
+      devicesLoading: sensorData.devicesLoading,
+      selectedDeviceId,
+      setSelectedDeviceId,
       refetch: sensorData.refetch,
     }),
-    [sensorData]
+    [sensorData, selectedDeviceId]
   );
 
   const settingsContextValue = useMemo(
