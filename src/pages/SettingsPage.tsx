@@ -1490,6 +1490,19 @@ export default function SettingsPage() {
               </div>
             )}
 
+            {smsHealth?.circuitBreaker && smsHealth.circuitBreaker.state !== "CLOSED" && (
+              <div className="flex items-center gap-2 bg-red-50 border border-red-200 text-red-800 rounded-lg p-3 text-sm">
+                <AlertTriangle size={16} className="text-red-600 shrink-0" />
+                <span>
+                  SMS circuit breaker <b>{smsHealth.circuitBreaker.state}</b> after{" "}
+                  {smsHealth.circuitBreaker.consecutiveFailures} consecutive failure(s). Sends are paused
+                  {smsHealth.circuitBreaker.state === "OPEN" && smsHealth.circuitBreaker.cooldownUntil
+                    ? " until the cooldown expires and a probe succeeds"
+                    : ""}.
+                </span>
+              </div>
+            )}
+
             <div className="flex flex-wrap items-center gap-3 text-sm bg-white rounded-xl border border-gray-100 p-4 shadow-sm">
               <label className="flex items-center gap-2 text-gray-600">
                 <Bell size={14} className="text-orange-500" />

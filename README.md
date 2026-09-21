@@ -367,6 +367,51 @@ db/migrations/                 # Structural SQL migrations (run manually)
 
 ---
 
+## Failure Handling & Resilience
+
+The system deliberately handles failures at every layer instead of crashing, so
+a capstone demo can fail a component and show automatic recovery.
+
+### 1. Firmware Watchdog + Safe Mode (ESP32)
+- A 30-second **task watchdog** (`esp_task_wdt`) is armed in `setup()`; if the main
+  loop ever stalls (e.g. a fatal `while(1);`) the chip resets itself.
+- On a watchdog reset the boot detects it via `esp_reset_reason()` and enters
+  **Safe Mode**: the display shows `SAFE MODE` with the **last known-good sensor
+  values** (persisted to NVS by `saveLastKnownValues()`), and the onboard LED
+  blinks on a `millis()` cadence (never a blocking delay, so the watchdog stays fed).
+- While in Safe Mode the device keeps reading sensors and retrying the uplink
+  with WiFi **exponential backoff** (1s → 2s → 4s → … capped at 5 min). The first
+  successful sensor POST clears Safe Mode automatically and restores the normal UI.
+- Why: a hung sensor loop must not mean a bricked device at the farm.
+
+### 2. SMS Circuit Breaker (backend)
+- Every HTTPSMS send is routed through a **circuit breaker** (`services/smsService.cjs`)
+  with states **CLOSED → OPEN → HALF_OPEN**:
+  - CLOSED: sends normally; after **5 consecutive failures** the circuit trips OPEN.
+  - OPEN: sends fail fast (`SMS circuit breaker OPEN` in the logs) — no more
+    hammering a dead gateway or risking provider/API bans.
+  - HALF_OPEN: after a **60s cooldown** a single probe is allowed; success returns
+    to CLOSED, failure re-opens it with a fresh cooldown.
+- Only the send (POST) path is guarded; delivery reconciliation (GET poller) runs
+  outside the breaker so queued SMS still settle after recovery.
+- Live state is exposed in `GET /alert/sms-health` (`circuitBreaker` field) and
+  shown in the Settings page SMS panel.
+- Why: gateway/API outages are the norm in SMS integrations; hammering makes them
+  worse and burns daily-text caps.
+
+### How to observe handling during a demo
+- **Watchdog**: brick `loop()` with `while(1);` → serial prints `[WDT] Task watchdog
+  armed`, chip reboots ~30s later → `[WDT] Boot after watchdog reset → Safe Mode`,
+  screen shows SAFE MODE + last values, LED blinks → first POST resumes normal UI.
+- **WiFi backoff**: disconnect the router → serial shows `Reconnect attempt 1 (next
+  backoff 1s)`, `attempt 2 (2s)`, `attempt 4s...` → reconnect clears the streak.
+- **Circuit breaker**: block `api.httpsms.com` (hosts file) → trigger ≥3 alerts →
+  server logs `SMS circuit breaker OPEN after 5 consecutive failures` →
+  `GET /alert/sms-health` returns `"circuitBreaker":"OPEN"` → unblock → cooldown →
+  HALF_OPEN probe succeeds → back to CLOSED.
+
+---
+
 ## Troubleshooting
 
 | Issue | Solution |

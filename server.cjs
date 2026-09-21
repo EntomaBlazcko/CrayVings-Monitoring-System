@@ -18,6 +18,10 @@ const nodemailer = require("nodemailer");
 const axios = require("axios");
 require("dotenv").config();
 
+// SMS gateway circuit breaker (services/smsService.cjs) - stops hammering the
+// HTTPSMS gateway after repeated failures and exposes state via sms-health.
+const { smsCircuitBreaker, sendSmsWithBreaker } = require("./services/smsService.cjs");
+
 // ========================
 // EXPRESS APP SETUP
 // ========================
@@ -586,16 +590,23 @@ function buildSmsMessage(type, body) {
 }
 
 // POST to httpsms; resolves with the provider's message id (async delivery).
+// Routed through the circuit breaker so a dead/unreachable gateway fails fast
+// instead of being hammered. The config check stays OUTSIDE the breaker so a
+// missing key is reported immediately rather than tripping the breaker.
 async function sendHttpsms({ to, content }) {
   if (!HTTPSMS_API_KEY || !HTTPSMS_FROM) {
     const err = new Error("HTTPSMS_API_KEY / HTTPSMS_FROM not configured");
     err.missingConfig = true;
     throw err;
   }
-  const response = await axios.post(
-    HTTPSMS_API_URL,
-    { from: HTTPSMS_FROM, to, content },
-    { headers: { "x-api-key": HTTPSMS_API_KEY } }
+  const response = await sendSmsWithBreaker(
+    () =>
+      axios.post(
+        HTTPSMS_API_URL,
+        { from: HTTPSMS_FROM, to, content },
+        { headers: { "x-api-key": HTTPSMS_API_KEY } }
+      ),
+    "HTTPSMS"
   );
   return response.data?.data?.id || null;
 }
@@ -2303,6 +2314,7 @@ app.get("/alert/sms-health", requireAuth, async (req, res) => {
       from: HTTPSMS_FROM || null,
       smsToday: sentToday.rows[0].n,
       smsCap: SMS_DAILY_CAP,
+      circuitBreaker: smsCircuitBreaker.snapshot(),
       last24h: {
         processed: Number(counts.rows[0].processed),
         failed: Number(counts.rows[0].failed),

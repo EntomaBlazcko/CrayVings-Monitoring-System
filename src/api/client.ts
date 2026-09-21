@@ -686,6 +686,14 @@ export interface SmsHealth {
   from: string | null;
   smsToday: number;
   smsCap: number;
+  circuitBreaker?: {
+    state: "CLOSED" | "OPEN" | "HALF_OPEN";
+    consecutiveFailures: number;
+    failureThreshold: number;
+    cooldownMs: number;
+    cooldownUntil: number | null;
+    lastError: string | null;
+  };
   last24h: { processed: number; failed: number; capped: number; stuckQueued: number };
   degraded: boolean;
   latestFailure: SmsLogEntry | null;

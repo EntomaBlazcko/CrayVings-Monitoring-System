@@ -375,6 +375,114 @@ so it remains available when the ESP32 is offline:
 
 
 ================================================================================
+FAILURE HANDLING & RESILIENCE
+================================================================================
+
+The system is designed to survive component failures with automatic recovery so
+that a single fault (hung firmware, dead SMS gateway, broken Wi-Fi) never leaves
+the farm unmonitored or the device bricked. Three mechanisms cover three
+different failure domains: firmware hang (hardware), network loss (device),
+and SMS provider outage (backend/cloud).
+
+--------------------------------------------------------------------------------
+1) FIRMWARE WATCHDOG + SAFE MODE  (water_monitoring_system.ino)
+--------------------------------------------------------------------------------
+
+WATCHDOG ARMING
+
+  - setup() calls esp_task_wdt_init(30, true) and esp_task_wdt_add(NULL), which
+    subscribes the Arduino main loop task to the task watchdog with a 30-second
+    timeout and panic-on-timeout. If loop() ever stalls (e.g. an accidental
+    while(1);), the panic handler resets the chip after ~30s instead of leaving
+    the device hung forever.
+  - loop() feeds the watchdog on every tick with esp_task_wdt_reset() followed
+    by a vTaskDelay(1). Safe Mode's LED blink is millis()-based precisely so the
+    watchdog is never starved by a blocking delay.
+
+SAFE MODE START (auto-detected on boot)
+
+  - On startup, esp_reset_reason() is checked. ESP_RST_TASK_WDT / ESP_RST_WDT
+    mean the previous run was killed by the watchdog, so the device boots into
+    Safe Mode instead of pretending nothing happened.
+  - enterSafeMode() loads the last known-good sensor snapshot (temperature,
+    water level, ammonia) that readAllSensors() persisted to NVS on every read
+    cycle (saveLastKnownValues/loadLastKnownValues, Preferences namespace
+    "safe"), draws a red SAFE MODE screen with those values, and blinks the
+    onboard LED (GPIO2) at 500ms.
+  - In Safe Mode the device keeps reading sensors (refreshing the NVS snapshot)
+    and keeps trying to send, but skips the config portal on boot failure and
+    skips normal page repaints so the SAFE MODE screen stays visible.
+
+SAFE MODE EXIT (automatic recovery)
+
+  - sendSensorTask keeps polling SEND_INTERVAL. The moment the first sensor POST
+    succeeds (HTTP response >= 200), safeModeActive is cleared and the main loop
+    is told to redraw the normal UI (PAGE_OVERVIEW). The device fully resumes
+    normal operation with no human intervention.
+
+WIFI RECONNECTION WITH EXPONENTIAL BACKOFF
+
+  - When WiFi.status() != WL_CONNECTED, sendSensorData() no longer silently
+    returns: it issues WiFi.reconnect() at increasing intervals
+    (1s, 2s, 4s, ... capped at 5 minutes) and prints
+    "[WIFI] Reconnect attempt N (next backoff Xs)".
+  - The first successful send resets the streak and backoff to 1s. This bounds
+    how hard the device pushes a dead/unreachable AP and is the same mechanism
+    that lets Safe Mode wait out an outage.
+
+OBSERVE DURING DEMO
+
+  1. Brick loop() with a while(1); -> ~30s later the chip reboots; serial shows
+     "[WDT] Boot after watchdog reset -> Safe Mode"; the screen shows SAFE MODE
+     with the last known values and the LED blinks.
+  2. With Wi-Fi back on, the first POST succeeds -> "[SAFE MODE] Recovery
+     complete, back to normal operation" and the normal UI returns.
+
+--------------------------------------------------------------------------------
+2) SMS CIRCUIT BREAKER  (services/smsService.cjs + server.cjs)
+--------------------------------------------------------------------------------
+
+WHY
+
+  If the HTTPSMS gateway (or the Android phone running it) becomes unreachable,
+  every alert SMS fails. Naively retrying forever hammers the provider, risks
+  an API ban, and drains the daily SMS cap with 'failed' rows. The circuit
+  breaker stops the hammering after a threshold and resumes automatically after
+  a cooldown.
+
+STATES
+
+  CLOSED     normal operation; sends go straight to sendHttpsms()
+  OPEN       every send throws immediately ("SMS circuit breaker OPEN") until
+             the cooldown elapses
+  HALF_OPEN  after the cooldown, one probe send is allowed; success -> CLOSED,
+             failure -> OPEN again with a fresh cooldown
+
+WHERE IT HOOKS IN
+
+  - sendHttpsms() (server.cjs) wraps its axios POST with
+    sendSmsWithBreaker(...). The breaker counts consecutive failures (threshold
+    5) and exposes snapshot() for /alert/sms-health.
+  - The HTTPSMS_API_KEY / HTTPSMS_FROM config check runs BEFORE the breaker, so
+    a misconfiguration is reported immediately and never travels the breaker.
+  - The delivery poller (fetchHttpsmsMessages / pollUndeliveredSms) is NOT
+    wrapped: reconciliation needs the GET /v1/messages read path to keep working
+    during an outage so queued SMS still settle after recovery.
+
+OBSERVABLE OUTPUT
+
+  - Server log on every transition:
+      "SMS circuit breaker OPEN after 5 consecutive failures (cooldown 60000ms)"
+      "SMS circuit breaker HALF_OPEN - single probe send allowed"
+      "SMS circuit breaker HALF_OPEN -> CLOSED after successful send"
+  - GET /alert/sms-health adds:
+      circuitBreaker: { state, consecutiveFailures, failureThreshold,
+                        cooldownMs, cooldownUntil, lastError }
+  - The dashboard Settings page SMS panel shows a red banner while the circuit
+    is OPEN or HALF_OPEN.
+
+
+================================================================================
 ALERT SYSTEM
 ================================================================================
 
