@@ -1,4 +1,3 @@
-
 <img width="2048" height="2048" alt="CRAYVINGS" src="https://github.com/user-attachments/assets/57608e73-686f-4dfb-9b6a-3ceba1092add" />
 
 # CRAYvings Monitoring System
@@ -32,6 +31,7 @@ This can help reduce risks caused by poor water conditions and improve overall m
 ## Features
 
 ### Core Features
+- **Authentication & roles** - Login-based access control (owner/admin/user) with session tokens and 24-hour expiry
 - **Real-time sensor monitoring** - Temperature, water level, and ammonia (3 parameters via ESP32)
 - **ESP32-based data collection** - Wireless sensor data transmission with WiFiManager captive portal
 - **Web dashboard** - Responsive React UI with icon-based navigation
@@ -39,34 +39,39 @@ This can help reduce risks caused by poor water conditions and improve overall m
 - **Smart connection detection** - Connection status based on actual sensor data timestamp, not API poll time
 - **Offline data display** - When ESP32 disconnects, pages show last known readings with yellow offline banner; historical data remains viewable from the database
 - **Smart alerts** - Floating popup notifications with threshold-based alerts and cooldown
-- **SMS notifications** - Critical threshold alerts and device disconnect alerts via SkySMS API
+- **Alert acknowledgment** - Confirm or Allow each alert, tracked per alert row
+- **SMS notifications** - Critical threshold alerts, hourly status updates, and device disconnect alerts via HTTPSMS (Android gateway)
+- **SMS delivery tracking** - Per-message status (queued/delivered/failed), delivery poller, daily send cap, and SMS logs
 - **SMS mute/sleep** - Pause SMS alerts for 1, 2, 4, 6, 8, 12, or 24 hours
 - **Disconnect/reconnect alerts** - Floating popup, sound, and activity log when ESP32 goes offline or comes back online
-- **Recipient management** - Manage SMS alert recipients
+- **Recipient management** - Manage SMS alert recipients with archive/restore/purge
+- **User management** - Create users, reset passwords, and soft-delete/restore accounts; deletion is verified via email OTP
 - **Custom alert sounds** - Audio alerts via Web Audio API
 - **PDF export** - Export system logs to PDF (LogsPage) and weekly reports to PDF (Historical Data)
+- **Analytics** - Period overviews, trends, daily breakdowns, and rule-based insights
 - **Activity logging** - Track user interactions including device connect/disconnect events
-- **Browser-based firmware flasher** - Flash or update the ESP32 firmware directly from the browser via Web Serial (Settings > Firmware Flasher, owner/admin only)
 - **WiFiManager** - ESP32 firmware uses captive portal for WiFi config (no hardcoded credentials)
 - **Touchscreen UI** - 480x320 TFT with XPT2046 resistive touch (HSPI); on-screen left/right page arrows and triple-tap gestures
 - **Non-blocking data send** - HTTP POST runs on a background FreeRTOS task, so a slow/unreachable backend never freezes the UI or touch input
 
 ### Monitoring Parameters
-| Parameter | Sensor | Safe Range |
+| Parameter | Sensor | Safe Range (default thresholds) |
 |-----------|--------|------------|
 | Temperature | DS18B20 | 20 - 31°C |
 | Water Level | Ultrasonic HC-SR04 | 10 - 100% |
-| Ammonia | MQ-137 (NH3 gas) | 0 - 25 ppm |
+| Ammonia | MQ-137 (NH3 gas) | 0.25 - 1.0 ppm |
 
 ### Dashboard Pages
-- **Home** - Overview, quick stats, connection status, system alerts
-- **Dashboard** - Live readings, trend charts, tank status, sensor hub status
+- **Dashboard** - Overview, quick stats, connection status, system alerts
+- **Analytics** - Period overview, trends, daily breakdowns, and insights
 - **Sensors** - Individual sensor details with threshold info and connection status
-- **Alerts** - Alert history with filtering (Alert/Change)
+- **Alerts** - Alert history with filtering (Alert/Change) and acknowledgment
 - **Historical Data** - Trend charts with time filtering (1h, 6h, 24h, 1 week, all time) and weekly report PDF export
 - **Activity Logs** - User activity tracking including device connect/disconnect events
-- **Logs** - System event logs with parameter filtering and PDF export
-- **Settings** - Configure thresholds, manage SMS recipients, mute/sleep SMS alerts, user management, flash ESP32 firmware (owner/admin)
+- **Sensor Logs** - System event logs with parameter filtering and PDF export
+- **Settings** - Thresholds, SMS recipients and mute/sleep, SMS logs, user management (owner/admin)
+
+Admins see all pages; regular users are restricted to the monitoring pages (Dashboard, Analytics, Sensors, Alerts, Historical Data, Sensor Logs).
 
 ---
 
@@ -93,8 +98,7 @@ This can help reduce risks caused by poor water conditions and improve overall m
 | Database | PostgreSQL | 15+ |
 | Connection Pool | pg | 8.20 |
 | Validation | Zod | 4.3 |
-| SMS Service | SkySMS API | - |
-| Web Flasher | esptool-js | 0.6 |
+| SMS Service | HTTPSMS (Android gateway) | - |
 
 ---
 
@@ -104,7 +108,7 @@ This can help reduce risks caused by poor water conditions and improve overall m
 Sensors → ESP32 → Wi-Fi → Express API → PostgreSQL → React Dashboard
                      │                              │
                      ▼                              ▼
-                SMS via SkySMS ←───── Alert System (popup + sound + activity log)
+                SMS via HTTPSMS ←───── Alert System (popup + sound + activity log)
 ```
 
 ### Data Flow
@@ -114,7 +118,7 @@ Sensors → ESP32 → Wi-Fi → Express API → PostgreSQL → React Dashboard
 4. **React Dashboard** polls for data every 1 second
 5. **Connection check** compares sensor data timestamp against current time
 6. **Alerts** triggered when values exceed thresholds or ESP32 disconnects
-7. **SMS** sent to active recipients for critical events (unless muted)
+7. **SMS** sent to active recipients through the HTTPSMS Android gateway (unless muted)
 
 ---
 
@@ -124,6 +128,8 @@ Sensors → ESP32 → Wi-Fi → Express API → PostgreSQL → React Dashboard
 - ESP32 DevKit V1
 - DS18B20 temperature sensor
 - HC-SR04 water level sensor
+- MQ-137 ammonia sensor
+- (Optional) Android phone running the HttpSms app, as the SMS gateway
 
 ### Software
 - Node.js 18+
@@ -142,7 +148,7 @@ npm install
 
 ### 2. Configure Environment
 
-Create a `.env` file:
+Copy `.env.example` to `.env` and fill in your values:
 
 ```bash
 PORT=3000
@@ -152,17 +158,34 @@ PG_DATABASE=crayvings_monitoring_system_db
 PG_USER=postgres
 PG_PASSWORD=your_password
 ALLOWED_ORIGINS=http://localhost:5173
-SKYSMS_API_KEY=your_skysms_api_key_here
-SKYSMS_API_URL=https://skysms.skyio.site/api/v1
+
+# SMS via HTTPSMS (optional Android gateway; see docs/HTTPSMS_SETUP.txt)
+HTTPSMS_API_KEY=your_httpsms_api_key
+HTTPSMS_FROM=+639XXXXXXXXXX
+
+# First-time admin (see step 3)
+ADMIN_INITIAL_PASSWORD=your_strong_password
 ```
 
-### 3. Start Backend
+The server auto-applies additive schema columns and indexes on startup. Structural migrations live in `db/migrations/` (run them with `node db/migrations/xxx.cjs` when upgrading).
+
+### 3. Create Initial Admin
+
+The owner/admin account is bootstrapped from `.env` (never hardcoded). On a fresh database:
+
+```bash
+npm run seed:admin
+```
+
+This creates the owner account using `ADMIN_USERNAME`/`ADMIN_EMAIL`/`ADMIN_INITIAL_PASSWORD`. Existing admin passwords are never overwritten.
+
+### 4. Start Backend
 
 ```bash
 npm run server
 ```
 
-### 4. Start Frontend
+### 5. Start Frontend
 
 ```bash
 npm run dev
@@ -170,19 +193,16 @@ npm run dev
 
 Dashboard opens at http://localhost:5173
 
-### 5. Connect ESP32
+### 6. Connect ESP32
 
-Flash the ESP32 with `water_monitoring_system/water_monitoring_system.ino`. On boot it first tries the saved network; if that fails it automatically opens the "Aquaculture-Setup" WiFi access point so you can configure credentials (and backend server IP/port/device ID) via the captive portal at http://192.168.4.1 (or serial command `W`, or triple-tap the top-left corner). The firmware's default backend address is `192.168.100.152:3000` (`SERVER_IP_DEFAULT` in `water_monitoring_system.ino`) — set it to your backend machine's LAN IP if it differs.
-
-#### Updating firmware without a wire → use the web flasher
-Prefer the **browser-based flasher** for updates: Settings > Firmware Flasher (owner/admin only). Plug the ESP32 in via USB, click Connect Device, pick a firmware build, and Flash — no Arduino IDE needed. Compiled binaries and the manifest live in `public/firmware/`; see `docs/WEB_FLASHER_NOTES.txt` for the full guide.
+Flash the ESP32 with `water_monitoring_system/water_monitoring_system.ino`. On boot it first tries the saved network; if that fails it automatically opens the "Aquaculture-Setup" WiFi access point so you can configure credentials (and backend server IP/port/device ID) via the captive portal at http://192.168.4.1 (or serial command `W`, or triple-tap the top-left corner). The firmware's default backend address is `192.168.100.152:3000` (`SERVER_IP_DEFAULT` in `water_monitoring_system.ino`) — set it to your backend machine's LAN IP if it differs. If you set `DEVICE_SECRET` in `.env`, enter the same value on the device so the backend accepts its readings.
 
 ---
 
 ## Configuration
 
 ### Setting Thresholds
-Navigate to **Settings** to configure temperature and water level min/max values.
+Navigate to **Settings** to configure minimum/maximum values for temperature, water level, and ammonia. Threshold changes are logged to activity logs.
 
 ### SMS Mute / Sleep
 Two ways to pause SMS alerts:
@@ -192,30 +212,80 @@ Two ways to pause SMS alerts:
 While muted, disconnect alerts still show as popups and are logged, but SMS is not sent.
 
 ### SMS Notifications
-- SkySMS integration for critical alerts and device disconnect alerts
-- Recipient management in Settings page
-- Test SMS feature to verify configuration
+- HTTPSMS integration (httpsms.com) using an Android phone as the SMS gateway
+- Automated sends for critical threshold alerts, an hourly status update, and device-disconnect warnings
+- Recipient management with archive/restore and a test-SMS feature in Settings
+- Delivery tracking (queued/delivered/failed) with SMS logs and a daily send cap
+
+### User Management
+- Owner/admin accounts with full access; regular users see monitoring pages only
+- Create accounts, reset passwords, and revoke access
+- Account deletion requires a 6-digit OTP via email (emailed with SMTP, or printed to the console in dev)
 
 ---
 
 ## API Endpoints
 
+### Auth & Users (admin-gated unless noted)
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/health` | GET | Server health check |
-| `/sensor` | POST | Submit sensor data |
-| `/sensor/latest` | GET | Get latest reading |
+| `/auth/login` | POST | Log in, returns user + session token |
+| `/auth/logout` | POST | Log out and invalidate token |
+| `/auth/users` | GET | List active users |
+| `/auth/users` | POST | Create a user |
+| `/auth/users/archived` | GET | List soft-deleted users |
+| `/auth/users/:id/deletion-request` | POST | Start deletion; emails OTP |
+| `/auth/users/:id/deletion-verify` | POST | Verify OTP and soft-delete |
+| `/auth/users/deletion-requests` | GET | List pending deletion requests |
+| `/auth/users/:id/restore` | POST | Restore a soft-deleted user |
+| `/auth/users/archived/:id` | DELETE | Permanently purge archived user |
+| `/auth/users/:id/password` | PUT | Reset a user's password |
+
+### Sensors & Reports
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/sensor` | POST | Submit sensor data (device secret required when `DEVICE_SECRET` is set) |
+| `/sensor/latest` | GET | Get latest reading (`recv_at` = live device heartbeat) |
 | `/sensor` | GET | Get history (`limit`: 1-1000) |
 | `/report/weekly` | GET | Weekly report (summary, daily breakdown, alert counts) |
+| `/report/range` | GET | Aggregated report for `?hours=N` (hourly buckets when ≤24h, daily otherwise; admin) |
+
+### Settings & Recipients
+| Endpoint | Method | Description |
+|----------|--------|-------------|
 | `/settings` | GET/POST | Get/update thresholds |
+| `/settings/reset` | POST | Reset thresholds to defaults |
 | `/settings/recipients` | GET/POST | List/add SMS recipients |
 | `/settings/recipients/:id` | PUT/DELETE | Update/delete recipient |
+| `/settings/recipients/archived` | GET | List archived recipients |
+| `/settings/recipients/:id/archive` | POST | Soft-delete recipient |
+| `/settings/recipients/:id/restore` | POST | Restore archived recipient |
+| `/settings/recipients/archived/:id` | DELETE | Permanently purge archived recipient |
 | `/settings/recipients/test/:id` | POST | Send test SMS |
-| `/alert/device-disconnect` | POST | Send disconnect alert SMS |
+
+### Alerts & SMS
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/alert/status` | POST | Send current status SMS to all recipients |
 | `/alert/mute` | POST | Mute SMS alerts (`{ hours }`) |
 | `/alert/mute-status` | GET | Check mute status |
+| `/alert/sms-health` | GET | SMS health (configured, today's count, cap) |
+| `/sms-logs` | GET | SMS delivery logs (`page`, `pageSize`, `status` filters) |
+
+### Logs
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/logs` | POST | Create system log entry |
+| `/logs/:id/ack` | POST | Acknowledge an alert (`confirmed`/`allowed`) |
 | `/system-logs` | GET | Get system logs (`page`, `limit`, `action`, `parameter` filters) |
 | `/activity-logs` | GET/POST | Get/create activity logs |
+
+### Analytics
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/analytics/overview` | GET | Period stats, trends, alerts, uptime |
+| `/analytics/daily` | GET | Daily averages per day |
+| `/analytics/insights` | GET | Rule-based insights for the period |
 
 ---
 
@@ -225,34 +295,44 @@ While muted, disconnect alerts still show as popups and are logged, but SMS is n
 src/
 ├── api/client.ts              # API client functions
 ├── components/
-│   ├── FirmwareFlasher.tsx   # Browser-based ESP32 web flasher card (Settings)
+│   ├── AnalyticsSection.tsx   # Analytics summary cards + insights
+│   ├── DeviceConnectionMonitor.tsx  # ESP32 connect/disconnect monitoring
+│   ├── FixLegend.tsx          # Alert guidance legend
 │   ├── FloatingAlert.tsx      # Popup alerts with mute options
-│   └── DeviceConnectionMonitor.tsx  # ESP32 connect/disconnect monitoring
+│   ├── Header.tsx             # Top bar with user info + logout
+│   ├── Loading.tsx            # Loading/error cards
+│   ├── StatCard.tsx           # KPI stat card
+│   └── TrendCard.tsx          # Mini trend chart card
 ├── contexts/
+│   ├── AuthContext.tsx        # Auth provider + session state
 │   ├── SensorContext.tsx
-│   └── SensorProvider.tsx     # Data polling + stale detection
+│   ├── SensorProvider.tsx     # Data polling + stale detection
+│   └── useAuth.ts             # useAuth hook
 ├── hooks/
-│   ├── useEspFlasher.ts
+│   ├── useFloatingAlerts.ts
 │   ├── useSensors.ts
-│   ├── useThresholdAlert.ts
-│   └── useFloatingAlerts.ts
+│   └── useThresholdAlert.ts
 ├── pages/
-│   ├── HomePage.tsx           # Shows last data with offline banner when ESP32 offline
-│   ├── DashboardPage.tsx
-│   ├── SensorsPage.tsx
+│   ├── ActivityLogsPage.tsx
 │   ├── AlertsPage.tsx
+│   ├── AnalyticsPage.tsx
+│   ├── AuthPage.tsx           # Login
+│   ├── DashboardPage.tsx
 │   ├── HistoricalDataPage.tsx
-│   ├── SettingsPage.tsx       # Thresholds + recipients + SMS mute + users
-│   ├── LogsPage.tsx
-│   └── ActivityLogsPage.tsx
+│   ├── LogsPage.tsx           # Sensor/system logs
+│   ├── SensorsPage.tsx
+│   └── SettingsPage.tsx       # Thresholds + recipients + SMS mute + users
 ├── types/index.ts
+├── utils/alertGuidance.ts
 ├── utils/playAlertSound.ts
-├── App.tsx
+├── utils/time.ts
+├── App.tsx                    # Routing, sidebar, role-based menus
 ├── main.tsx
 └── index.css
-server.cjs                     # Express backend
+server.cjs                     # Express backend (auth, sensors, logs, SMS, analytics)
+seed-admin.cjs                 # Bootstrap the initial owner/admin account
 water_monitoring_system/water_monitoring_system.ino        # ESP32 firmware (WiFiManager)
-public/firmware/               # Pre-compiled firmware + manifest for web flasher
+db/migrations/                 # Structural SQL migrations (run manually)
 ```
 
 ---
@@ -261,9 +341,16 @@ public/firmware/               # Pre-compiled firmware + manifest for web flashe
 
 ### How Connection Status Works
 - Frontend polls `GET /sensor/latest` every 1 second
-- `lastUpdate` uses the **actual sensor data timestamp** (not poll time)
-- If sensor data is older than 15 seconds → status = **offline**
+- `lastUpdate` uses the `recv_at` **heartbeat** (device receive time, refreshed even when delta logging skips a row)
+- If no heartbeat is received within 15 seconds → status = **offline**
 - After 5 consecutive failed API requests → status = **offline**
+
+### Change-Only (Delta) Logging
+- `POST /sensor` writes a new row only when a parameter differs from the last stored reading beyond its per-sensor tolerance (defaults: temp ±0.1°C, water level ±1.0%, ammonia ±0.05 ppm)
+- Unchanged readings refresh `devices.last_seen` as a heartbeat and respond `200 { skipped: true }` with no new row
+- Keeps the `sensors` table small; alerts, SMS, and online/offline detection (frontend + analytics) stay accurate via the heartbeat
+- Tune with `DELTA_LOGGING_ENABLED`, `TEMP_DELTA_TOLERANCE`, `WATER_LEVEL_DELTA_TOLERANCE`, `AMMONIA_DELTA_TOLERANCE` in `.env`
+- On restart the last stored reading per device is re-seeded from PostgreSQL, so unchanged POSTs after boot are still skipped
 
 ### When ESP32 Disconnects
 1. Sensor data becomes stale (older than 15s)
@@ -271,7 +358,7 @@ public/firmware/               # Pre-compiled firmware + manifest for web flashe
 3. Floating popup: "ESP32 device disconnected — no data received"
 4. Critical alert sound plays
 5. Activity log: `device_disconnect`
-6. SMS sent to active recipients (unless muted)
+6. SMS sent to active recipients (unless muted, and subject to a rearm grace period to prevent flapping)
 
 ### When ESP32 Reconnects
 1. Fresh data arrives → status = **online**, pages show live readings
@@ -288,8 +375,8 @@ public/firmware/               # Pre-compiled firmware + manifest for web flashe
 | No data showing | Verify ESP32 is connected to same WiFi network |
 | CORS error | Add frontend port to ALLOWED_ORIGINS |
 | "Device offline" | Check ESP32 WiFi connection (use WiFiManager portal) |
-| Firmware flasher: "The port is already open" | Close all tabs using the serial port, fully restart the browser, then retry. Ensure you're picking the correct COM port in the dialog. See `docs/WEB_FLASHER_NOTES.txt` Section 18 for full troubleshooting steps. |
-| SMS not sending | Verify SKYSMS_API_KEY in .env |
+| SMS not sending | Verify HTTPSMS_API_KEY / HTTPSMS_FROM in .env; see docs/HTTPSMS_SETUP.txt |
+| Can't log in | First-time setup requires `npm run seed:admin` (ADMIN_INITIAL_PASSWORD) |
 | AudioContext warning | Click anywhere on the page to unlock audio |
 
 ### Debug Commands
@@ -320,4 +407,4 @@ ISC
 
 ## Support
 
-For detailed documentation see docs/HOW_IT_WORKS.txt. For the ESP32 web flasher see docs/WEB_FLASHER_NOTES.txt. For SMS configuration see docs/SMS_HOWTO.txt.
+For detailed documentation see docs/HOW_IT_WORKS.txt. For the database schema see docs/DATABASE_SCHEMA.txt. For SMS configuration see docs/HTTPSMS_SETUP.txt. For the free/$0 production deployment guide see docs/DEPLOYMENT.txt.

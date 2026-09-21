@@ -251,7 +251,9 @@ DATA FLOW
 3. BACKEND PROCESSING
   The Express server (server.cjs) performs these operations:
     a) Validation: Uses Zod schema to validate incoming data
-    b) Storage: Inserts readings into PostgreSQL sensors table
+    b) Storage: Inserts readings into PostgreSQL sensors table -- but only
+       when change-only (delta) logging sees a value move beyond tolerance;
+       unchanged readings refresh devices.last_seen as a heartbeat only
     c) Threshold Checking: Compares values against configurable settings;
        readings below each sensor's minValid (temperature 0.0001, water
        level 0) are treated as failed sensors (-1 from the ESP32) and skipped
@@ -280,10 +282,12 @@ CONNECTION & OFFLINE HANDLING
 HOW CONNECTION STATUS WORKS
 
 The frontend polls GET /sensor/latest every 1 second. The connection status
-is determined by the actual timestamp of the sensor data stored in the
-database, not the time the API responded.
+is determined by the recv_at heartbeat (the receive time of the latest POST,
+always newer than the data's stored timestamp). With change-only (delta)
+logging enabled, unchanged readings are skipped so the data timestamp would
+otherwise go stale -- recv_at is bumped on every single POST.
 
-  lastUpdate = new Date(latest.timestamp)   // Sensor's actual send time
+  lastUpdate = new Date(latest.recv_at || latest.timestamp)
   gap = Date.now() - lastUpdate.getTime()
   if gap > 15000 then OFFLINE
 
@@ -295,6 +299,40 @@ This means:
   - Slow requests from a superseded poll are dropped by a request-id guard
     (not aborted), so a slow or failed network still advances the failure
     counter -- the status can never freeze at "online" during an outage
+
+CHANGE-ONLY (DELTA) SENSOR LOGGING
+
+The sensors table stores all parameters in a single row per reading. To keep
+the database small, POST /sensor only inserts a new row when at least one
+parameter differs from the last stored reading beyond its per-sensor tolerance.
+
+  DELTA_LOGGING_ENABLED=true            (default on; set "false" to disable)
+  TEMP_DELTA_TOLERANCE=0.1              °C
+  WATER_LEVEL_DELTA_TOLERANCE=1.0       %
+  AMMONIA_DELTA_TOLERANCE=0.05          ppm
+
+Flow inside POST /sensor:
+  1. Device secret check + schema validation
+  2. Ammonia spike guard (rejects jumps > 20 ppm from the last stored value)
+  3. devices.last_seen always updated (heartbeat) -- never skipped
+  4. Delta check vs. lastSensorReading[device_id], an in-memory baseline seeded
+     from PostgreSQL at boot (SELECT DISTINCT ON (device_id) ... ORDER BY
+     device_id, timestamp DESC):
+       - a parameter is invalid when temperature <= 0 or water_level < 0 or
+         ammonia < 0 (ESP32 failure sentinel = -1)
+       - "changed" = validity flipped OR |new - last| > tolerance
+  5. All unchanged  -> respond 200 { skipped: true }, no row written
+     Any changed   -> INSERT new row + refresh the in-memory baseline
+  6. The background alert engine runs on EVERY accepted POST (skipped or not),
+     so critical-threshold re-alerts after SMS cooldown behave exactly as before
+
+Downstream notes:
+  - GET /sensor/latest returns recv_at = devices.last_seen alongside the row
+  - /analytics/overview and /analytics/insights derive device_offline from
+    devices.last_seen (heartbeat), and gap_events now counts logged
+    "Device Disconnect" episodes instead of inter-sensor-row gaps
+  - history, weekly/range reports, and daily averages aggregate whatever rows
+    exist -- with delta logging the "readings" counts reflect value changes
 
 WHEN ESP32 DISCONNECTS
 
@@ -457,7 +495,8 @@ COMPLETE API REFERENCE
                                           X-Device-Secret when
                                           DEVICE_SECRET is set)
   /sensor                        GET      Get history (limit: 1-1000)
-  /sensor/latest                 GET      Get latest reading
+  /sensor/latest                 GET      Get latest reading (incl. recv_at
+                                          heartbeat)
   /report/weekly                 GET      Weekly report (summary, daily
                                           breakdown, alert counts)
   /settings                      GET      Get thresholds

@@ -499,6 +499,22 @@ const DISCONNECT_STALE_MS = parseInt(process.env.DISCONNECT_STALE_MS) || 30000;
 // a briefly-flickering ESP32 from spamming the same alert over and over.
 const DISCONNECT_REARM_MS = parseInt(process.env.DISCONNECT_REARM_MS) || 300000;
 
+// Change-only (delta) sensor logging: a sensors row is inserted only when a
+// parameter differs from the last stored reading beyond its per-sensor tolerance.
+// Unchanged readings still refresh devices.last_seen (heartbeat) but write no row.
+const DELTA_LOGGING_ENABLED = process.env.DELTA_LOGGING_ENABLED !== "false";
+const DELTA_TOLERANCES = {
+  temperature: Number.isFinite(parseFloat(process.env.TEMP_DELTA_TOLERANCE))
+    ? parseFloat(process.env.TEMP_DELTA_TOLERANCE)
+    : 0.1,
+  water_level: Number.isFinite(parseFloat(process.env.WATER_LEVEL_DELTA_TOLERANCE))
+    ? parseFloat(process.env.WATER_LEVEL_DELTA_TOLERANCE)
+    : 1,
+  ammonia: Number.isFinite(parseFloat(process.env.AMMONIA_DELTA_TOLERANCE))
+    ? parseFloat(process.env.AMMONIA_DELTA_TOLERANCE)
+    : 0.05,
+};
+
 // Daily SMS budget: counts every real send today (0 disables the cap). Once the
 // budget is exhausted, producers log "capped" rows instead of sending, so the
 // audit trail stays honest. Manual/test SMS bypass this cap by design.
@@ -844,6 +860,8 @@ let deviceSecretWarned = false;
 let lastAlertedState = {};
 // Server-side ammonia spike guard: last stored reading per device
 let lastAmmoniaReading = {};
+// Change-only logging baseline: last INSERTED reading per device (seeded from DB at boot)
+let lastSensorReading = {};
 const AMMONIA_SPIKE_THRESHOLD = 20; // ppm — reject readings jumping more than this from last stored value
 // Cooldown prevents system_logs alert spam for a repeated status (~2 minutes)
 const ALERT_COOLDOWN_MS = 120000;
@@ -929,6 +947,84 @@ app.get("/", (req, res) => {
 // SENSOR DATA ENDPOINTS
 // ========================
 
+// Background threshold evaluation + alert state updates. Runs after every
+// accepted reading (inserted or delta-skipped) so alerting behaves unchanged.
+function scheduleAlertProcessing(device_id, ts, temperature, water_level, ammonia) {
+  setImmediate(async () => {
+    try {
+      const settingsResult = await pool.query("SELECT * FROM sensor_settings LIMIT 1");
+      const settings = settingsResult.rows[0] || { temp_min: 20, temp_max: 31, water_level_min: 10, water_level_max: 100, ammonia_min: 0.25, ammonia_max: 1 };
+
+      const sensorChecks = [
+        { key: "Temperature", val: Number(temperature), min: Number(settings.temp_min), max: Number(settings.temp_max), minValid: 0.0001 },
+        { key: "Water Level", val: Number(water_level), min: Number(settings.water_level_min), max: Number(settings.water_level_max), minValid: 0 },
+        { key: "Ammonia", val: Number(ammonia), min: Number(settings.ammonia_min), max: Number(settings.ammonia_max), minValid: 0 },
+      ];
+
+      const nowTs = ts.getTime();
+
+      for (const sensor of sensorChecks) {
+        if (sensor.val < sensor.minValid) continue;
+        const status = getThresholdStatus(sensor.val, sensor.min, sensor.max);
+        const last = lastAlertedState[`${device_id}:${sensor.key}`] || {};
+        const lastTs = last.timestamp ? new Date(last.timestamp).getTime() : 0;
+
+        if (status === "good") {
+          if (last.status && last.status !== "good") {
+            await pool.query(
+              `INSERT INTO last_alerts (device_id, sensor_key, status, value, timestamp) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (device_id, sensor_key) DO UPDATE SET status = $3, value = $4, timestamp = $5`,
+              [device_id, sensor.key, "good", sensor.val, ts.toISOString()]
+            );
+            lastAlertedState[`${device_id}:${sensor.key}`] = { status: "good", value: sensor.val, timestamp: ts.toISOString() };
+            await pool.query(`INSERT INTO system_logs (action, parameter, old_value, new_value) VALUES ($1, $2, $3, $4)`,
+              ["Alert Resolved", sensor.key, last.status, "good"]);
+          }
+          continue;
+        }
+
+        if (status === last.status && nowTs - lastTs < ALERT_COOLDOWN_MS) continue;
+
+        const direction = sensor.val < sensor.min ? "Low" : "High";
+
+        await pool.query(`INSERT INTO system_logs (action, parameter, old_value, new_value) VALUES ($1, $2, $3, $4)`,
+          ["Alert", sensor.key, direction, sensor.val]);
+
+        if (status === "critical" && !isSmsMuted()) {
+          const smsKey = `${device_id}:${sensor.key}`;
+          if (nowTs - (lastSmsSent[smsKey] || 0) >= SMS_COOLDOWN_MS) {
+            lastSmsSent[smsKey] = nowTs;
+            const unit = sensor.key === "Temperature" ? "°C" : sensor.key === "Water Level" ? "%" : " ppm";
+            const breachedLimit = sensor.val < sensor.min ? sensor.min : sensor.max;
+            const smsContent = buildSmsMessage(
+              "CRAYVINGS AQUACULTURE MONITORING — CRITICAL ALERT",
+              [
+                `CRITICAL: ${sensor.key} is critically ${direction === "Low" ? "LOW" : "HIGH"}.`,
+                `Device: ${device_id}`,
+                `Current Reading: ${sensor.val}${unit}`,
+                `Safe Range: ${sensor.min}${unit} to ${sensor.max}${unit}`,
+                `Breached Limit: ${breachedLimit}${unit}`,
+                "",
+                "Immediate action is recommended to protect your stock.",
+              ].join("\n")
+            );
+            sendSmsToRecipients(smsContent).catch((smsErr) =>
+              console.error(`[${new Date().toISOString()}] Critical SMS error:`, smsErr.message)
+            );
+          }
+        }
+
+        await pool.query(
+          `INSERT INTO last_alerts (device_id, sensor_key, status, value, timestamp) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (device_id, sensor_key) DO UPDATE SET status = $3, value = $4, timestamp = $5`,
+          [device_id, sensor.key, status, sensor.val, ts.toISOString()]
+        );
+        lastAlertedState[`${device_id}:${sensor.key}`] = { status, value: sensor.val, timestamp: ts.toISOString() };
+      }
+    } catch (bgErr) {
+      console.error(`[${new Date().toISOString()}] Background alert processing error:`, bgErr.message);
+    }
+  });
+}
+
 // POST /sensor - ESP32 ingestion; stores reading and evaluates thresholds
 app.post("/sensor", async (req, res) => {
   try {
@@ -974,102 +1070,48 @@ app.post("/sensor", async (req, res) => {
     if (disconnectedDevices.delete(device_id)) {
       deviceOnlineSince.set(device_id, Date.now());
     }
+    const readings = {
+      temperature: Number(temperature ?? 0),
+      water_level: Number(water_level ?? 0),
+      ammonia: Number(ammonia ?? 0),
+    };
+    const baseline = lastSensorReading[device_id];
+    const paramChanged = (key) => {
+      if (!baseline || baseline[key] == null) return true;
+      const newVal = readings[key];
+      const lastVal = baseline[key];
+      const isValid = (val) => (key === "temperature" ? val > 0 : val >= 0);
+      if (isValid(newVal) !== isValid(lastVal)) return true;
+      if (!isValid(newVal)) return false;
+      return Math.abs(newVal - lastVal) > DELTA_TOLERANCES[key];
+    };
+    const hasDelta = ["temperature", "water_level", "ammonia"].some(paramChanged);
+
+    // Delta mode: an unchanged reading is still a heartbeat (devices.last_seen
+    // already updated above) but writes no new sensors row.
+    if (DELTA_LOGGING_ENABLED && !hasDelta) {
+      console.log(`[${new Date().toISOString()}] Sensor heartbeat from ${device_id} (unchanged - no row written)`);
+      res.status(200).json({ message: "No change, skipped", skipped: true, data: { device_id, ...readings, timestamp: ts.toISOString() } });
+      scheduleAlertProcessing(device_id, ts, temperature, water_level, ammonia);
+      return;
+    }
+
     const result = await pool.query(
       `INSERT INTO sensors (device_id, temperature, water_level, ammonia, timestamp) VALUES ($1, $2, $3, $4, $5) RETURNING *`,
-      [device_id, Number(temperature ?? 0), Number(water_level ?? 0), Number(ammonia ?? 0), ts]
+      [device_id, readings.temperature, readings.water_level, readings.ammonia, ts]
     );
     console.log(`[${new Date().toISOString()}] Sensor data saved from ${device_id}`);
 
     if (ammoniaVal > 0) {
       lastAmmoniaReading[device_id] = ammoniaVal;
     }
+    lastSensorReading[device_id] = readings;
 
-// Respond immediately; timestamp returned as UTC ISO-8601 so the frontend
+    // Respond immediately; timestamp returned as UTC ISO-8601 so the frontend
     // renders it in the farm timezone without silent timezone conversion.
     res.status(201).json({ message: "Saved", data: { ...result.rows[0], timestamp: ts.toISOString() } });
 
-    // Background: evaluate thresholds and update alert state
-    setImmediate(async () => {
-      try {
-        const settingsResult = await pool.query("SELECT * FROM sensor_settings LIMIT 1");
-        const settings = settingsResult.rows[0] || { temp_min: 20, temp_max: 31, water_level_min: 10, water_level_max: 100, ammonia_min: 0.25, ammonia_max: 1 };
-
-        const sensorChecks = [
-          { key: "Temperature", val: Number(temperature), min: Number(settings.temp_min), max: Number(settings.temp_max), minValid: 0.0001 },
-          { key: "Water Level", val: Number(water_level), min: Number(settings.water_level_min), max: Number(settings.water_level_max), minValid: 0 },
-          { key: "Ammonia", val: Number(ammonia), min: Number(settings.ammonia_min), max: Number(settings.ammonia_max), minValid: 0 },
-        ];
-
-        const nowTs = ts.getTime();
-
-        for (const sensor of sensorChecks) {
-          // Skip invalid readings: ESP32 sends -1 on failure, and 0 for temperature
-          // is also a failure (0°C is outside the firmware's valid range)
-          if (sensor.val < sensor.minValid) continue;
-          const status = getThresholdStatus(sensor.val, sensor.min, sensor.max);
-          const last = lastAlertedState[`${device_id}:${sensor.key}`] || {};
-          const lastTs = last.timestamp ? new Date(last.timestamp).getTime() : 0;
-
-          // Reading returned to normal: resolve the alert
-          if (status === "good") {
-            if (last.status && last.status !== "good") {
-              await pool.query(
-                `INSERT INTO last_alerts (device_id, sensor_key, status, value, timestamp) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (device_id, sensor_key) DO UPDATE SET status = $3, value = $4, timestamp = $5`,
-                [device_id, sensor.key, "good", sensor.val, ts.toISOString()]
-              );
-              lastAlertedState[`${device_id}:${sensor.key}`] = { status: "good", value: sensor.val, timestamp: ts.toISOString() };
-              // Log "Alert Resolved" to system_logs
-              await pool.query(`INSERT INTO system_logs (action, parameter, old_value, new_value) VALUES ($1, $2, $3, $4)`,
-                ["Alert Resolved", sensor.key, last.status, "good"]);
-            }
-            continue;
-          }
-
-          // Cooldown prevents repeated alerts for a persistent status
-          if (status === last.status && nowTs - lastTs < ALERT_COOLDOWN_MS) continue;
-
-          const direction = sensor.val < sensor.min ? "Low" : "High";
-
-          // Log the alert to system_logs
-          await pool.query(`INSERT INTO system_logs (action, parameter, old_value, new_value) VALUES ($1, $2, $3, $4)`,
-            ["Alert", sensor.key, direction, sensor.val]);
-
-          // Critical readings fan out an SMS alert (cooldown- and mute-aware)
-          if (status === "critical" && !isSmsMuted()) {
-            const smsKey = `${device_id}:${sensor.key}`;
-            if (nowTs - (lastSmsSent[smsKey] || 0) >= SMS_COOLDOWN_MS) {
-              lastSmsSent[smsKey] = nowTs;
-              const unit = sensor.key === "Temperature" ? "°C" : sensor.key === "Water Level" ? "%" : " ppm";
-              const breachedLimit = sensor.val < sensor.min ? sensor.min : sensor.max;
-              const smsContent = buildSmsMessage(
-                "CRAYVINGS AQUACULTURE MONITORING — CRITICAL ALERT",
-                [
-                  `CRITICAL: ${sensor.key} is critically ${direction === "Low" ? "LOW" : "HIGH"}.`,
-                  `Device: ${device_id}`,
-                  `Current Reading: ${sensor.val}${unit}`,
-                  `Safe Range: ${sensor.min}${unit} to ${sensor.max}${unit}`,
-                  `Breached Limit: ${breachedLimit}${unit}`,
-                  "",
-                  "Immediate action is recommended to protect your stock.",
-                ].join("\n")
-              );
-              sendSmsToRecipients(smsContent).catch((smsErr) =>
-                console.error(`[${new Date().toISOString()}] Critical SMS error:`, smsErr.message)
-              );
-            }
-          }
-
-          // Update last_alerts (upsert) and in-memory dedup state
-          await pool.query(
-            `INSERT INTO last_alerts (device_id, sensor_key, status, value, timestamp) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (device_id, sensor_key) DO UPDATE SET status = $3, value = $4, timestamp = $5`,
-            [device_id, sensor.key, status, sensor.val, ts.toISOString()]
-          );
-          lastAlertedState[`${device_id}:${sensor.key}`] = { status, value: sensor.val, timestamp: ts.toISOString() };
-        }
-      } catch (bgErr) {
-        console.error(`[${new Date().toISOString()}] Background alert processing error:`, bgErr.message);
-      }
-    });
+    scheduleAlertProcessing(device_id, ts, temperature, water_level, ammonia);
   } catch (err) {
     console.error(`[${new Date().toISOString()}] Error saving sensor:`, err.message);
     res.status(500).json({ message: "Error saving data", error: err.message });
@@ -1091,7 +1133,13 @@ app.get("/sensor", requireAuth, async (req, res) => {
 // GET /sensor/latest - most recent reading; 404 when none exist
 app.get("/sensor/latest", requireAuth, async (req, res) => {
   try {
-    const result = await pool.query("SELECT * FROM sensors ORDER BY timestamp DESC LIMIT 1");
+    const result = await pool.query(
+      `SELECT s.*, d.last_seen AS recv_at
+       FROM sensors s
+       LEFT JOIN devices d ON d.device_id = s.device_id
+       ORDER BY s.timestamp DESC
+       LIMIT 1`
+    );
     if (result.rows.length === 0) return res.status(404).json({ message: "No sensor data found" });
     res.json(result.rows[0]);
   } catch (err) {
@@ -2438,7 +2486,6 @@ app.get("/activity-logs", requireAdmin, async (req, res) => {
 // =============================================================================
 
 const ANALYTICS_MAX_DAYS = 90;
-const GAP_THRESHOLD_SECONDS = 120;   // inter-reading gap treated as a device dropout
 const OFFLINE_LIMIT_MS = 5 * 60 * 1000; // device considered offline after this long without data
 
 // Normalizes a pg DATE value (JS Date at local midnight or ISO string) to YYYY-MM-DD.
@@ -2513,18 +2560,14 @@ async function queryAlertStats(startTs) {
   return { total, resolved, by_parameter: byParameter, by_action: byAction };
 }
 
-// Counts inter-reading gaps longer than GAP_THRESHOLD_SECONDS (device dropouts).
+// Counts device-disconnect episodes logged by the disconnect monitor within a
+// window. In delta mode the sensors table no longer has one row per reading, so
+// dropouts are measured from devices.last_seen / system_logs instead of gaps.
 async function queryGapEvents(startTs) {
   const result = await pool.query(
-    `SELECT COUNT(*)::int AS gaps FROM (
-       SELECT timestamp,
-              LAG(timestamp) OVER (ORDER BY timestamp) AS prev_ts
-       FROM sensors
-       WHERE timestamp >= $1
-     ) t
-     WHERE prev_ts IS NOT NULL
-       AND EXTRACT(EPOCH FROM (timestamp - prev_ts)) > $2`,
-    [startTs, GAP_THRESHOLD_SECONDS]
+    `SELECT COUNT(*)::int AS gaps FROM system_logs
+     WHERE action = 'Device Disconnect' AND timestamp >= $1`,
+    [startTs]
   );
   return parseInt(result.rows[0]?.gaps, 10) || 0;
 }
@@ -2545,17 +2588,19 @@ app.get("/analytics/overview", requireAuth, async (req, res) => {
     const currentStart = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
     const prevStart = new Date(currentStart.getTime() - days * 24 * 60 * 60 * 1000);
 
-    const [currentStats, prevStats, alerts, readings, gapEvents, latest] = await Promise.all([
+    const [currentStats, prevStats, alerts, readings, gapEvents, latest, deviceHeartbeat] = await Promise.all([
       queryPeriodStats(currentStart),
       queryPeriodStats(prevStart),
       queryAlertStats(currentStart),
       pool.query("SELECT COUNT(*)::int AS c FROM sensors WHERE timestamp >= $1", [currentStart]),
       queryGapEvents(currentStart),
       pool.query("SELECT timestamp FROM sensors ORDER BY timestamp DESC LIMIT 1"),
+      pool.query("SELECT MAX(last_seen) AS last_seen FROM devices"),
     ]);
 
     const lastReading = latest.rows[0]?.timestamp ? new Date(latest.rows[0].timestamp) : null;
-    const deviceOffline = !lastReading || (Date.now() - lastReading.getTime()) > OFFLINE_LIMIT_MS;
+    const deviceSeen = deviceHeartbeat.rows[0]?.last_seen ? new Date(deviceHeartbeat.rows[0].last_seen) : null;
+    const deviceOffline = !deviceSeen || (Date.now() - deviceSeen.getTime()) > OFFLINE_LIMIT_MS;
 
     res.json({
       period: { start: currentStart.toISOString(), end: new Date().toISOString() },
@@ -2744,19 +2789,21 @@ app.get("/analytics/insights", requireAuth, async (req, res) => {
     const days = analyticsDays(req);
     const currentStart = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
 
-    const [currentStats, prevStats, alerts, readings, gapEvents, latest, settingsResult] = await Promise.all([
+    const [currentStats, prevStats, alerts, readings, gapEvents, latest, deviceHeartbeat, settingsResult] = await Promise.all([
       queryPeriodStats(currentStart),
       queryPeriodStats(new Date(currentStart.getTime() - days * 24 * 60 * 60 * 1000)),
       queryAlertStats(currentStart),
       pool.query("SELECT COUNT(*)::int AS c FROM sensors WHERE timestamp >= $1", [currentStart]),
       queryGapEvents(currentStart),
       pool.query("SELECT timestamp FROM sensors ORDER BY timestamp DESC LIMIT 1"),
+      pool.query("SELECT MAX(last_seen) AS last_seen FROM devices"),
       pool.query("SELECT * FROM sensor_settings LIMIT 1"),
     ]);
 
     const settings = settingsResult.rows[0] || { temp_min: 20, temp_max: 31, water_level_min: 10, water_level_max: 100, ammonia_min: 0.25, ammonia_max: 1 };
 
     const lastReading = latest.rows[0]?.timestamp ? new Date(latest.rows[0].timestamp) : null;
+    const deviceSeen = deviceHeartbeat.rows[0]?.last_seen ? new Date(deviceHeartbeat.rows[0].last_seen) : null;
     const overview = {
       days,
       summary: currentStats,
@@ -2767,7 +2814,7 @@ app.get("/analytics/insights", requireAuth, async (req, res) => {
       },
       alerts,
       uptime: {
-        device_offline: !lastReading || (Date.now() - lastReading.getTime()) > OFFLINE_LIMIT_MS,
+        device_offline: !deviceSeen || (Date.now() - deviceSeen.getTime()) > OFFLINE_LIMIT_MS,
         last_reading: lastReading ? lastReading.toISOString() : null,
         readings: parseInt(readings.rows[0]?.c, 10) || 0,
         gap_events: gapEvents,
@@ -2848,6 +2895,20 @@ async function startServer() {
         lastAmmoniaReading[row.device_id] = Number(row.ammonia);
       }
       console.log(`[${new Date().toISOString()}] Loaded ammonia baseline for ${lastAmmoniaResult.rows.length} device(s) from DB`);
+
+      // Seed change-only logging baseline with the latest stored reading per device
+      const lastSensorResult = await client.query(
+        "SELECT DISTINCT ON (device_id) device_id, temperature, water_level, ammonia FROM sensors ORDER BY device_id, timestamp DESC"
+      );
+      lastSensorReading = {};
+      for (const row of lastSensorResult.rows) {
+        lastSensorReading[row.device_id] = {
+          temperature: Number(row.temperature),
+          water_level: Number(row.water_level),
+          ammonia: Number(row.ammonia),
+        };
+      }
+      console.log(`[${new Date().toISOString()}] Loaded delta-logging baseline for ${lastSensorResult.rows.length} device(s) from DB`);
 
       // SMS alerts: report config state and start the scheduled producers.
       if (HTTPSMS_API_KEY && HTTPSMS_FROM) {

@@ -16,6 +16,7 @@ export type SensorEntry = {
   water_level: number;
   ammonia: number;
   timestamp?: string;
+  recv_at?: string;
 };
 
 // Optimized for Recharts; "name" is a formatted time label for the X-axis.

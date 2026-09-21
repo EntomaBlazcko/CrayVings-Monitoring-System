@@ -24,9 +24,14 @@ session tokens.
   ----------------  -----------  -----------------------  --------------------
   id                SERIAL       PRIMARY KEY
   name              VARCHAR(100) NOT NULL                 Display name
-  username          VARCHAR(50)  NOT NULL UNIQUE          Login name (FK target
-                                                          for activity_logs)
-  email             VARCHAR(255) NOT NULL UNIQUE
+  username          VARCHAR(50)  NOT NULL                 Login name (FK target
+                                                          for activity_logs).
+                                                          UNIQUE only while
+                                                          active (partial index
+                                                          idx_users_username_active)
+  email             VARCHAR(255) NOT NULL                 UNIQUE only while
+                                                          active (partial index
+                                                          idx_users_email_active)
   password_hash     TEXT         NOT NULL                 PBKDF2
                                                           (iterations:salt:hash)
   role              VARCHAR(20)  NOT NULL DEFAULT 'user'  admin or user
@@ -38,10 +43,14 @@ session tokens.
                                                           so new Date() checks
                                                           are unambiguous)
   status            VARCHAR(20)  NOT NULL DEFAULT 'active' active, pending_deletion,
-                                                          or deleted (soft-delete
-                                                          lifecycle)
+                                                          deleted (legacy), or
+                                                          archived (soft-delete
+                                                          lifecycle). Login only
+                                                          succeeds for 'active'.
   deleted_at        TIMESTAMPTZ                           Set when the account
-                                                          is hard-deleted
+                                                          is archived (soft-
+                                                          deleted); cleared on
+                                                          restore
   pending_deletion_at        TIMESTAMPTZ                  When a deletion request
                                                           was made (account kept
                                                           working until approval)
@@ -50,6 +59,18 @@ session tokens.
 
 Indexes:
   idx_users_status  (status)
+  idx_users_username_active  UNIQUE (username)  WHERE status IS DISTINCT FROM 'archived'
+  idx_users_email_active     UNIQUE (email)     WHERE status IS DISTINCT FROM 'archived'
+
+Archiving (migration 006):
+  - Deleting an account is a SOFT delete: status flips to 'archived' and
+    deleted_at = NOW() (the row is kept so it can be restored).
+  - Restore sets status='active' and clears deleted_at.
+  - Permanently purging an archived account is the only irreversible action
+    (DELETE FROM users WHERE status = 'archived').
+  - The full-column UNIQUE constraints are replaced by the two PARTIAL unique
+    indexes above, so a new active account may reuse a username/email held by
+    an archived row. The owner account is guarded from archiving.
 
 ================================================================================
 TABLE: devices
@@ -267,13 +288,31 @@ SMS recipients allowed to receive alert notifications.
   Column       Type          Constraints              Notes
   ------------  -----------  -----------------------  --------------------
   id           SERIAL        PRIMARY KEY
-  phone_number VARCHAR(20)   NOT NULL UNIQUE          Contact number in
-                                                      E.164 format
+  phone_number VARCHAR(20)   NOT NULL                 Contact number in E.164
+                                                      format. UNIQUE only while
+                                                      active (partial index
+                                                      idx_recipients_phone_active)
   name         VARCHAR(100)                          Recipient display name
   is_active    BOOLEAN       DEFAULT true             Whether alerts are
                                                       sent here
-  created_at   TIMESTAMP     DEFAULT CURRENT_TIMESTAMP
-  updated_at   TIMESTAMP     DEFAULT CURRENT_TIMESTAMP
+  archived_at  TIMESTAMPTZ                            NULL = active. Set when
+                                                      the recipient is archived
+                                                      (soft-deleted); cleared on
+                                                      restore
+  created_at   TIMESTAMPTZ   DEFAULT NOW()
+  updated_at   TIMESTAMPTZ   DEFAULT NOW()
+
+Indexes:
+  idx_recipients_archived_at  (archived_at)
+  idx_recipients_phone_active UNIQUE (phone_number)  WHERE archived_at IS NULL
+
+Archive/restore (migration 006):
+  - Archive sets archived_at = NOW() (row kept, restorable); restore clears it.
+  - SMS sending only considers recipients WHERE is_active = true
+    AND archived_at IS NULL.
+  - phone_number's plain UNIQUE constraint was replaced by the partial unique
+    index above so an archived number does not block re-adding it later.
+  - Permanently purging an archived recipient is the only irreversible action.
 
 ================================================================================
 TABLE: sms_logs
@@ -369,6 +408,11 @@ NOTES
                                users.password_hash -> TEXT; makes
                                users.token_expires_at + sms_logs.sent_at
                                TIMESTAMPTZ
+      006_archive_restore.cjs - soft-delete (archive) + restore: users
+                               status='archived' reuse + partial unique
+                               indexes on username/email;
+                               authorized_recipients.archived_at column +
+                               partial unique index on phone_number
 
   - Hash format: password_hash = PBKDF2_ITERATIONS:salt_hex:hash_hex
     (sha512, 600,000 iterations, 64-byte key).
@@ -389,8 +433,8 @@ Copy the block below into https://dbdiagram.io to render the full diagram.
   Table users {
     id int [pk, increment]
     name varchar(100) [not null]
-    username varchar(50) [not null, unique]
-    email varchar(255) [not null, unique]
+    username varchar(50) [not null]
+    email varchar(255) [not null]
     password_hash text [not null]
     role varchar(20) [not null, default: "'user'"]
     token varchar(255)
@@ -398,12 +442,16 @@ Copy the block below into https://dbdiagram.io to render the full diagram.
     updated_at timestamp [default: `now()`]
     token_expires_at timestamptz
     status varchar(20) [not null, default: "'active'"]
-    deleted_at timestamp
-    pending_deletion_at timestamp
+    deleted_at timestamptz
+    pending_deletion_at timestamptz
     pending_deletion_requested_by varchar(100)
 
     Indexes {
       (status) [name: 'idx_users_status']
+      // PARTIAL unique: WHERE status IS DISTINCT FROM 'archived'
+      (username) [unique, name: 'idx_users_username_active']
+      // PARTIAL unique: WHERE status IS DISTINCT FROM 'archived'
+      (email) [unique, name: 'idx_users_email_active']
     }
   }
 
@@ -530,11 +578,18 @@ Copy the block below into https://dbdiagram.io to render the full diagram.
 
   Table authorized_recipients {
     id int [pk, increment]
-    phone_number varchar(20) [not null, unique]
+    phone_number varchar(20) [not null]
     name varchar(100)
     is_active boolean [default: true]
-    created_at timestamp [default: `now()`]
-    updated_at timestamp [default: `now()`]
+    archived_at timestamptz
+    created_at timestamptz [default: `now()`]
+    updated_at timestamptz [default: `now()`]
+
+    Indexes {
+      (archived_at) [name: 'idx_recipients_archived_at']
+      // PARTIAL unique: WHERE archived_at IS NULL
+      (phone_number) [unique, name: 'idx_recipients_phone_active']
+    }
   }
 
   Table sms_logs {

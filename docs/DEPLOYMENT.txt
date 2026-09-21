@@ -1,0 +1,582 @@
+================================================================================
+CRAYVINGS AQUACULTURE MONITORING - PRODUCTION DEPLOYMENT GUIDE
+Free. No subscriptions. No monthly fees.
+================================================================================
+
+This guide walks through putting the dashboard + backend + database into
+production for $0/month. It covers three ways to run it so you can pick the
+one that fits what hardware/internet you have:
+
+    Option A - Raspberry Pi on-site (best for a farm)
+    Option B - Free cloud VM (Oracle Cloud "Always Free", $0 forever)
+    Option C - A spare PC / the machine you already have
+
+Everything in this guide is either already-free software, software with a
+free tier that never expires, or services you already run (SMS via the
+HttpSms app, email via Gmail's free "app password").
+
+================================================================================
+1. THE FREE STACK AT A GLANCE
+================================================================================
+
+    Layer                 Free option used here                  Cost
+    --------------------  ------------------------------------   ----
+    Computer              Raspberry Pi / free cloud VM /         $0
+                          spare PC
+    Operating system      Raspberry Pi OS / Ubuntu LTS /         $0
+                          existing OS
+    Database              PostgreSQL on the same computer        $0
+                          (self-hosted, just like today)
+    API server            The app's own Express server           $0
+    Dashboard website     Built app (dist/) served by Express    $0
+                          itself (one process, no CORS)
+    Public web address    Cloudflare Tunnel (free tier)          $0
+    HTTPS / SSL           Automatic with the tunnel              $0
+    SMS alerts            HttpSms Android app + existing SIM     $0
+                          (no SMS service subscription)
+    Email (fallback)      Gmail + an app password                $0
+    Auto-start/restart    systemd (built into Linux)             $0
+    Backups               cron + pg_dump (built into Postgres)   $0
+    Uptime monitoring     UptimeRobot free tier (optional)       $0
+
+There is no subscription anywhere in this stack. Nothing expires after a
+year. The only recurring cost is whatever your internet connection and
+phone SIM already cost.
+
+================================================================================
+2. WHAT THE APP NEEDS TO RUN
+================================================================================
+
+Software                        Minimum version
+------------------------------  ---------------------------------------------
+Node.js                         20 LTS or newer (22 LTS recommended)
+PostgreSQL                      any recent install (14+) - likely already
+                                installed on your dev machine today
+npm                             comes with Node.js
+
+The app itself is a single file (server.cjs) plus the built frontend
+(folder dist/). PostgreSQL stores everything.
+
+Ports used:
+    - 3000  TCP  the app (API + dashboard) - the only port you really need
+    - the ESP32 posts sensor data to that same port (/sensor)
+
+================================================================================
+3. BEFORE YOU START (settings you will need to change for production)
+================================================================================
+
+The production setup differs from development in a few required ways:
+
+  Required changes
+  ----------------  ----------------------------------------------------------
+  NODE_ENV          must be "production"
+  DEVICE_SECRET     MUST be set. In production the server refuses sensor
+                    POSTs without a matching X-Device-Secret header
+                    (returns 503 if nothing is set).
+  ADMIN_INITIAL_    Required on first boot so the owner admin is created
+  PASSWORD          (exits with an error if unset on a fresh database).
+  ALLOWED_ORIGINS   must include the public URL the dashboard is served on.
+  VITE_API_BASE     must point at the public URL at BUILD time - the frontend
+                    bakes this into the website when you run npm run build.
+
+  Keep as-is
+  ----------
+  SMS (HTTPSMS_API_KEY / HTTPSMS_FROM)   points at your phone, no change
+  SMTP (email fallback)                  Gmail app password, no change
+  Port 3000                              fine to keep
+
+================================================================================
+4. OPTION A - RASPBERRY PI ON-SITE (RECOMMENDED FOR A FARM)
+================================================================================
+
+A Raspberry Pi is a tiny ~$100 computer that runs 24/7 next to your tank.
+It talks to the ESP32 over your own WiFi, so it keeps working even when the
+internet drops.
+
+Hardware
+--------
+    * Raspberry Pi 4 (2GB+) or Pi 5 - or anything you already own
+    * microSD card 32GB+ (or a USB SSD for reliability)
+    * power supply + network (WiFi is fine; Ethernet is more reliable)
+
+1. Flash the OS (one time)
+    - Download "Raspberry Pi Imager" (free, raspberrypi.com/software)
+    - Choose Raspberry Pi OS Lite (64-bit) - no desktop needed
+    - Click the gear icon and pre-set:
+        * enable SSH
+        * username + password (write these down)
+        * WiFi country/network + password
+    - Write to the microSD card, plug it into the Pi, power it on
+
+2. Find the Pi and log in via SSH
+    On Windows, open PowerShell:
+        ssh <username>@<pi-ip-address>
+    Find the Pi's IP on your router's admin page, or run:
+        arp -a
+    (If you set a static DHCP reservation on the router, the address will
+    never change - optional but recommended.)
+
+3. Install Node.js
+        sudo apt update && sudo apt install -y curl build-essential
+        curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
+        sudo apt install -y nodejs
+        node -v        # should print v22.x
+
+4. Install PostgreSQL
+        sudo apt install -y postgresql postgresql-contrib
+        sudo systemctl enable --now postgresql
+
+5. Get the code onto the Pi
+    Copy your project folder, or if it is in a git repo:
+        sudo apt install -y git
+        git clone <your-repo-url> aquaculture-dashboard
+        cd aquaculture-dashboard
+        npm install --omit=dev
+
+    Then continue at section 7 (application setup). The rest is identical
+    for all options.
+
+================================================================================
+5. OPTION B - FREE CLOUD VM (ORACLE CLOUD "ALWAYS FREE", $0 FOREVER)
+================================================================================
+
+Oracle gives away a small virtual computer forever: 4 CPU cores / 24 GB RAM
+(Ampere ARM A1.Flex) inside their data center. Your system runs there over
+the internet, so the ESP32 must reach it over the internet too.
+
+1. Create an account (free)
+    - Go to oracle.com/cloud/free, click "Start for free"
+    - You must add email + phone + a debit/credit card for identity
+      verification. Oracle will NOT charge it as long as you only use
+      "always free" resources. (You can remove/keep the card.)
+
+2. Create the VM (the free one)
+    - Console -> Compute -> Instances -> Create instance
+    - Shape: choose "Ampere - Arm" and tick "Always Free eligible"
+      (default A1.Flex) - pick 1 OCPU / 6 GB RAM minimum
+    - Image: Ubuntu 22.04 LTS (or 24.04 LTS)
+    - Add your SSH public key (generate one on Windows:
+          ssh-keygen -t ed25519
+      then paste the .pub contents)
+    - Create. Note the Public IP address (e.g. 146.56.xx.xx)
+
+3. Open the firewall so the app + tunnel can get out (SPF/NAT checks aside,
+   the always-free VM also routes outbound normally) and allow HTTPS IN:
+    - Networking -> Virtual Cloud Network -> your subnet -> Security List:
+        * Ingress rule: Allow TCP 3000 from 0.0.0.0/0 (temporary - you can
+          keep it or drop it once the Cloudflare tunnel is up and restrict
+          the app to the tunnel instead).
+
+4. Log in over SSH
+        ssh ubuntu@<your-public-ip>    # "ubuntu" or your chosen username
+
+5. Install Node.js
+        curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
+        sudo apt install -y nodejs build-essential
+        node -v        # v22.x
+
+6. Install PostgreSQL and secure it
+        sudo apt install -y postgresql postgresql-contrib
+        sudo systemctl enable --now postgresql
+        sudo -u postgres psql -c "CREATE USER crayvings WITH PASSWORD '<strong-password>';"
+        sudo -u postgres psql -c "CREATE DATABASE crayvings OWNER crayvings;"
+
+7. Get the code
+        sudo apt install -y git
+        git clone <your-repo-url> aquaculture-dashboard
+        cd aquaculture-dashboard
+        npm install --omit=dev
+
+    Then continue at section 7.
+
+    NOTE for Option B: the ESP32 posts to your server over the internet. In
+    the firmware set SERVER_IP to your VM's public IP (or domain). The
+    HttpSms/email alerts still work the same.
+
+================================================================================
+6. OPTION C - A SPARE PC / THE MACHINE YOU ALREADY USE
+================================================================================
+
+If you already have a desktop/laptop you can leave running, you can skip
+buying anything:
+
+    - Leave this project folder as the "production" copy
+    - Install PostgreSQL if not already installed
+    - Keep the machine on your farm/home WiFi
+    - Set a fixed LAN IP (router: DHCP reservation, or set the adapter's
+      static IP) so the URL never changes
+    - Make it auto-login / disable sleep (Settings -> Power -> never sleep)
+    - Continue at section 7
+
+    Windows tip: install NSSM (free, nssm.cc) OR just run the app as a
+    scheduled task "at startup" so it starts after a reboot.
+
+================================================================================
+7. APPLICATION SETUP (SAME FOR ALL OPTIONS)
+================================================================================
+
+All commands below run inside the project folder.
+
+1. Install dependencies
+        npm install --omit=dev
+
+2. Create the environment file
+
+        copy .env.example .env          (Windows)
+        cp .env.example .env            (Linux)
+
+3. Edit .env and set the production values
+
+        NODE_ENV=production
+
+        # Database - point at the local Postgres you created
+        PG_HOST=localhost
+        PG_PORT=5432
+        PG_DATABASE=crayvings
+        PG_USER=crayvings
+        PG_PASSWORD=<strong-password>
+
+        # Device secret - REQUIRED in production. Same value goes into the
+        # ESP32 firmware. Long random string, never share publicly.
+        DEVICE_SECRET=<long-random-string>
+
+        # Admin bootstrap (only used the first time)
+        ADMIN_INITIAL_PASSWORD=<one-time-strong-password>
+
+        # CORS - the public URL Cloudflare gives you (see section 9).
+        # If you serve the dashboard from the SAME URL as the API, this is
+        # mostly for safety; the dashboard itself is same-origin.
+        ALLOWED_ORIGINS=https://your-dashboard.<something>.trycloudflare.com
+
+        # SMS + email: leave your current working values (HttpSms / SMTP).
+
+4. Build the dashboard (IMPORTANT: VITE_API_BASE must be the public URL)
+
+    The frontend calls the API at a URL that is baked in at build time.
+    Set it to the same public URL that serves the dashboard, then build:
+
+        (Windows PowerShell)
+        $env:VITE_API_BASE="https://your-dashboard.<something>.trycloudflare.com"
+        npm run build
+
+        (Linux)
+        VITE_API_BASE="https://your-dashboard.<something>.trycloudflare.com" npm run build
+
+    Output goes into dist/.
+
+5. Run the database migrations (one time, in order)
+
+        node db/migrations/001_user_deletion.cjs
+        node db/migrations/002_owner_admin.cjs
+        node db/migrations/003_sms_integration.cjs
+        node db/migrations/004_sms_delivery.cjs
+        node db/migrations/005_schema_consistency.cjs
+        node db/migrations/006_archive_restore.cjs
+
+    Each is idempotent (safe to run twice). The server also auto-adds a
+    few columns/indexes on startup.
+
+6. Start the server to test
+
+        node server.cjs
+
+    Expected log lines (last one = success):
+        PostgreSQL connected
+        Loaded delta-logging baseline for N device(s) from DB
+        Server running on port 3000
+
+================================================================================
+8. SERVE THE DASHBOARD FROM THE EXPRESS SERVER (SMALL CODE CHANGE)
+================================================================================
+
+Today the backend (server.cjs) only serves the API; the dashboard runs on a
+separate dev server. For production, make Express serve the built site too,
+so ONE process + ONE port (3000) handles everything.
+
+Add a small block in server.cjs, AFTER the API routes are declared (before
+the "app.listen" at the bottom), roughly:
+
+    const path = require("path");
+    const distDir = path.join(__dirname, "dist");
+    app.use(express.static(distDir));
+    app.get(/^\/(?!api\/).*/, (req, res, next) => {
+      if (req.path.startsWith("/api")) return next();
+      res.sendFile(path.join(distDir, "index.html"));
+    });
+
+    // (adjust the "api" prefix to match however your routes are mounted;
+    //  the goal is: static files from dist/ + SPA fallback to index.html,
+    //  while /sensor, /auth, /analytics, ... keep answering as JSON)
+
+After this change:
+    - http://HOST:3000/ serves the dashboard
+    - http://HOST:3000/sensor/latest etc still return JSON
+    - No CORS problems, because the dashboard and API share one origin
+
+Rebuild the frontend (section 7 step 4) and restart the server, then open
+http://HOST:3000 in a browser and it should load the dashboard.
+
+================================================================================
+9. PUBLIC ADDRESS + HTTPS FOR FREE (CLOUDFLARE TUNNEL)
+================================================================================
+
+The Cloudflare Tunnel gives you a public https:// URL with no port
+forwarding, no domain, and no subscription. Your server opens an outbound
+connection to Cloudflare; nothing has to be exposed on your router.
+
+You only need this if you want to open the dashboard from OUTSIDE your
+network. On a purely local farm you can skip this section entirely and just
+visit http://<pi-ip>:3000 from your phone on the same WiFi.
+
+1. Subscribe nothing, just sign up
+    - cloudflare.com -> Sign up (email + password, free plan)
+    - Install "cloudflared" on your server:
+        (Linux/Pi/VM)
+        curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /usr/local/bin/cloudflared
+        sudo chmod +x /usr/local/bin/cloudflared
+
+        (Windows) download cloudflared-windows-amd64.exe from the same
+        releases page and put it in a folder on PATH.
+
+2. Authenticate
+        cloudflared tunnel login
+    - copy the URL it prints, open it in a browser, log in, pick your
+      free account -> it downloads a cert file automatically.
+
+3. Create the tunnel
+        cloudflared tunnel create crayvings
+    - note the tunnel ID (looks like a UUID) - write it down.
+
+4. Define what it forwards (config file, e.g. /etc/cloudflared/config.yml)
+        tunnel: <your-tunnel-id>
+        credentials-file: /root/.cloudflared/<your-tunnel-id>.json
+        ingress:
+          - hostname: crayvings-dashboard.<something>.trycloudflare.com
+            service: http://localhost:3000
+          - service: http_status:404
+
+5. Get a hostname on that tunnel (Zero Trust console)
+    - dash.cloudflare.com -> Zero Trust -> Networks -> Tunnels
+    - select your tunnel -> Public Hostname -> Add
+    - subdomain: crayvings-dashboard
+    - domain: pick a free `trycloudflare.com` or attach your own domain to
+      the free Cloudflare plan (optional)
+    - service: HTTP -> localhost:3000
+
+6. Run it as a service so it survives reboots
+        sudo cloudflared service install
+
+7. Open https://crayvings-dashboard.<something>.trycloudflare.com
+   You should see the login page with a padlock (HTTPS).
+
+   Because you set VITE_API_BASE (section 7) to this same address, the
+   dashboard talks to the API over the same secure address.
+
+================================================================================
+10. AUTO-START + RESTART (RUN FOREVER)
+================================================================================
+
+systemd (Linux - Pi and Oracle VM)
+
+Create /etc/systemd/system/crayvings.service:
+
+    [Unit]
+    Description=CRAYvings Aquaculture Monitoring
+    After=network-online.target postgresql.service
+    Wants=network-online.target
+
+    [Service]
+    WorkingDirectory=/home/<user>/aquaculture-dashboard
+    EnvironmentFile=/home/<user>/aquaculture-dashboard/.env
+    ExecStart=/usr/bin/node server.cjs
+    Restart=always
+    RestartSec=5
+    User=<user>
+
+    [Install]
+    WantedBy=multi-user.target
+
+Then run:
+
+        sudo systemctl daemon-reload
+        sudo systemctl enable --now crayvings
+        sudo systemctl status crayvings      # shows "active (running)"
+
+Useful commands later:
+
+        sudo systemctl restart crayvings     # restart the app
+        sudo journalctl -u crayvings -f      # watch its logs live
+
+PM2 alternative (if you prefer it on the Pi/VM)
+
+        npm install -g pm2
+        pm2 start server.cjs --name crayvings
+        pm2 save && pm2 startup             # auto-start on boot
+
+Windows spare-PC option
+
+    - Task Scheduler -> Create Task -> Trigger "At startup"
+    - Action: Start a program -> node -> arguments "server.cjs"
+      starting directory = this project folder
+    - Or use NSSM (free):  nssm install crayvings <node.exe path> server.cjs
+
+================================================================================
+11. FREE ALERTS (SMS + EMAIL)
+================================================================================
+
+Nothing to pay for - both already work in this app:
+
+    SMS - HttpSms (Android app)
+        - Install the HttpSms app on an Android phone that has a SIM
+        - Sign in, copy the API key from httpsms.com/settings
+        - .env:  HTTPSMS_API_KEY=...  HTTPSMS_FROM=<your +639... number>
+        - The app relays texts from your SIM - costs only whatever your
+          existing SIM plan already costs. No SMS-service subscription.
+        - Full details: see docs/HTTPSMS_SETUP.txt
+
+    Email fallback (Gmail)
+        - Gmail -> Settings -> 2-Step Verification -> App passwords ->
+          create one for this app
+        - .env: SMTP_HOST=smtp.gmail.com, SMTP_PORT=465, SMTP_USER,
+          SMTP_PASS=<app-password>
+        - The server already logs "SMTP transport ready" when it is set.
+
+    Phone number list
+        - Add recipient numbers in the Settings page of the dashboard
+          (authorized_recipients). Format: +639XXXXXXXXXX
+
+================================================================================
+12. BACKUPS + MONITORING (FREE)
+================================================================================
+
+PostgreSQL database backup - daily cron
+
+Create /home/<user>/backup.sh (Linux):
+
+    #!/bin/bash
+    export PGPASSWORD="<strong-password>"
+    DATE=$(date +%F)
+    pg_dump -U crayvings -h localhost crayvings > \
+        /home/<user>/backups/crayvings-$DATE.sql
+    find /home/<user>/backups -name "crayvings-*.sql" -mtime +30 -delete
+
+    mkdir -p /home/<user>/backups
+    chmod +x /home/<user>/backup.sh
+    crontab -e      # add this line (runs daily at 3am):
+    0 3 * * * /home/<user>/backup.sh
+
+    Copy the .sql files off-site occasionally (USB stick / cloud drive).
+
+What's stored where (you do NOT need to back up raw sensor data forever):
+    - The server already deletes sensors rows and system_logs older than
+      30 days automatically (startup + once a day).
+    - Still worth keeping the DB backup for settings, users, recipients,
+      alert history and SMS logs.
+
+Uptime monitoring (optional, free)
+    - UptimeRobot.com free plan: add a monitor for
+      https://your-dashboard.<something>.trycloudflare.com/health
+      It emails/telegrams you if the site stops responding.
+    - The app's own disconnect SMS already alerts you if the ESP32 goes
+      offline (DEVICE_DISCONNECT_ENABLED=true).
+
+================================================================================
+13. SECURITY CHECKLIST
+================================================================================
+
+    [ ] NODE_ENV=production everywhere
+    [ ] DEVICE_SECRET is long and random; same value flashed to the ESP32.
+        Without it, /sensor refuses everything (503).
+    [ ] ADMIN_INITIAL_PASSWORD only present on first boot; owner login
+        password changed afterwards; the initial value removed from .env
+    [ ] .env is NOT committed to git and has restricted file permissions
+        (Linux: chmod 600 .env)
+    [ ] ALLOWED_ORIGINS lists only the addresses you actually use
+    [ ] Postgres: non-default password, and localhost-only binding
+        (default already listens on 127.0.0.1)
+    [ ] Run the app as a normal user (not root) in systemd (section 10)
+    [ ] Optional hardening: change your Pi/VM SSH password, disable
+        password SSH login and use keys only
+    [ ] Optional: ufw firewall allowing only 22(SSH) + outbound; the tunnel
+        needs no inbound ports
+    [ ] SMS recipients: only numbers you trust (editable in Settings)
+
+================================================================================
+14. GO-LIVE TEST LIST
+================================================================================
+
+Run through these once everything is up. All commands from a computer on
+the same network (or from the internet via the tunnel URL).
+
+  API alive
+        curl http://localhost:3000/health
+        -> {"status":"ok", "serverTime":"..."}
+
+  Login
+        Open the dashboard URL, log in with the owner account.
+        You should land on the Dashboard page.
+
+  Sensor ingestion + delta logging (change-only) checks
+        # 1st POST (creates/updates a device, inserts 1 row)
+        curl.exe -X POST http://localhost:3000/sensor ^
+          -H "Content-Type: application/json" -H "X-Device-Secret: <secret>" ^
+          -d "{\"device_id\":\"TEST\",\"temperature\":25.0,\"water_level\":50.0,\"ammonia\":0.5}"
+
+        # same POST again -> should be: {"message":"No change, skipped",
+        # "skipped":true, ...} and NO new database row
+
+        # change temperature beyond tolerance (0.1) -> {"message":"Saved"} + new row
+
+  Dashboard "online"
+        Dashboard shows Online / live readings; values update under the
+        charts even while rows are being skipped (recv_at heartbeat).
+
+  Remote access
+        Open the Cloudflare https:// URL from your phone on mobile data
+        -> login page loads with a padlock.
+
+  Alerts (optional, with SMS unmuted)
+        Temporarily set a threshold out of range (Settings page) and confirm
+        the SMS arrives on a recipient phone.
+
+  ESP32 reconnect
+        Re-flash the firmware with the new SERVER_IP / DEVICE_SECRET and
+        confirm the server log shows "Sensor data saved from <device>" and
+        the dashboard flips to online.
+
+================================================================================
+15. APPENDIX - ESP32 NETWORKING NOTES
+================================================================================
+
+LAN-only (Option A / C at the farm)
+    - The ESP32 firmware holds SERVER_IP + SERVER_PORT. Point them at the
+      Pi/spare-PC's LAN IP (e.g. 192.168.100.152:3000).
+    - Keep the router DHCP reservation so the IP never changes, and
+      remember to update the firmware if you change it.
+
+Cloud (Option B)
+    - SERVER_IP = your VM public IP or its domain; the ESP32 posts over the
+      internet to /sensor on port 3000.
+    - If you later lock the VM down behind the Cloudflare tunnel, the ESP32
+      can instead POST to your public https:// URL (same path /sensor).
+    - Confirm the farm/office router allows 3000 OUT - usually it does.
+
+Device secret
+    - Set DEVICE_SECRET (same value) in .env and in the firmware's
+      X-Device-Secret, otherwise the server refuses the POST.
+
+================================================================================
+QUICK RECAP OF THE $0 MONTHLY STACK
+================================================================================
+
+    Run it on:           Your own Pi, a free Oracle VM, or a spare PC
+    Database:            PostgreSQL, self-hosted
+    Website + API:       one Express process on port 3000
+    Public URL + HTTPS:  Cloudflare Tunnel (free plan, no domain required)
+    SMS alerts:          HttpSms app + your existing SIM
+    Email:               Gmail app password
+    Auto-restart:        systemd / PM2 / Task Scheduler
+    Backups:             cron + pg_dump
+    Monitoring:          the app's own disconnect SMS (+ optional UptimeRobot)
+
+    Total: $0/month, no subscriptions, nothing expires after a free trial.

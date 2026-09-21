@@ -141,7 +141,9 @@ function useSensorDataPolling(): SensorDataState & { refetch: () => void } {
 
       if (latest && latest.timestamp) {
         consecutiveFailuresRef.current = 0;
-        const sensorTime = new Date(latest.timestamp);
+        // recv_at is the device heartbeat (refreshed even when change-only
+        // logging skips a row); timestamp stays the last value-change time.
+        const sensorTime = new Date(latest.recv_at || latest.timestamp);
         const gap = Date.now() - sensorTime.getTime();
         const isStale = gap > OFFLINE_THRESHOLD;
 
