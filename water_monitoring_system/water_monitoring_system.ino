@@ -1616,9 +1616,28 @@ void setup()
     // Application watchdog: reset the chip if the main loop ever stalls for
     // 30s (e.g. a fatal while(1) loop). On reset, esp_reset_reason() is checked
     // below so the device can recover through Safe Mode instead of bricking.
-    esp_task_wdt_init(30, true);
-    esp_task_wdt_add(NULL);
-    Serial.println("[WDT] Task watchdog armed (30s timeout)");
+    // This core exposes the IDF 5.x API: init takes an esp_task_wdt_config_t.
+    esp_task_wdt_config_t wdtCfg = {
+        .timeout_ms = 30000,
+        .idle_core_mask = (1 << portNUM_PROCESSORS) - 1, // idle tasks on every core
+        .trigger_panic = true,
+    };
+    esp_err_t wdtErr = esp_task_wdt_init(&wdtCfg);
+    if (wdtErr == ESP_ERR_INVALID_STATE)
+    {
+        // Already initialized (typically by the core at startup) - just retune
+        // the running TWDT instead of erroring out.
+        wdtErr = esp_task_wdt_reconfigure(&wdtCfg);
+    }
+    if (wdtErr != ESP_OK)
+    {
+        Serial.printf("[WDT] init/reconfigure failed (%d) - watchdog unavailable\n", (int)wdtErr);
+    }
+    else
+    {
+        esp_task_wdt_add(NULL); // subscribe the Arduino loop task
+        Serial.println("[WDT] Task watchdog armed (30s timeout)");
+    }
 
     // Detect a watchdog-triggered reset and recover into Safe Mode.
     const esp_reset_reason_t resetReason = esp_reset_reason();
