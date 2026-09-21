@@ -9,6 +9,8 @@
 #include <HTTPClient.h>
 #include <math.h>
 #include <Preferences.h>
+#include <esp_task_wdt.h>
+#include <esp_system.h>
 
 // =============================================================================
 // DISPLAY
@@ -128,6 +130,26 @@ float distance = -1.0;
 float waterLevel = 0.0;
 int mq137Raw = 0;
 float mq137Voltage = 0.0;
+
+// =============================================================================
+// FAILURE HANDLING (Watchdog / Safe Mode)
+// =============================================================================
+
+#define SAFE_LED_PIN 2   // Onboard LED on most ESP32 dev boards; safe to toggle
+
+bool safeModeActive = false;    // Set after a watchdog reset; cleared on recovery
+bool safeModeRecovered = false; // Loop redraws the normal UI once set
+float lastGoodTemperature = -127.0;  // Last-known-good snapshot for Safe Mode
+float lastGoodWaterLevel = 0.0;
+float lastGoodAmmonia = -1.0;
+unsigned long lastGoodMillis = 0;
+bool safeLedOn = false;
+unsigned long lastSafeBlinkMs = 0;
+
+// WiFi reconnection backoff (1s, 2s, 4s, ... capped at 5 min).
+unsigned long wifiBackoffMs = 1000;
+unsigned long lastWifiAttemptMs = 0;
+int wifiFailStreak = 0;
 
 // =============================================================================
 // PAGES
@@ -457,6 +479,28 @@ bool loadMq137R0()
     return mq137R0 > 5.0 && mq137R0 < 200.0;
 }
 
+// Persists the last-known-good sensor snapshot to NVS so Safe Mode can show
+// the last real values after a watchdog reset. Cheap enough to run every read.
+void saveLastKnownValues()
+{
+    Preferences prefs;
+    prefs.begin("safe", false);
+    prefs.putFloat("temp", lastGoodTemperature);
+    prefs.putFloat("water", lastGoodWaterLevel);
+    prefs.putFloat("ammonia", lastGoodAmmonia);
+    prefs.end();
+}
+
+void loadLastKnownValues()
+{
+    Preferences prefs;
+    prefs.begin("safe", true);
+    lastGoodTemperature = prefs.getFloat("temp", -127.0);
+    lastGoodWaterLevel = prefs.getFloat("water", 0.0);
+    lastGoodAmmonia = prefs.getFloat("ammonia", -1.0);
+    prefs.end();
+}
+
 // One-time R0 reset: on the first boot after this change the stored R0 is
 // deleted (and a flag set) so the fresh clean-air calibration always runs.
 // This prevents a stale/wrong R0 saved under the old RL assumption from being
@@ -757,6 +801,13 @@ void readAllSensors()
     }
 
     Serial.println("========================================");
+
+    // Keep the last-good snapshot for Safe Mode recovery after a watchdog reset.
+    if (temperature != -127.0) lastGoodTemperature = temperature;
+    if (waterLevel >= 0.0)     lastGoodWaterLevel = waterLevel;
+    if (ammoniaReady)          lastGoodAmmonia = ammoniaPpm;
+    lastGoodMillis = millis();
+    saveLastKnownValues();
 }
 
 // =============================================================================
@@ -1405,10 +1456,30 @@ void sendSensorData()
     if (WiFi.status() != WL_CONNECTED)
     {
         wifiConnected = false;
+
+        // Exponential-backoff reconnection: 1s, 2s, 4s, ... capped at 5 min.
+        // Avoids hammering the AP while coverage/power is down and gives the
+        // watchdog/safe-mode recovery time to hold before the next try.
+        unsigned long nowMs = millis();
+        if (nowMs - lastWifiAttemptMs >= wifiBackoffMs)
+        {
+            lastWifiAttemptMs = nowMs;
+            wifiFailStreak++;
+            WiFi.reconnect();
+            Serial.printf("[WIFI] Reconnect attempt %d (next backoff %.0fs)\n",
+                          wifiFailStreak, wifiBackoffMs / 1000.0);
+            wifiBackoffMs = (wifiBackoffMs < 300000UL) ? wifiBackoffMs * 2 : 300000UL;
+        }
         return;
     }
 
     wifiConnected = true;
+    if (wifiFailStreak > 0)
+    {
+        Serial.printf("[WIFI] Reconnected - fail streak %d cleared, backoff reset\n", wifiFailStreak);
+        wifiFailStreak = 0;
+        wifiBackoffMs = 1000;
+    }
 
     HTTPClient http;
     String url = "http://";
@@ -1443,6 +1514,15 @@ void sendSensorData()
     {
         Serial.print("[HTTP] Response code: ");
         Serial.println(httpResponseCode);
+
+        // First successful uplink while in Safe Mode completes the recovery:
+        // the loop redraws the normal UI the next tick.
+        if (safeModeActive)
+        {
+            safeModeActive = false;
+            safeModeRecovered = true;
+            Serial.println("[SAFE MODE] Sensor POST OK - recovery complete, back to normal operation");
+        }
     }
     else
     {
@@ -1473,10 +1553,64 @@ void sendSensorTask(void *pvParameters)
     }
 }
 
+// =============================================================================
+// SAFE MODE - recovery path after a watchdog reset.
+// Draws the last-known-good values from NVS, blinks the onboard LED on a
+// millis() cadence (never a blocking delay, so the watchdog stays fed), and
+// lets normal loop + sendSensorData retry until the first uplink succeeds.
+// =============================================================================
+
+void enterSafeMode()
+{
+    safeModeActive = true;
+    loadLastKnownValues();
+
+    pinMode(SAFE_LED_PIN, OUTPUT);
+    digitalWrite(SAFE_LED_PIN, LOW);
+
+    Serial.println("================================================");
+    Serial.println("[SAFE MODE] Recovering from watchdog reset");
+    Serial.printf("[SAFE MODE] Last known: temp %.2f C, water %.1f %%, NH3 %.3f ppm\n",
+                  lastGoodTemperature, lastGoodWaterLevel, lastGoodAmmonia);
+    Serial.println("================================================");
+
+    tft.fillScreen(TFT_WHITE);
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextColor(TFT_RED, TFT_WHITE);
+    tft.drawString("SAFE MODE", 240, 55, 4);
+    tft.setTextColor(TFT_BLACK, TFT_WHITE);
+    tft.drawString("Recovering from watchdog reset...", 240, 105, 2);
+
+    char line[40];
+    snprintf(line, sizeof(line), "Temp: %.2f C", (lastGoodTemperature == -127.0) ? -1.0 : lastGoodTemperature);
+    tft.drawString(line, 240, 145, 2);
+    snprintf(line, sizeof(line), "Water: %.1f %%", lastGoodWaterLevel);
+    tft.drawString(line, 240, 170, 2);
+    snprintf(line, sizeof(line), "NH3: %.3f ppm", lastGoodAmmonia);
+    tft.drawString(line, 240, 195, 2);
+    tft.setTextColor(TFT_ORANGE, TFT_WHITE);
+    tft.drawString("Waiting for uplink to auto-resume...", 240, 240, 2);
+}
+
 void setup()
 {
     Serial.begin(115200);
     delay(1000);
+
+    // Application watchdog: reset the chip if the main loop ever stalls for
+    // 30s (e.g. a fatal while(1) loop). On reset, esp_reset_reason() is checked
+    // below so the device can recover through Safe Mode instead of bricking.
+    esp_task_wdt_init(30, true);
+    esp_task_wdt_add(NULL);
+    Serial.println("[WDT] Task watchdog armed (30s timeout)");
+
+    // Detect a watchdog-triggered reset and recover into Safe Mode.
+    const esp_reset_reason_t resetReason = esp_reset_reason();
+    if (resetReason == ESP_RST_TASK_WDT || resetReason == ESP_RST_WDT)
+    {
+        Serial.printf("[WDT] Boot after watchdog reset (reason=%d) -> Safe Mode\n", (int)resetReason);
+        safeModeActive = true;
+    }
 
     Serial.println();
     Serial.println("================================================");
@@ -1567,8 +1701,15 @@ void setup()
     {
         wifiConnected = false;
         Serial.println("[WIFI] No saved network or connection failed.");
-        Serial.println("[WIFI] Starting configuration portal (AP: Aquaculture-Setup)...");
-        startWifiConfigPortal();
+        if (safeModeActive)
+        {
+            Serial.println("[WIFI] Safe Mode: skipping config portal, will retry on backoff.");
+        }
+        else
+        {
+            Serial.println("[WIFI] Starting configuration portal (AP: Aquaculture-Setup)...");
+            startWifiConfigPortal();
+        }
     }
 
     // One full initial sensor read so the UI shows live values right away.
@@ -1591,6 +1732,11 @@ void setup()
 
     currentPage = PAGE_OVERVIEW;
     drawCurrentPage();
+
+    if (safeModeActive)
+    {
+        enterSafeMode();
+    }
 
     // Send sensor data on a background task so the blocking HTTP POST (which
     // can stall for ~1-2s on a slow/unreachable server) never freezes touch
@@ -1691,12 +1837,36 @@ void loop()
     // sensor reads, screen redraws, or Wi-Fi sends.
     handleTouch();
 
+    // Safe Mode recovery: blink the LED (millis-based, never blocks), keep
+    // reading sensors for NVS, and redraw the normal UI once the first POST
+    // succeeded.
+    if (safeModeActive)
+    {
+        if (now - lastSafeBlinkMs >= 500)
+        {
+            lastSafeBlinkMs = now;
+            safeLedOn = !safeLedOn;
+            digitalWrite(SAFE_LED_PIN, safeLedOn ? HIGH : LOW);
+        }
+    }
+    else if (safeModeRecovered)
+    {
+        safeModeRecovered = false;
+        Serial.println("[SAFE MODE] Normal UI restored");
+        tft.fillScreen(TFT_WHITE);
+        currentPage = PAGE_OVERVIEW;
+        drawCurrentPage();
+    }
+
     if (now - lastSensorRead >= SENSOR_INTERVAL)
     {
         lastSensorRead = now;
         readAllSensors();
 
-        updateCurrentPage();
+        if (!safeModeActive)
+        {
+            updateCurrentPage();
+        }
     }
 
     checkSerialCommands();
@@ -1713,5 +1883,9 @@ void loop()
         startWifiConfigPortal();
     }
 
-    delay(1);
+    // Feed the task watchdog and yield. vTaskDelay replaces delay() because it
+    // lets lower-priority tasks run and is the standard loop pacing for the
+    // ESP32 Arduino core.
+    esp_task_wdt_reset();
+    vTaskDelay(1 / portTICK_PERIOD_MS);
 }
