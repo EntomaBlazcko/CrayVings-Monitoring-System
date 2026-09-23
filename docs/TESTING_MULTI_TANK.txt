@@ -241,9 +241,10 @@ Purpose: prove the firmware changes compile, serve GET /status, honor the new
          config fields, buffer against outages, and emit the -1 sentinel.
 
 E1. Compile
-    => Arduino IDE opens water_monitoring_system/water_monitoring_system.ino,
-       installs ESPAsyncWebServer + AsyncTCP (Library Manager), board
-       ESP32 Dev Module, and compiles clean. Watch for
+    => Arduino IDE opens water_monitoring_system/ESP32_main_code/ESP32_main_code.ino
+       (tank 1) or water_monitoring_system/NODE_main_code/NODE_main_code.ino
+       (spare / NodeMCU), installs ESPAsyncWebServer + AsyncTCP (Library
+       Manager), board ESP32 Dev Module, and compiles clean. Watch for
        "#include <ESPAsyncWebServer.h>" being satisfied.
 
 E2. Flash one tank

@@ -1,5 +1,31 @@
 @import "tailwindcss";
 
+@theme {
+  --color-brand-50: #fff7ed;
+  --color-brand-100: #ffedd5;
+  --color-brand-200: #fed7aa;
+  --color-brand-300: #fdba74;
+  --color-brand-400: #fb923c;
+  --color-brand-500: #f97316;
+  --color-brand-600: #ea580c;
+  --color-brand-700: #c2410c;
+  --color-brand-800: #9a3412;
+  --color-brand-900: #7c2d12;
+  --color-brand-950: #431407;
+
+  --color-semantic-safe: #10b981;
+  --color-semantic-warning: #f59e0b;
+  --color-semantic-critical: #ef4444;
+
+  --shadow-elev-1: 0 1px 2px 0 rgb(0 0 0 / 0.05);
+  --shadow-elev-2: 0 1px 3px 0 rgb(0 0 0 / 0.1), 0 1px 2px -1px rgb(0 0 0 / 0.1);
+  --shadow-elev-3: 0 4px 6px -1px rgb(0 0 0 / 0.1), 0 2px 4px -2px rgb(0 0 0 / 0.1);
+  --shadow-elev-4: 0 10px 15px -3px rgb(0 0 0 / 0.1), 0 4px 6px -4px rgb(0 0 0 / 0.1);
+
+  --radius-card: 0.75rem;
+  --radius-button: 0.5rem;
+}
+
 @keyframes slide-in {
   from {
     opacity: 0;

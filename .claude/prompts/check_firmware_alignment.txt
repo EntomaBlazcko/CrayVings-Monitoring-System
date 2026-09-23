@@ -1,4 +1,7 @@
-Verify alignment of water_monitoring_system.ino with embedded-c-c-expert & senior-architect skills:
+Verify alignment of the ESP32 firmware sketches
+(water_monitoring_system/ESP32_main_code/ESP32_main_code.ino and
+water_monitoring_system/NODE_main_code/NODE_main_code.ino) with
+embedded-c-c-expert & senior-architect skills:
 
 === CRITICAL SAFETY CHECKS ===
 [ ] Buffer overflows fixed: NO `strcpy(dest, src)`

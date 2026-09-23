@@ -1,6 +1,6 @@
 // =============================================================================
 // src/contexts/SensorProvider.tsx
-// Central data provider: polls sensors (1s), logs (5s), settings, activity logs.
+// Central data provider: SSE for real-time data, polling for history/devices.
 // Four hooks: useSensorDataPolling, useSettingsManager, useLogsManager, useActivityLogsManager.
 // =============================================================================
 
@@ -42,13 +42,15 @@ import {
 // ========================
 // POLLING CONFIGURATION
 // ========================
-const POLL_INTERVAL = 1000;             // 1s sensor data (matches ESP32 send rate)
 const HISTORY_POLL_INTERVAL = 30000;     // 30s chart history (heavy query)
 const DEVICES_POLL_INTERVAL = 5000;      // 5s fleet registry/online flags
-const OFFLINE_THRESHOLD = 15000;         // 15s without data = offline
-const MAX_CONSECUTIVE_FAILURES = 5;      // After 5 failures, mark offline
 const LOGS_POLL_INTERVAL = 5000;         // 5s system logs
 const LOGS_PAGE_SIZE = 10;
+
+// Exponential backoff configuration
+const BASE_POLL_DELAY = 1000;
+const MAX_POLL_DELAY = 30000;
+const MAX_CONSECUTIVE_FAILURES = 5;
 
 // ========================
 // STATE INTERFACES
@@ -101,18 +103,15 @@ function computeConnectionStatus(
   if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) return "offline";
   if (!lastUpdate) return "unknown";
   const gap = Date.now() - lastUpdate.getTime();
-  if (gap > OFFLINE_THRESHOLD) return "offline";
+  if (gap > 30000) return "offline"; // 30s threshold for SSE
   return "online";
 }
 
 // ========================
 // HOOK 1: SENSOR DATA POLLING
 // ========================
-// Polls sensor data every 1s + history every 30s, both scoped to the selected
-// device (null = all tanks). Polls the fleet registry every 5s for online flags.
-// Tracks connection status via consecutive failures and stale timestamps.
-// Uses request IDs (not AbortController) to drop superseded responses without
-// canceling in-flight requests.
+// Uses SSE for real-time sensor data, polls history every 30s, devices every 5s.
+// Tracks connection status via SSE state and stale timestamps.
 function useSensorDataPolling(
   selectedDeviceId: string | null,
   onDevicesLoaded: (devices: DeviceEntry[]) => void
@@ -131,80 +130,12 @@ function useSensorDataPolling(
     devicesLoading: true,
   });
 
-  const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const historyIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const devicesIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const latestAbortRef = useRef<AbortController | null>(null);
   const historyAbortRef = useRef<AbortController | null>(null);
   const devicesAbortRef = useRef<AbortController | null>(null);
-  // Request IDs: drop superseded responses without aborting (aborting caused
-  // ERR_CANCELED to bypass the failure counter, freezing status at "online").
-  const latestReqIdRef = useRef(0);
   const historyReqIdRef = useRef(0);
   const devicesReqIdRef = useRef(0);
   const consecutiveFailuresRef = useRef(0);
-
-  // Fetches latest sensor reading for the selected device (every 1s).
-  // Connection status derived from timestamp.
-  const fetchLatest = useCallback(async () => {
-    // Bump id so any in-flight response from a prior poll is ignored.
-    const reqId = ++latestReqIdRef.current;
-    latestAbortRef.current = new AbortController();
-
-    try {
-      const latest = await fetchLatestSensor(selectedDeviceId, latestAbortRef.current.signal);
-      if (reqId !== latestReqIdRef.current) return; // superseded by a newer poll
-
-      if (latest && latest.timestamp) {
-        consecutiveFailuresRef.current = 0;
-        // recv_at is the device heartbeat (refreshed even when change-only
-        // logging skips a row); timestamp stays the last value-change time.
-        const sensorTime = new Date(latest.recv_at || latest.timestamp);
-        const gap = Date.now() - sensorTime.getTime();
-        const isStale = gap > OFFLINE_THRESHOLD;
-
-        setState((prev) => ({
-          ...prev,
-          data: latest,
-          loading: false,
-          error: isStale ? "ESP32 device is offline. Last data received is stale." : null,
-          connectionStatus: computeConnectionStatus(false, sensorTime),
-          lastUpdate: sensorTime,
-          consecutiveFailures: 0,
-        }));
-      } else {
-        setState((prev) => ({
-          ...prev,
-          data: null,
-          loading: false,
-          error: prev.history.length > 0 ? "ESP32 device is offline. No new data received." : "No sensor data available",
-          connectionStatus: "unknown",
-        }));
-      }
-    } catch (error) {
-      // Superseded or unmounted: not a real failure.
-      if (isAxiosError(error) && error.code === "ERR_CANCELED") return;
-      if (reqId !== latestReqIdRef.current) return;
-
-      consecutiveFailuresRef.current += 1;
-
-      if (consecutiveFailuresRef.current >= MAX_CONSECUTIVE_FAILURES) {
-        setState((prev) => ({
-          ...prev,
-          error: "Unable to reach the server. Check your connection and try again.",
-          loading: false,
-          connectionStatus: "offline",
-          consecutiveFailures: consecutiveFailuresRef.current,
-        }));
-      } else {
-        setState((prev) => ({
-          ...prev,
-          consecutiveFailures: consecutiveFailuresRef.current,
-          loading: false,
-        }));
-      }
-    }
-  }, [selectedDeviceId]);
+  const pollDelayRef = useRef(BASE_POLL_DELAY);
 
   // Fetches chart history for the selected device (every 30s). Errors swallowed;
   // last good data stays on screen.
@@ -216,12 +147,16 @@ function useSensorDataPolling(
       const historyData = await fetchSensorHistory(1000, selectedDeviceId, historyAbortRef.current.signal);
       if (reqId !== historyReqIdRef.current) return;
       setState((prev) => ({ ...prev, history: historyData, historyStale: false, historyLastUpdated: new Date() }));
+      // Reset poll delay on success
+      pollDelayRef.current = BASE_POLL_DELAY;
     } catch (error) {
       if (isAxiosError(error) && error.code === "ERR_CANCELED") return;
       // Mark stale so UI can show "chart data may be outdated" warning.
       if (reqId === historyReqIdRef.current) {
         setState((prev) => ({ ...prev, historyStale: true }));
       }
+      // Exponential backoff for history polling
+      pollDelayRef.current = Math.min(pollDelayRef.current * 2, MAX_POLL_DELAY);
     }
   }, [selectedDeviceId]);
 
@@ -232,68 +167,220 @@ function useSensorDataPolling(
     devicesAbortRef.current = new AbortController();
 
     try {
-      const devices = await fetchDevices(devicesAbortRef.current.signal);
+      const devices = await fetchDevices(false, devicesAbortRef.current.signal);
       if (reqId !== devicesReqIdRef.current) return;
       setState((prev) => ({ ...prev, devices, devicesLoading: false }));
       onDevicesLoaded(devices);
+      // Reset poll delay on success
+      pollDelayRef.current = BASE_POLL_DELAY;
     } catch (error) {
       if (isAxiosError(error) && error.code === "ERR_CANCELED") return;
       if (reqId === devicesReqIdRef.current) {
         // Keep last known fleet; only surface loading state so UI retries quietly.
         setState((prev) => ({ ...prev, devicesLoading: false }));
       }
+      // Exponential backoff for devices polling
+      pollDelayRef.current = Math.min(pollDelayRef.current * 2, MAX_POLL_DELAY);
     }
   }, [onDevicesLoaded]);
 
   const refetch = useCallback(() => {
-    fetchLatest();
     fetchHistory();
     fetchDevicesList();
-  }, [fetchLatest, fetchHistory, fetchDevicesList]);
+    // Also trigger initial fetch for latest data via REST (fallback)
+    fetchLatestSensor(selectedDeviceId).then((result) => {
+      if (result.data && result.data.timestamp) {
+        const sensorTime = new Date(result.data.recv_at || result.data.timestamp);
+        setState((prev) => ({
+          ...prev,
+          data: result.data,
+          loading: false,
+          error: null,
+          connectionStatus: computeConnectionStatus(false, sensorTime),
+          lastUpdate: sensorTime,
+          consecutiveFailures: 0,
+        }));
+      }
+    }).catch(() => {
+      // Ignore - SSE will handle real-time updates
+    });
+  }, [fetchHistory, fetchDevicesList, selectedDeviceId]);
 
-  // Start polling on mount (and restart when the selected tank changes); both
-  // pause while the tab is hidden.
+  // Set up SSE for real-time sensor data
   useEffect(() => {
-    refetch();
-    intervalRef.current = setInterval(() => {
-      if (!document.hidden) fetchLatest();
-    }, POLL_INTERVAL);
-    historyIntervalRef.current = setInterval(() => {
+    let eventSource: EventSource | null = null;
+    let reconnectTimeout: ReturnType<typeof setTimeout> | null = null;
+    let reconnectAttempts = 0;
+    const maxReconnectAttempts = 10;
+
+    const connectSSE = () => {
+      if (eventSource) {
+        eventSource.close();
+      }
+
+      setState((prev) => ({ ...prev, loading: true, connectionStatus: "connecting" }));
+
+      const baseUrl = import.meta.env.VITE_API_BASE || "http://localhost:3000";
+      // EventSource cannot set Authorization headers, so the JWT is passed as
+      // a query parameter (authenticateToken accepts it for SSE streams).
+      const params = new URLSearchParams();
+      const token = localStorage.getItem("crayvings_token");
+      if (token) params.set("token", token);
+      if (selectedDeviceId) params.set("device_id", selectedDeviceId);
+      const url = `${baseUrl}/sensor/stream${params.toString() ? `?${params.toString()}` : ""}`;
+
+      try {
+        const es = new EventSource(url, { withCredentials: true });
+        eventSource = es;
+
+        es.onopen = () => {
+          reconnectAttempts = 0;
+          setState((prev) => ({
+            ...prev,
+            loading: false,
+            connectionStatus: "online",
+            error: null,
+          }));
+        };
+
+        es.onmessage = (event) => {
+          try {
+            const message = JSON.parse(event.data);
+            if (message.type === "sensor_update" && message.data) {
+              const sensorTime = new Date(message.data.recv_at || message.data.timestamp);
+              setState((prev) => ({
+                ...prev,
+                data: message.data,
+                loading: false,
+                error: null,
+                connectionStatus: "online",
+                lastUpdate: sensorTime,
+                consecutiveFailures: 0,
+              }));
+              consecutiveFailuresRef.current = 0;
+            }
+          } catch {
+            // Malformed SSE payload - ignore this frame
+          }
+        };
+
+        es.onerror = () => {
+          setState((prev) => ({
+            ...prev,
+            connectionStatus: "offline",
+            error: "Real-time connection lost. Attempting to reconnect...",
+          }));
+          es.close();
+
+          // Exponential backoff reconnection
+          if (reconnectAttempts < maxReconnectAttempts) {
+            const delay = Math.min(1000 * Math.pow(2, reconnectAttempts), 30000) + Math.random() * 1000;
+            reconnectAttempts++;
+            setState((prev) => ({
+              ...prev,
+              error: `Reconnecting in ${Math.round(delay / 1000)}s... (attempt ${reconnectAttempts}/${maxReconnectAttempts})`,
+            }));
+
+            reconnectTimeout = setTimeout(() => {
+              connectSSE();
+            }, delay);
+          } else {
+            setState((prev) => ({
+              ...prev,
+              error: "Max reconnection attempts reached. Please refresh the page.",
+              connectionStatus: "offline",
+            }));
+          }
+        };
+      } catch {
+        setState((prev) => ({
+          ...prev,
+          loading: false,
+          connectionStatus: "offline",
+          error: "Failed to establish real-time connection",
+        }));
+      }
+    };
+
+    // Initial connection
+    connectSSE();
+
+    // Also do an initial REST fetch as fallback
+    fetchLatestSensor(selectedDeviceId).then((result) => {
+      if (result.data && result.data.timestamp) {
+        const sensorTime = new Date(result.data.recv_at || result.data.timestamp);
+        setState((prev) => ({
+          ...prev,
+          data: result.data,
+          loading: false,
+          connectionStatus: computeConnectionStatus(false, sensorTime),
+          lastUpdate: sensorTime,
+          consecutiveFailures: 0,
+        }));
+      }
+    }).catch(() => {
+      // Ignore - SSE will handle it
+    });
+
+    return () => {
+      if (eventSource) {
+        eventSource.close();
+      }
+      if (reconnectTimeout) {
+        clearTimeout(reconnectTimeout);
+      }
+    };
+  }, [selectedDeviceId]);
+
+  // History polling with exponential backoff
+  useEffect(() => {
+    fetchHistory();
+    const historyInterval = setInterval(() => {
       if (!document.hidden) fetchHistory();
     }, HISTORY_POLL_INTERVAL);
 
     return () => {
-      if (intervalRef.current) {
-        clearInterval(intervalRef.current);
-      }
-      if (historyIntervalRef.current) {
-        clearInterval(historyIntervalRef.current);
-      }
-      if (latestAbortRef.current) {
-        latestAbortRef.current.abort();
-      }
+      clearInterval(historyInterval);
       if (historyAbortRef.current) {
         historyAbortRef.current.abort();
       }
     };
-  }, [refetch, fetchLatest, fetchHistory]);
+  }, [fetchHistory]);
 
-  // Fleet registry poll: independent of selection, runs for app lifetime.
+  // Fleet registry poll: independent of selection, runs for app lifetime with backoff
   useEffect(() => {
     fetchDevicesList();
-    devicesIntervalRef.current = setInterval(() => {
+    const devicesInterval = setInterval(() => {
       if (!document.hidden) fetchDevicesList();
     }, DEVICES_POLL_INTERVAL);
 
     return () => {
-      if (devicesIntervalRef.current) {
-        clearInterval(devicesIntervalRef.current);
-      }
+      clearInterval(devicesInterval);
       if (devicesAbortRef.current) {
         devicesAbortRef.current.abort();
       }
     };
   }, [fetchDevicesList]);
+
+  // Periodic connection health check for SSE
+  useEffect(() => {
+    const healthCheck = setInterval(() => {
+      if (state.lastUpdate) {
+        const gap = Date.now() - state.lastUpdate.getTime();
+        if (gap > 30000) { // 30s without data = offline
+          setState((prev) => ({
+            ...prev,
+            connectionStatus: "offline",
+            error: "No real-time data received for 30s",
+            consecutiveFailures: prev.consecutiveFailures + 1,
+          }));
+          consecutiveFailuresRef.current += 1;
+        }
+      }
+    }, 10000); // Check every 10s
+
+    return () => clearInterval(healthCheck);
+  }, [state.lastUpdate]);
 
   const computedConnectionStatus = useMemo(
     () => computeConnectionStatus(state.loading, state.lastUpdate, state.consecutiveFailures),
@@ -691,8 +778,10 @@ export function SensorProvider({ children }: { children: ReactNode }) {
 
   const handleDevicesLoaded = useCallback((devices: DeviceEntry[]) => {
     setSelectedDeviceId((current) => {
-      if (current !== null) return current;
-      if (!devices || devices.length === 0) return current;
+      if (!devices || devices.length === 0) return null;
+      // Keep the current pick only if it still exists in the visible fleet
+      // (e.g. it wasn't just hidden); otherwise fall back to the first tank.
+      if (current !== null && devices.some((d) => d.device_id === current)) return current;
       const first = [...devices].sort((a, b) => a.device_id.localeCompare(b.device_id))[0];
       return first.device_id;
     });

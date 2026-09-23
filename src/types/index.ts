@@ -169,6 +169,17 @@ export type DeviceStatus = {
   ammonia: number;
 };
 
+// Freshest in-memory reading per tank, returned by GET /devices/latest. Values
+// are null when the server has no reading for a tank yet (e.g. right after a
+// backend restart before that tank's first POST).
+export type DeviceLiveReading = {
+  device_id: string;
+  recv_at: string | null;
+  temperature: number | null;
+  water_level: number | null;
+  ammonia: number | null;
+};
+
 // ========================
 // THRESHOLD STATUS EVALUATION
 // ========================

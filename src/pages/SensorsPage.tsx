@@ -24,6 +24,7 @@ import {
 } from "lucide-react";
 import { useSensors } from "../hooks/useSensors";
 import { LoadingCard, ErrorCard } from "../components/Loading";
+import TankSelector from "../components/TankSelector";
 import TrendCard from "../components/TrendCard";
 import { getSettingsThresholds, getThresholdStatus } from "../types";
 import type { ThresholdRange } from "../types";
@@ -199,6 +200,11 @@ export default function SensorsPage() {
 
   return (
     <div className="space-y-4">
+      {/* Tank switcher: sensors shown below belong to the selected tank */}
+      <section>
+        <TankSelector />
+      </section>
+
       {isOfflineWithData && (
         <div className="bg-yellow-50 border border-yellow-200 rounded-xl p-3 flex items-center gap-2">
           <AlertTriangle size={16} className="text-yellow-600 shrink-0" />

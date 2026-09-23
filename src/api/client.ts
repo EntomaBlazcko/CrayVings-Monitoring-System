@@ -5,7 +5,7 @@
 // =============================================================================
 
 import axios, { isAxiosError, type AxiosError } from "axios";
-import type { SensorEntry, ChartPoint, LogEntry, SensorSettings, ActivityLog, ActivityLogEntry, AuthResponse, WeeklyReport, AnalyticsOverview, AnalyticsDailyResponse, AnalyticsInsightsResponse, DeviceEntry, DeviceStatus } from "../types";
+import type { SensorEntry, ChartPoint, LogEntry, SensorSettings, ActivityLog, ActivityLogEntry, AuthResponse, WeeklyReport, AnalyticsOverview, AnalyticsDailyResponse, AnalyticsInsightsResponse, DeviceEntry, DeviceLiveReading, DeviceStatus } from "../types";
 import { API_BASE } from "../types";
 import { formatFarmTime } from "../utils/time";
 
@@ -134,19 +134,17 @@ export class ApiError extends Error {
 // ========================
 
 // GET /sensor/latest - fetch latest reading; optional device_id scopes to one tank
-export async function fetchLatestSensor(deviceId?: string | null, signal?: AbortSignal): Promise<SensorEntry | null> {
+// Returns { data: SensorEntry | null, deviceExists: boolean }
+export async function fetchLatestSensor(deviceId?: string | null, signal?: AbortSignal): Promise<{ data: SensorEntry | null; deviceExists: boolean }> {
   try {
-    const response = await client.get<SensorEntry>("/sensor/latest", {
+    const response = await client.get<{ data: SensorEntry | null; deviceExists: boolean }>("/sensor/latest", {
       params: deviceId ? { device_id: deviceId } : undefined,
       signal,
     });
     return response.data;
   } catch (error) {
     if (isAxiosError(error) && error.code === "ERR_CANCELED") {
-      return null;
-    }
-    if (isAxiosError(error) && error.response?.status === 404) {
-      return null;
+      return { data: null, deviceExists: false };
     }
     throw error;
   }
@@ -189,10 +187,36 @@ export async function fetchSensorHistory(limit = 1000, deviceId?: string | null,
 // ========================
 
 // GET /devices - fleet registry with online flags (drives the tank selector
-// and fleet grid; polled on an interval, not per second).
-export async function fetchDevices(signal?: AbortSignal): Promise<DeviceEntry[]> {
-  const response = await client.get<DeviceEntry[]>("/devices", { signal });
+// and fleet grid; polled on an interval, not per second). Hidden tanks are
+// excluded unless includeHidden is requested (restore panel).
+export async function fetchDevices(includeHidden = false, signal?: AbortSignal): Promise<DeviceEntry[]> {
+  const response = await client.get<DeviceEntry[]>("/devices", {
+    params: includeHidden ? { include_hidden: 1 } : undefined,
+    signal,
+  });
   return response.data || [];
+}
+
+// GET /devices/latest - freshest reading per active tank, in one call (the Live
+// Tank Bar's data source). Polled on a 1s cadence; in-memory read on the server.
+export async function fetchDevicesLatest(signal?: AbortSignal): Promise<DeviceLiveReading[]> {
+  const response = await client.get<DeviceLiveReading[]>("/devices/latest", { signal });
+  return response.data || [];
+}
+
+// PUT /devices/:id - rename a tank (tank_name), set its location, and/or hide
+// or show it (is_active). The hardware device_id never changes.
+export async function updateDevice(
+  deviceId: string,
+  payload: { tank_name?: string | null; tank_location?: string | null; is_active?: boolean },
+  signal?: AbortSignal
+): Promise<DeviceEntry> {
+  const response = await client.put<DeviceEntry>(
+    `/devices/${encodeURIComponent(deviceId)}`,
+    payload,
+    { signal }
+  );
+  return response.data;
 }
 
 // GET /devices/:id/status - live on-demand read of one ESP32's GET /status.

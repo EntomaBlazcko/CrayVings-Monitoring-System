@@ -31,9 +31,10 @@ This can help reduce risks caused by poor water conditions and improve overall m
 ## Features
 
 ### Core Features
-- **Authentication & roles** - Login-based access control (owner/admin/user) with session tokens and 24-hour expiry
-- **Multi-tank star topology** - One ESP32 per tank (up to 6) pushing to a central server; the server health-polls each device's `GET /status`, and the dashboard scopes live/history/analytics to a selected tank with a tank-selector chip bar and fleet grid
+- **Authentication & roles** - Login-based access control (owner/admin/user) with session tokens and 24-hour expiry; login is rate-limited (5 attempts / 15 min / IP)
+- **Multi-tank star topology** - One ESP32 per tank (up to 6) pushing to a central server; the server health-polls each device's `GET /status`, and the dashboard scopes live/history/analytics to a selected tank with a tank-selector chip bar and farm overview grid
 - **Real-time sensor monitoring** - Temperature, water level, and ammonia (3 parameters via ESP32)
+- **Server-Sent Events (SSE) push** - Live readings stream to every open dashboard over `GET /sensor/stream` (no 1s polling); history refreshes every 30s and the fleet registry every 5s, both with exponential backoff on failure
 - **ESP32-based data collection** - Wireless sensor data transmission with WiFiManager captive portal
 - **Web dashboard** - Responsive React UI with icon-based navigation
 - **Database storage** - PostgreSQL for historical data
@@ -51,6 +52,8 @@ This can help reduce risks caused by poor water conditions and improve overall m
 - **PDF export** - Export system logs to PDF (LogsPage) and weekly reports to PDF (Historical Data)
 - **Analytics** - Period overviews, trends, daily breakdowns, and rule-based insights
 - **Activity logging** - Track user interactions including device connect/disconnect events
+- **Hardened ingestion** - Sensor-failure sentinels (temp -127/0, water/ammonia -1) are stored as NULL, per-device secrets are supported alongside the shared `DEVICE_SECRET`, ingestion is rate-limited (3/sec/device), and DB CHECK constraints keep bad rows out
+- **Security headers** - `helmet` CSP and standard hardening headers on all API responses; `ALLOWED_ORIGINS` is required in production
 - **WiFiManager** - ESP32 firmware uses captive portal for WiFi config (no hardcoded credentials)
 - **Touchscreen UI** - 480x320 TFT with XPT2046 resistive touch (HSPI); on-screen left/right page arrows and triple-tap gestures
 - **Non-blocking data send** - HTTP POST runs on a background FreeRTOS task, so a slow/unreachable backend never freezes the UI or touch input
@@ -96,6 +99,7 @@ Admins see all pages; regular users are restricted to the monitoring pages (Dash
 | PDF Export | jsPDF + autoTable | 4.2 + 5.0 |
 | HTTP Client | Axios | 1.15 |
 | Backend | Express.js | 5.2 |
+| Security headers | helmet | 8.0 |
 | Database | PostgreSQL | 15+ |
 | Connection Pool | pg | 8.20 |
 | Validation | Zod | 4.3 |
@@ -107,21 +111,22 @@ Admins see all pages; regular users are restricted to the monitoring pages (Dash
 
 ```
 Tanks (ESP32 x6) ──POST /sensor (1s)──► Express API ──► PostgreSQL
-       │                                   │
-       └──GET /status ◄─ device poller (5s)└── React Dashboard (fleet + selected tank)
-                                             │
-                                        SMS via HTTPSMS ←──── Alert System
+        │                                   │        │
+        └──GET /status ◄─ device poller (5s)│        └── SSE push ──► React Dashboard
+                                              │                        (fleet + selected tank)
+                                         SMS via HTTPSMS ←──── Alert System
 ```
 
 One ESP32 per tank at `192.168.4.100-105`, central server at `192.168.4.10`
 (LAN `192.168.4.0/24`). The poller only reads diagnostics — sensor rows come
-exclusively from the device push.
+exclusively from the device push. Every accepted reading is broadcast to all
+connected dashboards over SSE, so the UI updates instantly without polling.
 
 ### Data Flow
 1. **Sensors** read environmental data
-2. **ESP32** collects and sends data via HTTP POST
-3. **Express API** validates and stores in PostgreSQL
-4. **React Dashboard** polls for data every 1 second
+2. **ESP32** collects and sends data via HTTP POST (rate-limited to 3/sec/device; failed-sensor sentinels stored as NULL)
+3. **Express API** validates, stores in PostgreSQL, and pushes the reading to all SSE clients
+4. **React Dashboard** receives live readings over SSE; chart history refreshes every 30s and the fleet registry every 5s (both back off exponentially on failure)
 5. **Connection check** compares sensor data timestamp against current time
 6. **Alerts** triggered when values exceed thresholds or ESP32 disconnects
 7. **SMS** sent to active recipients through the HTTPSMS Android gateway (unless muted)
@@ -201,7 +206,7 @@ Dashboard opens at http://localhost:5173
 
 ### 6. Connect ESP32
 
-Flash the ESP32 with `water_monitoring_system/water_monitoring_system.ino`. On boot it first tries the saved network; if that fails it automatically opens the "Aquaculture-Setup" WiFi access point so you can configure credentials, backend server IP/port/device ID, device secret, tank height, and the device's static IP via the captive portal at http://192.168.4.1 (or serial command `W`, or triple-tap the top-left corner). The firmware's default backend address is `192.168.4.10:3000` (`SERVER_IP_DEFAULT` in `water_monitoring_system.ino`) — set it to your backend machine's LAN IP if it differs. If you set `DEVICE_SECRET` in `.env`, enter the same value on the device so the backend accepts its readings. The firmware now requires the **ESPAsyncWebServer** and **AsyncTCP** libraries (it serves read-only `GET /status` on port 80 for fleet health checks). Apply the multi-tank DB migration once (`node db/migrations/007_multi_device.cjs`) and give each device its own `device_id` (e.g. `tank01`).
+Flash each device with its matching sketch: `water_monitoring_system/ESP32_main_code/ESP32_main_code.ino` (tank 1, defaults to device ID `ESP32_01`) or `water_monitoring_system/NODE_main_code/NODE_main_code.ino` (spare / NodeMCU, defaults to device ID `ESP32_02`). On boot it first tries the saved network; if that fails it automatically opens the "Aquaculture-Setup" WiFi access point so you can configure credentials, backend server IP/port/device ID, device secret, tank height, and the device's static IP via the captive portal at http://192.168.4.1 (or serial command `W`, or triple-tap the top-left corner). The firmware's default backend address is `192.168.4.10:3000` (`SERVER_IP_DEFAULT` in the sketches) — set it to your backend machine's LAN IP if it differs. If you set `DEVICE_SECRET` in `.env`, enter the same value on the device so the backend accepts its readings. The firmware now requires the **ESPAsyncWebServer** and **AsyncTCP** libraries (it serves read-only `GET /status` on port 80 for fleet health checks). Apply the multi-tank DB migration once (`node db/migrations/007_multi_device.cjs`). Each sketch ships its own device ID default so the server always knows which tank is which — the ID shown in the config portal is what gets persisted to NVS and reported to the backend.
 
 ---
 
@@ -250,10 +255,12 @@ While muted, disconnect alerts still show as popups and are logged, but SMS is n
 ### Sensors & Reports
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/sensor` | POST | Submit sensor data (device secret required when `DEVICE_SECRET` is set) |
-| `/sensor/latest` | GET | Get latest reading (`recv_at` = live device heartbeat; optional `device_id` filter) |
-| `/sensor` | GET | Get history (`limit`: 1-1000; optional `device_id` filter, per-tank) |
+| `/sensor` | POST | Submit sensor data (shared `DEVICE_SECRET` or per-device `devices.device_secret`; 3/sec/device rate limit; failure sentinels stored as NULL) |
+| `/sensor/latest` | GET | Latest reading as `{ data, deviceExists }` — HTTP 200 even when no readings exist yet; `recv_at` = live device heartbeat; optional `device_id` filter |
+| `/sensor` | GET | Get history (`limit`: 1-1000; optional `device_id` filter, per-tank; `?before=<ISO timestamp>` keyset cursor for paging older data) |
+| `/sensor/stream` | GET | **SSE** live-reading stream (auth via `?token=` because EventSource cannot send headers; keep-alive pings every 25s) |
 | `/devices` | GET | Fleet registry + online flags (name, tank_name, tank_location, ip_address, last_health_seen) |
+| `/devices/latest` | GET | Freshest in-memory reading per active tank in one call (drives the Live Tank Bar; no DB hit) |
 | `/devices/:deviceId/status` | GET | Live on-demand poll of one ESP32's `GET /status` (3s timeout) |
 | `/report/weekly` | GET | Weekly report (summary, daily breakdown, alert counts) |
 | `/report/range` | GET | Aggregated report for `?hours=N` (hourly buckets when ≤24h, daily otherwise; admin) |
@@ -302,23 +309,29 @@ While muted, disconnect alerts still show as popups and are logged, but SMS is n
 ```
 src/
 ├── api/client.ts              # API client functions
-- Components/
-  │   ├── AnalyticsSection.tsx   # Analytics summary cards + insights
-  │   ├── TankSelector.tsx       # Tank chip bar (online dots, X/Y online)
-  │   ├── FleetGrid.tsx          # Fleet cards + on-demand "Live check"
-  │   ├── DeviceConnectionMonitor.tsx  # ESP32 connect/disconnect monitoring
-  │   ├── FixLegend.tsx          # Alert guidance legend
+├── components/
+│   ├── AnalyticsSection.tsx   # Analytics summary cards + insights
+│   ├── TankSelector.tsx       # Tank chip bar (online dots, X/Y online)
+│   ├── FarmOverview.tsx       # Dashboard fleet grid + on-demand "Live check"
+│   ├── deviceActions.tsx      # Per-tank rename / hide / live-check controls
+│   ├── DeviceConnectionMonitor.tsx  # ESP32 connect/disconnect monitoring
+│   ├── FixLegend.tsx          # Alert guidance legend
 │   ├── FloatingAlert.tsx      # Popup alerts with mute options
 │   ├── Header.tsx             # Top bar with user info + logout
 │   ├── Loading.tsx            # Loading/error cards
-│   ├── StatCard.tsx           # KPI stat card
+│   ├── StatCard.tsx           # Shared KPI stat card (single implementation)
 │   └── TrendCard.tsx          # Mini trend chart card
+├── config/
+│   ├── routes.ts              # Centralized route/menu definitions (role-aware)
+│   └── sensorDisplay.ts       # Centralized sensor display config (icon/color/status classes)
 ├── contexts/
 │   ├── AuthContext.tsx        # Auth provider + session state
 │   ├── SensorContext.tsx
-│   ├── SensorProvider.tsx     # Data polling + stale detection
+│   ├── SensorProvider.tsx     # SSE live data + history/devices polling with backoff
 │   └── useAuth.ts             # useAuth hook
 ├── hooks/
+│   ├── useDevicesLatest.ts    # Shared 5s poll of /devices/latest + thresholds
+│   ├── useSSE.ts              # Reusable SSE connection hook (token auth, reconnect)
 │   ├── useFloatingAlerts.ts
 │   ├── useSensors.ts
 │   └── useThresholdAlert.ts
@@ -338,30 +351,38 @@ src/
 ├── utils/time.ts
 ├── App.tsx                    # Routing, sidebar, role-based menus
 ├── main.tsx
-└── index.css
-server.cjs                     # Express backend (auth, sensors, logs, SMS, analytics)
+└── index.css                  # Tailwind v4 @theme design tokens (brand colors, elevation)
+server.cjs                     # Express backend (auth, sensors, SSE, logs, SMS, analytics)
+services/                      # smsService.cjs (circuit breaker), devicePoller.cjs (health checks)
 seed-admin.cjs                 # Bootstrap the initial owner/admin account
-water_monitoring_system/water_monitoring_system.ino        # ESP32 firmware (WiFiManager)
-db/migrations/                 # Structural SQL migrations (run manually)
+water_monitoring_system/ESP32_main_code/ESP32_main_code.ino  # ESP32 tank-1 firmware (WiFiManager), device ID ESP32_01
+water_monitoring_system/NODE_main_code/NODE_main_code.ino    # NodeMCU spare firmware (WiFiManager), device ID ESP32_02
+db/migrations/                 # Structural SQL migrations (run manually, tracked in schema_migrations)
 ```
+
+Migrations of note: `007_multi_device.cjs` (star topology), `008_device_secrets.cjs`
+(opt-in per-device secrets), `009_sensor_constraints.cjs` (NULLs stored
+sentinels, adds CHECK constraints + a partial index), and
+`010_schema_migrations.cjs` (version-tracking table seeded with 001-010).
 
 ---
 
 ## Connection & Offline Handling
 
 ### How Connection Status Works
-- Frontend polls `GET /sensor/latest` every 1 second **for the selected tank**; a separate poll every 5 seconds refreshes the fleet registry (`GET /devices`), and the backend rides on it to mark each device online/offline
+- Live readings for the selected tank arrive over **SSE** (`GET /sensor/stream`); the client reconnects automatically with exponential backoff (up to 10 attempts) and falls back to a REST `GET /sensor/latest` fetch on mount
 - `lastUpdate` uses the `recv_at` **heartbeat** (device receive time, refreshed even when delta logging skips a row)
-- If no heartbeat is received within 15 seconds → status = **offline**
-- After 5 consecutive failed API requests → status = **offline**
-- Device readings are per-tank; selecting a different tank re-scopes latest/history/analytics, while the fleet grid shows every device's online state
+- If no heartbeat is received within 30 seconds → status = **offline** (a health check also runs every 10s)
+- A separate poll every 5 seconds refreshes the fleet registry (`GET /devices`) and the per-tank live values (`GET /devices/latest`); chart history refreshes every 30 seconds. Both polls back off exponentially on repeated failures and pause while the tab is hidden
+- Device readings are per-tank; selecting a different tank re-scopes latest/history/analytics, while the farm grid shows every device's online state
 
 ### Change-Only (Delta) Logging
 - `POST /sensor` writes a new row only when a parameter differs from the last stored reading beyond its per-sensor tolerance (defaults: temp ±0.1°C, water level ±1.0%, ammonia ±0.05 ppm)
+- **Sensor-failure sentinels are stored as NULL**: temperature -127/0 (DS18B20 failure), water level -1 (HC-SR04 failure), and ammonia -1 (MQ-137 failure) are converted to NULL before the row is written, so failed sensors never pollute charts or trigger false alerts. Older sentinel rows were migrated to NULL by `db/migrations/009_sensor_constraints.cjs`, and CHECK constraints now keep them out
 - Unchanged readings refresh `devices.last_seen` as a heartbeat and respond `200 { skipped: true }` with no new row
 - Keeps the `sensors` table small; alerts, SMS, and online/offline detection (frontend + analytics) stay accurate via the heartbeat
 - Tune with `DELTA_LOGGING_ENABLED`, `TEMP_DELTA_TOLERANCE`, `WATER_LEVEL_DELTA_TOLERANCE`, `AMMONIA_DELTA_TOLERANCE` in `.env`
-- On restart the last stored reading per device is re-seeded from PostgreSQL, so unchanged POSTs after boot are still skipped
+- On restart the last stored reading per device is re-seeded from PostgreSQL (NULLs preserved), so unchanged POSTs after boot are still skipped
 
 ### When ESP32 Disconnects
 1. Sensor data becomes stale (older than 15s)
@@ -410,6 +431,24 @@ a capstone demo can fail a component and show automatic recovery.
 - Why: gateway/API outages are the norm in SMS integrations; hammering makes them
   worse and burns daily-text caps.
 
+### 3. Backend Resilience (server.cjs)
+- **DB retry with backoff**: at startup the server waits for PostgreSQL with
+  exponential backoff (5 attempts, 2s → 4s → 8s → …) so a slow-starting database
+  no longer kills the boot sequence. Idle-client pool errors are logged, not fatal.
+- **Connection pool sizing**: `max: 20` clients, 30s idle timeout, 5s acquire
+  timeout — sized for concurrent dashboards plus ingestion bursts.
+- **Graceful shutdown**: `SIGINT`/`SIGTERM`/`SIGUSR2` (Ctrl+C, containers/PM2,
+  nodemon) close SSE clients, drain HTTP connections, and end the pool before
+  exiting, with a 10s force-exit safety net.
+- **Centralized error handling**: unknown paths return JSON 404s; a final
+  error middleware logs every unhandled failure and never leaks internal error
+  messages to production clients.
+- **Security hardening**: `helmet` CSP/security headers; CORS allowlist required
+  in production (`ALLOWED_ORIGINS`); login limited to 5 attempts/15 min/IP;
+  sensor ingestion limited to 3/sec/device with per-device or shared secrets.
+- Why: a farm dashboard must survive DB restarts and deploys without losing
+  readings, and must not expose internals when things do go wrong.
+
 ### How to observe handling during a demo
 - **Watchdog**: brick `loop()` with `while(1);` → serial prints `[WDT] Task watchdog
   armed`, chip reboots ~30s later → `[WDT] Boot after watchdog reset → Safe Mode`,
@@ -427,10 +466,14 @@ a capstone demo can fail a component and show automatic recovery.
 
 | Issue | Solution |
 |-------|----------|
-| Backend won't start | Check PostgreSQL connection |
+| Backend won't start | Check PostgreSQL connection (server retries 5x with backoff, then exits with the error) |
 | No data showing | Verify ESP32 is connected to same WiFi network |
-| CORS error | Add frontend port to ALLOWED_ORIGINS |
+| CORS error | Add frontend port to ALLOWED_ORIGINS (required in production) |
 | "Device offline" | Check ESP32 WiFi connection (use WiFiManager portal) |
+| Live values stop updating | SSE connection dropped — the client auto-reconnects with backoff; check the server is reachable and the session token is still valid |
+| "Too many login attempts" | Login rate limit (5/15 min/IP) — wait or restart the server in dev |
+| Sensor POST returns 401 | `DEVICE_SECRET` mismatch — send it in the `X-Device-Secret` header, or set `devices.device_secret` for the device |
+| Sensor POST returns 400 | Reading rejected by validation (bad range or ammonia spike guard) — sentinels are fine, out-of-bounds values are not |
 | SMS not sending | Verify HTTPSMS_API_KEY / HTTPSMS_FROM in .env; see docs/HTTPSMS_SETUP.txt |
 | Can't log in | First-time setup requires `npm run seed:admin` (ADMIN_INITIAL_PASSWORD) |
 | AudioContext warning | Click anywhere on the page to unlock audio |
@@ -438,9 +481,21 @@ a capstone demo can fail a component and show automatic recovery.
 ### Debug Commands
 ```bash
 curl http://localhost:3000/health
-curl http://localhost:3000/sensor/latest
-curl -X POST http://localhost:3000/sensor -H "Content-Type: application/json" -d '{"device_id":"TEST","temperature":25,"water_level":75,"ammonia":4.5}'
-curl -X POST http://localhost:3000/alert/mute -H "Content-Type: application/json" -d '{"hours": 4}'
+
+# Authenticated endpoints need the session token from POST /auth/login:
+TOKEN="paste-token-here"
+curl -H "Authorization: Bearer $TOKEN" http://localhost:3000/sensor/latest
+# → { "data": { ...readings... }, "deviceExists": true }   (200 even with no data yet)
+
+# Ingest a test reading (add -H "X-Device-Secret: $DEVICE_SECRET" when set):
+curl -X POST http://localhost:3000/sensor -H "Content-Type: application/json" \
+  -d '{"device_id":"TEST","temperature":25,"water_level":75,"ammonia":0.4}'
+
+# Watch the live SSE stream:
+curl -N "http://localhost:3000/sensor/stream?token=$TOKEN"
+
+curl -X POST http://localhost:3000/alert/mute -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" -d '{"hours": 4}'
 ```
 
 ---
@@ -463,4 +518,4 @@ ISC
 
 ## Support
 
-For detailed documentation see docs/HOW_IT_WORKS.txt. For the database schema see docs/DATABASE_SCHEMA.txt. For SMS configuration see docs/HTTPSMS_SETUP.txt. For the free/$0 production deployment guide see docs/DEPLOYMENT.txt.
+For detailed documentation see docs/HOW_IT_WORKS.txt. For the database schema see docs/DATABASE_SCHEMA.txt. For SMS configuration see docs/HTTPSMS_SETUP.txt.

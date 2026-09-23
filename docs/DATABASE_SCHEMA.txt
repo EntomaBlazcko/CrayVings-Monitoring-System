@@ -96,14 +96,26 @@ the device's static IP (used to poll GET /status) and last health check.
                                                           by the device poller
                                                           to reach GET /status
   tank_name        VARCHAR(100)                           Friendly tank label
-                                                          (e.g. "Tank 3 -
-                                                          Bayside")
+                                                           (e.g. "Tank 3 -
+                                                           Bayside")
   tank_location    VARCHAR(100)                           Physical location / zone
+  device_secret    VARCHAR(255)                           Optional per-device
+                                                           ingestion secret
+                                                           (migration 008). When
+                                                           set, POST /sensor
+                                                           accepts this value in
+                                                           X-Device-Secret for
+                                                           this device; otherwise
+                                                           the shared
+                                                           DEVICE_SECRET applies.
+                                                           Deliberately opt-in —
+                                                           no secrets are
+                                                           auto-generated.
   last_health_seen TIMESTAMPTZ                            Last successful GET
-                                                          /status poll (health
-                                                          only; sensors rows are
-                                                          not written by the
-                                                          poller)
+                                                           /status poll (health
+                                                           only; sensors rows are
+                                                           not written by the
+                                                           poller)
 
 Devices are auto-registered server-side on first sensor ingest
 (INSERT INTO devices ... ON CONFLICT ... UPDATE) so the sensors.device_id
@@ -114,26 +126,51 @@ metadata and should be set once (admin-side), not overwritten by ingests.
 TABLE: sensors
 ================================================================================
 
-Time-series log of ESP32 sensor readings. One row per reading.
+Time-series log of ESP32 sensor readings. One row per reading (delta logging:
+unchanged heartbeats write no row).
 
   Column       Type          Constraints                         Notes
   ------------  -------------  --------------------------------  --------------------
   id           SERIAL        PRIMARY KEY
   device_id    VARCHAR(50)   NOT NULL, FK -> devices.device_id   ESP32 device identifier
-  temperature  DECIMAL(5,2)  DEFAULT 0                           Degrees Celsius
-  water_level  DECIMAL(5,2)  DEFAULT 0                           Percent (%), or -1
-                                                                sentinel when the
-                                                                HC-SR04 read failed
-  ammonia      DECIMAL(5,3)  DEFAULT 0                           ppm (MQ-137 sensor)
+  temperature  DECIMAL(5,2)  DEFAULT 0, NULLABLE                Degrees Celsius.
+                                                                 NULL when the DS18B20
+                                                                 failed (firmware
+                                                                 reports -127 / 0).
+  water_level  DECIMAL(5,2)  DEFAULT 0, NULLABLE                 Percent (%).
+                                                                 NULL when the HC-SR04
+                                                                 failed (firmware
+                                                                 reports -1).
+  ammonia      DECIMAL(5,3)  DEFAULT 0, NULLABLE                 ppm (MQ-137 sensor).
+                                                                 NULL when the MQ-137
+                                                                 failed (firmware
+                                                                 reports -1).
   timestamp    TIMESTAMPTZ   DEFAULT CURRENT_TIMESTAMP           Reading time
-                                                                (migration 007)
+                                                                 (migration 007)
+
+  Since migration 009 the server converts firmware failure sentinels
+  (temperature -127/0, water_level -1, ammonia -1) to NULL before the row is
+  written; existing sentinel rows were migrated to NULL. CHECK constraints
+  enforce this at the database level.
+
+Check constraints (migration 009):
+  chk_sensors_temperature_valid  temperature IS NULL OR (temperature > -100
+                                 AND temperature <= 100)
+  chk_sensors_water_level_valid  water_level IS NULL OR (water_level >= 0
+                                 AND water_level <= 200)
+  chk_sensors_ammonia_valid      ammonia IS NULL OR (ammonia >= 0
+                                 AND ammonia <= 1000)
 
 Indexes:
   idx_sensors_timestamp      (timestamp DESC)
   idx_sensors_device_id      (device_id)
   idx_sensors_device_timestamp (device_id, timestamp DESC)       per-tank history /
-                                                                trend queries
-                                                                (migration 007)
+                                                                 trend queries
+                                                                 (migration 007)
+  idx_sensors_valid_readings (device_id, timestamp DESC)        PARTIAL: rows with
+                                 WHERE temperature IS NOT NULL   at least one valid
+                                    OR water_level IS NOT NULL  reading (migration
+                                    OR ammonia IS NOT NULL      009)
 
 ================================================================================
 TABLE: sensor_settings
@@ -367,6 +404,22 @@ nails down delivered_at / failure_reason so every SMS reaches a terminal state.
 Indexes:
   idx_sms_logs_sent_at (sent_at DESC)
   idx_sms_logs_status  (status)
+
+================================================================================
+TABLE: schema_migrations
+================================================================================
+
+Version tracking for the db/migrations/*.cjs scripts (migration 010). Seeded
+with the history of migrations 001-010 so operators can see which structural
+changes have been applied.
+
+  Column       Type           Constraints    Notes
+  ------------  -------------  -------------  --------------------------
+  version      VARCHAR(50)    PRIMARY KEY    Migration number (e.g. "009")
+  name         VARCHAR(255)   NOT NULL       Migration slug
+  applied_at   TIMESTAMPTZ    NOT NULL       When it was applied
+                                             (DEFAULT NOW())
+  checksum     VARCHAR(64)                   Reserved for future use
 
 ================================================================================
 FOREIGN KEY RELATIONSHIPS (enforced)

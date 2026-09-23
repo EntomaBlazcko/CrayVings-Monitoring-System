@@ -32,14 +32,46 @@ const PORT = process.env.PORT || 3000;
 // ========================
 // POSTGRESQL CONNECTION POOL
 // ========================
-// Pool config read from environment variables (.env)
+// Pool config read from environment variables (.env). Sized for the dashboard
+// (concurrent browsers polling history/devices) plus ingestion bursts.
 const pool = new Pool({
   host: process.env.PG_HOST,
   port: parseInt(process.env.PG_PORT),
   database: process.env.PG_DATABASE,
   user: process.env.PG_USER,
   password: process.env.PG_PASSWORD,
+  max: 20,                      // max clients in the pool
+  idleTimeoutMillis: 30000,     // free idle clients after 30s
+  connectionTimeoutMillis: 5000 // fail fast if a client cannot be acquired
 });
+
+// Idle-client errors (network blips, DB restarts) must not crash the process.
+pool.on("error", (err) => {
+  console.error(`[${new Date().toISOString()}] Unexpected PostgreSQL pool error:`, err.message);
+});
+
+// Verify the database is reachable, retrying with exponential backoff so a
+// slow-starting DB (container restart, network blip) does not kill the server.
+async function waitForDatabase(attempts = 5, baseDelayMs = 2000) {
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      await pool.query("SELECT NOW()");
+      return;
+    } catch (err) {
+      if (attempt === attempts) throw err;
+      const delay = baseDelayMs * Math.pow(2, attempt - 1);
+      console.warn(`[${new Date().toISOString()}] DB connection attempt ${attempt}/${attempts} failed (${err.message}); retrying in ${delay}ms...`);
+      await new Promise((resolve) => setTimeout(resolve, delay));
+    }
+  }
+}
+
+// Production guard: the CORS allowlist must be explicit in production so the
+// API is never accidentally exposed cross-origin.
+if (process.env.NODE_ENV === "production" && !process.env.ALLOWED_ORIGINS) {
+  console.error("ALLOWED_ORIGINS must be set in production (comma-separated frontend origins)");
+  process.exit(1);
+}
 
 // CORS restricted to ALLOWED_ORIGINS allowlist; requests without an
 // Origin header (ESP32, curl) are allowed.
@@ -62,6 +94,27 @@ app.use(
 // 10kb body limit prevents oversized-payload memory abuse (ESP32 payloads are tiny)
 app.use(express.json({ limit: "10kb" }));
 
+// Security headers (audit 2.5.5). CSP allows the dashboard's own origin plus
+// every CORS-allowed frontend origin for XHR/SSE connections.
+const helmet = require("helmet");
+app.use(
+  helmet({
+    contentSecurityPolicy: {
+      useDefaults: true,
+      directives: {
+        defaultSrc: ["'self'"],
+        scriptSrc: ["'self'", "'unsafe-inline'"],
+        styleSrc: ["'self'", "'unsafe-inline'"],
+        imgSrc: ["'self'", "data:", "https:"],
+        connectSrc: ["'self'", ...allowedOrigins],
+        objectSrc: ["'none'"],
+        frameAncestors: ["'none'"],
+      },
+    },
+    crossOriginEmbedderPolicy: false,
+  })
+);
+
 // =============================================================================
 // RATE LIMITING
 // =============================================================================
@@ -77,11 +130,26 @@ const globalLimiter = rateLimit({
 });
 
 const loginLimiter = rateLimit({
-  windowMs: 10 * 60 * 1000,   // 10 minutes
-  limit: 25,                  // 25 login attempts / 10 min / IP (was 10, too strict)
+  windowMs: 15 * 60 * 1000,   // 15 minutes
+  limit: 5,                   // 5 login attempts / 15 min / IP (brute-force guard)
   standardHeaders: "draft-7",
   legacyHeaders: false,
   message: { message: "Too many login attempts. Please try again later." },
+  validate: { xForwardedForHeader: false },
+});
+
+// Per-device limiter for sensor ingestion (audit 2.2.5/2.5.2): the ESP32 sends
+// at most 1 reading/second, so 3/second tolerates retries without allowing a
+// flood of duplicate rows from a misbehaving device. Keyed by device_id; posts
+// without a device_id share one bucket and fail validation anyway.
+const sensorIngestLimiter = rateLimit({
+  windowMs: 1000,
+  limit: 3,
+  standardHeaders: "draft-7",
+  legacyHeaders: false,
+  keyGenerator: (req) =>
+    req.body && typeof req.body.device_id === "string" ? `device:${req.body.device_id}` : "device:unknown",
+  message: { message: "Device ingestion rate limit exceeded" },
   validate: { xForwardedForHeader: false },
 });
 
@@ -179,7 +247,11 @@ app._deleteUserHard = async (userId, actorUsername) => {
   return reqResult.rows[0];
 };
 function requireAuth(req, res, next) {
-  const token = req.headers.authorization?.replace("Bearer ", "");
+  // Token normally arrives as "Authorization: Bearer <token>". EventSource (SSE)
+  // cannot set custom headers, so a `?token=` query parameter is also accepted.
+  const headerToken = req.headers.authorization?.replace("Bearer ", "");
+  const queryToken = typeof req.query?.token === "string" ? req.query.token : null;
+  const token = headerToken || queryToken;
   if (!token) return res.status(401).json({ message: "Authentication required" });
 
   pool.query("SELECT * FROM users WHERE token = $1 AND status = 'active'", [token])
@@ -422,15 +494,29 @@ async function updateOnlyIfChanged(client, { table, keyColumn, keyValue, current
 // ESP32 marks failed sensors with -1 (and 0 for temperature), so lower bounds
 // must accept those sentinel values.
 
-// POST /sensor (ESP32 ingestion); failed-sensor sentinels are filtered out later
+// POST /sensor (ESP32 ingestion). Sensor-failure sentinels (temperature -127 /
+// 0, water_level -1, ammonia -1) are accepted at the schema level so the device
+// heartbeat keeps flowing, then converted to NULL before the DB write so
+// sentinel values never pollute the time-series data (audit 2.2.2).
 const sensorSchema = z.object({
   device_id: z.string().min(1).max(50),
-  temperature: z.coerce.number().min(-10).max(50),
+  // -127.0 is the DS18B20 disconnect sentinel; physical range is -10..50.
+  temperature: z.coerce.number().min(-127).max(50),
+  // -1 is the HC-SR04 / MQ-137 failed-sensor sentinel.
   water_level: z.coerce.number().min(-1).max(100),
-  // ammonia is now a real NH3 gas reading in ppm (MQ-137). Upper bound covers
+  // ammonia is a real NH3 gas reading in ppm (MQ-137). Upper bound covers
   // the full datasheet range (5-500 ppm); -1 is the failed-sensor sentinel.
   ammonia: z.coerce.number().min(-1).max(500).optional(),
 });
+
+// Converts a raw sensor value to null when it is a failed-sensor sentinel.
+const TEMP_SENTINEL = -100; // anything at/below this (e.g. -127) = sensor failed
+function readingOrNull(key, raw) {
+  const value = Number(raw);
+  if (!Number.isFinite(value)) return null;
+  if (key === "temperature") return value > TEMP_SENTINEL && value !== 0 ? value : null;
+  return value >= 0 ? value : null;
+}
 
 // POST /settings (threshold configuration); partial updates, each pair validated min < max
 const settingsFieldSchema = z.object({
@@ -1037,18 +1123,51 @@ function scheduleAlertProcessing(device_id, ts, temperature, water_level, ammoni
   });
 }
 
+// =============================================================================
+// REAL-TIME PUSH (SSE) + IN-MEMORY LATEST READINGS
+// =============================================================================
+// Every accepted reading is pushed to all connected dashboards over
+// Server-Sent Events, removing the need for 1s client polling. The same
+// in-memory map backs GET /devices/latest (freshest reading per active tank).
+
+const sseClients = new Set(); // open EventSource responses
+const latestDeviceReadings = new Map(); // device_id -> { ...readings, recv_at }
+
+function broadcastSensorUpdate(deviceId, readings, ts) {
+  if (sseClients.size === 0) return;
+  const payload = `data: ${JSON.stringify({ type: "sensor_update", data: { device_id: deviceId, ...readings, timestamp: ts.toISOString(), recv_at: ts.toISOString() } })}\n\n`;
+  for (const client of sseClients) {
+    try {
+      client.write(payload);
+    } catch {
+      sseClients.delete(client); // dead connection
+    }
+  }
+}
+
 // POST /sensor - ESP32 ingestion; stores reading and evaluates thresholds
-app.post("/sensor", async (req, res) => {
+app.post("/sensor", sensorIngestLimiter, async (req, res) => {
   try {
-    // Device auth: if DEVICE_SECRET is set, require a matching X-Device-Secret header
-    if (DEVICE_SECRET) {
-      const presented = req.headers["x-device-secret"];
-      if (!presented || presented !== DEVICE_SECRET) {
+    // Device auth: prefer the per-device secret from the devices registry, fall
+    // back to the shared DEVICE_SECRET so existing firmware keeps working.
+    const presented = req.headers["x-device-secret"];
+    if (DEVICE_SECRET || process.env.NODE_ENV === "production") {
+      if (!presented) {
+        return res.status(401).json({ message: "Device secret required" });
+      }
+      let authorized = presented === DEVICE_SECRET;
+      if (!authorized) {
+        const perDevice = await pool.query(
+          "SELECT device_secret FROM devices WHERE device_id = $1 AND is_active = true",
+          [req.body?.device_id ?? ""]
+        );
+        if (perDevice.rows.length > 0 && perDevice.rows[0].device_secret && presented === perDevice.rows[0].device_secret) {
+          authorized = true;
+        }
+      }
+      if (!authorized) {
         return res.status(401).json({ message: "Invalid device secret" });
       }
-    } else if (process.env.NODE_ENV === "production") {
-      // Fail closed: never accept unauthenticated sensor ingestion in production
-      return res.status(503).json({ message: "Sensor ingestion is disabled: DEVICE_SECRET not configured" });
     } else if (!deviceSecretWarned) {
       deviceSecretWarned = true;
       console.warn(`[${new Date().toISOString()}] DEVICE_SECRET not set - sensor ingestion is unauthenticated. Set DEVICE_SECRET in production.`);
@@ -1060,10 +1179,18 @@ app.post("/sensor", async (req, res) => {
     const { device_id, temperature, water_level, ammonia } = parsed.data;
     if (!device_id) return res.status(400).json({ message: "device_id is required" });
 
+    // Sensor-failure sentinels become NULL so failed sensors never pollute the
+    // time-series data (audit 2.2.2); the heartbeat itself still flows.
+    const readings = {
+      temperature: readingOrNull("temperature", temperature),
+      water_level: readingOrNull("water_level", water_level),
+      ammonia: readingOrNull("ammonia", ammonia),
+    };
+
     // Ammonia spike guard: reject readings jumping too far from the last stored
     // value (USB-disconnect electrical noise causes wild spikes)
-    const ammoniaVal = Number(ammonia ?? 0);
-    if (ammoniaVal > 0 && lastAmmoniaReading[device_id] != null) {
+    const ammoniaVal = readings.ammonia;
+    if (ammoniaVal != null && lastAmmoniaReading[device_id] != null) {
       const jump = Math.abs(ammoniaVal - lastAmmoniaReading[device_id]);
       if (jump > AMMONIA_SPIKE_THRESHOLD) {
         console.warn(`[${new Date().toISOString()}] Ammonia spike rejected from ${device_id}: ${ammoniaVal} ppm (last: ${lastAmmoniaReading[device_id]} ppm, jump: ${jump.toFixed(1)} ppm)`);
@@ -1082,28 +1209,28 @@ app.post("/sensor", async (req, res) => {
     if (disconnectedDevices.delete(device_id)) {
       deviceOnlineSince.set(device_id, Date.now());
     }
-    const readings = {
-      temperature: Number(temperature ?? 0),
-      water_level: Number(water_level ?? 0),
-      ammonia: Number(ammonia ?? 0),
-    };
     const baseline = lastSensorReading[device_id];
     const paramChanged = (key) => {
       if (!baseline || baseline[key] == null) return true;
       const newVal = readings[key];
       const lastVal = baseline[key];
-      const isValid = (val) => (key === "temperature" ? val > 0 : val >= 0);
+      const isValid = (val) => val != null;
       if (isValid(newVal) !== isValid(lastVal)) return true;
       if (!isValid(newVal)) return false;
       return Math.abs(newVal - lastVal) > DELTA_TOLERANCES[key];
     };
     const hasDelta = ["temperature", "water_level", "ammonia"].some(paramChanged);
 
+    // Publish the freshest reading to the in-memory map (drives /devices/latest
+    // and the SSE push) regardless of whether a row gets written.
+    latestDeviceReadings.set(device_id, { ...readings, recv_at: ts.toISOString() });
+
     // Delta mode: an unchanged reading is still a heartbeat (devices.last_seen
     // already updated above) but writes no new sensors row.
     if (DELTA_LOGGING_ENABLED && !hasDelta) {
       console.log(`[${new Date().toISOString()}] Sensor heartbeat from ${device_id} (unchanged - no row written)`);
       res.status(200).json({ message: "No change, skipped", skipped: true, data: { device_id, ...readings, timestamp: ts.toISOString() } });
+      broadcastSensorUpdate(device_id, readings, ts);
       scheduleAlertProcessing(device_id, ts, temperature, water_level, ammonia);
       return;
     }
@@ -1114,7 +1241,7 @@ app.post("/sensor", async (req, res) => {
     );
     console.log(`[${new Date().toISOString()}] Sensor data saved from ${device_id}`);
 
-    if (ammoniaVal > 0) {
+    if (ammoniaVal != null) {
       lastAmmoniaReading[device_id] = ammoniaVal;
     }
     lastSensorReading[device_id] = readings;
@@ -1123,30 +1250,36 @@ app.post("/sensor", async (req, res) => {
     // renders it in the farm timezone without silent timezone conversion.
     res.status(201).json({ message: "Saved", data: { ...result.rows[0], timestamp: ts.toISOString() } });
 
+    broadcastSensorUpdate(device_id, readings, ts);
     scheduleAlertProcessing(device_id, ts, temperature, water_level, ammonia);
   } catch (err) {
     console.error(`[${new Date().toISOString()}] Error saving sensor:`, err.message);
-    res.status(500).json({ message: "Error saving data", error: err.message });
+    res.status(500).json({ message: "Error saving data", error: process.env.NODE_ENV === "production" ? undefined : err.message });
   }
 });
 
 // GET /sensor - sensor history, newest first; ?limit (default 300, max 1000),
-// optional ?device_id to scope to one tank, optional ?from & ?to (ISO dates)
+// optional ?device_id to scope to one tank, optional ?from & ?to (ISO dates),
+// optional ?before (ISO timestamp cursor: return rows strictly older than it —
+// keyset pagination for efficient deep history paging, audit 2.3.3)
 app.get("/sensor", requireAuth, async (req, res) => {
   try {
     const limit = Math.min(1000, Math.max(1, parseInt(req.query.limit) || 300));
     const deviceId = req.query.device_id ? String(req.query.device_id) : null;
     const from = req.query.from ? new Date(String(req.query.from)) : null;
     const to = req.query.to ? new Date(String(req.query.to)) : null;
+    const before = req.query.before ? new Date(String(req.query.before)) : null;
     const result = await pool.query(
       `SELECT * FROM sensors
         WHERE ($1::text IS NULL OR device_id = $1)
           AND ($2::timestamptz IS NULL OR timestamp >= $2)
           AND ($3::timestamptz IS NULL OR timestamp <= $3)
+          AND ($4::timestamptz IS NULL OR timestamp < $4)
         ORDER BY timestamp DESC
-        LIMIT $4`,
+        LIMIT $5`,
       [deviceId, from && !isNaN(from.getTime()) ? from : null,
-       to && !isNaN(to.getTime()) ? to : null, limit]
+       to && !isNaN(to.getTime()) ? to : null,
+       before && !isNaN(before.getTime()) ? before : null, limit]
     );
     res.json(result.rows);
   } catch (err) {
@@ -1168,12 +1301,69 @@ app.get("/sensor/latest", requireAuth, async (req, res) => {
        LIMIT 1`,
       [deviceId]
     );
-    if (result.rows.length === 0) return res.status(404).json({ message: "No sensor data found" });
-    res.json(result.rows[0]);
+    // 200 + { data, deviceExists } (audit 2.1.2): "no readings yet" is a normal
+    // state, not an error, and 404 was ambiguous with "device not found".
+    if (result.rows.length === 0) {
+      let deviceExists = false;
+      if (deviceId) {
+        const deviceCheck = await pool.query("SELECT 1 FROM devices WHERE device_id = $1", [deviceId]);
+        deviceExists = deviceCheck.rows.length > 0;
+      }
+      return res.json({ data: null, deviceExists });
+    }
+    const row = result.rows[0];
+    const toNumber = (v) => (v === null || v === undefined || v === "" ? null : Number(v));
+    res.json({
+      data: {
+        device_id: row.device_id,
+        recv_at: row.recv_at ? row.recv_at.toISOString() : null,
+        temperature: toNumber(row.temperature),
+        water_level: toNumber(row.water_level),
+        ammonia: toNumber(row.ammonia),
+        timestamp: row.timestamp ? row.timestamp.toISOString() : null,
+      },
+      deviceExists: true,
+    });
   } catch (err) {
     console.error(`[${new Date().toISOString()}] Error fetching latest:`, err.message);
-    res.status(500).json({ message: "Error", error: err.message });
+    res.status(500).json({ message: "Error", error: process.env.NODE_ENV === "production" ? undefined : err.message });
   }
+});
+
+// =============================================================================
+// REAL-TIME STREAM (SSE)
+// =============================================================================
+// GET /sensor/stream - Server-Sent Events feed of live readings. Auth uses the
+// session token as a ?token= query parameter because EventSource cannot set
+// Authorization headers. Broadcasts happen on every accepted POST /sensor.
+app.get("/sensor/stream", requireAuth, (req, res) => {
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+  res.flushHeaders();
+
+  // Send the current freshest reading immediately so a newly opened dashboard
+  // has data before the next ESP32 POST arrives.
+  if (latestDeviceReadings.size > 0) {
+    for (const [deviceId, readings] of latestDeviceReadings) {
+      res.write(`data: ${JSON.stringify({ type: "sensor_update", data: { device_id: deviceId, ...readings, timestamp: readings.recv_at } })}\n\n`);
+    }
+  }
+  res.write(`data: ${JSON.stringify({ type: "connected", timestamp: new Date().toISOString() })}\n\n`);
+
+  sseClients.add(res);
+  const keepAlive = setInterval(() => {
+    try {
+      res.write(": keep-alive\n\n");
+    } catch {
+      clearInterval(keepAlive);
+    }
+  }, 25000); // comment ping prevents proxy idle timeouts
+
+  req.on("close", () => {
+    clearInterval(keepAlive);
+    sseClients.delete(res);
+  });
 });
 
 // ========================
@@ -1197,6 +1387,25 @@ app.get("/devices", requireAuth, async (req, res) => {
   } catch (err) {
     console.error(`[${new Date().toISOString()}] Error fetching devices:`, err.message);
     res.status(500).json({ message: "Error fetching devices", error: err.message });
+  }
+});
+
+// GET /devices/latest - freshest in-memory reading per active tank, in one
+// lightweight call (in-memory read, no DB). Drives the Live Tank Bar.
+app.get("/devices/latest", requireAuth, async (req, res) => {
+  try {
+    const result = await pool.query("SELECT device_id FROM devices WHERE is_active = true");
+    const rows = [];
+    for (const device of result.rows) {
+      const latest = latestDeviceReadings.get(device.device_id);
+      if (latest) {
+        rows.push({ device_id: device.device_id, ...latest });
+      }
+    }
+    res.json(rows);
+  } catch (err) {
+    console.error(`[${new Date().toISOString()}] Error fetching latest device readings:`, err.message);
+    res.status(500).json({ message: "Error fetching latest readings", error: err.message });
   }
 });
 
@@ -2918,6 +3127,26 @@ app.get("/analytics/insights", requireAuth, async (req, res) => {
 });
 
 // =============================================================================
+// FALLBACK ROUTE + CENTRALIZED ERROR HANDLER
+// =============================================================================
+// JSON 404 for unknown paths (Express's default is an HTML error page), and a
+// final error middleware that logs the failure and never leaks stack traces or
+// internal messages to production clients (audit 2.4.1).
+
+app.use((req, res) => {
+  res.status(404).json({ message: "Route not found" });
+});
+
+// eslint-disable-next-line no-unused-vars
+app.use((err, req, res, next) => {
+  console.error(`[${new Date().toISOString()}] Unhandled route error (${req.method} ${req.originalUrl}):`, err.message);
+  res.status(err.statusCode || 500).json({
+    message: err.statusCode ? err.message : "Internal server error",
+    ...(process.env.NODE_ENV !== "production" && { error: err.message }),
+  });
+});
+
+// =============================================================================
 // SERVER STARTUP
 // =============================================================================
 // Connects to PostgreSQL, ensures an admin account, restores alert state from
@@ -2926,6 +3155,9 @@ app.get("/analytics/insights", requireAuth, async (req, res) => {
 // Runs initialization and starts the HTTP listener
 async function startServer() {
   try {
+    // Wait for the database with retry/backoff before doing anything else so a
+    // slow-starting DB does not kill the server on the first attempt.
+    await waitForDatabase();
     const client = await pool.connect();
     try {
       console.log(`[${new Date().toISOString()}] PostgreSQL connected`);
@@ -2974,19 +3206,39 @@ async function startServer() {
       }
       console.log(`[${new Date().toISOString()}] Loaded ammonia baseline for ${lastAmmoniaResult.rows.length} device(s) from DB`);
 
-      // Seed change-only logging baseline with the latest stored reading per device
+      // Seed change-only logging baseline with the latest stored reading per device.
+      // NULL columns (sensor failures) stay null so the delta comparison treats
+      // them as invalid readings rather than coercing them to 0.
       const lastSensorResult = await client.query(
         "SELECT DISTINCT ON (device_id) device_id, temperature, water_level, ammonia FROM sensors ORDER BY device_id, timestamp DESC"
       );
       lastSensorReading = {};
       for (const row of lastSensorResult.rows) {
         lastSensorReading[row.device_id] = {
-          temperature: Number(row.temperature),
-          water_level: Number(row.water_level),
-          ammonia: Number(row.ammonia),
+          temperature: row.temperature == null ? null : Number(row.temperature),
+          water_level: row.water_level == null ? null : Number(row.water_level),
+          ammonia: row.ammonia == null ? null : Number(row.ammonia),
         };
       }
       console.log(`[${new Date().toISOString()}] Loaded delta-logging baseline for ${lastSensorResult.rows.length} device(s) from DB`);
+
+      // Seed the in-memory latest readings (backing /devices/latest + SSE)
+      // with the most recent row per device so a dashboard opened right after
+      // a server restart still sees data before the next ESP32 POST.
+      const latestSeed = await client.query(
+        `SELECT DISTINCT ON (s.device_id) s.device_id, s.temperature, s.water_level, s.ammonia, d.last_seen
+           FROM sensors s JOIN devices d ON d.device_id = s.device_id
+          ORDER BY s.device_id, s.timestamp DESC`
+      );
+      for (const row of latestSeed.rows) {
+        latestDeviceReadings.set(row.device_id, {
+          temperature: row.temperature == null ? null : Number(row.temperature),
+          water_level: row.water_level == null ? null : Number(row.water_level),
+          ammonia: row.ammonia == null ? null : Number(row.ammonia),
+          recv_at: (row.last_seen ?? row.timestamp)?.toISOString?.() ?? null,
+        });
+      }
+      console.log(`[${new Date().toISOString()}] Seeded latest readings for ${latestSeed.rows.length} device(s)`);
 
       // SMS alerts: report config state and start the scheduled producers.
       if (HTTPSMS_API_KEY && HTTPSMS_FROM) {
@@ -3021,12 +3273,40 @@ async function startServer() {
     }
 
     // Listen for HTTP requests on all network interfaces
-    app.listen(PORT, "::", () => {
+    const server = app.listen(PORT, "::", () => {
       console.log(`[${new Date().toISOString()}] Server running on port ${PORT} (dual-stack)`);
     });
 
     // Star topology: poll the registered ESP32 /status endpoints for health.
     startDevicePoller(pool);
+
+    // Graceful shutdown (audit 2.8.3): drain connections, close SSE clients,
+    // end the DB pool, then exit. Covers Ctrl+C (SIGINT), containers/PM2
+    // (SIGTERM) and nodemon restarts (SIGUSR2).
+    let shuttingDown = false;
+    const shutdown = (signal) => {
+      if (shuttingDown) return;
+      shuttingDown = true;
+      console.log(`\n[${new Date().toISOString()}] ${signal} received — shutting down gracefully...`);
+      for (const client of sseClients) {
+        try { client.end(); } catch { /* already closed */ }
+      }
+      sseClients.clear();
+      server.close(async () => {
+        try {
+          await pool.end();
+          console.log(`[${new Date().toISOString()}] Shutdown complete`);
+        } catch (err) {
+          console.error(`[${new Date().toISOString()}] Error closing pool:`, err.message);
+        }
+        process.exit(0);
+      });
+      // Safety net: force-exit if connections refuse to drain
+      setTimeout(() => process.exit(1), 10000).unref();
+    };
+    process.on("SIGINT", () => shutdown("SIGINT"));
+    process.on("SIGTERM", () => shutdown("SIGTERM"));
+    process.on("SIGUSR2", () => shutdown("SIGUSR2"));
   } catch (err) {
     console.error(`[${new Date().toISOString()}] Server startup error:`, err.message);
     process.exit(1);

@@ -197,7 +197,7 @@ unsigned long lastPageChange = 0;
 // WIFI & BACKEND CONFIG
 // =============================================================================
 
-#define DEVICE_ID_DEFAULT "ESP32_01"
+#define DEVICE_ID_DEFAULT "ESP32_02"
 
 // Backend IP when no portal override has been saved. If serverIP is still this
 // placeholder after the device connects to WiFi, autoDeriveServerIp() rewrites
@@ -317,8 +317,8 @@ void applyStaticIpConfig()
     if (staticIpConfigured)
     {
         WiFi.config(staticIp, staticGateway, staticSubnet);
-        Serial.print("[WIFI] Static IP applied: ");
-        Serial.println(WiFi.localIP());
+        Serial.print("[WIFI] Static IP configured: ");
+        Serial.println(staticIp.toString());
     }
 }
 
@@ -335,10 +335,9 @@ void loadSystemConfig()
     strncpy(serverPort, val.c_str(), sizeof(serverPort) - 1);
     serverPort[sizeof(serverPort) - 1] = '\0';
 
-    val = prefs.getString("device_id", DEVICE_ID_DEFAULT);
-    strncpy(deviceId, val.c_str(), sizeof(deviceId) - 1);
-    deviceId[sizeof(deviceId) - 1] = '\0';
-
+    // Device ID is pinned to the compiled-in DEVICE_ID_DEFAULT (ESP32_02);
+    // never editable via the config portal, so a board can't register under a
+    // random name. Friendly tank names are set on the dashboard instead.
     val = prefs.getString("device_secret", "");
     strncpy(deviceSecret, val.c_str(), sizeof(deviceSecret) - 1);
     deviceSecret[sizeof(deviceSecret) - 1] = '\0';
@@ -1689,13 +1688,6 @@ void startWifiConfigPortal()
         6
     );
 
-    WiFiManagerParameter deviceIdParam(
-        "device_id",
-        "Device ID (e.g. ESP32_01)",
-        DEVICE_ID_DEFAULT,
-        50
-    );
-
     char tankHeightText[10];
     snprintf(tankHeightText, sizeof(tankHeightText), "%.1f", tankHeightCm);
 
@@ -1746,7 +1738,6 @@ void startWifiConfigPortal()
 
     wm.addParameter(&serverIPParam);
     wm.addParameter(&serverPortParam);
-    wm.addParameter(&deviceIdParam);
     wm.addParameter(&deviceSecretParam);
     wm.addParameter(&tankHeightParam);
     wm.addParameter(&staticIpParam);
@@ -1766,10 +1757,15 @@ void startWifiConfigPortal()
     // which would trip the 30s task watchdog armed in setup() and reset the
     // chip every 30s in an endless loop. Suspend this task's WDT subscription
     // while the portal runs, and re-arm it once the portal returns.
+    // Release port 80 before the portal opens so the captive setup page loads
+    // on the phone (AP without portal = the symptom we are fixing).
+    stopStatusServer();
+
     esp_task_wdt_delete(NULL);
     bool wifiResult = wm.startConfigPortal("Aquaculture-Setup");
     esp_task_wdt_add(NULL);
     Serial.println("[WDT] Task watchdog re-armed after config portal");
+    startStatusServer();
 
     if (wifiResult)
     {
@@ -1780,11 +1776,9 @@ void startWifiConfigPortal()
 
         strncpy(serverIP, serverIPParam.getValue(), sizeof(serverIP) - 1);
         strncpy(serverPort, serverPortParam.getValue(), sizeof(serverPort) - 1);
-        strncpy(deviceId, deviceIdParam.getValue(), sizeof(deviceId) - 1);
 
         serverIP[sizeof(serverIP) - 1] = '\0';
         serverPort[sizeof(serverPort) - 1] = '\0';
-        deviceId[sizeof(deviceId) - 1] = '\0';
 
         // If the portal field still holds the placeholder IP, fall back to the
         // auto-derived <wifi-subnet>.10 address instead of the stale default.
@@ -1876,6 +1870,7 @@ void startWifiConfigPortal()
 // =============================================================================
 
 AsyncWebServer statusServer(80);
+bool statusServerRunning = false;
 
 String buildStatusJson()
 {
@@ -1894,6 +1889,11 @@ String buildStatusJson()
 
 void startStatusServer()
 {
+    if (statusServerRunning)
+    {
+        return;
+    }
+
     statusServer.on("/status", HTTP_GET, [](AsyncWebServerRequest *request)
     {
         request->send(200, "application/json", buildStatusJson());
@@ -1905,7 +1905,23 @@ void startStatusServer()
     });
 
     statusServer.begin();
+    statusServerRunning = true;
     Serial.println("[HTTP] Status server on port 80 (GET /status | /)");
+}
+
+// The WiFiManager captive portal needs port 80 too (it serves the config page).
+// Release the port while the portal runs, or the phone joins the AP but the
+// setup page never loads.
+void stopStatusServer()
+{
+    if (!statusServerRunning)
+    {
+        return;
+    }
+
+    statusServer.end();
+    statusServerRunning = false;
+    Serial.println("[HTTP] Status server stopped (portal needs port 80)");
 }
 
 // One POST attempt for a single reading; returns the HTTP response code
@@ -2009,6 +2025,11 @@ void sendSensorData()
                 sendBufCount++;
                 break;
             }
+            // Feed the send-task watchdog (subscribed in sendSensorTask): a
+            // long backlog flush (up to 10 posts x ~2s) must never approach
+            // the 30s budget. This task is also subscribed to the TWDT itself,
+            // so it must reset or the chip reboots mid-flush.
+            esp_task_wdt_reset();
             vTaskDelay(25 / portTICK_PERIOD_MS);
         }
 
@@ -2111,7 +2132,7 @@ void enterSafeMode()
 
 void setup()
 {
-    Serial.begin(115200);
+    Serial.begin(230400);
     delay(1000);
 
     // Load persisted device config (server IP/port, device id, secret, tank
@@ -2222,10 +2243,12 @@ void setup()
     }
 
     WiFi.mode(WIFI_STA);
-    WiFi.begin();
 
-    // Apply the persisted static IP (192.168.4.x) if configured.
+    // Apply the persisted static IP (192.168.4.x) BEFORE connecting; calling
+    // WiFi.config() after WiFi.begin() can silently ignore the static address.
     applyStaticIpConfig();
+
+    WiFi.begin();
 
     unsigned long startAttemptTime = millis();
     bool connected = false;
@@ -2237,6 +2260,9 @@ void setup()
             connected = true;
             break;
         }
+        // Keep the loop-task watchdog fed: this wait runs before reconnection
+        // handling in sendSensorData() takes over in the background task.
+        esp_task_wdt_reset();
         delay(100);
     }
 
@@ -2276,9 +2302,6 @@ void setup()
     // Expose GET /status (and /) so the central server can read this device.
     startStatusServer();
 
-    // One full initial sensor read so the UI shows live values right away.
-    readAllSensors();
-
     // Load a previously calibrated MQ-137 R0, or run the clean-air calibration
     // on first boot (needs the display up, since it shows progress on screen).
     // refreshMq137R0Once() forces one fresh calibration the first boot after a
@@ -2299,6 +2322,10 @@ void setup()
     {
         Serial.printf("[MQ-137] Loaded R0 = %.2f kOhm from NVS\n", mq137R0);
     }
+
+    // One full initial sensor read so the UI shows live values right away.
+    // Runs after R0 calibration so the first ammonia sample is not a -1 blip.
+    readAllSensors();
 
     currentPage = PAGE_OVERVIEW;
     if (!headlessMode)

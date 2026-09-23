@@ -126,7 +126,8 @@ Features:
     (not poll time)
 
 NOTE: Ammonia is measured as real NH3 gas concentration in ppm using the
-MQ-137 chemiresistor (readAmmonia() in water_monitoring_system/water_monitoring_system.ino). The
+MQ-137 chemiresistor (readAmmonia() in the ESP32 sketches, e.g.
+water_monitoring_system/ESP32_main_code/ESP32_main_code.ino). The
 firmware computes Rs/R0 from the module's analog output and converts it
 to ppm with the datasheet NH3 curve. R0 is calibrated in clean air on
 first boot (and persisted to NVS); triple-tap the top-right corner of
@@ -446,7 +447,7 @@ different failure domains: firmware hang (hardware), network loss (device),
 and SMS provider outage (backend/cloud).
 
 --------------------------------------------------------------------------------
-1) FIRMWARE WATCHDOG + SAFE MODE  (water_monitoring_system.ino)
+1) FIRMWARE WATCHDOG + SAFE MODE  (ESP32_main_code / NODE_main_code sketches)
 --------------------------------------------------------------------------------
 
 WATCHDOG ARMING
@@ -839,8 +840,7 @@ NETWORK REQUIREMENTS
   - Devices use NVS-configured static IPs by default (WiFi config portal
     fields static_ip / static_gateway / static_subnet); DHCP address
     reservations are an alternative so long as the subnet stays 192.168.4.0/24
-  - The HTTP POST runs on a background FreeRTOS task (sendSensorTask in
-    water_monitoring_system.ino) with a 1-second connect timeout and 1-second response
+  - The HTTP POST runs on a background FreeRTOS task (sendSensorTask in the ESP32 sketches) with a 1-second connect timeout and 1-second response
     timeout. The main loop only sets a sendPending/sendBusy flag every
     SEND_INTERVAL (1000 ms), so even when the backend IP is wrong/unreachable
     the POST stalls the background task only -- the screen and touch keep
@@ -874,7 +874,7 @@ with a XPT2046 resistive touch panel on the HSPI bus:
     (Aquaculture-Setup AP, http://192.168.4.1)
   - Triple-tap top-right corner: re-runs the MQ-137 clean-air R0 calibration
   - Touch mapping: raw XPT2046 coordinates are scaled to screen pixels with
-    hardcoded map constants (RAW_X_MIN/MAX, RAW_Y_MIN/MAX in water_monitoring_system.ino)
+    hardcoded map constants (RAW_X_MIN/MAX, RAW_Y_MIN/MAX in the sketches)
   - Press detection: pressure threshold MIN_PRESSURE (default 40) with a
     Z1/Z2 validity range guard (readings outside ~0-4000 are ignored)
 
@@ -932,7 +932,8 @@ PROJECT STRUCTURE
   +-- index.css
   server.cjs                         Express backend
   water_monitoring_system/
-  +-- water_monitoring_system.ino                  ESP32 firmware (WiFiManager)
+  +-- ESP32_main_code/ESP32_main_code.ino         ESP32 tank-1 firmware (WiFiManager), device ID ESP32_01
+  +-- NODE_main_code/NODE_main_code.ino           NodeMCU spare firmware (WiFiManager), device ID ESP32_02
 
 
 ================================================================================
@@ -951,16 +952,18 @@ RUNNING THE APPLICATION
 
 3. ESP32
 
-  Flash the ESP32 with water_monitoring_system/water_monitoring_system.ino. On boot it first tries the
+  Flash each device with its matching sketch: ESP32_main_code.ino (default
+  device ID ESP32_01) for the main tank, or NODE_main_code.ino (default device
+  ID ESP32_02) for the spare / NodeMCU board. On boot it first tries the
   saved network; if that fails it automatically opens the "Aquaculture-Setup"
   WiFi access point so you can configure your network (and backend server IP,
   port, device ID, device secret, tank height, and static IP) via the captive
   portal at http://192.168.4.1. The firmware default backend address is
-  192.168.4.10:3000 (SERVER_IP_DEFAULT in water_monitoring_system.ino); set it
-  to your backend machine's LAN IP if it differs. Each tank must also be given
-  its own device_id (e.g. tank01..tank06) and, if desired, a static IP in
-  192.168.4.100-105. Requires the ESPAsyncWebServer + AsyncTCP libraries
-  installed in Arduino IDE.
+  192.168.4.10:3000 (SERVER_IP_DEFAULT in the sketches); set it
+  to your backend machine's LAN IP if it differs. Each sketch ships its own
+  device_id default, so re-flashing or a wiped NVS still reports the right
+  tank; keep the portal's device_id field distinct per board otherwise.
+  Requires the ESPAsyncWebServer + AsyncTCP libraries installed in Arduino IDE.
 
 
 ================================================================================

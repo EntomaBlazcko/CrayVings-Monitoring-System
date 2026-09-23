@@ -6,7 +6,7 @@
 
 import { useState, useMemo } from "react";
 import { Thermometer, Waves, FlaskConical, AlertTriangle, AlertCircle, CheckCircle, RefreshCw, BellOff, Settings, Volume2, VolumeX } from "lucide-react";
-import type { MenuKey, ThresholdStatus } from "../types";
+import type { ThresholdStatus, MenuKey } from "../types";
 import { useSensors } from "../hooks/useSensors";
 import { useAuth } from "../contexts/useAuth";
 import { getSettingsThresholds, getThresholdStatus } from "../types";
@@ -16,60 +16,12 @@ import type { AlertGuidance } from "../utils/alertGuidance";
 import { FixLegendPanel, FixLegendModal } from "../components/FixLegend";
 import { getIsSoundEnabled, setSoundEnabled } from "../utils/playAlertSound";
 import TrendCard from "../components/TrendCard";
-import TankSelector from "../components/TankSelector";
-import FleetGrid from "../components/FleetGrid";
+import FarmOverview from "../components/FarmOverview";
+import StatCard from "../components/StatCard";
 
 type Props = {
   onNavigate?: (menu: MenuKey) => void;
 };
-
-type Stat = {
-  title: string;
-  value: string;
-  description: string;
-  gradient: string;
-  icon: React.ReactNode;
-  loading?: boolean;
-  status?: ThresholdStatus;
-  parameter?: "temperature" | "water_level" | "ammonia";
-  onFix?: () => void;
-};
-
-function StatCard({ title, value, description, gradient, icon, loading = false, status, onFix }: Stat) {
-  const pillText = status === "critical" ? "Critical" : status === "warning" ? "Warning" : "Safe";
-  const pillClass =
-    status === "critical"
-      ? "bg-red-100 text-red-700"
-      : status === "warning"
-        ? "bg-amber-100 text-amber-800"
-        : "bg-white/25 text-white";
-
-  return (
-    <div className={`rounded-2xl bg-gradient-to-r ${gradient} p-5 text-white shadow-sm`}>
-      <div className="flex items-center justify-between">
-        <p className="text-sm text-white/90">{title}</p>
-        <div className="flex items-center gap-2">
-          {status && (
-            <span className={`text-[10px] font-bold uppercase tracking-wide px-2 py-0.5 rounded-full ${pillClass}`}>
-              {pillText}
-            </span>
-          )}
-          <div className="text-white/80">{icon}</div>
-        </div>
-      </div>
-      <h3 className={`mt-2 text-3xl font-bold ${loading ? "animate-pulse" : ""}`}>{value}</h3>
-      <p className="mt-2 text-sm text-white/90">{description}</p>
-      {onFix && (status === "warning" || status === "critical") && (
-        <button
-          onClick={onFix}
-          className="mt-3 inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-[11px] font-semibold bg-white/20 hover:bg-white/30 text-white transition"
-        >
-          How to fix
-        </button>
-      )}
-    </div>
-  );
-}
 
 export default function DashboardPage({ onNavigate }: Props) {
   const { data, history, connectionStatus, lastUpdate, settings, loading, historyStale, historyLastUpdated, refetch, devices, selectedDeviceId } = useSensors();
@@ -186,51 +138,40 @@ export default function DashboardPage({ onNavigate }: Props) {
     return "bg-gray-400";
   };
 
-  const getCardGradient = (defaultGradient: string) => {
-    if (loading) return "from-gray-400 to-gray-500";
-    if (isOfflineWithData) return "from-yellow-400 to-yellow-500";
-    return defaultGradient;
+  // Color mapping for shared StatCard component
+  const sensorColors: Record<string, string> = {
+    temperature: "text-orange-500",
+    water_level: "text-blue-500",
+    ammonia: "text-emerald-500",
   };
 
-  // Out-of-range readings override the default gradient so the tile "turns"
-  // amber/red instead of staying blue/green.
-  const statusGradient = (key: "temperature" | "water_level" | "ammonia", fallback: string) => {
-    const s = data ? sensorStatuses[key] : undefined;
-    if (s === "critical") return "from-red-500 to-red-600";
-    if (s === "warning") return "from-amber-400 to-orange-500";
-    return fallback;
-  };
-
-  const stats: Stat[] = [
+  const stats = [
     {
       title: "Water Temperature",
       value: loading ? "Loading..." : data ? `${data.temperature}°C` : "--°C",
-      description: `Threshold: ${thresholds.temperature.range.min}-${thresholds.temperature.range.max}°C`,
-      gradient: statusGradient("temperature", getCardGradient("from-orange-500 to-amber-500")),
+      color: sensorColors.temperature,
       icon: <Thermometer size={24} />,
+      loading,
       status: data ? sensorStatuses.temperature : undefined,
-      parameter: "temperature",
-      onFix: () => openFixModal("temperature"),
+      rangeLabel: `Threshold: ${thresholds.temperature.range.min}-${thresholds.temperature.range.max}°C`,
     },
     {
       title: "Water Level",
       value: loading ? "Loading..." : data ? `${data.water_level}%` : "--%",
-      description: `Threshold: ${thresholds.water_level.range.min}-${thresholds.water_level.range.max}%`,
-      gradient: statusGradient("water_level", getCardGradient("from-blue-500 to-sky-500")),
+      color: sensorColors.water_level,
       icon: <Waves size={24} />,
+      loading,
       status: data ? sensorStatuses.water_level : undefined,
-      parameter: "water_level",
-      onFix: () => openFixModal("water_level"),
+      rangeLabel: `Threshold: ${thresholds.water_level.range.min}-${thresholds.water_level.range.max}%`,
     },
     {
       title: "Ammonia",
       value: loading ? "Loading..." : data ? `${data.ammonia} ppm` : "-- ppm",
-      description: `Threshold: ${thresholds.ammonia.range.min}-${thresholds.ammonia.range.max} ppm`,
-      gradient: statusGradient("ammonia", getCardGradient("from-emerald-500 to-teal-500")),
+      color: sensorColors.ammonia,
       icon: <FlaskConical size={24} />,
+      loading,
       status: data ? sensorStatuses.ammonia : undefined,
-      parameter: "ammonia",
-      onFix: () => openFixModal("ammonia"),
+      rangeLabel: `Threshold: ${thresholds.ammonia.range.min}-${thresholds.ammonia.range.max} ppm`,
     },
   ];
 
@@ -288,9 +229,9 @@ export default function DashboardPage({ onNavigate }: Props) {
 
   return (
     <div className="space-y-6">
-      {/* Tank selector: switch which tank the dashboard is monitoring */}
+      {/* Farm overview: every tank with live readings; click a card to drill in */}
       <section>
-        <TankSelector />
+        <FarmOverview />
       </section>
 
       {isOfflineWithData && (
@@ -464,11 +405,6 @@ export default function DashboardPage({ onNavigate }: Props) {
             unit=" ppm"
           />
         </div>
-      </section>
-
-      {/* Fleet status - one card per registered tank */}
-      <section>
-        <FleetGrid />
       </section>
 
       {/* Quick controls + key metrics */}
