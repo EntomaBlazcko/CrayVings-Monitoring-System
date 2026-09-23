@@ -1,19 +1,13 @@
-// =============================================================================
-// src/components/FixLegend.tsx
 // Shared "Fix Legend" surface: a severity key + scenario guidance panel and a
 // single-scenario modal. Used on Dashboard, Sensors, Alerts, and the floating
 // alert toasts so fix guidance is consistent throughout the web app.
-// =============================================================================
 
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useState } from "react";
 import {
   X,
   Lightbulb,
   ChevronDown,
   ChevronUp,
-  Thermometer,
-  Waves,
-  FlaskConical,
   AlertTriangle,
   AlertCircle,
   Settings2,
@@ -24,15 +18,7 @@ import {
   type AlertGuidance,
 } from "../utils/alertGuidance";
 import { SENSOR_KEY_TO_DISPLAY } from "../types";
-
-const PARAM_ICON: Record<string, ReactNode> = {
-  Temperature: <Thermometer size={16} className="text-orange-500" />,
-  "Water Level": <Waves size={16} className="text-blue-500" />,
-  Ammonia: <FlaskConical size={16} className="text-emerald-500" />,
-  temperature: <Thermometer size={16} className="text-orange-500" />,
-  water_level: <Waves size={16} className="text-blue-500" />,
-  ammonia: <FlaskConical size={16} className="text-emerald-500" />,
-};
+import { PARAM_ICON } from "../utils/paramIcons";
 
 // What each status pill means — mirrors the server's 15% deviation margin.
 const SEVERITY_KEY = [
@@ -53,9 +39,6 @@ const SEVERITY_KEY = [
   },
 ] as const;
 
-// ========================
-// LEGEND PANEL
-// ========================
 export function FixLegendPanel({
   counts,
   activeKeys,
@@ -87,7 +70,6 @@ export function FixLegendPanel({
 
       {open && (
         <div className="border-t border-gray-100 p-4">
-          {/* Severity key */}
           <div className="mb-4 grid grid-cols-1 sm:grid-cols-3 gap-2">
             {SEVERITY_KEY.map((s) => (
               <div key={s.level} className={`rounded-lg border px-3 py-2 ${s.cls}`}>
@@ -158,9 +140,6 @@ export function FixLegendPanel({
   );
 }
 
-// ========================
-// SINGLE-SCENARIO MODAL
-// ========================
 export function FixLegendModal({
   guidance,
   onClose,

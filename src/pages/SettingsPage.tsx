@@ -1,8 +1,3 @@
-// =============================================================================
-// src/pages/SettingsPage.tsx
-// Settings page: alert thresholds and user management.
-// =============================================================================
-
 import { useState, useCallback, useMemo, useEffect } from "react";
 import { isAxiosError } from "axios";
 import { useSensorSettings, useActivityLogger } from "../hooks/useSensors";

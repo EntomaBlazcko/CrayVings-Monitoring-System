@@ -1,8 +1,3 @@
-// =============================================================================
-// FILE: src/types/threshold.test.cjs
-// PURPOSE: Mirrors server.cjs threshold logic to guard against drift.
-// =============================================================================
-
 const { test } = require("node:test");
 const assert = require("node:assert");
 

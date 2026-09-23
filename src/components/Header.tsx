@@ -1,9 +1,3 @@
-// =============================================================================
-// FILE: src/components/Header.tsx
-// =============================================================================
-// PURPOSE: Top navigation header with branding, user role, and logout.
-// =============================================================================
-
 import { User, Shield } from "lucide-react";
 import type { AuthUser } from "../types";
 

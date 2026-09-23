@@ -1,12 +1,3 @@
-// =============================================================================
-// FILE: src/utils/playAlertSound.ts
-// =============================================================================
-// PURPOSE: Web Audio utility for alert sounds (MP3 with synth-tone fallback).
-// =============================================================================
-
-// ========================
-// TONE CONFIGURATION
-// ========================
 // Default synthesized tone parameters, used as fallback when MP3 files are unavailable
 const TONE_CONFIG = {
   warning: { frequency: 440, duration: 0.3, type: "sine" as OscillatorType },
@@ -15,17 +6,13 @@ const TONE_CONFIG = {
   high: { frequency: 600, duration: 0.4, type: "square" as OscillatorType },
 } as const;
 
-// ========================
 // AUDIO PARAMETERS
-// ========================
 const DEFAULT_VOLUME = 0.8;
 const MIN_FREQ = 1;
 const MAX_FREQ = 20000;
 const MAX_DURATION = 10;
 
-// ========================
 // SHARED STATE
-// ========================
 // Singleton AudioContext and volume setting
 let audioContext: AudioContext | null = null;
 let volume: number = DEFAULT_VOLUME;
@@ -33,9 +20,7 @@ let volume: number = DEFAULT_VOLUME;
 // Pre-loaded audio buffers indexed by sound key ("warning", "critical", etc.)
 const audioBuffers: Record<string, AudioBuffer> = {};
 
-// ========================
 // AUDIO CONTEXT MANAGEMENT
-// ========================
 
 // Browsers suspend the AudioContext until a user interaction; resume it here
 async function ensureAudioContext(): Promise<AudioContext> {
@@ -70,9 +55,7 @@ function validateParams(frequency: number, duration: number, type: OscillatorTyp
   }
 }
 
-// ========================
 // SOUND ENABLE/DISABLE (localStorage)
-// ========================
 
 function isSoundEnabled(): boolean {
   try {
@@ -96,9 +79,7 @@ export function setSoundEnabled(enabled: boolean): void {
   }
 }
 
-// ========================
 // VOLUME CONTROL
-// ========================
 
 export function getVolume(): number {
   return volume;
@@ -113,9 +94,7 @@ export function setVolume(newVolume: number): void {
   volume = Math.max(0, Math.min(1, newVolume));
 }
 
-// ========================
 // SYNTHESIZED TONE PLAYBACK
-// ========================
 
 // Plays a synth tone via oscillator + gain with exponential fade-out
 async function playTone(frequency: number, duration: number, type: OscillatorType = "sine"): Promise<void> {
@@ -151,9 +130,7 @@ async function playTone(frequency: number, duration: number, type: OscillatorTyp
   }
 }
 
-// ========================
 // CUSTOM SOUND (MP3) PLAYBACK
-// ========================
 
 // Plays a pre-loaded audio buffer (MP3) via AudioBufferSourceNode
 async function playCustomSound(audioBuffer: AudioBuffer): Promise<void> {
@@ -188,9 +165,7 @@ async function decodeAudioData(arrayBuffer: ArrayBuffer): Promise<AudioBuffer> {
   return ctx.decodeAudioData(arrayBuffer);
 }
 
-// ========================
 // SOUND LOADING FUNCTIONS
-// ========================
 
 // Fetches and decodes an audio file from a URL, storing it by key
 export async function setCustomSound(key: string, url: string): Promise<void> {
@@ -218,9 +193,7 @@ export function hasCustomSound(key: string): boolean {
   return key in audioBuffers;
 }
 
-// ========================
 // DEFAULT SOUND FILE URLS
-// ========================
 // MP3 paths in public/sounds/
 const SOUND_URLS = {
   warning: "/sounds/warning.mp3",
@@ -273,9 +246,7 @@ function getToneConfigForKey(key: string): { frequency: number; duration: number
   }
 }
 
-// ========================
 // PUBLIC SOUND PLAYBACK FUNCTIONS
-// ========================
 
 export async function playWarningSound(): Promise<void> {
   if (!isSoundEnabled()) return;

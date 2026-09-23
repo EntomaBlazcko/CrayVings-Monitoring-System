@@ -1,8 +1,3 @@
-// =============================================================================
-// FILE: src/components/FloatingAlert.tsx
-// PURPOSE: Toast notification system with auto-dismiss.
-// =============================================================================
-
 import { useState, useEffect, useRef, useCallback, type ReactNode } from "react";
 import { X, AlertTriangle, AlertCircle } from "lucide-react";
 import { playLowAlertSound, playHighAlertSound } from "../utils/playAlertSound";
@@ -19,13 +14,10 @@ interface FloatingAlertProviderProps {
   children: ReactNode;
 }
 
-// ========================
-// FLOATING ALERT PROVIDER
-// ========================
 export function FloatingAlertProvider({ children }: FloatingAlertProviderProps) {
   const [notifications, setNotifications] = useState<AlertNotification[]>([]);
 
-  // Plays low pitch for min threshold, high pitch for max.
+  // Low pitch for a min-threshold breach, high pitch for max.
   const playAlertSound = useCallback(async (threshold: "min" | "max") => {
     try {
       if (threshold === "min") {
@@ -38,15 +30,16 @@ export function FloatingAlertProvider({ children }: FloatingAlertProviderProps) 
     }
   }, []);
 
-  // Plays sound before state update; replaces existing notification for same sensor+threshold.
+  // Sound plays before the state update; an existing notification for the same
+  // sensor+threshold is replaced instead of stacked.
   const addNotification = useCallback(async (notification: Omit<AlertNotification, "id">) => {
     const id = `${notification.parameter}-${notification.threshold}-${Date.now()}`;
-    
-    // Play sound first (skip for device notifications - handled by DeviceConnectionMonitor)
+
+    // Device notifications don't beep here (DeviceConnectionMonitor handles them).
     if (notification.parameter !== "device") {
       await playAlertSound(notification.threshold);
     }
-    
+
     setNotifications((prev) => {
       const filtered = prev.filter(
         (n) => !(n.parameter === notification.parameter && n.threshold === notification.threshold)
@@ -70,9 +63,6 @@ export function FloatingAlertProvider({ children }: FloatingAlertProviderProps) 
   );
 }
 
-// ========================
-// FLOATING ALERT CONTAINER
-// ========================
 export function FloatingAlertContainer() {
   const { notifications, removeNotification } = useFloatingAlerts();
 
@@ -89,9 +79,6 @@ export function FloatingAlertContainer() {
   );
 }
 
-// ========================
-// FLOATING ALERT ITEM
-// ========================
 interface FloatingAlertItemProps {
   notification: AlertNotification;
   onClose: () => void;

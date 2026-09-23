@@ -1,17 +1,8 @@
-// =============================================================================
-// FILE: src/api/client.ts
-// =============================================================================
-// PURPOSE: Centralized API client with typed wrappers for every backend endpoint.
-// =============================================================================
-
 import axios, { isAxiosError, type AxiosError } from "axios";
 import type { SensorEntry, ChartPoint, LogEntry, SensorSettings, ActivityLog, ActivityLogEntry, AuthResponse, WeeklyReport, AnalyticsOverview, AnalyticsDailyResponse, AnalyticsInsightsResponse, DeviceEntry, DeviceLiveReading, DeviceStatus } from "../types";
 import { API_BASE } from "../types";
 import { formatFarmTime } from "../utils/time";
 
-// ========================
-// USER TYPE (Admin Management)
-// ========================
 export interface UserEntry {
   id: number;
   name: string;
@@ -25,9 +16,6 @@ export interface UserEntry {
   deleted_at?: string | null;
 }
 
-// ========================
-// AXIOS CLIENT INSTANCE
-// ========================
 
 const client = axios.create({
   baseURL: API_BASE,
@@ -37,9 +25,6 @@ const client = axios.create({
   },
 });
 
-// ========================
-// REQUEST INTERCEPTOR
-// ========================
 // Attaches the auth token from localStorage to every request.
 
 client.interceptors.request.use((config) => {
@@ -50,9 +35,6 @@ client.interceptors.request.use((config) => {
   return config;
 });
 
-// ========================
-// RESPONSE INTERCEPTOR
-// ========================
 // Timeouts/cancels are left to the call site. A 401 clears the stored
 // session so the app returns to login on next load.
 
@@ -113,9 +95,6 @@ client.interceptors.response.use(
   }
 );
 
-// ========================
-// CUSTOM ERROR CLASS
-// ========================
 
 // API failure error with HTTP status and network-error flag for UI handling
 export class ApiError extends Error {
@@ -129,9 +108,6 @@ export class ApiError extends Error {
   }
 }
 
-// ========================
-// SENSOR DATA ENDPOINTS
-// ========================
 
 // GET /sensor/latest - fetch latest reading; optional device_id scopes to one tank
 // Returns { data: SensorEntry | null, deviceExists: boolean }
@@ -182,9 +158,6 @@ export async function fetchSensorHistory(limit = 1000, deviceId?: string | null,
   return data;
 }
 
-// ========================
-// DEVICE / TANK ENDPOINTS
-// ========================
 
 // GET /devices - fleet registry with online flags (drives the tank selector
 // and fleet grid; polled on an interval, not per second). Hidden tanks are
@@ -227,9 +200,6 @@ export async function fetchDeviceStatus(deviceId: string, signal?: AbortSignal):
   return response.data;
 }
 
-// ========================
-// WEEKLY REPORT ENDPOINT
-// ========================
 
 // GET /report/weekly - fetch 7-day aggregate report stats
 export async function fetchWeeklyReport(signal?: AbortSignal): Promise<WeeklyReport> {
@@ -245,9 +215,6 @@ export async function fetchRangeReport(hours: number | null, signal?: AbortSigna
   return response.data;
 }
 
-// ========================
-// ANALYTICS ENDPOINTS
-// ========================
 
 // GET /analytics/overview - period summary, trends, alerts, uptime stats.
 // Optional deviceId scopes the summary/uptime to one tank.
@@ -277,9 +244,6 @@ export async function fetchAnalyticsInsights(days = 7, signal?: AbortSignal): Pr
   return response.data;
 }
 
-// ========================
-// SYSTEM LOGS ENDPOINTS
-// ========================
 
 // Response shape for paginated system logs
 export interface LogsResponse {
@@ -316,9 +280,6 @@ export async function fetchLogs(
   };
 }
 
-// ========================
-// SETTINGS ENDPOINTS
-// ========================
 
 // GET /settings - fetch thresholds, converting PostgreSQL NUMERIC strings to numbers
 export async function fetchSettings(signal?: AbortSignal): Promise<SensorSettings> {
@@ -347,9 +308,6 @@ export async function resetSettings(signal?: AbortSignal): Promise<SensorSetting
   return response.data.data;
 }
 
-// ========================
-// LOG CREATION ENDPOINT
-// ========================
 
 // POST /logs - create a new system log entry
 export async function createLog(
@@ -388,9 +346,6 @@ export async function acknowledgeLog(
   return response.data.data;
 }
 
-// ========================
-// HEALTH CHECK
-// ========================
 
 // GET /health - check backend is running and responsive
 export async function checkHealth(signal?: AbortSignal): Promise<{ status: string; serverTime: string }> {
@@ -398,9 +353,6 @@ export async function checkHealth(signal?: AbortSignal): Promise<{ status: strin
   return response.data;
 }
 
-// ========================
-// ACTIVITY LOG ENDPOINTS
-// ========================
 
 // Response shape for paginated activity logs
 export interface ActivityLogsResponse {
@@ -445,9 +397,6 @@ export async function fetchActivityLogs(
   return response.data;
 }
 
-// ========================
-// AUTHENTICATION ENDPOINTS
-// ========================
 
 // POST /auth/login - authenticate and return a session token
 export async function loginUser(
@@ -602,9 +551,6 @@ export async function resetUserPassword(
   await client.put(`/auth/users/${userId}/password`, { newPassword }, { signal });
 }
 
-// ========================
-// SMS ALERT TYPES
-// ========================
 export interface SmsRecipient {
   id: number;
   phone_number: string;

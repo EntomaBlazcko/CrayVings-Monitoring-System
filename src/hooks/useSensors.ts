@@ -1,8 +1,3 @@
-// =============================================================================
-// FILE: src/hooks/useSensors.ts
-// PURPOSE: Convenience hooks for accessing sensor-related context data.
-// =============================================================================
-
 import { useContext } from "react";
 import { SensorDataContext, SensorSettingsContext, LogsContext, ActivityLogsContext } from "../contexts/SensorContext";
 
@@ -12,13 +7,13 @@ export function useSensors() {
   const settingsContext = useContext(SensorSettingsContext);
   const logsContext = useContext(LogsContext);
   const activityLogsContext = useContext(ActivityLogsContext);
-  
+
   if (!dataContext || !settingsContext || !logsContext || !activityLogsContext) {
     throw new Error("useSensors must be used within a SensorProvider");
   }
-  
+
   return {
-    data: dataContext.data,
+    latestReading: dataContext.latestReading,
     history: dataContext.history,
     loading: dataContext.loading,
     error: dataContext.error,
@@ -102,13 +97,11 @@ export function useActivityLogs() {
   return context;
 }
 
-// Returns only connection-related fields.
 export function useConnectionStatus() {
   const { connectionStatus, lastUpdate, consecutiveFailures } = useSensorData();
   return { connectionStatus, lastUpdate, consecutiveFailures };
 }
 
-// Returns only the logActivity function.
 export function useActivityLogger() {
   const context = useContext(ActivityLogsContext);
   if (!context) {

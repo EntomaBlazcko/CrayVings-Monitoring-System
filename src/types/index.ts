@@ -1,16 +1,9 @@
-// =============================================================================
-// FILE: src/types/index.ts
-// =============================================================================
-// Central TypeScript types, constants, and threshold logic for the frontend.
-// =============================================================================
+// Central frontend types, constants, and threshold logic.
 
-// ========================
-// SENSOR DATA TYPES
-// ========================
+// Sensor data types
+
 // Raw data from the ESP32 and transformed data for charts.
-
 export type SensorEntry = {
-  _id?: string;
   device_id: string;
   temperature: number;
   water_level: number;
@@ -28,10 +21,7 @@ export type ChartPoint = {
   ammonia: number | null;
 };
 
-// ========================
-// NAVIGATION TYPES
-// ========================
-// Valid page/menu keys for routing and sidebar navigation.
+// Navigation types
 
 export const VALID_MENU_KEYS = [
   "Dashboard",
@@ -51,9 +41,7 @@ export function isValidMenuKey(value: string): value is MenuKey {
   return VALID_MENU_KEYS.includes(value as MenuKey);
 }
 
-// ========================
-// LOG ENTRY TYPES
-// ========================
+// Log entry types
 
 export type LogEntry = {
   id?: number;
@@ -67,10 +55,7 @@ export type LogEntry = {
   acknowledged_by?: string | null;
 };
 
-// ========================
-// SENSOR SETTINGS TYPES
-// ========================
-// Threshold configuration for alert triggering.
+// Sensor settings types
 
 // Min/max acceptable ranges for each sensor parameter.
 export type SensorSettings = {
@@ -86,17 +71,15 @@ export type SensorSettings = {
 
 // Default safe ranges for crayfish aquaculture (used when no DB settings exist).
 export const DEFAULT_SETTINGS: SensorSettings = {
-  temp_min:20.0,
-  temp_max:31.0,
-  water_level_min:10.0,
-  water_level_max:100.0,
-  ammonia_min:0.25,
-  ammonia_max:1.0,
+  temp_min: 20.0,
+  temp_max: 31.0,
+  water_level_min: 10.0,
+  water_level_max: 100.0,
+  ammonia_min: 0.25,
+  ammonia_max: 1.0,
 };
 
-// ========================
-// THRESHOLD CONFIGURATION TYPES
-// ========================
+// Threshold configuration types
 
 export type ThresholdRange = {
   min: number;
@@ -118,7 +101,7 @@ export function getSettingsThresholds(settings: SensorSettings | null): Record<s
   return {
     temperature: {
       name: "Temperature",
-      unit: "°C",
+      unit: "Â°C",
       range: { min: defaults.temp_min, max: defaults.temp_max },
       isMinOnly: false,
       color: "text-orange-500",
@@ -140,9 +123,8 @@ export function getSettingsThresholds(settings: SensorSettings | null): Record<s
   };
 }
 
-// ========================
-// DEVICE / TANK TYPES
-// ========================
+// Device / tank types
+
 // Fleet registry entries as returned by GET /devices, plus the live payload of
 // each ESP32's GET /status endpoint (server -> device, health/diagnostics only).
 
@@ -180,14 +162,14 @@ export type DeviceLiveReading = {
   ammonia: number | null;
 };
 
-// ========================
-// THRESHOLD STATUS EVALUATION
-// ========================
-// Frontend mirror of server.cjs getThresholdStatus() with same 15% margin logic.
+// Threshold status evaluation
 
 export type ThresholdStatus = "good" | "warning" | "critical";
 
-// Evaluates a value against its range; 15% deviation = critical, otherwise warning.
+// Evaluates a value against its range; 15% deviation beyond the range = critical.
+// IMPORTANT: must stay in sync with server.cjs getThresholdStatus() â€” changes
+// affect Alerts page severity and the threshold cross-check test
+// (src/types/threshold.test.cjs).
 export function getThresholdStatus(
   value: number,
   range: ThresholdRange,
@@ -200,10 +182,8 @@ export function getThresholdStatus(
   const rangeSize = max - min;
   const criticalMargin = rangeSize * 0.15;
 
-  // IMPORTANT: Must stay in sync with server.cjs getThresholdStatus().
-  // Changes affect Alerts page severity and threshold cross-check test.
   if (isMinOnly) {
-    // Min-only threshold: only values below min are breaches, with same 15% margin.
+    // Min-only threshold: only values below min are breaches, same 15% margin.
     if (val < min) {
       const deviation = min - val;
       return deviation >= criticalMargin ? "critical" : "warning";
@@ -223,9 +203,7 @@ export function getThresholdStatus(
   return "good";
 }
 
-// ========================
-// ALERT TYPES
-// ========================
+// Alert types
 
 export type AlertSeverity = "info" | "warning" | "critical";
 
@@ -243,23 +221,18 @@ export function parseAlertSeverity(log: LogEntry, settings?: SensorSettings | nu
   return getThresholdStatus(val, config.range, config.isMinOnly) === "critical" ? "critical" : "warning";
 }
 
-// ========================
-// API CONFIGURATION
-// ========================
+// API configuration
 
 const DEFAULT_API_BASE = "http://localhost:3000";
 
-// Returns API base URL from VITE_API_BASE env var or falls back to localhost.
-export function getApiBase(): string {
+function getApiBase(): string {
   if (typeof import.meta !== "undefined" && import.meta.env) {
     return import.meta.env.VITE_API_BASE || DEFAULT_API_BASE;
   }
   return DEFAULT_API_BASE;
 }
 
-// ========================
-// SENSOR KEY MAPPINGS
-// ========================
+// Sensor key mappings
 
 export const SENSOR_KEY_TO_DISPLAY: Record<string, string> = {
   temperature: "Temperature",
@@ -275,9 +248,7 @@ export const DISPLAY_TO_SENSOR_KEY: Record<string, string> = {
 
 export const API_BASE = getApiBase();
 
-// ========================
-// ACTIVITY LOG TYPES
-// ========================
+// Activity log types
 
 export type ActivityLog = {
   id?: number;
@@ -299,18 +270,6 @@ export type ActivityActionType =
   | "login"
   | "logout";
 
-export const ACTIVITY_ACTION_TYPES: ActivityActionType[] = [
-  "navigation",
-  "button_click",
-  "form_submit",
-  "settings_change",
-  "device_connect",
-  "device_disconnect",
-  "system_event",
-  "login",
-  "logout",
-];
-
 // Input for creating activity log entries; user_name defaults to "Admin" server-side.
 export interface ActivityLogEntry {
   user_name?: string;
@@ -319,9 +278,7 @@ export interface ActivityLogEntry {
   module: string;
 }
 
-// ========================
-// AUTHENTICATION TYPES
-// ========================
+// Authentication types
 
 // "admin" = full access, "user" = read-only dashboards/logs.
 export type UserRole = "user" | "admin";
@@ -344,9 +301,7 @@ export interface AuthResponse {
   token: string;
 }
 
-// ========================
-// WEEKLY REPORT TYPES
-// ========================
+// Weekly report types
 
 export type WeeklyReportDaily = {
   date: string;
@@ -387,10 +342,7 @@ export type WeeklyReport = {
   };
 };
 
-// ========================
-// ANALYTICS TYPES
-// ========================
-// Server-computed aggregates, trends, and rule-engine suggestions.
+// Analytics types
 
 export type AnalyticsParamStats = { avg: number; min: number; max: number };
 export type AnalyticsTrend = { current_avg: number; previous_avg: number; change_pct: number; direction: "up" | "down" | "stable" };

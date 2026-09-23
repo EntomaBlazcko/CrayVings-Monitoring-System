@@ -1,23 +1,10 @@
-// =============================================================================
-// FILE: src/contexts/AuthContext.tsx
-// =============================================================================
-// PURPOSE: Authentication context provider for managing user login state,
-// with localStorage persistence and login/logout flows.
-// =============================================================================
-
 import { createContext, useState, useCallback, useEffect, type ReactNode } from "react";
 import type { AuthUser } from "../types";
 import { loginUser, logoutUser } from "../api/client";
 
-// ========================
-// LOCAL STORAGE KEYS
-// ========================
 const TOKEN_KEY = "crayvings_token";
 const USER_KEY = "crayvings_user";
 
-// ========================
-// CONTEXT TYPE DEFINITION
-// ========================
 export interface AuthContextType {
   user: AuthUser | null;
   isLoading: boolean;
@@ -34,10 +21,6 @@ interface AuthProviderProps {
   children: ReactNode;
 }
 
-// ========================
-// LOCAL STORAGE HELPERS
-// ========================
-
 function getStoredToken(): string | null {
   return localStorage.getItem(TOKEN_KEY);
 }
@@ -50,7 +33,7 @@ function setStoredToken(token: string | null) {
   }
 }
 
-// Handles corrupted localStorage data gracefully by removing it
+// Corrupted localStorage user JSON is discarded rather than crashing boot.
 function getStoredUser(): AuthUser | null {
   const raw = localStorage.getItem(USER_KEY);
   if (!raw) return null;
@@ -70,14 +53,10 @@ function setStoredUser(user: AuthUser | null) {
   }
 }
 
-// ========================
-// AUTH PROVIDER COMPONENT
-// ========================
-
-// Token stored in localStorage; vulnerable to XSS but acceptable for this app.
-// Server-side validation on every protected request; token regenerated per login.
+// The session token lives in localStorage (XSS-exposed, but acceptable here:
+// the server validates it on every protected request and regenerates it per
+// login).
 export function AuthProvider({ children }: AuthProviderProps) {
-  // Restores session from localStorage on page refresh
   const [user, setUser] = useState<AuthUser | null>(() => {
     const savedUser = getStoredUser();
     const savedToken = getStoredToken();
@@ -86,7 +65,6 @@ export function AuthProvider({ children }: AuthProviderProps) {
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  // Authenticates via API, stores token/user, re-throws for caller to display
   const login = useCallback(async (username: string, password: string) => {
     setIsLoading(true);
     setError(null);
@@ -107,7 +85,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
     }
   }, []);
 
-  // Revokes token server-side (fire-and-forget), clears local auth state
+  // Server-side revoke is fire-and-forget; local state clears immediately.
   const logout = useCallback(() => {
     void logoutUser();
     setUser(null);
@@ -119,8 +97,9 @@ export function AuthProvider({ children }: AuthProviderProps) {
     setError(null);
   }, []);
 
-  // Force logout whenever the API reports an expired/invalid session (401), so
-  // the user goes back to the login screen instead of a stuck error card.
+  // The axios interceptor dispatches "crayvings_unauthorized" when the server
+  // reports an expired/invalid session; drop local state so the app returns to
+  // the login screen instead of showing a stuck error card.
   useEffect(() => {
     const onUnauthorized = () => {
       setUser(null);

@@ -1,13 +1,7 @@
-// =============================================================================
-// FILE: src/components/FarmOverview.tsx
-// =============================================================================
-// PURPOSE: Phase B - the "all tanks in one place" view. A responsive grid of
-// one live card per tank (real-time temp / water / ammonia, red when out of
-// range, online state, last update) with the per-tank actions (rename / hide /
-// live-check) directly on each card. Clicking a card selects that tank and the
-// rest of the Dashboard drills into its detail. Hidden tanks can be restored
-// from the "Hidden" panel - hiding is never destructive.
-// =============================================================================
+// Dashboard "farm grid": one live card per tank (real-time temp / water /
+// ammonia, red when out of range, online state, last update) with rename /
+// hide / live-check actions on each card. Clicking a card selects that tank.
+// Hiding is never destructive — hidden tanks are restorable from the panel.
 
 import { useState } from "react";
 import { Eye, EyeOff, RotateCcw, Boxes, TriangleAlert } from "lucide-react";
@@ -159,10 +153,10 @@ export default function FarmOverview() {
             .sort((a, b) => a.device_id.localeCompare(b.device_id))
             .map((device) => {
               const active = device.device_id === selectedDeviceId;
-              const temp = readValue(device, "temperature");
+              const tempC = readValue(device, "temperature");
               const water = readValue(device, "water_level");
               const ammonia = readValue(device, "ammonia");
-              const tempAtRisk = isAtRisk("temperature", temp);
+              const tempAtRisk = isAtRisk("temperature", tempC);
               const waterAtRisk = isAtRisk("water_level", water);
               const ammoniaAtRisk = isAtRisk("ammonia", ammonia);
               const reading = latestByTank[device.device_id];
@@ -219,7 +213,7 @@ export default function FarmOverview() {
                   </div>
 
                   <div className="flex items-stretch gap-1.5">
-                    {metricTile("Temp", temp !== null ? `${temp.toFixed(1)}°` : "--", tempAtRisk, "°C")}
+                    {metricTile("Temp", tempC !== null ? `${tempC.toFixed(1)}°` : "--", tempAtRisk, "°C")}
                     {metricTile("Water", water !== null ? `${water.toFixed(0)}%` : "--", waterAtRisk, "%")}
                     {metricTile("Ammonia", ammonia !== null ? `${ammonia.toFixed(2)}` : "--", ammoniaAtRisk, "ppm")}
                   </div>

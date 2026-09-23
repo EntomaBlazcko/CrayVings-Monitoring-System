@@ -1,9 +1,3 @@
-// =============================================================================
-// FILE: src/hooks/useFloatingAlerts.ts
-// =============================================================================
-// Context and hook for managing floating toast notifications.
-// =============================================================================
-
 import { createContext, useContext } from "react";
 
 interface AlertNotification {
@@ -24,7 +18,6 @@ interface FloatingAlertContextType {
 
 export const FloatingAlertContext = createContext<FloatingAlertContextType | null>(null);
 
-// Throws if used outside FloatingAlertProvider.
 export function useFloatingAlerts() {
   const context = useContext(FloatingAlertContext);
   if (!context) {

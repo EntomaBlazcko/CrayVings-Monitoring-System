@@ -1,8 +1,3 @@
-// =============================================================================
-// src/pages/ActivityLogsPage.tsx
-// User activity logs with search, filter, sort, action breakdown, and pagination.
-// =============================================================================
-
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   Search,
@@ -26,23 +21,8 @@ import {
 } from "lucide-react";
 import { useActivityLogs } from "../hooks/useSensors";
 import { Spinner, LoadingCard, ErrorCard } from "../components/Loading";
-import { formatFarmDateTime, formatFarmTime } from "../utils/time";
-
-// Formats a timestamp into a relative time string (e.g. "5s ago", "3m ago").
-function formatTimeAgo(timestamp: string | Date): string {
-  const date = timestamp instanceof Date ? timestamp : new Date(timestamp);
-  if (isNaN(date.getTime())) return "N/A";
-
-  const seconds = Math.floor((Date.now() - date.getTime()) / 1000);
-  if (seconds < 0) return "Just now";
-  if (seconds < 60) return `${seconds}s ago`;
-  const minutes = Math.floor(seconds / 60);
-  if (minutes < 60) return `${minutes}m ago`;
-  const hours = Math.floor(minutes / 60);
-  if (hours < 24) return `${hours}h ago`;
-  const days = Math.floor(hours / 24);
-  return `${days}d ago`;
-}
+import { formatFarmDateTime, formatFarmTime, formatTimeAgo } from "../utils/time";
+import { titleCase } from "../utils/text";
 
 const ACTION_META: Record<string, { color: string; icon: typeof Map }> = {
   navigation: { color: "bg-orange-100 text-orange-700", icon: Map },
@@ -56,12 +36,6 @@ const ACTION_META: Record<string, { color: string; icon: typeof Map }> = {
 };
 
 const FILTER_ACTION_TYPES = ["navigation", "settings_change", "device_connect", "device_disconnect"];
-
-const titleCase = (s: string) =>
-  String(s)
-    .split(/[\s_]+/)
-    .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
-    .join(" ");
 
 export default function ActivityLogsPage() {
   const {

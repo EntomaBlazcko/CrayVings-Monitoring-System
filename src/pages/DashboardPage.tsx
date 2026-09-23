@@ -1,9 +1,3 @@
-// =============================================================================
-// src/pages/DashboardPage.tsx
-// Landing dashboard: hero banner, live stat cards, alerts sidebar, quick
-// controls, live trend charts, and key metrics summary.
-// =============================================================================
-
 import { useState, useMemo } from "react";
 import { Thermometer, Waves, FlaskConical, AlertTriangle, AlertCircle, CheckCircle, RefreshCw, BellOff, Settings, Volume2, VolumeX } from "lucide-react";
 import type { ThresholdStatus, MenuKey } from "../types";
@@ -24,7 +18,7 @@ type Props = {
 };
 
 export default function DashboardPage({ onNavigate }: Props) {
-  const { data, history, connectionStatus, lastUpdate, settings, loading, historyStale, historyLastUpdated, refetch, devices, selectedDeviceId } = useSensors();
+  const { latestReading, history, connectionStatus, lastUpdate, settings, loading, historyStale, historyLastUpdated, refetch, devices, selectedDeviceId } = useSensors();
   const { user } = useAuth();
   const isAdmin = user?.role === "admin";
   const [alertsDismissed, setAlertsDismissed] = useState(false);
@@ -34,7 +28,6 @@ export default function DashboardPage({ onNavigate }: Props) {
 
   const thresholds = useMemo(() => getSettingsThresholds(settings), [settings]);
 
-  // Currently selected tank (drives data + history scoping).
   const currentTank = useMemo(
     () => devices.find((d) => d.device_id === selectedDeviceId) ?? null,
     [devices, selectedDeviceId]
@@ -43,7 +36,7 @@ export default function DashboardPage({ onNavigate }: Props) {
 
   const isOnline = connectionStatus === "online";
   const isConnecting = connectionStatus === "connecting";
-  const hasData = !!data;
+  const hasData = !!latestReading;
   const isOfflineWithData = !isOnline && !isConnecting && hasData;
 
   const tankStatus = useMemo(() => {
@@ -54,7 +47,7 @@ export default function DashboardPage({ onNavigate }: Props) {
 
     for (const key of sensorKeys) {
       const threshold = thresholds[key];
-      const value = data[key];
+      const value = latestReading[key];
       const status = getThresholdStatus(value, threshold.range, threshold.isMinOnly);
 
       if (status === "warning" || status === "critical") {
@@ -67,19 +60,18 @@ export default function DashboardPage({ onNavigate }: Props) {
       safe: alerts.length === 0,
       alerts: alerts.length > 0 ? alerts : ["Tank is Safe"],
     };
-  }, [data, thresholds, hasData]);
+  }, [latestReading, thresholds, hasData]);
 
-  // Per-sensor safe/warning/critical status for the stat card color coding.
   const sensorStatuses = useMemo(() => {
     const out: Partial<Record<"temperature" | "water_level" | "ammonia", ThresholdStatus>> = {};
-    if (!data) return out;
+    if (!latestReading) return out;
     const sensorKeys = ["temperature", "water_level", "ammonia"] as const;
     for (const key of sensorKeys) {
       const threshold = thresholds[key];
-      out[key] = getThresholdStatus(data[key], threshold.range, threshold.isMinOnly);
+      out[key] = getThresholdStatus(latestReading[key], threshold.range, threshold.isMinOnly);
     }
     return out;
-  }, [data, thresholds]);
+  }, [latestReading, thresholds]);
 
   const getStatusBadge = () => {
     if (loading) {
@@ -138,7 +130,6 @@ export default function DashboardPage({ onNavigate }: Props) {
     return "bg-gray-400";
   };
 
-  // Color mapping for shared StatCard component
   const sensorColors: Record<string, string> = {
     temperature: "text-orange-500",
     water_level: "text-blue-500",
@@ -148,37 +139,37 @@ export default function DashboardPage({ onNavigate }: Props) {
   const stats = [
     {
       title: "Water Temperature",
-      value: loading ? "Loading..." : data ? `${data.temperature}°C` : "--°C",
+      value: loading ? "Loading..." : latestReading ? `${latestReading.temperature}°C` : "--°C",
       color: sensorColors.temperature,
       icon: <Thermometer size={24} />,
       loading,
-      status: data ? sensorStatuses.temperature : undefined,
+      status: latestReading ? sensorStatuses.temperature : undefined,
       rangeLabel: `Threshold: ${thresholds.temperature.range.min}-${thresholds.temperature.range.max}°C`,
     },
     {
       title: "Water Level",
-      value: loading ? "Loading..." : data ? `${data.water_level}%` : "--%",
+      value: loading ? "Loading..." : latestReading ? `${latestReading.water_level}%` : "--%",
       color: sensorColors.water_level,
       icon: <Waves size={24} />,
       loading,
-      status: data ? sensorStatuses.water_level : undefined,
+      status: latestReading ? sensorStatuses.water_level : undefined,
       rangeLabel: `Threshold: ${thresholds.water_level.range.min}-${thresholds.water_level.range.max}%`,
     },
     {
       title: "Ammonia",
-      value: loading ? "Loading..." : data ? `${data.ammonia} ppm` : "-- ppm",
+      value: loading ? "Loading..." : latestReading ? `${latestReading.ammonia} ppm` : "-- ppm",
       color: sensorColors.ammonia,
       icon: <FlaskConical size={24} />,
       loading,
-      status: data ? sensorStatuses.ammonia : undefined,
+      status: latestReading ? sensorStatuses.ammonia : undefined,
       rangeLabel: `Threshold: ${thresholds.ammonia.range.min}-${thresholds.ammonia.range.max} ppm`,
     },
   ];
 
   const highlights = [
-    { label: "Temperature", value: loading ? "..." : data ? `${data.temperature}°C` : "--", color: isOfflineWithData ? "bg-yellow-50 border-yellow-200 text-yellow-700" : data ? "bg-orange-50 border-orange-200 text-orange-700" : "bg-red-50 border-red-200 text-red-700" },
-    { label: "Water Level", value: loading ? "..." : data ? `${data.water_level}%` : "--", color: isOfflineWithData ? "bg-yellow-50 border-yellow-200 text-yellow-700" : data ? "bg-blue-50 border-blue-200 text-blue-700" : "bg-red-50 border-red-200 text-red-700" },
-    { label: "Ammonia", value: loading ? "..." : data ? `${data.ammonia} ppm` : "--", color: isOfflineWithData ? "bg-yellow-50 border-yellow-200 text-yellow-700" : data ? "bg-emerald-50 border-emerald-200 text-emerald-700" : "bg-red-50 border-red-200 text-red-700" },
+    { label: "Temperature", value: loading ? "..." : latestReading ? `${latestReading.temperature}°C` : "--", color: isOfflineWithData ? "bg-yellow-50 border-yellow-200 text-yellow-700" : latestReading ? "bg-orange-50 border-orange-200 text-orange-700" : "bg-red-50 border-red-200 text-red-700" },
+    { label: "Water Level", value: loading ? "..." : latestReading ? `${latestReading.water_level}%` : "--", color: isOfflineWithData ? "bg-yellow-50 border-yellow-200 text-yellow-700" : latestReading ? "bg-blue-50 border-blue-200 text-blue-700" : "bg-red-50 border-red-200 text-red-700" },
+    { label: "Ammonia", value: loading ? "..." : latestReading ? `${latestReading.ammonia} ppm` : "--", color: isOfflineWithData ? "bg-yellow-50 border-yellow-200 text-yellow-700" : latestReading ? "bg-emerald-50 border-emerald-200 text-emerald-700" : "bg-red-50 border-red-200 text-red-700" },
   ];
 
   const recentAlerts = tankStatus.alerts.filter(alert => alert !== "Tank is Safe").slice(0, 4);
@@ -192,7 +183,7 @@ export default function DashboardPage({ onNavigate }: Props) {
     }
   };
 
-  // Toggles the browser alert-sound preference (persisted to localStorage).
+  // Sound preference is persisted to localStorage.
   const toggleAlertSound = () => {
     const next = !alertsSoundEnabled;
     setSoundEnabled(next);
@@ -202,34 +193,30 @@ export default function DashboardPage({ onNavigate }: Props) {
   // Scenario keys currently breaching their safe range (e.g. "temperature:High")
   // so the Fix Legend can highlight the relevant guidance cards.
   const activeScenarioKeys = useMemo(() => {
-    if (!data) return [];
+    if (!latestReading) return [];
     const keys: string[] = [];
     for (const key of ["temperature", "water_level", "ammonia"] as const) {
       const status = sensorStatuses[key];
       if (!status || status === "good") continue;
-      const direction = data[key] < thresholds[key].range.min ? "Low" : "High";
+      const direction = latestReading[key] < thresholds[key].range.min ? "Low" : "High";
       keys.push(`${key}:${direction}`);
     }
     return keys;
-  }, [data, sensorStatuses, thresholds]);
+  }, [latestReading, sensorStatuses, thresholds]);
 
-  // Opens the fix guidance modal for a live sensor reading.
   const openFixModal = (parameter: "temperature" | "water_level" | "ammonia") => {
-    if (!data) return;
-    const guidance = buildLiveGuidance(parameter, Number(data[parameter]), settings);
+    if (!latestReading) return;
+    const guidance = buildLiveGuidance(parameter, Number(latestReading[parameter]), settings);
     if (guidance) setFixGuidance(guidance);
   };
 
-  // Opens the fix guidance modal from an active scenario key (used by the panel).
   const openFixModalFromKey = (scenarioKey: string) => {
     const [parameterKey] = scenarioKey.split(":");
-    const parameter = parameterKey as "temperature" | "water_level" | "ammonia";
-    openFixModal(parameter);
+    openFixModal(parameterKey as "temperature" | "water_level" | "ammonia");
   };
 
   return (
     <div className="space-y-6">
-      {/* Farm overview: every tank with live readings; click a card to drill in */}
       <section>
         <FarmOverview />
       </section>
@@ -243,7 +230,6 @@ export default function DashboardPage({ onNavigate }: Props) {
         </div>
       )}
 
-      {/* Hero banner */}
       <section className="relative overflow-hidden rounded-3xl border border-gray-200 bg-gradient-to-r from-orange-50 via-amber-50 to-orange-100 shadow-sm">
         <div
           className="absolute inset-0 bg-cover bg-center opacity-10"
@@ -284,19 +270,19 @@ export default function DashboardPage({ onNavigate }: Props) {
             </p>
 
             <div className="mt-6 flex flex-wrap gap-3">
-              {highlights.map((item) => (
+              {highlights.map((highlight) => (
                 <div
-                  key={item.label}
-                  className={`rounded-xl border px-4 py-3 shadow-sm ${item.color}`}
+                  key={highlight.label}
+                  className={`rounded-xl border px-4 py-3 shadow-sm ${highlight.color}`}
                 >
-                  <p className="text-xs opacity-80">{item.label}</p>
-                  <p className="text-sm font-semibold">{item.value}</p>
+                  <p className="text-xs opacity-80">{highlight.label}</p>
+                  <p className="text-sm font-semibold">{highlight.value}</p>
                 </div>
               ))}
             </div>
           </div>
 
-            <aside className="rounded-3xl border border-gray-200 bg-white/90 p-6 shadow-sm">
+          <aside className="rounded-3xl border border-gray-200 bg-white/90 p-6 shadow-sm">
               <h3 className="mb-4 text-xl font-bold text-gray-800">System Alerts and Notifications</h3>
               {alertsDismissed ? (
                 <p className="text-sm text-gray-400">Alerts dismissed</p>
@@ -348,11 +334,10 @@ export default function DashboardPage({ onNavigate }: Props) {
       {/* Live stat cards */}
       <section className={`grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3 ${isOfflineWithData ? "opacity-60" : ""}`}>
         {stats.map((stat) => (
-          <StatCard key={stat.title} {...stat} loading={loading} />
+          <StatCard key={stat.title} {...stat} />
         ))}
       </section>
 
-      {/* Fix legend - how to respond to each sensor alert */}
       <section>
         <FixLegendPanel
           activeKeys={activeScenarioKeys}
@@ -360,7 +345,6 @@ export default function DashboardPage({ onNavigate }: Props) {
         />
       </section>
 
-      {/* Live trend charts */}
       <section className="space-y-3">
         <div className="flex items-center justify-between">
           <h3 className="text-lg font-bold text-gray-800">Live Trends</h3>
@@ -408,8 +392,7 @@ export default function DashboardPage({ onNavigate }: Props) {
       </section>
 
       {/* Quick controls + key metrics */}
-      <section className="grid grid-cols-1 gap-4 lg:grid-cols-4">
-        <div className="rounded-2xl border border-gray-200 bg-white p-6 shadow-sm lg:col-span-1">
+      <section className="grid grid-cols-1 gap-4 lg:grid-cols-4">        <div className="rounded-2xl border border-gray-200 bg-white p-6 shadow-sm lg:col-span-1">
           <h3 className="mb-4 text-lg font-bold text-gray-800">Quick Controls</h3>
           <div className="flex flex-col gap-3">
             <button
@@ -459,21 +442,21 @@ export default function DashboardPage({ onNavigate }: Props) {
             <div className={`grid grid-cols-1 gap-4 sm:grid-cols-3 ${isOfflineWithData ? "opacity-60" : ""}`}>
               <div className="rounded-xl bg-orange-50 p-4">
                 <p className="text-xs text-gray-500">Temperature</p>
-                <p className="mt-1 text-2xl font-bold text-orange-600">{data?.temperature ?? "--"}°C</p>
+                <p className="mt-1 text-2xl font-bold text-orange-600">{latestReading?.temperature ?? "--"}°C</p>
                 <p className="mt-1 text-xs text-gray-400">
                   Optimal: {thresholds.temperature.range.min}-{thresholds.temperature.range.max}°C
                 </p>
               </div>
               <div className="rounded-xl bg-blue-50 p-4">
                 <p className="text-xs text-gray-500">Water Level</p>
-                <p className="mt-1 text-2xl font-bold text-blue-600">{data?.water_level ?? "--"}%</p>
+                <p className="mt-1 text-2xl font-bold text-blue-600">{latestReading?.water_level ?? "--"}%</p>
                 <p className="mt-1 text-xs text-gray-400">
                   Optimal: {thresholds.water_level.range.min}-{thresholds.water_level.range.max}%
                 </p>
               </div>
               <div className="rounded-xl bg-emerald-50 p-4">
                 <p className="text-xs text-gray-500">Ammonia</p>
-                <p className="mt-1 text-2xl font-bold text-emerald-600">{data?.ammonia ?? "--"} ppm</p>
+                <p className="mt-1 text-2xl font-bold text-emerald-600">{latestReading?.ammonia ?? "--"} ppm</p>
                 <p className="mt-1 text-xs text-gray-400">
                   Optimal: {thresholds.ammonia.range.min}-{thresholds.ammonia.range.max} ppm
                 </p>
@@ -483,7 +466,7 @@ export default function DashboardPage({ onNavigate }: Props) {
         </div>
       </section>
 
-      {/* Fix guidance modal (opened via "How to fix" on stat cards / legend panel) */}
+      {/* Fix guidance modal */}
       {fixGuidance && (
         <FixLegendModal
           guidance={fixGuidance}

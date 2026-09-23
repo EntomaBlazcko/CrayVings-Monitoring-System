@@ -1,24 +1,12 @@
-// =============================================================================
-// FILE: src/contexts/SensorContext.tsx
-// =============================================================================
-// Context interfaces and hooks for sensor data, settings, and logs.
-// =============================================================================
-
-import { createContext, useContext } from "react";
+import { createContext } from "react";
 import type { SensorEntry, ChartPoint, LogEntry, SensorSettings, ActivityLog, ActivityActionType, DeviceEntry } from "../types";
 
-// ========================
-// CONNECTION STATUS TYPE
-// ========================
-// "online" = data within 15s, "offline" = no data for 15+s,
+// "online" = heartbeat within 30s, "offline" = no heartbeat for 30+s,
 // "connecting" = waiting for first data, "unknown" = never received data.
 export type ConnectionStatus = "online" | "offline" | "connecting" | "unknown";
 
-// ========================
-// SENSOR DATA CONTEXT
-// ========================
 export interface SensorDataContextValue {
-  data: SensorEntry | null;
+  latestReading: SensorEntry | null;
   history: ChartPoint[];
   loading: boolean;
   error: string | null;
@@ -27,16 +15,13 @@ export interface SensorDataContextValue {
   consecutiveFailures: number;         // consecutive failed polls
   historyStale: boolean;               // true if last history fetch failed
   historyLastUpdated: Date | null;
-  devices: DeviceEntry[];              // fleet registry, polled every ~5s
+  devices: DeviceEntry[];              // fleet registry, polled every 5s
   devicesLoading: boolean;
   selectedDeviceId: string | null;     // currently viewed tank
   setSelectedDeviceId: (deviceId: string | null) => void;
   refetch: () => void;
 }
 
-// ========================
-// SENSOR SETTINGS CONTEXT
-// ========================
 export interface SensorSettingsContextValue {
   settings: SensorSettings | null;
   settingsLoading: boolean;
@@ -48,9 +33,6 @@ export interface SensorSettingsContextValue {
   settingsSaving: boolean;
 }
 
-// ========================
-// SYSTEM LOGS CONTEXT
-// ========================
 export interface LogsContextValue {
   logs: LogEntry[];
   logsLoading: boolean;
@@ -66,9 +48,6 @@ export interface LogsContextValue {
   setLogsParameterFilter: (filter: string) => void;
 }
 
-// ========================
-// ACTIVITY LOGS CONTEXT
-// ========================
 export interface ActivityLogsContextValue {
   activityLogs: ActivityLog[];
   activityLogsLoading: boolean;
@@ -87,50 +66,9 @@ export interface ActivityLogsContextValue {
   logActivity: (actionType: ActivityActionType, description: string, module: string) => void;
 }
 
-// ========================
-// CONTEXT OBJECTS
-// ========================
-// Null defaults; values provided by SensorProvider.tsx.
-
+// Contexts are null until SensorProvider mounts; consumer hooks live in
+// hooks/useSensors.ts and throw when used outside the provider.
 export const ActivityLogsContext = createContext<ActivityLogsContextValue | null>(null);
-
 export const SensorDataContext = createContext<SensorDataContextValue | null>(null);
 export const SensorSettingsContext = createContext<SensorSettingsContextValue | null>(null);
 export const LogsContext = createContext<LogsContextValue | null>(null);
-
-// ========================
-// CUSTOM HOOKS
-// ========================
-// Throw if used outside SensorProvider.
-
-export function useSensorData(): SensorDataContextValue {
-  const context = useContext(SensorDataContext);
-  if (!context) {
-    throw new Error("useSensorData must be used within a SensorProvider");
-  }
-  return context;
-}
-
-export function useSensorSettings(): SensorSettingsContextValue {
-  const context = useContext(SensorSettingsContext);
-  if (!context) {
-    throw new Error("useSensorSettings must be used within a SensorProvider");
-  }
-  return context;
-}
-
-export function useSystemLogs(): LogsContextValue {
-  const context = useContext(LogsContext);
-  if (!context) {
-    throw new Error("useSystemLogs must be used within a SensorProvider");
-  }
-  return context;
-}
-
-export function useActivityLogs(): ActivityLogsContextValue {
-  const context = useContext(ActivityLogsContext);
-  if (!context) {
-    throw new Error("useActivityLogs must be used within a SensorProvider");
-  }
-  return context;
-}

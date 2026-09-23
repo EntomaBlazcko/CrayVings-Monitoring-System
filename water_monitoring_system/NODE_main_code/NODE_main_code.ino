@@ -1951,6 +1951,20 @@ int postReading(const String &url, float tempToSend, float levelToSend, float am
     Serial.println(payload);
 
     int code = http.POST(payload);
+    if (code > 0 && (code < 200 || code >= 300))
+    {
+        // Rejected by the server (4xx/3xx): print WHY so the serial monitor
+        // shows the actual error message, not just the bare code.
+        String body = http.getString();
+        Serial.printf("[HTTP] Rejected (HTTP %d): ", code);
+        Serial.println(body.substring(0, 160));
+        if (code == 401)
+        {
+            Serial.println("[HTTP] 401 = device secret problem. Open the config portal (triple-tap the");
+            Serial.println("[HTTP] top-left corner, or send 'W' over serial) and set 'Device Secret' to");
+            Serial.println("[HTTP] the same value as DEVICE_SECRET in the server's .env, then save.");
+        }
+    }
     http.end();
     return code;
 }
@@ -2014,13 +2028,15 @@ void sendSensorData()
             }
 
             int code = postReading(baseUrl, r.temp, r.level, r.ammonia);
-            if (code > 0)
+            if (code >= 200 && code < 300)
             {
                 flushed++;
             }
             else
             {
-                // Put it back at the head for the next flush attempt.
+                // Not accepted (rejected or transport error): put it back at
+                // the head for the next flush attempt. Never count a rejected
+                // reading as delivered - a 4xx would silently drop it.
                 sendBufRead = (sendBufRead - 1 + SEND_BUFFER_CAP) % SEND_BUFFER_CAP;
                 sendBufCount++;
                 break;
@@ -2041,7 +2057,7 @@ void sendSensorData()
 
     int httpResponseCode = postReading(baseUrl, tempToSend, levelToSend, ammoniaToSend);
 
-    if (httpResponseCode > 0)
+    if (httpResponseCode >= 200 && httpResponseCode < 300)
     {
         Serial.print("[HTTP] Response code: ");
         Serial.println(httpResponseCode);

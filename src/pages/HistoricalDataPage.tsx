@@ -1,9 +1,3 @@
-// =============================================================================
-// src/pages/HistoricalDataPage.tsx
-// Historical data analysis with time-range filtering, trend overlays,
-// window highlights, reading breakdown, and weekly PDF report.
-// =============================================================================
-
 import { useState, useMemo, useEffect, useCallback, createElement } from "react";
 import {
   History,

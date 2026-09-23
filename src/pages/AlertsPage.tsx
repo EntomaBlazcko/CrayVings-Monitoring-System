@@ -1,9 +1,3 @@
-// =============================================================================
-// src/pages/AlertsPage.tsx
-// Alert history with severity classification, action/severity filters,
-// parameter breakdown, and pagination.
-// =============================================================================
-
 import { useEffect, useMemo, useState } from "react";
 import {
   Bell,
@@ -11,9 +5,6 @@ import {
   AlertCircle,
   ChevronLeft,
   ChevronRight,
-  Thermometer,
-  Waves,
-  FlaskConical,
   Activity,
   RefreshCw,
   Clock,
@@ -24,36 +15,21 @@ import {
   X,
   Settings2,
 } from "lucide-react";
-import { useSensors } from "../hooks/useSensors";
-import { useActivityLogger } from "../hooks/useSensors";
+import { useSensors, useActivityLogger } from "../hooks/useSensors";
 import { useAuth } from "../contexts/useAuth";
 import { Spinner, LoadingCard, ErrorCard } from "../components/Loading";
 import { parseAlertSeverity, type AlertSeverity } from "../types";
 import { SENSOR_KEY_TO_DISPLAY, DISPLAY_TO_SENSOR_KEY } from "../types";
 import type { LogEntry, MenuKey } from "../types";
-import { formatFarmDateTime, formatFarmTime } from "../utils/time";
+import { formatFarmDateTime, formatFarmTime, formatTimeAgo } from "../utils/time";
+import { titleCase } from "../utils/text";
 import { buildScenarioGuidance, getAlertGuidance } from "../utils/alertGuidance";
 import type { AlertGuidance } from "../utils/alertGuidance";
 import { FixLegendPanel, FixLegendModal } from "../components/FixLegend";
+import { PARAM_ICON } from "../utils/paramIcons";
 import { acknowledgeLog } from "../api/client";
 
 type SeverityFilter = AlertSeverity | "";
-
-// Formats a timestamp into a relative time string (e.g. "5s ago", "3m ago").
-function formatTimeAgo(timestamp: string | Date): string {
-  const date = timestamp instanceof Date ? timestamp : new Date(timestamp);
-  if (isNaN(date.getTime())) return "N/A";
-
-  const seconds = Math.floor((Date.now() - date.getTime()) / 1000);
-  if (seconds < 0) return "Just now";
-  if (seconds < 60) return `${seconds}s ago`;
-  const minutes = Math.floor(seconds / 60);
-  if (minutes < 60) return `${minutes}m ago`;
-  const hours = Math.floor(minutes / 60);
-  if (hours < 24) return `${hours}h ago`;
-  const days = Math.floor(hours / 24);
-  return `${days}d ago`;
-}
 
 const SEVERITY_META: Record<AlertSeverity, { bar: string; pill: string; label: string; icon: React.ReactNode }> = {
   critical: {
@@ -74,15 +50,6 @@ const SEVERITY_META: Record<AlertSeverity, { bar: string; pill: string; label: s
     label: "Info",
     icon: <AlertCircle size={14} />,
   },
-};
-
-const PARAM_ICON: Record<string, React.ReactNode> = {
-  Temperature: <Thermometer size={16} className="text-orange-500" />,
-  "Water Level": <Waves size={16} className="text-blue-500" />,
-  Ammonia: <FlaskConical size={16} className="text-emerald-500" />,
-  temperature: <Thermometer size={16} className="text-orange-500" />,
-  water_level: <Waves size={16} className="text-blue-500" />,
-  ammonia: <FlaskConical size={16} className="text-emerald-500" />,
 };
 
 type AckStatus = "confirmed" | "allowed";
@@ -429,11 +396,6 @@ export default function AlertsPage({ onNavigate }: { onNavigate?: (menu: MenuKey
               const meta = SEVERITY_META[severity];
               const displayParam = SENSOR_KEY_TO_DISPLAY[log.parameter] ?? log.parameter;
               const paramIcon = PARAM_ICON[log.parameter] ?? PARAM_ICON[displayParam] ?? <Activity size={16} className="text-gray-400" />;
-              const titleCase = (s: string) =>
-                String(s)
-                  .split(/[\s_]+/)
-                  .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
-                  .join(" ");
 
               return (
                 <div

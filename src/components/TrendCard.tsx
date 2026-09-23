@@ -1,16 +1,10 @@
-// =============================================================================
-// FILE: src/components/TrendCard.tsx
-// PURPOSE: Recharts line chart card for visualizing sensor trends over time.
-// Optionally overlays the configured safe range as a shaded band so threshold
-// breaches are visible at a glance, and an optional moving-average overlay.
+// Recharts line chart card with an optional safe-range band overlay and an
+// optional moving-average line.
 //
-// NOTE: The safe band + limit lines are drawn with plain Area/Line series
-// instead of ReferenceArea/ReferenceLine. Recharts 3.8.1's reference-elements
-// slice dispatches on every render (no deps array) and, combined with React 19,
-// triggers "Maximum update depth exceeded" white-screen crashes. Plain series
-// avoid that entirely.
-// =============================================================================
-
+// NOTE: the safe band + limit lines use plain Area/Line series instead of
+// ReferenceArea/ReferenceLine — Recharts 3.8.1's reference-elements slice
+// dispatches on every render (no deps array), which combined with React 19
+// triggers "Maximum update depth exceeded" white-screen crashes.
 import {
   ComposedChart,
   Line,
@@ -21,6 +15,7 @@ import {
   Tooltip,
   ResponsiveContainer,
 } from "recharts";
+import { useMemo } from "react";
 import type { ChartPoint, ThresholdRange } from "../types";
 
 type Props = {
@@ -109,9 +104,13 @@ export default function TrendCard({
   const isLargeDataset = data.length > 50;
   const domain = computeDomain(data, dataKey, range);
 
-  const chartData = range
-    ? data.map((d) => ({ ...d, [BAND_MIN_KEY]: range.min, [BAND_MAX_KEY]: range.max }))
-    : data;
+  const chartData = useMemo(
+    () =>
+      range
+        ? data.map((d) => ({ ...d, [BAND_MIN_KEY]: range.min, [BAND_MAX_KEY]: range.max }))
+        : data,
+    [data, range]
+  );
 
   return (
     <div className="bg-white rounded-xl border border-gray-100 p-4 shadow-sm hover:shadow-md transition">

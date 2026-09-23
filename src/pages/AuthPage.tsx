@@ -1,17 +1,9 @@
-// =============================================================================
-// src/pages/AuthPage.tsx
-// Login page with Zod validation and API authentication.
-// =============================================================================
-
 import { useState, useCallback } from "react";
 import { z } from "zod";
 import { Eye, EyeOff, User, Lock, LogIn } from "lucide-react";
 import { useAuth } from "../contexts/useAuth";
 import logo from "../assets/crayvings.png";
 
-// ========================
-// LOGIN FORM VALIDATION SCHEMA
-// ========================
 const loginSchema = z.object({
   username: z.string().min(3, "Username must be at least 3 characters").max(50),
   password: z.string().min(6, "Password must be at least 6 characters").max(100),
@@ -20,9 +12,6 @@ const loginSchema = z.object({
 type LoginForm = z.infer<typeof loginSchema>;
 type FormErrors = Record<string, string>;
 
-/**
- * Login page component with Zod form validation and API authentication.
- */
 export default function AuthPage() {
   const { login, isLoading, clearError } = useAuth();
   const [showPassword, setShowPassword] = useState(false);
@@ -34,7 +23,6 @@ export default function AuthPage() {
   const [loginErrors, setLoginErrors] = useState<FormErrors>({});
   const [apiError, setApiError] = useState<string | null>(null);
 
-  // Validates login form against Zod schema; returns field-specific errors.
   const validateLoginForm = useCallback((): FormErrors => {
     try {
       loginSchema.parse(loginForm);
@@ -53,7 +41,6 @@ export default function AuthPage() {
     }
   }, [loginForm]);
 
-  // Validates input, clears previous errors, attempts login.
   const handleLoginSubmit = useCallback(async (e: React.FormEvent) => {
     e.preventDefault();
     clearError();
@@ -78,10 +65,8 @@ export default function AuthPage() {
   return (
     <div className="min-h-screen bg-gradient-to-br from-orange-50 via-white to-orange-100 flex items-center justify-center p-4">
       <div className="w-full max-w-md">
-        {/* Login card */}
         <div className="bg-white rounded-2xl shadow-xl overflow-hidden">
-          {/* Card header with branding */}
-          <div className="bg-gradient-to-r from-[#d94b1e] to-[#ef6a2e] p-6 text-center text-white">
+            <div className="bg-gradient-to-r from-[#d94b1e] to-[#ef6a2e] p-6 text-center text-white">
             <div className="w-20 h-20 mx-auto rounded-full bg-white flex items-center justify-center overflow-hidden border-2 border-white/50 mb-3">
               <img src={logo} alt="CrayVings Logo" className="w-full h-full object-contain" />
             </div>
@@ -89,9 +74,7 @@ export default function AuthPage() {
             <p className="text-sm opacity-90 mt-1">Smart aquaculture monitoring dashboard</p>
           </div>
 
-          {/* Login form */}
           <div className="p-6">
-            {/* API error message display */}
             {(apiError) && (
               <div className="bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded-lg mb-4 text-sm">
                 {apiError}
@@ -99,7 +82,6 @@ export default function AuthPage() {
             )}
 
             <form onSubmit={handleLoginSubmit} className="space-y-4" noValidate>
-              {/* Username field */}
               <div>
                 <label htmlFor="login-username" className="block text-sm font-medium text-gray-700 mb-1">
                   Username
@@ -129,7 +111,6 @@ export default function AuthPage() {
                 )}
               </div>
 
-              {/* Password field with visibility toggle */}
               <div>
                 <label htmlFor="login-password" className="block text-sm font-medium text-gray-700 mb-1">
                   Password
@@ -166,7 +147,6 @@ export default function AuthPage() {
                 )}
               </div>
 
-              {/* Submit button with loading spinner */}
               <button
                 type="submit"
                 disabled={isLoading}

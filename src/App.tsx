@@ -1,8 +1,3 @@
-// =============================================================================
-// FILE: src/App.tsx
-// PURPOSE: Root component with routing, layout, and context providers.
-// =============================================================================
-
 import { useState, useCallback, useRef, useMemo, lazy, Suspense } from "react";
 import {
   Menu,
@@ -23,7 +18,7 @@ import Header from "./components/Header";
 import AuthPage from "./pages/AuthPage";
 import { LoadingCard } from "./components/Loading";
 import { SensorProvider } from "./contexts/SensorProvider";
-import { useActivityLogs } from "./contexts/SensorContext";
+import { useActivityLogs } from "./hooks/useSensors";
 import { AuthProvider } from "./contexts/AuthContext";
 import { useAuth } from "./contexts/useAuth";
 import { DeviceConnectionMonitor } from "./components/DeviceConnectionMonitor";
@@ -40,9 +35,6 @@ const LogsPage = lazy(() => import("./pages/LogsPage"));
 const ActivityLogsPage = lazy(() => import("./pages/ActivityLogsPage"));
 const AnalyticsPage = lazy(() => import("./pages/AnalyticsPage"));
 
-// ========================
-// NAVIGATION MENU DEFINITION
-// ========================
 const menuDefinitions: { label: MenuKey; icon: React.ReactNode }[] = [
   { label: "Dashboard", icon: <LayoutDashboard size={18} /> },
   { label: "Analytics", icon: <BarChart3 size={18} /> },
@@ -54,12 +46,8 @@ const menuDefinitions: { label: MenuKey; icon: React.ReactNode }[] = [
   { label: "Settings", icon: <Settings size={18} /> },
 ];
 
-// ========================
-// ROLE-BASED ACCESS CONTROL
-// ========================
-// Admin sees every page; users are restricted to monitoring pages (no audit
-// logs, settings, or user management). Enforced in the UI (menu + navigation)
-// and on the server (requireAuth / requireAdmin).
+// Admins see every page; users are restricted to monitoring pages. Enforced in
+// the UI here and by requireAuth/requireAdmin on the server.
 const ADMIN_MENU_KEYS: MenuKey[] = [...VALID_MENU_KEYS];
 
 const USER_MENU_KEYS: MenuKey[] = [
@@ -75,9 +63,6 @@ function getAllowedMenuKeys(role?: UserRole): MenuKey[] {
   return role === "admin" ? ADMIN_MENU_KEYS : USER_MENU_KEYS;
 }
 
-// ========================
-// LOCAL STORAGE STATE RESTORATION
-// ========================
 function getInitialMenuDefault(role?: UserRole): MenuKey {
   const saved = localStorage.getItem("activeMenu");
   if (saved && isValidMenuKey(saved) && getAllowedMenuKeys(role).includes(saved)) {
@@ -86,9 +71,6 @@ function getInitialMenuDefault(role?: UserRole): MenuKey {
   return "Dashboard";
 }
 
-// ========================
-// DASHBOARD LAYOUT COMPONENT
-// ========================
 function DashboardLayout() {
   const { user, logout } = useAuth();
   const { logActivity } = useActivityLogs();
@@ -96,7 +78,7 @@ function DashboardLayout() {
   const activeMenuRef = useRef<MenuKey>(getInitialMenuDefault(user?.role));
   const [activeMenu, setActiveMenu] = useState<MenuKey>(getInitialMenuDefault(user?.role));
   const [sidebarOpen, setSidebarOpen] = useState(false);
-  
+
   useThresholdAlert();
 
   const allowedKeys = useMemo(
@@ -153,7 +135,6 @@ function DashboardLayout() {
         break;
     }
 
-    // Suspense shows a loading state while lazy page chunks download.
     return (
       <Suspense
         fallback={
@@ -187,7 +168,7 @@ function DashboardLayout() {
         className={`fixed md:static inset-y-0 left-0 z-50 w-24 bg-[#f5efe9] border-r border-[#eadfd6] min-h-screen flex flex-col items-center pt-4 transform transition-transform duration-300 ${
           sidebarOpen ? "translate-x-0" : "-translate-x-full md:translate-x-0"
         }`}
-        >
+      >
         <div className="w-14 h-14 rounded-full bg-white flex items-center justify-center overflow-hidden border-2 border-[#e9d3c6] mb-4">
           <img
             src={logo}
@@ -236,11 +217,8 @@ function DashboardLayout() {
   );
 }
 
-// ========================
-// APP CONTENT COMPONENT
-// ========================
-// SensorProvider only mounts after login so background polling (which now
-// requires auth) never fires on the AuthPage.
+// SensorProvider mounts only after login so its authenticated polling and SSE
+// connection never fire on the login screen.
 function AppContent() {
   const { user } = useAuth();
 
@@ -256,9 +234,6 @@ function AppContent() {
   );
 }
 
-// ========================
-// ROOT APP COMPONENT
-// ========================
 export default function App() {
   return (
     <AuthProvider>

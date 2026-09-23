@@ -1,17 +1,13 @@
-// =============================================================================
-// FILE: src/components/DeviceConnectionMonitor.tsx
-// PURPOSE: Background watcher for ESP32 connection status (no visible UI).
-// =============================================================================
+// Headless watcher: turns ESP32 connection-status transitions into floating
+// alerts, sounds, and activity-log entries.
 
 import { useEffect, useRef } from "react";
-import { useSensorData } from "../hooks/useSensors";
+import { useSensorData, useActivityLogger } from "../hooks/useSensors";
 import { useFloatingAlerts } from "../hooks/useFloatingAlerts";
-import { useActivityLogger } from "../hooks/useSensors";
 import { playCriticalSound } from "../utils/playAlertSound";
 
 type ConnectionStatus = "online" | "offline" | "connecting" | "unknown";
 
-// Watches ESP32 connection status; triggers alerts on disconnect/reconnect.
 export function DeviceConnectionMonitor() {
   const { connectionStatus, consecutiveFailures, lastUpdate } = useSensorData();
   const { addNotification, removeNotification } = useFloatingAlerts();

@@ -52,7 +52,7 @@ This can help reduce risks caused by poor water conditions and improve overall m
 - **PDF export** - Export system logs to PDF (LogsPage) and weekly reports to PDF (Historical Data)
 - **Analytics** - Period overviews, trends, daily breakdowns, and rule-based insights
 - **Activity logging** - Track user interactions including device connect/disconnect events
-- **Hardened ingestion** - Sensor-failure sentinels (temp -127/0, water/ammonia -1) are stored as NULL, per-device secrets are supported alongside the shared `DEVICE_SECRET`, ingestion is rate-limited (3/sec/device), and DB CHECK constraints keep bad rows out
+- **Hardened ingestion** - Sensor-failure sentinels (temp -1/0, water/ammonia -1) are stored as NULL, per-device secrets are supported alongside the shared `DEVICE_SECRET`, ingestion is rate-limited (12/sec/device, burst headroom for the offline-buffer flush), and DB CHECK constraints keep bad rows out
 - **Security headers** - `helmet` CSP and standard hardening headers on all API responses; `ALLOWED_ORIGINS` is required in production
 - **WiFiManager** - ESP32 firmware uses captive portal for WiFi config (no hardcoded credentials)
 - **Touchscreen UI** - 480x320 TFT with XPT2046 resistive touch (HSPI); on-screen left/right page arrows and triple-tap gestures
@@ -378,7 +378,7 @@ sentinels, adds CHECK constraints + a partial index), and
 
 ### Change-Only (Delta) Logging
 - `POST /sensor` writes a new row only when a parameter differs from the last stored reading beyond its per-sensor tolerance (defaults: temp ±0.1°C, water level ±1.0%, ammonia ±0.05 ppm)
-- **Sensor-failure sentinels are stored as NULL**: temperature -127/0 (DS18B20 failure), water level -1 (HC-SR04 failure), and ammonia -1 (MQ-137 failure) are converted to NULL before the row is written, so failed sensors never pollute charts or trigger false alerts. Older sentinel rows were migrated to NULL by `db/migrations/009_sensor_constraints.cjs`, and CHECK constraints now keep them out
+- **Sensor-failure sentinels are stored as NULL**: both firmwares convert the DS18B20's -127 disconnect code to -1 before sending, so the wire sentinels are temperature -1/0, water level -1 (HC-SR04 failure), and ammonia -1 (MQ-137 failure). The server converts all of them to NULL before the row is written, so failed sensors never pollute charts, analytics, or alerts. Older sentinel rows were migrated to NULL by `db/migrations/009_sensor_constraints.cjs`, and CHECK constraints now keep them out
 - Unchanged readings refresh `devices.last_seen` as a heartbeat and respond `200 { skipped: true }` with no new row
 - Keeps the `sensors` table small; alerts, SMS, and online/offline detection (frontend + analytics) stay accurate via the heartbeat
 - Tune with `DELTA_LOGGING_ENABLED`, `TEMP_DELTA_TOLERANCE`, `WATER_LEVEL_DELTA_TOLERANCE`, `AMMONIA_DELTA_TOLERANCE` in `.env`

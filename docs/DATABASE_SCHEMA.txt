@@ -136,7 +136,7 @@ unchanged heartbeats write no row).
   temperature  DECIMAL(5,2)  DEFAULT 0, NULLABLE                Degrees Celsius.
                                                                  NULL when the DS18B20
                                                                  failed (firmware
-                                                                 reports -127 / 0).
+                                                                 reports -1 / 0).
   water_level  DECIMAL(5,2)  DEFAULT 0, NULLABLE                 Percent (%).
                                                                  NULL when the HC-SR04
                                                                  failed (firmware
@@ -148,13 +148,16 @@ unchanged heartbeats write no row).
   timestamp    TIMESTAMPTZ   DEFAULT CURRENT_TIMESTAMP           Reading time
                                                                  (migration 007)
 
-  Since migration 009 the server converts firmware failure sentinels
-  (temperature -127/0, water_level -1, ammonia -1) to NULL before the row is
-  written; existing sentinel rows were migrated to NULL. CHECK constraints
+  Since migration 009 the server converts firmware failure sentinels to NULL
+  before the row is written; existing sentinel rows were migrated to NULL.
+  Both firmwares convert the DS18B20's -127 disconnect code to -1 before
+  sending, so the WIRE sentinels are: temperature -1 or 0, water_level -1,
+  ammonia -1. Temperature <= 0 is treated as a failure (tropical farm; the
+  client chart filter and alert engine use the same rule). CHECK constraints
   enforce this at the database level.
 
 Check constraints (migration 009):
-  chk_sensors_temperature_valid  temperature IS NULL OR (temperature > -100
+  chk_sensors_temperature_valid  temperature IS NULL OR (temperature > 0
                                  AND temperature <= 100)
   chk_sensors_water_level_valid  water_level IS NULL OR (water_level >= 0
                                  AND water_level <= 200)

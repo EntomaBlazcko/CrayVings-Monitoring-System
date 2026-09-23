@@ -1,11 +1,3 @@
-// =============================================================================
-// src/components/AnalyticsSection.tsx
-// Analytics dashboard: period summary with threshold status, trends, alert
-// activity, device uptime, daily readings/alerts volume, a focusable daily
-// averages chart (with configured safe-range band + rolling average), and
-// rule-engine suggestions.
-// =============================================================================
-
 import { useState, useEffect, useMemo } from "react";
 import {
   BarChart3,

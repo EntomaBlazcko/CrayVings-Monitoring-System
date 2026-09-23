@@ -1,8 +1,5 @@
-// =============================================================================
-// src/utils/alertGuidance.ts
 // The "Fix Legend" for sensor alerts. Single source of truth for the suggested
 // fixes shown on the Alerts page (legend panel + per-alert modal).
-// =============================================================================
 
 import {
   getSettingsThresholds,

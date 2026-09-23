@@ -1,11 +1,3 @@
-// =============================================================================
-// FILE: src/utils/time.ts
-// =============================================================================
-// Time formatting helpers that render timestamps in the farm's timezone (Asia/Manila).
-// Dates render as "September 12 2026" and datetimes as "September 12 2026, 3:42 PM".
-// =============================================================================
-
-// All near-real-time labels render in this zone.
 export const FARM_TIME_ZONE = "Asia/Manila";
 
 // Formats as short time (e.g. "3:42 PM"); returns "N/A" on invalid input.
@@ -24,7 +16,6 @@ export function formatFarmTime(value: Date | string | null | undefined): string 
   }
 }
 
-// Extracts date parts ("September", "12", "2026") in the farm timezone.
 function getFarmDateParts(d: Date): { month: string; day: string; year: string } {
   const parts = new Intl.DateTimeFormat("en-US", {
     month: "long",
@@ -67,4 +58,19 @@ export function formatFarmDateTime(value: Date | string | null | undefined): str
   } catch {
     return d.toLocaleString();
   }
+}
+
+// Relative age of a timestamp, e.g. "5s ago", "3m ago"; "N/A" on invalid input.
+export function formatTimeAgo(timestamp: string | Date): string {
+  const date = timestamp instanceof Date ? timestamp : new Date(timestamp);
+  if (isNaN(date.getTime())) return "N/A";
+
+  const seconds = Math.floor((Date.now() - date.getTime()) / 1000);
+  if (seconds < 0) return "Just now";
+  if (seconds < 60) return `${seconds}s ago`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  return `${Math.floor(hours / 24)}d ago`;
 }

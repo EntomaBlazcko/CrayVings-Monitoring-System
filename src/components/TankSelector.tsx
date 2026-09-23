@@ -1,14 +1,9 @@
-// =============================================================================
-// FILE: src/components/TankSelector.tsx
-// =============================================================================
-// PURPOSE: "Live Tank Bar" - fleet-wide tank switcher with a live mini card per
-// tank. Each card shows the tank name, online/offline state, and the freshest
-// temp / water / ammonia values (red when out of range), plus the per-tank
-// actions: rename, hide (non-destructive, restorable), and live diagnostics.
-// Clicking a card selects that tank for Dashboard / Historical Data / Analytics.
-// =============================================================================
+// "Live Tank Bar": fleet-wide tank switcher. Each card shows the tank name,
+// online/offline state, and the freshest temp / water / ammonia values (red
+// when out of range), plus rename / hide / live-diagnostics actions. Clicking
+// a card selects that tank for Dashboard / Historical Data / Analytics.
 
-import { useState, useMemo } from "react";
+import { useState, useCallback } from "react";
 import { Eye, EyeOff, RotateCcw } from "lucide-react";
 import { useSensorData } from "../hooks/useSensors";
 import { useDevicesLatest } from "../hooks/useDevicesLatest";
@@ -31,14 +26,14 @@ export default function TankSelector() {
   const onlineCount = devices.filter((d) => d.online).length;
   const hiddenCount = hiddenDevices?.length ?? 0;
 
-  const inRange = useMemo(() => (key: string, value: number | null) => {
+  const inRange = useCallback((key: string, value: number | null) => {
     if (value === null) return true;
     const t = thresholds[key];
     if (!t) return true;
     return value >= t.range.min && value <= t.range.max;
   }, [thresholds]);
 
-  const valueClass = useMemo(() => (key: string, value: number | null) =>
+  const valueClass = useCallback((key: string, value: number | null) =>
     inRange(key, value) ? "text-gray-600" : "font-bold text-red-600",
   [inRange]);
 
@@ -120,7 +115,7 @@ export default function TankSelector() {
             .map((device) => {
               const active = device.device_id === selectedDeviceId;
               const reading = latestByTank[device.device_id];
-              const temp = reading && reading.temperature != null && reading.temperature > 0 ? reading.temperature : null;
+              const tempC = reading && reading.temperature != null && reading.temperature > 0 ? reading.temperature : null;
               const water = reading && reading.water_level != null && reading.water_level >= 0 ? reading.water_level : null;
               const ammonia = reading && reading.ammonia != null && reading.ammonia >= 0 ? reading.ammonia : null;
 
@@ -171,7 +166,7 @@ export default function TankSelector() {
                   </div>
 
                   <div className="flex flex-wrap items-center gap-x-2 text-[11px]">
-                    <span className={valueClass("temperature", temp)}>{temp !== null ? `${temp.toFixed(1)} °C` : "-- °C"}</span>
+                    <span className={valueClass("temperature", tempC)}>{tempC !== null ? `${tempC.toFixed(1)} °C` : "-- °C"}</span>
                     <span className="text-gray-300">·</span>
                     <span className={valueClass("water_level", water)}>{water !== null ? `${water.toFixed(0)}%` : "--%"}</span>
                     <span className="text-gray-300">·</span>

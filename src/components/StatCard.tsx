@@ -1,10 +1,4 @@
-// =============================================================================
-// FILE: src/components/StatCard.tsx
-// =============================================================================
-// PURPOSE: Reusable statistic card. Optionally color-codes each value against
-// its configured safe range (good/warning/critical) like a monitoring tile.
-// =============================================================================
-
+// KPI stat card; color-codes its value against the configured safe range.
 import type { ThresholdStatus } from "../types";
 
 type Props = {

@@ -1,8 +1,6 @@
-// =============================================================================
-// src/contexts/SensorProvider.tsx
-// Central data provider: SSE for real-time data, polling for history/devices.
-// Four hooks: useSensorDataPolling, useSettingsManager, useLogsManager, useActivityLogsManager.
-// =============================================================================
+// Central data provider. Live readings arrive over SSE (/sensor/stream); chart
+// history polls every 30s and the fleet registry every 5s. Polls pause while
+// the tab is hidden.
 
 import {
   useState,
@@ -39,25 +37,35 @@ import {
   saveSettings as apiSaveSettings,
 } from "../api/client";
 
-// ========================
-// POLLING CONFIGURATION
-// ========================
-const HISTORY_POLL_INTERVAL = 30000;     // 30s chart history (heavy query)
-const DEVICES_POLL_INTERVAL = 5000;      // 5s fleet registry/online flags
-const LOGS_POLL_INTERVAL = 5000;         // 5s system logs
+const HISTORY_POLL_INTERVAL = 30000;
+const DEVICES_POLL_INTERVAL = 5000;
+const LOGS_POLL_INTERVAL = 5000;
 const LOGS_PAGE_SIZE = 10;
 
-// Exponential backoff configuration
-const BASE_POLL_DELAY = 1000;
-const MAX_POLL_DELAY = 30000;
+const HEARTBEAT_STALE_MS = 30000; // no heartbeat for 30s -> offline
 const MAX_CONSECUTIVE_FAILURES = 5;
+const SSE_MAX_RECONNECT_ATTEMPTS = 10;
 
-// ========================
-// STATE INTERFACES
-// ========================
+// 401s are re-thrown so the axios response interceptor can clear the session
+// and route back to the login screen.
+function isSessionExpired(error: unknown): boolean {
+  return isAxiosError(error) && error.response?.status === 401;
+}
+
+function computeConnectionStatus(
+  loading: boolean,
+  lastUpdate: Date | null,
+  consecutiveFailures = 0
+): "online" | "offline" | "connecting" | "unknown" {
+  if (loading) return "connecting";
+  if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) return "offline";
+  if (!lastUpdate) return "unknown";
+  if (Date.now() - lastUpdate.getTime() > HEARTBEAT_STALE_MS) return "offline";
+  return "online";
+}
 
 interface SensorDataState {
-  data: SensorEntry | null;
+  latestReading: SensorEntry | null;
   history: ChartPoint[];
   loading: boolean;
   error: string | null;
@@ -90,34 +98,12 @@ interface LogsState {
   logsParameterFilter: string;
 }
 
-// ========================
-// CONNECTION STATUS HELPER
-// ========================
-// Pure function: derives online/offline/connecting/unknown from last update + failure count.
-function computeConnectionStatus(
-  loading: boolean,
-  lastUpdate: Date | null,
-  consecutiveFailures = 0
-): "online" | "offline" | "connecting" | "unknown" {
-  if (loading) return "connecting";
-  if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) return "offline";
-  if (!lastUpdate) return "unknown";
-  const gap = Date.now() - lastUpdate.getTime();
-  if (gap > 30000) return "offline"; // 30s threshold for SSE
-  return "online";
-}
-
-// ========================
-// HOOK 1: SENSOR DATA POLLING
-// ========================
-// Uses SSE for real-time sensor data, polls history every 30s, devices every 5s.
-// Tracks connection status via SSE state and stale timestamps.
 function useSensorDataPolling(
   selectedDeviceId: string | null,
   onDevicesLoaded: (devices: DeviceEntry[]) => void
 ): SensorDataState & { refetch: () => void } {
   const [state, setState] = useState<SensorDataState>({
-    data: null,
+    latestReading: null,
     history: [],
     loading: true,
     error: null,
@@ -135,10 +121,10 @@ function useSensorDataPolling(
   const historyReqIdRef = useRef(0);
   const devicesReqIdRef = useRef(0);
   const consecutiveFailuresRef = useRef(0);
-  const pollDelayRef = useRef(BASE_POLL_DELAY);
 
-  // Fetches chart history for the selected device (every 30s). Errors swallowed;
-  // last good data stays on screen.
+  // Request IDs drop superseded responses without aborting in-flight requests
+  // (aborting let ERR_CANCELED bypass the failure counter and freeze status at
+  // "online").
   const fetchHistory = useCallback(async () => {
     const reqId = ++historyReqIdRef.current;
     historyAbortRef.current = new AbortController();
@@ -147,21 +133,16 @@ function useSensorDataPolling(
       const historyData = await fetchSensorHistory(1000, selectedDeviceId, historyAbortRef.current.signal);
       if (reqId !== historyReqIdRef.current) return;
       setState((prev) => ({ ...prev, history: historyData, historyStale: false, historyLastUpdated: new Date() }));
-      // Reset poll delay on success
-      pollDelayRef.current = BASE_POLL_DELAY;
     } catch (error) {
       if (isAxiosError(error) && error.code === "ERR_CANCELED") return;
-      // Mark stale so UI can show "chart data may be outdated" warning.
       if (reqId === historyReqIdRef.current) {
+        // Flag as stale so charts can show the "may be outdated" warning;
+        // otherwise keep the last good data on screen.
         setState((prev) => ({ ...prev, historyStale: true }));
       }
-      // Exponential backoff for history polling
-      pollDelayRef.current = Math.min(pollDelayRef.current * 2, MAX_POLL_DELAY);
     }
   }, [selectedDeviceId]);
 
-  // Fetches the fleet registry + online flags (every 5s). Drives the tank
-  // selector and fleet grid; lightweight compared to per-second polling.
   const fetchDevicesList = useCallback(async () => {
     const reqId = ++devicesReqIdRef.current;
     devicesAbortRef.current = new AbortController();
@@ -171,47 +152,45 @@ function useSensorDataPolling(
       if (reqId !== devicesReqIdRef.current) return;
       setState((prev) => ({ ...prev, devices, devicesLoading: false }));
       onDevicesLoaded(devices);
-      // Reset poll delay on success
-      pollDelayRef.current = BASE_POLL_DELAY;
     } catch (error) {
       if (isAxiosError(error) && error.code === "ERR_CANCELED") return;
       if (reqId === devicesReqIdRef.current) {
-        // Keep last known fleet; only surface loading state so UI retries quietly.
+        // Keep the last known fleet; the next poll retries quietly.
         setState((prev) => ({ ...prev, devicesLoading: false }));
       }
-      // Exponential backoff for devices polling
-      pollDelayRef.current = Math.min(pollDelayRef.current * 2, MAX_POLL_DELAY);
     }
   }, [onDevicesLoaded]);
+
+  const applyLatestReading = useCallback((reading: SensorEntry) => {
+    const sensorTime = new Date(reading.recv_at || reading.timestamp || "");
+    setState((prev) => ({
+      ...prev,
+      latestReading: reading,
+      loading: false,
+      error: null,
+      connectionStatus: computeConnectionStatus(false, sensorTime),
+      lastUpdate: sensorTime,
+      consecutiveFailures: 0,
+    }));
+  }, []);
 
   const refetch = useCallback(() => {
     fetchHistory();
     fetchDevicesList();
-    // Also trigger initial fetch for latest data via REST (fallback)
-    fetchLatestSensor(selectedDeviceId).then((result) => {
-      if (result.data && result.data.timestamp) {
-        const sensorTime = new Date(result.data.recv_at || result.data.timestamp);
-        setState((prev) => ({
-          ...prev,
-          data: result.data,
-          loading: false,
-          error: null,
-          connectionStatus: computeConnectionStatus(false, sensorTime),
-          lastUpdate: sensorTime,
-          consecutiveFailures: 0,
-        }));
-      }
-    }).catch(() => {
-      // Ignore - SSE will handle real-time updates
-    });
-  }, [fetchHistory, fetchDevicesList, selectedDeviceId]);
+    fetchLatestSensor(selectedDeviceId)
+      .then((result) => {
+        if (result.data && result.data.timestamp) applyLatestReading(result.data);
+      })
+      .catch(() => {
+        // SSE handles real-time updates; refetch is best-effort.
+      });
+  }, [fetchHistory, fetchDevicesList, selectedDeviceId, applyLatestReading]);
 
-  // Set up SSE for real-time sensor data
+  // SSE stream for live readings, with exponential-backoff reconnects.
   useEffect(() => {
     let eventSource: EventSource | null = null;
     let reconnectTimeout: ReturnType<typeof setTimeout> | null = null;
     let reconnectAttempts = 0;
-    const maxReconnectAttempts = 10;
 
     const connectSSE = () => {
       if (eventSource) {
@@ -221,8 +200,8 @@ function useSensorDataPolling(
       setState((prev) => ({ ...prev, loading: true, connectionStatus: "connecting" }));
 
       const baseUrl = import.meta.env.VITE_API_BASE || "http://localhost:3000";
-      // EventSource cannot set Authorization headers, so the JWT is passed as
-      // a query parameter (authenticateToken accepts it for SSE streams).
+      // EventSource cannot set Authorization headers, so the session token
+      // travels as a query parameter (the server accepts it for SSE).
       const params = new URLSearchParams();
       const token = localStorage.getItem("crayvings_token");
       if (token) params.set("token", token);
@@ -247,20 +226,11 @@ function useSensorDataPolling(
           try {
             const message = JSON.parse(event.data);
             if (message.type === "sensor_update" && message.data) {
-              const sensorTime = new Date(message.data.recv_at || message.data.timestamp);
-              setState((prev) => ({
-                ...prev,
-                data: message.data,
-                loading: false,
-                error: null,
-                connectionStatus: "online",
-                lastUpdate: sensorTime,
-                consecutiveFailures: 0,
-              }));
+              applyLatestReading(message.data);
               consecutiveFailuresRef.current = 0;
             }
           } catch {
-            // Malformed SSE payload - ignore this frame
+            // Malformed frame — ignore it.
           }
         };
 
@@ -272,13 +242,12 @@ function useSensorDataPolling(
           }));
           es.close();
 
-          // Exponential backoff reconnection
-          if (reconnectAttempts < maxReconnectAttempts) {
+          if (reconnectAttempts < SSE_MAX_RECONNECT_ATTEMPTS) {
             const delay = Math.min(1000 * Math.pow(2, reconnectAttempts), 30000) + Math.random() * 1000;
             reconnectAttempts++;
             setState((prev) => ({
               ...prev,
-              error: `Reconnecting in ${Math.round(delay / 1000)}s... (attempt ${reconnectAttempts}/${maxReconnectAttempts})`,
+              error: `Reconnecting in ${Math.round(delay / 1000)}s... (attempt ${reconnectAttempts}/${SSE_MAX_RECONNECT_ATTEMPTS})`,
             }));
 
             reconnectTimeout = setTimeout(() => {
@@ -302,25 +271,17 @@ function useSensorDataPolling(
       }
     };
 
-    // Initial connection
     connectSSE();
 
-    // Also do an initial REST fetch as fallback
-    fetchLatestSensor(selectedDeviceId).then((result) => {
-      if (result.data && result.data.timestamp) {
-        const sensorTime = new Date(result.data.recv_at || result.data.timestamp);
-        setState((prev) => ({
-          ...prev,
-          data: result.data,
-          loading: false,
-          connectionStatus: computeConnectionStatus(false, sensorTime),
-          lastUpdate: sensorTime,
-          consecutiveFailures: 0,
-        }));
-      }
-    }).catch(() => {
-      // Ignore - SSE will handle it
-    });
+    // Seed the latest reading via REST so a freshly opened dashboard has data
+    // before the next device POST arrives.
+    fetchLatestSensor(selectedDeviceId)
+      .then((result) => {
+        if (result.data && result.data.timestamp) applyLatestReading(result.data);
+      })
+      .catch(() => {
+        // SSE will deliver readings once the device posts.
+      });
 
     return () => {
       if (eventSource) {
@@ -330,9 +291,8 @@ function useSensorDataPolling(
         clearTimeout(reconnectTimeout);
       }
     };
-  }, [selectedDeviceId]);
+  }, [selectedDeviceId, applyLatestReading]);
 
-  // History polling with exponential backoff
   useEffect(() => {
     fetchHistory();
     const historyInterval = setInterval(() => {
@@ -347,7 +307,6 @@ function useSensorDataPolling(
     };
   }, [fetchHistory]);
 
-  // Fleet registry poll: independent of selection, runs for app lifetime with backoff
   useEffect(() => {
     fetchDevicesList();
     const devicesInterval = setInterval(() => {
@@ -362,22 +321,21 @@ function useSensorDataPolling(
     };
   }, [fetchDevicesList]);
 
-  // Periodic connection health check for SSE
+  // Watchdog for a silently dead stream: the connection can look open while no
+  // readings arrive (e.g. server restarted). The error it sets is surfaced by
+  // the Sensors page.
   useEffect(() => {
     const healthCheck = setInterval(() => {
-      if (state.lastUpdate) {
-        const gap = Date.now() - state.lastUpdate.getTime();
-        if (gap > 30000) { // 30s without data = offline
-          setState((prev) => ({
-            ...prev,
-            connectionStatus: "offline",
-            error: "No real-time data received for 30s",
-            consecutiveFailures: prev.consecutiveFailures + 1,
-          }));
-          consecutiveFailuresRef.current += 1;
-        }
+      if (state.lastUpdate && Date.now() - state.lastUpdate.getTime() > HEARTBEAT_STALE_MS) {
+        setState((prev) => ({
+          ...prev,
+          connectionStatus: "offline",
+          error: "No real-time data received for 30s",
+          consecutiveFailures: prev.consecutiveFailures + 1,
+        }));
+        consecutiveFailuresRef.current += 1;
       }
-    }, 10000); // Check every 10s
+    }, 10000);
 
     return () => clearInterval(healthCheck);
   }, [state.lastUpdate]);
@@ -397,10 +355,8 @@ function useSensorDataPolling(
   );
 }
 
-// ========================
-// HOOK 2: SETTINGS MANAGER
-// ========================
-// Manages sensor threshold settings: fetch on mount, save with optimistic update.
+// Threshold settings: fetch on mount, save with optimistic local update and a
+// 2s "saved" confirmation.
 function useSettingsManager(): SensorSettingsState & { refetch: () => void; save: (s: Partial<SensorSettings>) => Promise<void> } {
   const [state, setState] = useState<SensorSettingsState>({
     settings: null,
@@ -429,11 +385,7 @@ function useSettingsManager(): SensorSettingsState & { refetch: () => void; save
         settingsError: null,
       }));
     } catch (error) {
-      // If it's a 401 unauthorized error, let the API interceptor handle it
-      if (isAxiosError(error) && error.response?.status === 401) {
-        // Re-throw to allow the API interceptor to clear tokens and dispatch unauthorized event
-        return Promise.reject(error);
-      }
+      if (isSessionExpired(error)) return Promise.reject(error);
       setState((prev) => ({
         ...prev,
         settingsLoading: false,
@@ -454,7 +406,6 @@ function useSettingsManager(): SensorSettingsState & { refetch: () => void; save
     };
   }, [fetchData]);
 
-  // Saves settings: optimistic local update + "saved" confirmation for 2s.
   const save = useCallback(async (newSettings: Partial<SensorSettings>) => {
     if (abortControllerRef.current) {
       abortControllerRef.current.abort();
@@ -479,18 +430,14 @@ function useSettingsManager(): SensorSettingsState & { refetch: () => void; save
         setState((prev) => ({ ...prev, settingsSaved: false }));
       }, 2000);
     } catch (error) {
-      // If it's a 401 unauthorized error, let the API interceptor handle it
-      if (isAxiosError(error) && error.response?.status === 401) {
-        // Re-throw to allow the API interceptor to clear tokens and dispatch unauthorized event
-        return Promise.reject(error);
-      }
+      if (isSessionExpired(error)) return Promise.reject(error);
       setState((prev) => ({
-      ...prev,
-      settingsSaving: false,
-      saveError: "Failed to save settings",
-    }));
-  }
-}, []);
+        ...prev,
+        settingsSaving: false,
+        saveError: "Failed to save settings",
+      }));
+    }
+  }, []);
 
   const refetch = useCallback(() => {
     setState((prev) => ({ ...prev, settingsLoading: true, settingsError: null, saveError: null }));
@@ -507,9 +454,6 @@ function useSettingsManager(): SensorSettingsState & { refetch: () => void; save
   );
 }
 
-// ========================
-// HOOK 3: LOGS MANAGER
-// ========================
 // Paginated system logs, auto-polled every 5s.
 function useLogsManager(): LogsState & { refetch: () => void; setPage: (page: number) => void; setLogsActionFilter: (filter: string) => void; setLogsParameterFilter: (filter: string) => void } {
   const [state, setState] = useState<LogsState>({
@@ -552,11 +496,7 @@ function useLogsManager(): LogsState & { refetch: () => void; setPage: (page: nu
       }));
     } catch (error) {
       if (isAxiosError(error) && error.code === "ERR_CANCELED") return;
-      // If it's a 401 unauthorized error, let the API interceptor handle it
-      if (isAxiosError(error) && error.response?.status === 401) {
-        // Re-throw to allow the API interceptor to clear tokens and dispatch unauthorized event
-        return Promise.reject(error);
-      }
+      if (isSessionExpired(error)) return Promise.reject(error);
       setState((prev) => ({
         ...prev,
         logsLoading: false,
@@ -565,7 +505,6 @@ function useLogsManager(): LogsState & { refetch: () => void; setPage: (page: nu
     }
   }, []);
 
-  // Fetch on mount; auto-poll pauses while the tab is hidden.
   useEffect(() => {
     fetchData(state.logsPage, state.logsActionFilter, state.logsParameterFilter);
     const interval = setInterval(
@@ -622,11 +561,6 @@ function useLogsManager(): LogsState & { refetch: () => void; setPage: (page: nu
   );
 }
 
-// ========================
-// HOOK 4: ACTIVITY LOGS MANAGER
-// ========================
-// Activity logs with pagination (20/page), search, sort, and action-type filter.
-// Uses isMountedRef to prevent setState on unmounted components.
 interface ActivityLogsState {
   activityLogs: ActivityLog[];
   activityLogsLoading: boolean;
@@ -639,6 +573,7 @@ interface ActivityLogsState {
   activityActionFilter: string;
 }
 
+// Activity logs with pagination, search, sort, and action-type filter.
 function useActivityLogsManager() {
   const [state, setState] = useState<ActivityLogsState>({
     activityLogs: [],
@@ -660,7 +595,6 @@ function useActivityLogsManager() {
     stateRef.current = state;
   }, [state]);
 
-  // Fetches activity logs with optional page/search/sort/filter params.
   const fetchData = useCallback(async (page = 1, search?: string, sortBy?: "newest" | "oldest", actionFilter?: string) => {
     if (abortControllerRef.current) {
       abortControllerRef.current.abort();
@@ -681,7 +615,7 @@ function useActivityLogsManager() {
         currentFilter || undefined,
         abortControllerRef.current.signal
       );
-      
+
       if (isMountedRef.current) {
         setState((prev) => ({
           ...prev,
@@ -695,11 +629,7 @@ function useActivityLogsManager() {
       }
     } catch (error) {
       if (isAxiosError(error) && error.code === "ERR_CANCELED") return;
-      // If it's a 401 unauthorized error, let the API interceptor handle it
-      if (isAxiosError(error) && error.response?.status === 401) {
-        // Re-throw to allow the API interceptor to clear tokens and dispatch unauthorized event
-        return Promise.reject(error);
-      }
+      if (isSessionExpired(error)) return Promise.reject(error);
       if (isMountedRef.current) {
         setState((prev) => ({
           ...prev,
@@ -747,7 +677,7 @@ function useActivityLogsManager() {
     fetchData(1, undefined, undefined, filter);
   }, [fetchData]);
 
-  // Fire-and-forget: logs user activity to the backend.
+  // Fire-and-forget audit trail entry.
   const logActivity = useCallback((actionType: ActivityActionType, description: string, module: string) => {
     apiLogActivity({ action_type: actionType, description, module });
   }, []);
@@ -766,21 +696,17 @@ function useActivityLogsManager() {
   );
 }
 
-// ========================
-// SENSOR PROVIDER COMPONENT
-// ========================
-// Combines all four hooks into a single provider tree.
 export function SensorProvider({ children }: { children: ReactNode }) {
-  // Selected tank is lifted here so it persists across pages (Dashboard ->
-  // Historical Data -> Analytics). Defaults to the first registered device,
-  // set once by the fleet poll callback (not an effect — avoids cascading renders).
+  // The selected tank lives here so it persists across pages. It defaults to
+  // the first registered device, set from the fleet poll callback (not an
+  // effect — that would cause cascading renders).
   const [selectedDeviceId, setSelectedDeviceId] = useState<string | null>(null);
 
   const handleDevicesLoaded = useCallback((devices: DeviceEntry[]) => {
     setSelectedDeviceId((current) => {
       if (!devices || devices.length === 0) return null;
-      // Keep the current pick only if it still exists in the visible fleet
-      // (e.g. it wasn't just hidden); otherwise fall back to the first tank.
+      // Keep the current pick only if it is still in the visible fleet (e.g.
+      // it wasn't just hidden); otherwise fall back to the first tank.
       if (current !== null && devices.some((d) => d.device_id === current)) return current;
       const first = [...devices].sort((a, b) => a.device_id.localeCompare(b.device_id))[0];
       return first.device_id;
@@ -794,7 +720,7 @@ export function SensorProvider({ children }: { children: ReactNode }) {
 
   const dataContextValue = useMemo(
     () => ({
-      data: sensorData.data,
+      latestReading: sensorData.latestReading,
       history: sensorData.history,
       loading: sensorData.loading,
       error: sensorData.error,

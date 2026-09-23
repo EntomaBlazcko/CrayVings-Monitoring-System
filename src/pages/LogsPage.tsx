@@ -1,8 +1,3 @@
-// =============================================================================
-// src/pages/LogsPage.tsx
-// Sensor/system parameter logs with filtering, action badges, and PDF export.
-// =============================================================================
-
 import { useState, useMemo, useCallback } from "react";
 import {
   FileText,
@@ -22,23 +17,8 @@ import { useSensors } from "../hooks/useSensors";
 import { useAuth } from "../contexts/useAuth";
 import { Spinner, LoadingCard, ErrorCard } from "../components/Loading";
 import { SENSOR_KEY_TO_DISPLAY } from "../types";
-import { formatFarmDateTime, formatFarmDate, formatFarmTime } from "../utils/time";
-
-// Formats a timestamp into a relative time string (e.g. "5s ago", "3m ago").
-function formatTimeAgo(timestamp: string | Date): string {
-  const date = timestamp instanceof Date ? timestamp : new Date(timestamp);
-  if (isNaN(date.getTime())) return "N/A";
-
-  const seconds = Math.floor((Date.now() - date.getTime()) / 1000);
-  if (seconds < 0) return "Just now";
-  if (seconds < 60) return `${seconds}s ago`;
-  const minutes = Math.floor(seconds / 60);
-  if (minutes < 60) return `${minutes}m ago`;
-  const hours = Math.floor(minutes / 60);
-  if (hours < 24) return `${hours}h ago`;
-  const days = Math.floor(hours / 24);
-  return `${days}d ago`;
-}
+import { formatFarmDateTime, formatFarmDate, formatFarmTime, formatTimeAgo } from "../utils/time";
+import { titleCase } from "../utils/text";
 
 const PARAMETER_ICONS: Record<string, React.ReactNode> = {
   Temperature: <Thermometer size={15} className="text-orange-500" />,
@@ -57,12 +37,6 @@ const ACTION_META: Record<string, { color: string; icon: typeof AlertTriangle }>
 
 const PARAMETERS = ["all", "Temperature", "Water Level", "Ammonia"] as const;
 
-const titleCase = (s: string) =>
-  String(s)
-    .split(/[\s_]+/)
-    .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
-    .join(" ");
-
 export default function LogsPage() {
   const { logs, logsLoading, logsError, refetchLogs, logsPage, logsTotal, setLogsPage, logsParameterFilter, setLogsParameterFilter, logsCounts, connectionStatus, lastUpdate } = useSensors();
   const { user } = useAuth();
@@ -74,9 +48,6 @@ export default function LogsPage() {
     return SENSOR_KEY_TO_DISPLAY[param] ?? param;
   };
 
-  // Logs are filtered server-side by the active parameter filter.
-  const filteredLogs = logs;
-
   const alertsTotal = logsCounts?.Alert ?? 0;
   const changesTotal = logsCounts?.Change ?? 0;
   const totalEntries = logsTotal || 0;
@@ -87,12 +58,12 @@ export default function LogsPage() {
   // Parameter breakdown for the currently loaded page.
   const paramCounts = useMemo(() => {
     const counts: Record<string, number> = {};
-    for (const log of filteredLogs) {
+    for (const log of logs) {
       const label = getDisplayParameter(log.parameter);
       counts[label] = (counts[label] || 0) + 1;
     }
     return counts;
-  }, [filteredLogs]);
+  }, [logs]);
 
   const totalPages = useMemo(() => {
     const total = Number(logsTotal) || 0;
@@ -115,7 +86,7 @@ export default function LogsPage() {
 
   const handleExport = useCallback(async () => {
     if (!isAdmin) return;
-    if (filteredLogs.length === 0) {
+    if (logs.length === 0) {
       alert("No logs to export.");
       return;
     }
@@ -149,7 +120,7 @@ export default function LogsPage() {
     doc.setFont("helvetica", "normal");
     doc.text(`Generated on ${formatFarmDateTime(new Date())}`, pageWidth / 2, 28, { align: "center" });
 
-    const parameterCounts = filteredLogs.reduce<Record<string, number>>((acc, log) => {
+    const parameterCounts = logs.reduce<Record<string, number>>((acc, log) => {
       const displayParam = getDisplayParameter(log.parameter);
       if (["Temperature", "Water Level", "Ammonia"].includes(displayParam)) {
         acc[displayParam] = (acc[displayParam] || 0) + 1;
@@ -165,7 +136,7 @@ export default function LogsPage() {
     doc.setFontSize(9);
     doc.setFont("helvetica", "normal");
     let summaryLineY = summaryY + 6;
-    doc.text(`Total Entries: ${filteredLogs.length}`, 14, summaryLineY);
+    doc.text(`Total Entries: ${logs.length}`, 14, summaryLineY);
     summaryLineY += 5;
 
     Object.entries(parameterCounts).forEach(([param, count]) => {
@@ -175,7 +146,7 @@ export default function LogsPage() {
 
     const tableStartY = summaryLineY + 8;
 
-    const tableData = filteredLogs
+    const tableData = logs
       .filter((log) => {
         const displayParam = getDisplayParameter(log.parameter);
         return ["Temperature", "Water Level", "Ammonia"].includes(displayParam);
@@ -247,7 +218,7 @@ export default function LogsPage() {
 
     doc.save(`CRAYvings_System_Logs_${new Date().toISOString().split("T")[0]}.pdf`);
     setExporting(false);
-  }, [filteredLogs, isAdmin]);
+  }, [logs, isAdmin]);
 
   if (logsLoading) {
     return <LoadingCard title="Sensor Logs" message="Loading logs..." />;
@@ -329,7 +300,7 @@ export default function LogsPage() {
             {isAdmin && (
               <button
                 onClick={handleExport}
-                disabled={exporting || filteredLogs.length === 0}
+                disabled={exporting || logs.length === 0}
                 className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-white text-[#c2410c] text-sm font-semibold hover:bg-orange-50 disabled:opacity-50 disabled:cursor-not-allowed transition"
               >
                 <Download size={14} />
@@ -383,7 +354,7 @@ export default function LogsPage() {
         </div>
       </div>
 
-      {filteredLogs.length === 0 ? (
+      {logs.length === 0 ? (
         <div className="bg-white rounded-xl border border-gray-100 p-8 text-center">
           <FileText size={40} className="mx-auto mb-3 text-gray-300" />
           <h3 className="mt-0 text-gray-800">No logs found</h3>
@@ -423,7 +394,7 @@ export default function LogsPage() {
                   </tr>
                 </thead>
                 <tbody>
-                  {filteredLogs.map((log, index) => {
+                  {logs.map((log, index) => {
                     const meta = ACTION_META[log.action] ?? ACTION_META.Change!;
                     const Icon = meta.icon;
                     const displayParam = getDisplayParameter(log.parameter);

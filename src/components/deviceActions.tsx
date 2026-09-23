@@ -1,11 +1,6 @@
-// =============================================================================
-// FILE: src/components/deviceActions.tsx
-// =============================================================================
-// PURPOSE: Shared per-tank action controls used by the Live Tank Bar (and any
-// future farm-overview grids): inline rename, non-destructive hide, and an
-// on-demand live diagnostics check. Extracted from the old FleetGrid so the
-// controls live on the tank cards themselves (one place for everything).
-// =============================================================================
+// Per-tank action controls used by the Live Tank Bar and the Dashboard farm
+// grid: inline rename, non-destructive hide, and an on-demand live
+// diagnostics check.
 
 import { useState } from "react";
 import { Activity, Pencil, Check, X, Loader2, EyeOff, RefreshCw } from "lucide-react";

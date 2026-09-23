@@ -1,8 +1,3 @@
-// =============================================================================
-// FILE: src/components/Loading.tsx
-// PURPOSE: Shared loading/error UI primitives used across all pages.
-// =============================================================================
-
 import { Loader2, AlertTriangle, RefreshCw } from "lucide-react";
 
 export function Spinner({

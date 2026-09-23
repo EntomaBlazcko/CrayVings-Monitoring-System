@@ -20,11 +20,14 @@ async function migrate() {
   try {
     // 1) Convert stored failure sentinels to NULL so historical data matches
     //    the new ingestion behavior (sentinels are never stored going forward).
-    //    ESP32 sentinels: temperature -127 (and 0), water_level -1, ammonia -1.
+    //    Wire sentinels: temperature -1 or 0 (both firmwares convert the
+    //    DS18B20's -127 disconnect code to -1 before sending), water_level -1,
+    //    ammonia -1. Temperature <= 0 is a failure for this tropical farm —
+    //    the client and alert engine already treat it that way.
     const cleaned = await db.query(`
       UPDATE sensors
          SET temperature = NULL
-       WHERE temperature IS NOT NULL AND (temperature <= -100 OR temperature = 0);
+       WHERE temperature IS NOT NULL AND temperature <= 0;
     `);
     console.log(`  NULLed ${cleaned.rowCount} temperature sentinel row(s)`);
 
@@ -53,7 +56,7 @@ async function migrate() {
         ) THEN
           ALTER TABLE sensors
             ADD CONSTRAINT chk_sensors_temperature_valid
-            CHECK (temperature IS NULL OR (temperature > -100 AND temperature <= 100));
+            CHECK (temperature IS NULL OR (temperature > 0 AND temperature <= 100));
           RAISE NOTICE 'Added chk_sensors_temperature_valid';
         END IF;
       END $$;

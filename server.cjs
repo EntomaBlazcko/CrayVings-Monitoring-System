@@ -138,13 +138,15 @@ const loginLimiter = rateLimit({
   validate: { xForwardedForHeader: false },
 });
 
-// Per-device limiter for sensor ingestion (audit 2.2.5/2.5.2): the ESP32 sends
-// at most 1 reading/second, so 3/second tolerates retries without allowing a
-// flood of duplicate rows from a misbehaving device. Keyed by device_id; posts
-// without a device_id share one bucket and fail validation anyway.
+// Per-device limiter for sensor ingestion (audit 2.2.5/2.5.2). The normal send
+// rate is 1/second, but the offline-buffer flush posts up to 10 back-to-back
+// plus the live reading, so the limit must leave burst headroom: 12/second
+// still blocks a flooding device while letting a reconnect drain its backlog.
+// Keyed by device_id; posts without a device_id share one bucket and fail
+// validation anyway.
 const sensorIngestLimiter = rateLimit({
   windowMs: 1000,
-  limit: 3,
+  limit: 12,
   standardHeaders: "draft-7",
   legacyHeaders: false,
   keyGenerator: (req) =>
@@ -494,15 +496,17 @@ async function updateOnlyIfChanged(client, { table, keyColumn, keyValue, current
 // ESP32 marks failed sensors with -1 (and 0 for temperature), so lower bounds
 // must accept those sentinel values.
 
-// POST /sensor (ESP32 ingestion). Sensor-failure sentinels (temperature -127 /
-// 0, water_level -1, ammonia -1) are accepted at the schema level so the device
-// heartbeat keeps flowing, then converted to NULL before the DB write so
-// sentinel values never pollute the time-series data (audit 2.2.2).
+// POST /sensor (ESP32 ingestion). Both firmwares convert the DS18B20's -127
+// disconnect code to -1 before sending, so the WIRE sentinels are: temperature
+// -1 or 0, water_level -1, ammonia -1. The schema accepts them (the heartbeat
+// must keep flowing), and readingOrNull converts them to NULL before the DB
+// write so failed sensors never pollute the time-series data (audit 2.2.2).
 const sensorSchema = z.object({
   device_id: z.string().min(1).max(50),
-  // -127.0 is the DS18B20 disconnect sentinel; physical range is -10..50.
+  // Accepts -127 (raw DS18B20 code, in case a firmware variant sends it) and
+  // the -1/0 wire sentinels; physical range is -10..50.
   temperature: z.coerce.number().min(-127).max(50),
-  // -1 is the HC-SR04 / MQ-137 failed-sensor sentinel.
+  // -1 is the HC-SR04 failed-sensor sentinel.
   water_level: z.coerce.number().min(-1).max(100),
   // ammonia is a real NH3 gas reading in ppm (MQ-137). Upper bound covers
   // the full datasheet range (5-500 ppm); -1 is the failed-sensor sentinel.
@@ -510,11 +514,13 @@ const sensorSchema = z.object({
 });
 
 // Converts a raw sensor value to null when it is a failed-sensor sentinel.
-const TEMP_SENTINEL = -100; // anything at/below this (e.g. -127) = sensor failed
+// Temperature <= 0 is treated as a failure: the farm is tropical (water never
+// freezes) and both the client chart filter (>= 0.0001) and the alert engine
+// (minValid 0.0001) already treat it that way, so aggregates stay consistent.
 function readingOrNull(key, raw) {
   const value = Number(raw);
   if (!Number.isFinite(value)) return null;
-  if (key === "temperature") return value > TEMP_SENTINEL && value !== 0 ? value : null;
+  if (key === "temperature") return value > 0 ? value : null;
   return value >= 0 ? value : null;
 }
 
@@ -1153,19 +1159,28 @@ app.post("/sensor", sensorIngestLimiter, async (req, res) => {
     const presented = req.headers["x-device-secret"];
     if (DEVICE_SECRET || process.env.NODE_ENV === "production") {
       if (!presented) {
+        console.warn(`[${new Date().toISOString()}] POST /sensor 401 from ${req.ip}: missing X-Device-Secret header (device_id: ${req.body?.device_id ?? "?"})`);
         return res.status(401).json({ message: "Device secret required" });
       }
       let authorized = presented === DEVICE_SECRET;
       if (!authorized) {
-        const perDevice = await pool.query(
-          "SELECT device_secret FROM devices WHERE device_id = $1 AND is_active = true",
-          [req.body?.device_id ?? ""]
-        );
-        if (perDevice.rows.length > 0 && perDevice.rows[0].device_secret && presented === perDevice.rows[0].device_secret) {
-          authorized = true;
+        // Per-device secret (migration 008). If the column/migration is
+        // missing, fail gracefully to the shared-secret decision instead of
+        // crashing the request with a 500.
+        try {
+          const perDevice = await pool.query(
+            "SELECT device_secret FROM devices WHERE device_id = $1 AND is_active = true",
+            [req.body?.device_id ?? ""]
+          );
+          if (perDevice.rows.length > 0 && perDevice.rows[0].device_secret && presented === perDevice.rows[0].device_secret) {
+            authorized = true;
+          }
+        } catch (perDeviceErr) {
+          console.warn(`[${new Date().toISOString()}] Per-device secret check skipped (migration 008 not applied?): ${perDeviceErr.message}`);
         }
       }
       if (!authorized) {
+        console.warn(`[${new Date().toISOString()}] POST /sensor 401 from ${req.ip}: wrong X-Device-Secret (device_id: ${req.body?.device_id ?? "?"})`);
         return res.status(401).json({ message: "Invalid device secret" });
       }
     } else if (!deviceSecretWarned) {
@@ -3137,7 +3152,8 @@ app.use((req, res) => {
   res.status(404).json({ message: "Route not found" });
 });
 
-// eslint-disable-next-line no-unused-vars
+// The 4-arity signature is what makes Express treat this as the error handler;
+// `next` must stay in the signature even though it is unused.
 app.use((err, req, res, next) => {
   console.error(`[${new Date().toISOString()}] Unhandled route error (${req.method} ${req.originalUrl}):`, err.message);
   res.status(err.statusCode || 500).json({

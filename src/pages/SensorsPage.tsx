@@ -1,9 +1,3 @@
-// =============================================================================
-// src/pages/SensorsPage.tsx
-// Live sensor overview: hero status banner, threshold gauge cards per sensor,
-// live trend charts, recent readings table, and device/connection details.
-// =============================================================================
-
 import { useMemo, useState } from "react";
 import {
   Thermometer,
@@ -28,27 +22,11 @@ import TankSelector from "../components/TankSelector";
 import TrendCard from "../components/TrendCard";
 import { getSettingsThresholds, getThresholdStatus } from "../types";
 import type { ThresholdRange } from "../types";
-import { formatFarmDateTime, formatFarmTime } from "../utils/time";
+import { formatFarmDateTime, formatFarmTime, formatTimeAgo } from "../utils/time";
 import { buildLiveGuidance } from "../utils/alertGuidance";
 import type { AlertGuidance } from "../utils/alertGuidance";
 import { FixLegendModal } from "../components/FixLegend";
 import type { ChartPoint } from "../types";
-
-// Formats a timestamp into a relative time string (e.g. "5s ago", "3m ago").
-function formatTimeAgo(timestamp: string | Date): string {
-  const date = timestamp instanceof Date ? timestamp : new Date(timestamp);
-  if (isNaN(date.getTime())) return "N/A";
-
-  const seconds = Math.floor((Date.now() - date.getTime()) / 1000);
-  if (seconds < 0) return "Just now";
-  if (seconds < 60) return `${seconds}s ago`;
-  const minutes = Math.floor(seconds / 60);
-  if (minutes < 60) return `${minutes}m ago`;
-  const hours = Math.floor(minutes / 60);
-  if (hours < 24) return `${hours}h ago`;
-  const days = Math.floor(hours / 24);
-  return `${days}d ago`;
-}
 
 type ParamKey = "temperature" | "water_level" | "ammonia";
 
@@ -100,7 +78,7 @@ function RangeGauge({ value, range }: { value: number | null; range: ThresholdRa
 }
 
 export default function SensorsPage() {
-  const { data, history, connectionStatus, settings, settingsLoading, loading, error, refetch, lastUpdate, consecutiveFailures } = useSensors();
+  const { latestReading, history, connectionStatus, settings, settingsLoading, loading, error, refetch, lastUpdate, consecutiveFailures } = useSensors();
   const [refreshing, setRefreshing] = useState(false);
   const [fixGuidance, setFixGuidance] = useState<AlertGuidance | null>(null);
 
@@ -108,7 +86,7 @@ export default function SensorsPage() {
 
   const isOnline = connectionStatus === "online";
   const isConnecting = connectionStatus === "connecting";
-  const hasData = !!data;
+  const hasData = !!latestReading;
   const isOfflineWithData = !isOnline && !isConnecting && hasData;
 
   const sensors = useMemo(() => {
@@ -122,7 +100,7 @@ export default function SensorsPage() {
 
     return keys.map((key) => {
       const threshold = thresholds[key];
-      const raw = data?.[key];
+      const raw = latestReading?.[key];
       const value = raw !== undefined && raw !== null && Number.isFinite(Number(raw)) ? Number(raw) : null;
       const status = value !== null ? getThresholdStatus(value, threshold.range, threshold.isMinOnly) : "warning";
       const badge = STATUS_PILL[status];
@@ -143,7 +121,7 @@ export default function SensorsPage() {
         valueClass,
       };
     });
-  }, [data, thresholds]);
+  }, [latestReading, thresholds]);
 
   const recentReadings = useMemo(() => {
     const sorted = [...history].sort((a, b) => new Date(a.timestamp || 0).getTime() - new Date(b.timestamp || 0).getTime());
@@ -423,7 +401,7 @@ export default function SensorsPage() {
           <div className="space-y-2.5 text-sm">
             <div className="flex justify-between gap-2">
               <span className="text-gray-500">Device ID</span>
-              <span className="font-semibold text-gray-800">{data?.device_id || "--"}</span>
+              <span className="font-semibold text-gray-800">{latestReading?.device_id || "--"}</span>
             </div>
             <div className="flex justify-between gap-2">
               <span className="text-gray-500">Connection</span>
@@ -444,7 +422,7 @@ export default function SensorsPage() {
             <div className="pt-3 mt-3 border-t border-gray-100">
               <p className="text-gray-500 text-xs mb-1">Received at</p>
               <p className="font-semibold text-gray-800 text-sm">
-                {data?.timestamp ? formatFarmDateTime(data.timestamp) : "N/A"}
+                {latestReading?.timestamp ? formatFarmDateTime(latestReading.timestamp) : "N/A"}
               </p>
               <p className="flex items-center gap-1.5 text-xs text-gray-400 mt-1">
                 {isOnline || isOfflineWithData ? (
