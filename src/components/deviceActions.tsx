@@ -13,6 +13,11 @@ export type LiveState =
   | { status: "error"; message: string }
   | { status: "ok"; data: DeviceStatus };
 
+function fmtLive(key: "temperature" | "water_level" | "ammonia", value: number): string {
+  const isReal = key === "temperature" ? value > 0 : value >= 0;
+  return isReal ? String(value) : "--";
+}
+
 // On-demand poll of one ESP32's GET /status (uptime, RSSI, heap + live values).
 // Only triggered on user click - never in a tight poll loop.
 export function DeviceLiveCheck({ deviceId, ipAddress, compact }: { deviceId: string; ipAddress: string | null; compact?: boolean }) {
@@ -71,7 +76,7 @@ export function DeviceLiveCheck({ deviceId, ipAddress, compact }: { deviceId: st
         {(live.data.free_heap / 1024 / 1024).toFixed(1)} MB
       </p>
       <p>
-        {live.data.temperature}°C · {live.data.water_level}% · {live.data.ammonia} ppm
+        {fmtLive("temperature", live.data.temperature)}°C · {fmtLive("water_level", live.data.water_level)}% · {fmtLive("ammonia", live.data.ammonia)} ppm
       </p>
     </div>
   );

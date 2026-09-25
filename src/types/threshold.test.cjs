@@ -18,6 +18,9 @@ function serverStatus(value, min, max) {
 
 // --- Mirror of src/types/index.ts getThresholdStatus(value, range, isMinOnly) ---
 function clientStatus(value, min, max, isMinOnly) {
+  // Failed sensors arrive as null (never a real reading); Number(null) === 0
+  // would otherwise breach the min and raise a false "critically low" alert.
+  if (value === null || value === undefined) return "good";
   const rangeSize = max - min;
   const criticalMargin = rangeSize * 0.15;
   if (isMinOnly) {
@@ -95,4 +98,10 @@ test("deviation exactly at the 15% critical margin is warning, not critical", ()
   // just past the margin -> critical
   assert.strictEqual(serverStatus(18.34, 20, 31), "critical");
   assert.strictEqual(clientStatus(18.34, 20, 31, false), "critical");
+});
+
+test("null readings (failed sensors) never breach thresholds (client)", () => {
+  assert.strictEqual(clientStatus(null, 20, 31, false), "good");
+  assert.strictEqual(clientStatus(null, 10, 100, false), "good");
+  assert.strictEqual(clientStatus(null, 0.25, 1.0, false), "good");
 });

@@ -1,13 +1,13 @@
 // Dashboard "farm grid": one live card per tank (real-time temp / water /
-// ammonia, red when out of range, online state, last update) with rename /
-// hide / live-check actions on each card. Clicking a card selects that tank.
-// Hiding is never destructive — hidden tanks are restorable from the panel.
+// ammonia, red when out of that tank's EFFECTIVE thresholds, online state,
+// last update) with rename / hide / live-check actions on each card. Clicking
+// a card selects that tank for every page. Hiding is never destructive —
+// hidden tanks are restorable from the panel. Readings + thresholds come from
+// the provider's single 5s fleet poll — no per-component fetching here.
 
-import { useState } from "react";
-import { Eye, EyeOff, RotateCcw, Boxes, TriangleAlert } from "lucide-react";
-import { useSensorData } from "../hooks/useSensors";
-import { useDevicesLatest } from "../hooks/useDevicesLatest";
-import { fetchDevices, updateDevice } from "../api/client";
+import { Boxes, Eye, EyeOff, RotateCcw, TriangleAlert } from "lucide-react";
+import { useSensorData, useSensorSettings } from "../hooks/useSensors";
+import { useHiddenDevices } from "../hooks/useHiddenDevices";
 import { formatFarmTime } from "../utils/time";
 import type { DeviceEntry } from "../types";
 import { DeviceHide, DeviceLiveCheck, DeviceRename } from "./deviceActions";
@@ -19,12 +19,9 @@ function deviceLabel(device: DeviceEntry): string {
 type LiveValue = number | null;
 
 export default function FarmOverview() {
-  const { devices, devicesLoading, selectedDeviceId, setSelectedDeviceId, refetch } = useSensorData();
-  const { latestByTank, thresholds } = useDevicesLatest();
-  const [showHidden, setShowHidden] = useState(false);
-  const [hiddenDevices, setHiddenDevices] = useState<DeviceEntry[] | null>(null);
-  const [loadingHidden, setLoadingHidden] = useState(false);
-  const [restoring, setRestoring] = useState<string | null>(null);
+  const { devices, devicesLoading, latestByTank, selectedDeviceId, setSelectedDeviceId, refetch } = useSensorData();
+  const { thresholdsFor } = useSensorSettings();
+  const { showHidden, hiddenDevices, hiddenCount, loadingHidden, restoring, toggleHiddenPanel, restore } = useHiddenDevices(refetch);
 
   if (devicesLoading && devices.length === 0) {
     return (
@@ -37,36 +34,6 @@ export default function FarmOverview() {
     );
   }
 
-  const toggleHiddenPanel = async () => {
-    if (showHidden) {
-      setShowHidden(false);
-      return;
-    }
-    setShowHidden(true);
-    setLoadingHidden(true);
-    try {
-      const all = await fetchDevices(true);
-      setHiddenDevices(all.filter((d) => !d.is_active));
-    } catch {
-      setHiddenDevices([]);
-    } finally {
-      setLoadingHidden(false);
-    }
-  };
-
-  const restore = async (deviceId: string) => {
-    setRestoring(deviceId);
-    try {
-      await updateDevice(deviceId, { is_active: true });
-      setHiddenDevices((prev) => (prev ?? []).filter((d) => d.device_id !== deviceId));
-      await refetch();
-    } catch {
-      // keep the chip in place; user can retry
-    } finally {
-      setRestoring(null);
-    }
-  };
-
   if (devices.length === 0 && !showHidden) {
     return (
       <div className="rounded-2xl border border-gray-200 bg-white p-6 shadow-sm">
@@ -78,7 +45,6 @@ export default function FarmOverview() {
   }
 
   const onlineCount = devices.filter((d) => d.online).length;
-  const hiddenCount = hiddenDevices?.length ?? 0;
 
   const readValue = (device: DeviceEntry, key: "temperature" | "water_level" | "ammonia"): LiveValue => {
     const reading = latestByTank[device.device_id];
@@ -90,15 +56,15 @@ export default function FarmOverview() {
     return raw >= 0 ? raw : null;
   };
 
-  const isAtRisk = (key: "temperature" | "water_level" | "ammonia", value: LiveValue) => {
+  const isAtRisk = (device: DeviceEntry, key: "temperature" | "water_level" | "ammonia", value: LiveValue) => {
     if (value === null) return false;
-    const t = thresholds[key];
+    const t = thresholdsFor(device.device_id)[key];
     if (!t) return false;
     return value < t.range.min || value > t.range.max;
   };
 
   const atRiskCount = devices.filter((device) =>
-    (["temperature", "water_level", "ammonia"] as const).some((key) => isAtRisk(key, readValue(device, key)))
+    (["temperature", "water_level", "ammonia"] as const).some((key) => isAtRisk(device, key, readValue(device, key)))
   ).length;
 
   const metricTile = (
@@ -156,9 +122,9 @@ export default function FarmOverview() {
               const tempC = readValue(device, "temperature");
               const water = readValue(device, "water_level");
               const ammonia = readValue(device, "ammonia");
-              const tempAtRisk = isAtRisk("temperature", tempC);
-              const waterAtRisk = isAtRisk("water_level", water);
-              const ammoniaAtRisk = isAtRisk("ammonia", ammonia);
+              const tempAtRisk = isAtRisk(device, "temperature", tempC);
+              const waterAtRisk = isAtRisk(device, "water_level", water);
+              const ammoniaAtRisk = isAtRisk(device, "ammonia", ammonia);
               const reading = latestByTank[device.device_id];
 
               return (

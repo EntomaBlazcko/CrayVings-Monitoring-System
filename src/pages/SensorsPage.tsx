@@ -20,7 +20,7 @@ import { useSensors } from "../hooks/useSensors";
 import { LoadingCard, ErrorCard } from "../components/Loading";
 import TankSelector from "../components/TankSelector";
 import TrendCard from "../components/TrendCard";
-import { getSettingsThresholds, getThresholdStatus } from "../types";
+import { getThresholdStatus } from "../types";
 import type { ThresholdRange } from "../types";
 import { formatFarmDateTime, formatFarmTime, formatTimeAgo } from "../utils/time";
 import { buildLiveGuidance } from "../utils/alertGuidance";
@@ -78,11 +78,16 @@ function RangeGauge({ value, range }: { value: number | null; range: ThresholdRa
 }
 
 export default function SensorsPage() {
-  const { latestReading, history, connectionStatus, settings, settingsLoading, loading, error, refetch, lastUpdate, consecutiveFailures } = useSensors();
+  const { latestReading, history, connectionStatus, settingsFor, thresholdsFor, settingsLoading, loading, error, refetch, lastUpdate, consecutiveFailures, selectedDeviceId } = useSensors();
   const [refreshing, setRefreshing] = useState(false);
   const [fixGuidance, setFixGuidance] = useState<AlertGuidance | null>(null);
 
-  const thresholds = useMemo(() => getSettingsThresholds(settings), [settings]);
+  // The SELECTED tank's effective thresholds (global defaults + per-tank
+  // override) — latestReading is already that tank's reading.
+  const thresholds = useMemo(
+    () => thresholdsFor(selectedDeviceId),
+    [thresholdsFor, selectedDeviceId]
+  );
 
   const isOnline = connectionStatus === "online";
   const isConnecting = connectionStatus === "connecting";
@@ -284,7 +289,7 @@ export default function SensorsPage() {
                 </p>
                 <button
                   onClick={() => {
-                    const guidance = buildLiveGuidance(sensor.key, sensor.value, settings);
+                    const guidance = buildLiveGuidance(sensor.key, sensor.value, settingsFor(selectedDeviceId));
                     if (guidance) setFixGuidance(guidance);
                   }}
                   className="mt-1.5 inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-[11px] font-semibold bg-orange-50 text-[#c2410c] border border-orange-200 hover:bg-orange-100 transition"

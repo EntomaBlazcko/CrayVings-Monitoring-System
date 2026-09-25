@@ -33,7 +33,7 @@ import { fetchAnalyticsOverview, fetchAnalyticsDaily, fetchAnalyticsInsights } f
 import { useSensors } from "../hooks/useSensors";
 import { isAxiosError } from "axios";
 import type { AnalyticsOverview, AnalyticsDailyEntry, Insight } from "../types";
-import { getSettingsThresholds, getThresholdStatus, SENSOR_KEY_TO_DISPLAY } from "../types";
+import { getThresholdStatus, SENSOR_KEY_TO_DISPLAY } from "../types";
 import { formatFarmDateTime, formatFarmDate } from "../utils/time";
 
 type RangeKey = 7 | 30 | 90;
@@ -244,10 +244,11 @@ export default function AnalyticsSection() {
   const [error, setError] = useState<string | null>(null);
   const [retry, setRetry] = useState(0);
   const [focused, setFocused] = useState<ParamKey | null>(null);
-  const { settings, selectedDeviceId } = useSensors();
+  const { thresholdsFor, selectedDeviceId } = useSensors();
 
-  // Fetch all three datasets for the selected range (abortable). Overview is
-  // scoped to the selected tank; daily aggregates + insights stay farm-wide.
+  // Fetch all three datasets for the selected range (abortable). Every
+  // dataset is scoped to the selected tank — daily aggregates and insights
+  // follow the same selection as the overview.
   useEffect(() => {
     const controller = new AbortController();
     // eslint-disable-next-line react-hooks/set-state-in-effect
@@ -256,7 +257,7 @@ export default function AnalyticsSection() {
 
     Promise.all([
       fetchAnalyticsOverview(range, selectedDeviceId, controller.signal),
-      fetchAnalyticsDaily(range, controller.signal),
+      fetchAnalyticsDaily(range, selectedDeviceId, controller.signal),
     ])
       .then(([ov, dailyRes]) => {
         setOverview(ov);
@@ -270,7 +271,7 @@ export default function AnalyticsSection() {
         }
       });
 
-    fetchAnalyticsInsights(range, controller.signal)
+    fetchAnalyticsInsights(range, selectedDeviceId, controller.signal)
       .then((res) => setInsights(res.insights || []))
       .catch(() => {
         /* insights are optional — charts still render if they fail */
@@ -279,7 +280,11 @@ export default function AnalyticsSection() {
     return () => controller.abort();
   }, [range, retry, selectedDeviceId]);
 
-  const thresholds = useMemo(() => getSettingsThresholds(settings), [settings]);
+  // The SELECTED tank's effective thresholds (global + per-tank override).
+  const thresholds = useMemo(
+    () => thresholdsFor(selectedDeviceId),
+    [thresholdsFor, selectedDeviceId]
+  );
 
   const chartData = useMemo(() => toChartPoints(daily), [daily]);
 

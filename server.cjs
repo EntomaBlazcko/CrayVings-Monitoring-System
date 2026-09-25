@@ -205,6 +205,14 @@ function generateToken() {
   return crypto.randomBytes(32).toString("hex");
 }
 
+// Session tokens are stored HASHED (SHA-256) so a DB read (backup leak,
+// pgAdmin access) can never impersonate a user. Clients keep the raw token;
+// every comparison hashes the presented value first. Migration 013 hashed
+// existing sessions in place, so live logins survive the switch.
+function hashToken(token) {
+  return crypto.createHash("sha256").update(token, "utf8").digest("hex");
+}
+
 // =============================================================================
 // AUTHENTICATION MIDDLEWARE
 // =============================================================================
@@ -216,7 +224,7 @@ function requireAdmin(req, res, next) {
   const token = req.headers.authorization?.replace("Bearer ", "");
   if (!token) return res.status(401).json({ message: "Authentication required" });
 
-  pool.query("SELECT * FROM users WHERE token = $1 AND status = 'active'", [token])
+  pool.query("SELECT * FROM users WHERE token = $1 AND status = 'active'", [hashToken(token)])
     .then(async result => {
       if (result.rows.length === 0) return res.status(403).json({ message: "Invalid token" });
       const user = result.rows[0];
@@ -256,7 +264,7 @@ function requireAuth(req, res, next) {
   const token = headerToken || queryToken;
   if (!token) return res.status(401).json({ message: "Authentication required" });
 
-  pool.query("SELECT * FROM users WHERE token = $1 AND status = 'active'", [token])
+  pool.query("SELECT * FROM users WHERE token = $1 AND status = 'active'", [hashToken(token)])
     .then(async result => {
       if (result.rows.length === 0) return res.status(403).json({ message: "Invalid token" });
       const user = result.rows[0];
@@ -511,6 +519,9 @@ const sensorSchema = z.object({
   // ammonia is a real NH3 gas reading in ppm (MQ-137). Upper bound covers
   // the full datasheet range (5-500 ppm); -1 is the failed-sensor sentinel.
   ammonia: z.coerce.number().min(-1).max(500).optional(),
+  // Optional device-side capture time (ISO 8601, SNTP-synced on the ESP32).
+  // Sanitized below: not in the future, not older than the offline buffer.
+  read_at: z.string().max(40).optional(),
 });
 
 // Converts a raw sensor value to null when it is a failed-sensor sentinel.
@@ -628,11 +639,45 @@ const SMS_POLL_WINDOW_MS = 6 * 60 * 60 * 1000;
 const rawRetention = parseInt(process.env.SMS_RETENTION_DAYS, 10);
 const SMS_RETENTION_DAYS = Number.isFinite(rawRetention) && rawRetention >= 0 ? rawRetention : 30;
 
-// In-memory SMS mute (resets on restart) — suppresses all SMS producers.
-let smsMuteUntil = null;
+// SMS mute state. Two layers, both persisted in the system_state table so a
+// restart no longer silently unmutes:
+//   - smsMuteUntil (global): suppresses every SMS producer fleet-wide.
+//   - deviceSmsMuteUntil (per tank): suppresses that tank's critical-alert
+//     and disconnect SMS only; the fleet digest still names the tank.
+// Pruning helper returns the ISO string while still active, else null.
+function pruneMuteUntil(value) {
+  return value && new Date() < new Date(value) ? value : null;
+}
+
+let smsMuteUntil = null;                    // global mute (ISO string | null)
+const deviceSmsMuteUntil = new Map();       // device_id -> ISO string | null
+
 function isSmsMuted() {
-  if (smsMuteUntil && new Date() >= new Date(smsMuteUntil)) smsMuteUntil = null;
-  return Boolean(smsMuteUntil && new Date() < new Date(smsMuteUntil));
+  smsMuteUntil = pruneMuteUntil(smsMuteUntil);
+  return Boolean(smsMuteUntil);
+}
+
+// True when SMS for this tank is suppressed by EITHER the global or the
+// per-tank mute. deviceId null/undefined checks the global mute only.
+function isSmsMutedFor(deviceId) {
+  if (isSmsMuted()) return true;
+  if (!deviceId) return false;
+  const value = pruneMuteUntil(deviceSmsMuteUntil.get(deviceId));
+  if (!value) deviceSmsMuteUntil.delete(deviceId);
+  return Boolean(value);
+}
+
+// system_state persistence for mute state (best-effort; failures only log).
+async function persistMuteState(key, value) {
+  try {
+    await pool.query(
+      `INSERT INTO system_state (key, value) VALUES ($1, $2)
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+      [key, value ?? ""]
+    );
+  } catch (err) {
+    console.error(`[${new Date().toISOString()}] Failed to persist mute state ${key}:`, err.message);
+  }
 }
 
 // Per-sensor cooldown map (last critical SMS wall-clock ms) + disconnect dedup
@@ -838,45 +883,72 @@ function runSmsMaintenance() {
   }
 }
 
-// Latest sensor readings + per-sensor threshold status, or null when no data.
-async function buildStatusSms() {
+// Latest sensor readings + per-sensor threshold status, or null when no active
+// tanks. deviceId scopes the report to one tank (per-tank thresholds apply);
+// without it the report is a fleet digest with one block per active tank —
+// previously it reported only whichever tank happened to post most recently.
+async function buildStatusSms(deviceId = null) {
   try {
-    const sensorResult = await pool.query("SELECT * FROM sensors ORDER BY timestamp DESC LIMIT 1");
-    if (sensorResult.rows.length === 0) return null;
-    const settingsResult = await pool.query("SELECT * FROM sensor_settings LIMIT 1");
-    const settings = settingsResult.rows[0] || { temp_min: 20, temp_max: 31, water_level_min: 10, water_level_max: 100, ammonia_min: 0.25, ammonia_max: 1 };
-    const row = sensorResult.rows[0];
-    const temp = row.temperature !== undefined ? Number(row.temperature) : null;
-    const water = row.water_level !== undefined ? Number(row.water_level) : null;
-    const ammonia = row.ammonia !== undefined ? Number(row.ammonia) : null;
-
-    const tempStatus = temp !== null && temp >= 0.0001 ? getThresholdStatus(temp, Number(settings.temp_min), Number(settings.temp_max)) : null;
-    const waterStatus = water !== null && water >= 0 ? getThresholdStatus(water, Number(settings.water_level_min), Number(settings.water_level_max)) : null;
-    const ammoniaStatus = ammonia !== null && ammonia >= 0 ? getThresholdStatus(ammonia, Number(settings.ammonia_min), Number(settings.ammonia_max)) : null;
+    const devicesResult = deviceId
+      ? await pool.query("SELECT device_id, tank_name FROM devices WHERE device_id = $1 AND is_active = true", [deviceId])
+      : await pool.query("SELECT device_id, tank_name FROM devices WHERE is_active = true ORDER BY device_id");
+    if (devicesResult.rows.length === 0) return null;
 
     const statusLabel = (s) => (s === "good" ? "NORMAL" : s === "warning" ? "WARNING" : "CRITICAL");
 
     const lines = [
       "CRAYVINGS AQUACULTURE MONITORING",
-      "HOURLY STATUS REPORT",
+      deviceId ? "TANK STATUS REPORT" : "FLEET STATUS REPORT",
       formatSmsTime(),
-      "",
-      `Temperature: ${temp !== null && temp >= 0.0001 ? `${temp}°C` : "Not available"} ${tempStatus ? `(${statusLabel(tempStatus)})` : ""}`,
-      `Water Level: ${water !== null && water >= 0 ? `${water}%` : "Not available"} ${waterStatus ? `(${statusLabel(waterStatus)})` : ""}`,
-      `Ammonia: ${ammonia !== null && ammonia >= 0 ? `${ammonia} ppm` : "Not available"} ${ammoniaStatus ? `(${statusLabel(ammoniaStatus)})` : ""}`,
-      "",
-      "SAFE RANGES",
-      `Temperature: ${settings.temp_min}°C - ${settings.temp_max}°C`,
-      `Water Level: ${settings.water_level_min}% - ${settings.water_level_max}%`,
-      `Ammonia: ${settings.ammonia_min} - ${settings.ammonia_max} ppm`,
       "",
     ];
 
-    const breached = [tempStatus, waterStatus, ammoniaStatus].filter((s) => s && s !== "good");
-    if (breached.length === 0) {
+    let anyBreached = false;
+    let anyReading = false;
+
+    for (const device of devicesResult.rows) {
+      const label = device.tank_name ? `${device.tank_name} (${device.device_id})` : device.device_id;
+      const sensorResult = await pool.query(
+        "SELECT * FROM sensors WHERE device_id = $1 ORDER BY timestamp DESC LIMIT 1",
+        [device.device_id]
+      );
+      if (sensorResult.rows.length === 0) {
+        lines.push(`Tank: ${label}`, "No readings yet.", "");
+        continue;
+      }
+      anyReading = true;
+      const settings = await getThresholdsForDevice(device.device_id);
+      const row = sensorResult.rows[0];
+      const temp = row.temperature == null ? null : Number(row.temperature);
+      const water = row.water_level == null ? null : Number(row.water_level);
+      const ammonia = row.ammonia == null ? null : Number(row.ammonia);
+
+      const tempStatus = temp !== null && temp >= 0.0001 ? getThresholdStatus(temp, settings.temp_min, settings.temp_max) : null;
+      const waterStatus = water !== null && water >= 0 ? getThresholdStatus(water, settings.water_level_min, settings.water_level_max) : null;
+      const ammoniaStatus = ammonia !== null && ammonia >= 0 ? getThresholdStatus(ammonia, settings.ammonia_min, settings.ammonia_max) : null;
+
+      if ([tempStatus, waterStatus, ammoniaStatus].some((s) => s && s !== "good")) anyBreached = true;
+
+      lines.push(`Tank: ${label}`);
+      lines.push(`Temperature: ${temp !== null && temp >= 0.0001 ? `${temp}°C` : "Not available"} ${tempStatus ? `(${statusLabel(tempStatus)})` : ""}`);
+      lines.push(`Water Level: ${water !== null && water >= 0 ? `${water}%` : "Not available"} ${waterStatus ? `(${statusLabel(waterStatus)})` : ""}`);
+      lines.push(`Ammonia: ${ammonia !== null && ammonia >= 0 ? `${ammonia} ppm` : "Not available"} ${ammoniaStatus ? `(${statusLabel(ammoniaStatus)})` : ""}`);
+      if (deviceId) {
+        lines.push(
+          "",
+          "SAFE RANGES",
+          `Temperature: ${settings.temp_min}°C - ${settings.temp_max}°C`,
+          `Water Level: ${settings.water_level_min}% - ${settings.water_level_max}%`,
+          `Ammonia: ${settings.ammonia_min} - ${settings.ammonia_max} ppm`
+        );
+      }
+      lines.push("");
+    }
+
+    if (anyReading && anyBreached) {
+      lines.push("STATUS: Attention required — one or more readings out of range.");
+    } else if (anyReading) {
       lines.push("STATUS: All readings are within safe ranges.");
-    } else {
-      lines.push(`STATUS: Attention required — ${breached.length} reading(s) out of range.`);
     }
     lines.push("Crayvings Monitoring System");
     return lines.join("\n");
@@ -921,10 +993,13 @@ async function checkDeviceDisconnects() {
           "Please check the device power and network connection.",
         ].join("\n")
       );
-      await sendSmsToRecipients(content);
+      // Per-tank mute: silence just this tank's disconnect SMS when muted.
+      if (!isSmsMutedFor(row.device_id)) {
+        await sendSmsToRecipients(content);
+      }
       await pool.query(
-        "INSERT INTO system_logs (action, parameter, old_value, new_value) VALUES ($1, $2, $3, $4)",
-        ["Device Disconnect", String(row.device_id), "last_seen stale", `> ${staleSeconds}s`]
+        "INSERT INTO system_logs (action, parameter, old_value, new_value, device_id) VALUES ($1, $2, $3, $4, $5)",
+        ["Device Disconnect", String(row.device_id), "last_seen stale", `> ${staleSeconds}s`, row.device_id]
       );
     }
   } catch (err) {
@@ -954,6 +1029,33 @@ function getThresholdStatus(value, min, max) {
   return "good";
 }
 
+// Farm-wide default thresholds (used when no sensor_settings row exists).
+const DEFAULT_THRESHOLDS = { temp_min: 20, temp_max: 31, water_level_min: 10, water_level_max: 100, ammonia_min: 0.25, ammonia_max: 1 };
+
+// Effective thresholds for one tank: per-tank overrides
+// (device_threshold_overrides, migration 012) win over the global
+// sensor_settings singleton; NULL/missing override columns fall back to
+// global. deviceId null/undefined resolves to the global row alone. Missing
+// override table (migration 012 not applied) degrades to global quietly.
+async function getThresholdsForDevice(deviceId) {
+  const [settingsResult, overrideResult] = await Promise.all([
+    pool.query("SELECT * FROM sensor_settings LIMIT 1"),
+    deviceId
+      ? pool.query("SELECT * FROM device_threshold_overrides WHERE device_id = $1", [deviceId]).catch(() => ({ rows: [] }))
+      : Promise.resolve({ rows: [] }),
+  ]);
+  const global = settingsResult.rows[0] || DEFAULT_THRESHOLDS;
+  const override = overrideResult.rows[0] || {};
+  return {
+    temp_min: override.temp_min != null ? Number(override.temp_min) : Number(global.temp_min),
+    temp_max: override.temp_max != null ? Number(override.temp_max) : Number(global.temp_max),
+    water_level_min: override.water_level_min != null ? Number(override.water_level_min) : Number(global.water_level_min),
+    water_level_max: override.water_level_max != null ? Number(override.water_level_max) : Number(global.water_level_max),
+    ammonia_min: override.ammonia_min != null ? Number(override.ammonia_min) : Number(global.ammonia_min ?? DEFAULT_THRESHOLDS.ammonia_min),
+    ammonia_max: override.ammonia_max != null ? Number(override.ammonia_max) : Number(global.ammonia_max ?? DEFAULT_THRESHOLDS.ammonia_max),
+  };
+}
+
 // DEVICE_SECRET: ESP32 must send matching X-Device-Secret header for POST /sensor.
 // When set, requests without it are rejected; when unset (local dev), ingestion
 // is allowed but a warning is logged. Set DEVICE_SECRET in production.
@@ -966,7 +1068,10 @@ let lastAlertedState = {};
 let lastAmmoniaReading = {};
 // Change-only logging baseline: last INSERTED reading per device (seeded from DB at boot)
 let lastSensorReading = {};
-const AMMONIA_SPIKE_THRESHOLD = 20; // ppm — reject readings jumping more than this from last stored value
+const AMMONIA_SPIKE_THRESHOLD = 20; // ppm jump vs last stored value that gets flagged as a "Spike"
+// Oldest device read_at the ingest accepts: the offline ring buffer holds 600
+// readings (~10 min at 1 Hz); 15 min covers flush delays with slack.
+const MAX_BACKLOG_AGE_MS = 15 * 60 * 1000;
 // Cooldown prevents system_logs alert spam for a repeated status (~2 minutes)
 const ALERT_COOLDOWN_MS = 120000;
 
@@ -998,6 +1103,23 @@ const ALERT_COOLDOWN_MS = 120000;
     await pool.query(`ALTER TABLE system_logs ADD COLUMN IF NOT EXISTS acknowledged_at TIMESTAMP`);
     await pool.query(`ALTER TABLE system_logs ADD COLUMN IF NOT EXISTS acknowledged_by VARCHAR(100)`);
 
+    // Per-tank log attribution + override table (migrations 011/012 mirror
+    // these so a server started without running migrations keeps alerting).
+    await pool.query(`ALTER TABLE system_logs ADD COLUMN IF NOT EXISTS device_id VARCHAR(50) REFERENCES devices(device_id) ON DELETE SET NULL`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_system_logs_device_ts ON system_logs (device_id, timestamp DESC)`);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS device_threshold_overrides (
+        device_id VARCHAR(50) PRIMARY KEY REFERENCES devices(device_id) ON DELETE CASCADE,
+        temp_min DECIMAL(5,2),
+        temp_max DECIMAL(5,2),
+        water_level_min DECIMAL(5,2),
+        water_level_max DECIMAL(5,2),
+        ammonia_min DECIMAL(5,2),
+        ammonia_max DECIMAL(5,2),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_system_logs_timestamp ON system_logs (timestamp DESC)`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_system_logs_action ON system_logs (action)`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_system_logs_ack_status ON system_logs (ack_status)`);
@@ -1010,8 +1132,13 @@ const ALERT_COOLDOWN_MS = 120000;
   }
 })();
 
-// Keep only last 30 days of logs and sensor readings (startup and daily)
+// Keep only last 30 days of logs and sensor readings (startup and daily).
+// activity_logs is a user-audit trail, not sensor data - it is kept longer
+// (default 90 days, ACTIVITY_LOGS_RETENTION_DAYS; 0 disables the purge).
 const LOGS_RETENTION_DAYS = 30;
+const rawActivityRetention = parseInt(process.env.ACTIVITY_LOGS_RETENTION_DAYS, 10);
+const ACTIVITY_LOGS_RETENTION_DAYS =
+  Number.isFinite(rawActivityRetention) && rawActivityRetention >= 0 ? rawActivityRetention : 90;
 async function cleanupOldData() {
   try {
     const result = await pool.query(
@@ -1019,6 +1146,16 @@ async function cleanupOldData() {
     );
     if (result.rowCount > 0) {
       console.log(`[${new Date().toISOString()}] Cleaned up ${result.rowCount} old system_logs entries`);
+    }
+
+    if (ACTIVITY_LOGS_RETENTION_DAYS > 0) {
+      const activityResult = await pool.query(
+        `DELETE FROM activity_logs WHERE timestamp < NOW() - ($1 || ' days')::interval RETURNING id`,
+        [ACTIVITY_LOGS_RETENTION_DAYS]
+      );
+      if (activityResult.rowCount > 0) {
+        console.log(`[${new Date().toISOString()}] Cleaned up ${activityResult.rowCount} activity_logs entries older than ${ACTIVITY_LOGS_RETENTION_DAYS} days`);
+      }
     }
 
     // ESP32 posts ~1 reading/sec, so the sensors table grows fast — prune old readings
@@ -1064,8 +1201,9 @@ app.get("/", (req, res) => {
 function scheduleAlertProcessing(device_id, ts, temperature, water_level, ammonia) {
   setImmediate(async () => {
     try {
-      const settingsResult = await pool.query("SELECT * FROM sensor_settings LIMIT 1");
-      const settings = settingsResult.rows[0] || { temp_min: 20, temp_max: 31, water_level_min: 10, water_level_max: 100, ammonia_min: 0.25, ammonia_max: 1 };
+      // Per-tank thresholds: overrides (migration 012) layered on the global
+      // singleton, so each tank alerts against its own effective range.
+      const settings = await getThresholdsForDevice(device_id);
 
       const sensorChecks = [
         { key: "Temperature", val: Number(temperature), min: Number(settings.temp_min), max: Number(settings.temp_max), minValid: 0.0001 },
@@ -1088,8 +1226,8 @@ function scheduleAlertProcessing(device_id, ts, temperature, water_level, ammoni
               [device_id, sensor.key, "good", sensor.val, ts.toISOString()]
             );
             lastAlertedState[`${device_id}:${sensor.key}`] = { status: "good", value: sensor.val, timestamp: ts.toISOString() };
-            await pool.query(`INSERT INTO system_logs (action, parameter, old_value, new_value) VALUES ($1, $2, $3, $4)`,
-              ["Alert Resolved", sensor.key, last.status, "good"]);
+            await pool.query(`INSERT INTO system_logs (action, parameter, old_value, new_value, device_id) VALUES ($1, $2, $3, $4, $5)`,
+              ["Alert Resolved", sensor.key, last.status, "good", device_id]);
           }
           continue;
         }
@@ -1098,10 +1236,10 @@ function scheduleAlertProcessing(device_id, ts, temperature, water_level, ammoni
 
         const direction = sensor.val < sensor.min ? "Low" : "High";
 
-        await pool.query(`INSERT INTO system_logs (action, parameter, old_value, new_value) VALUES ($1, $2, $3, $4)`,
-          ["Alert", sensor.key, direction, sensor.val]);
+        await pool.query(`INSERT INTO system_logs (action, parameter, old_value, new_value, device_id) VALUES ($1, $2, $3, $4, $5)`,
+          ["Alert", sensor.key, direction, sensor.val, device_id]);
 
-        if (status === "critical" && !isSmsMuted()) {
+        if (status === "critical" && !isSmsMutedFor(device_id)) {
           const smsKey = `${device_id}:${sensor.key}`;
           if (nowTs - (lastSmsSent[smsKey] || 0) >= SMS_COOLDOWN_MS) {
             lastSmsSent[smsKey] = nowTs;
@@ -1144,13 +1282,19 @@ function scheduleAlertProcessing(device_id, ts, temperature, water_level, ammoni
 // Server-Sent Events, removing the need for 1s client polling. The same
 // in-memory map backs GET /devices/latest (freshest reading per active tank).
 
-const sseClients = new Set(); // open EventSource responses
+// sseClients maps each open EventSource response -> that client's device
+// filter (device_id the dashboard selected, or null = receive every tank).
+// A Map (not a Set) so broadcastSensorUpdate can target frames per tank —
+// with multiple ESP32s posting, each dashboard must only see its own tank.
+const sseClients = new Map(); // res -> device_id filter (string | null)
 const latestDeviceReadings = new Map(); // device_id -> { ...readings, recv_at }
 
 function broadcastSensorUpdate(deviceId, readings, ts) {
   if (sseClients.size === 0) return;
   const payload = `data: ${JSON.stringify({ type: "sensor_update", data: { device_id: deviceId, ...readings, timestamp: ts.toISOString(), recv_at: ts.toISOString() } })}\n\n`;
-  for (const client of sseClients) {
+  for (const [client, filter] of sseClients) {
+    // Subscribed dashboards only receive their own tank's frames.
+    if (filter && filter !== deviceId) continue;
     try {
       client.write(payload);
     } catch {
@@ -1210,22 +1354,47 @@ app.post("/sensor", sensorIngestLimiter, async (req, res) => {
       ammonia: readingOrNull("ammonia", ammonia),
     };
 
-    // Ammonia spike guard: reject readings jumping too far from the last stored
-    // value (USB-disconnect electrical noise causes wild spikes)
+    // Ammonia spike tracking (accept-and-flag): compute the jump vs the last
+    // STORED reading but NEVER reject. The old hard-400 made the ESP32 requeue
+    // the reading and retry forever, so a genuine excursion never reached the
+    // dashboard or alerts — exactly when it mattered. Large jumps are stored
+    // normally AND flagged as a "Spike" system_logs row (visible on Alerts and
+    // Sensor Logs) so noise stays distinguishable from real events.
     const ammoniaVal = readings.ammonia;
-    if (ammoniaVal != null && lastAmmoniaReading[device_id] != null) {
-      const jump = Math.abs(ammoniaVal - lastAmmoniaReading[device_id]);
-      if (jump > AMMONIA_SPIKE_THRESHOLD) {
-        console.warn(`[${new Date().toISOString()}] Ammonia spike rejected from ${device_id}: ${ammoniaVal} ppm (last: ${lastAmmoniaReading[device_id]} ppm, jump: ${jump.toFixed(1)} ppm)`);
-        return res.status(400).json({ message: "Ammonia reading rejected: spike exceeds threshold", last_value: lastAmmoniaReading[device_id], rejected_value: ammoniaVal, jump: jump.toFixed(1) });
+    const prevAmmonia = lastAmmoniaReading[device_id] ?? null;
+    const ammoniaSpikeJump =
+      ammoniaVal != null && prevAmmonia != null ? Math.abs(ammoniaVal - prevAmmonia) : 0;
+    if (ammoniaSpikeJump > AMMONIA_SPIKE_THRESHOLD) {
+      console.warn(`[${new Date().toISOString()}] Ammonia spike flagged from ${device_id}: ${ammoniaVal} ppm (last stored: ${prevAmmonia} ppm, jump: ${ammoniaSpikeJump.toFixed(1)} ppm)`);
+    }
+
+    // Optional device-side capture time (backlog truthfulness): the ESP32
+    // stamps each reading via SNTP so an offline-backlog flush lands at the
+    // TRUE reading time instead of a "now" burst. Sane = not in the future
+    // and not older than the buffer could hold; anything else falls back to
+    // server arrival time.
+    let readAt = null;
+    if (typeof parsed.data.read_at === "string" && parsed.data.read_at) {
+      const parsedReadAt = new Date(parsed.data.read_at);
+      if (!Number.isNaN(parsedReadAt.getTime())) {
+        const ageMs = Date.now() - parsedReadAt.getTime();
+        if (ageMs >= -5000 && ageMs <= MAX_BACKLOG_AGE_MS) {
+          readAt = parsedReadAt;
+        } else {
+          console.warn(`[${new Date().toISOString()}] Out-of-bounds read_at from ${device_id} (${parsed.data.read_at}) - using server arrival time`);
+        }
       }
     }
 
-    const ts = new Date();
+    // arrivalTs: when this POST hit the server — drives the heartbeat clock
+    // (devices.last_seen, SSE, /devices/latest). rowTs: the reading's TRUE
+    // capture time (device clock when sane, else arrival) — stored on the row.
+    const arrivalTs = new Date();
+    const rowTs = readAt ?? arrivalTs;
     // Auto-register the device so the sensors.device_id FK never fails
     await pool.query(
       `INSERT INTO devices (device_id, last_seen) VALUES ($1, $2) ON CONFLICT (device_id) DO UPDATE SET last_seen = $2`,
-      [device_id, ts]
+      [device_id, arrivalTs]
     );
     // A fresh reading means the device is online again: re-arm its disconnect
     // alert and timestamp the recovery so reconnecting flaps don't re-alert.
@@ -1246,35 +1415,45 @@ app.post("/sensor", sensorIngestLimiter, async (req, res) => {
 
     // Publish the freshest reading to the in-memory map (drives /devices/latest
     // and the SSE push) regardless of whether a row gets written.
-    latestDeviceReadings.set(device_id, { ...readings, recv_at: ts.toISOString() });
+    latestDeviceReadings.set(device_id, { ...readings, recv_at: arrivalTs.toISOString() });
 
     // Delta mode: an unchanged reading is still a heartbeat (devices.last_seen
     // already updated above) but writes no new sensors row.
     if (DELTA_LOGGING_ENABLED && !hasDelta) {
       console.log(`[${new Date().toISOString()}] Sensor heartbeat from ${device_id} (unchanged - no row written)`);
-      res.status(200).json({ message: "No change, skipped", skipped: true, data: { device_id, ...readings, timestamp: ts.toISOString() } });
-      broadcastSensorUpdate(device_id, readings, ts);
-      scheduleAlertProcessing(device_id, ts, temperature, water_level, ammonia);
+      res.status(200).json({ message: "No change, skipped", skipped: true, data: { device_id, ...readings, timestamp: rowTs.toISOString() } });
+      broadcastSensorUpdate(device_id, readings, arrivalTs);
+      scheduleAlertProcessing(device_id, rowTs, temperature, water_level, ammonia);
       return;
     }
 
     const result = await pool.query(
       `INSERT INTO sensors (device_id, temperature, water_level, ammonia, timestamp) VALUES ($1, $2, $3, $4, $5) RETURNING *`,
-      [device_id, readings.temperature, readings.water_level, readings.ammonia, ts]
+      [device_id, readings.temperature, readings.water_level, readings.ammonia, rowTs]
     );
-    console.log(`[${new Date().toISOString()}] Sensor data saved from ${device_id}`);
+    console.log(`[${new Date().toISOString()}] Sensor data saved from ${device_id}${readAt ? ` (read_at ${rowTs.toISOString()})` : ""}`);
 
     if (ammoniaVal != null) {
+      if (ammoniaSpikeJump > AMMONIA_SPIKE_THRESHOLD) {
+        // Accept-and-flag: the reading above is already stored; this row makes
+        // the jump visible on the Alerts / Sensor Logs pages.
+        pool.query(
+          `INSERT INTO system_logs (action, parameter, old_value, new_value, device_id) VALUES ($1, $2, $3, $4, $5)`,
+          ["Spike", "Ammonia", String(prevAmmonia ?? ""), String(ammoniaVal), device_id]
+        ).catch((spikeLogErr) =>
+          console.error(`[${new Date().toISOString()}] Failed to log ammonia spike flag:`, spikeLogErr.message)
+        );
+      }
       lastAmmoniaReading[device_id] = ammoniaVal;
     }
     lastSensorReading[device_id] = readings;
 
     // Respond immediately; timestamp returned as UTC ISO-8601 so the frontend
     // renders it in the farm timezone without silent timezone conversion.
-    res.status(201).json({ message: "Saved", data: { ...result.rows[0], timestamp: ts.toISOString() } });
+    res.status(201).json({ message: "Saved", data: { ...result.rows[0], timestamp: rowTs.toISOString() } });
 
-    broadcastSensorUpdate(device_id, readings, ts);
-    scheduleAlertProcessing(device_id, ts, temperature, water_level, ammonia);
+    broadcastSensorUpdate(device_id, readings, arrivalTs);
+    scheduleAlertProcessing(device_id, rowTs, temperature, water_level, ammonia);
   } catch (err) {
     console.error(`[${new Date().toISOString()}] Error saving sensor:`, err.message);
     res.status(500).json({ message: "Error saving data", error: process.env.NODE_ENV === "production" ? undefined : err.message });
@@ -1365,16 +1544,22 @@ app.get("/sensor/stream", requireAuth, (req, res) => {
   res.setHeader("Connection", "keep-alive");
   res.flushHeaders();
 
+  // Per-client tank filter (?device_id=). When set, this client only receives
+  // that tank's frames — both the connect burst and live broadcasts.
+  const deviceFilter = req.query.device_id ? String(req.query.device_id) : null;
+
   // Send the current freshest reading immediately so a newly opened dashboard
-  // has data before the next ESP32 POST arrives.
+  // has data before the next ESP32 POST arrives. Filtered clients get only
+  // their own tank; unfiltered clients still get the whole fleet.
   if (latestDeviceReadings.size > 0) {
     for (const [deviceId, readings] of latestDeviceReadings) {
+      if (deviceFilter && deviceId !== deviceFilter) continue;
       res.write(`data: ${JSON.stringify({ type: "sensor_update", data: { device_id: deviceId, ...readings, timestamp: readings.recv_at } })}\n\n`);
     }
   }
   res.write(`data: ${JSON.stringify({ type: "connected", timestamp: new Date().toISOString() })}\n\n`);
 
-  sseClients.add(res);
+  sseClients.set(res, deviceFilter);
   const keepAlive = setInterval(() => {
     try {
       res.write(": keep-alive\n\n");
@@ -1394,15 +1579,18 @@ app.get("/sensor/stream", requireAuth, (req, res) => {
 // ========================
 
 // GET /devices - fleet registry with online flag (scoped to the sensor-path
-// heartbeat, matching the disconnect monitor's staleness window)
+// heartbeat, matching the disconnect monitor's staleness window). Hidden tanks
+// (is_active = false) are excluded unless ?include_hidden=1 (restore panel).
 app.get("/devices", requireAuth, async (req, res) => {
   try {
     const staleSeconds = Math.max(5, Math.floor(DISCONNECT_STALE_MS / 1000));
+    const includeHidden = req.query.include_hidden === "1" || req.query.include_hidden === "true";
     const result = await pool.query(
       `SELECT device_id, name, tank_name, tank_location, ip_address, is_active,
               last_seen, last_health_seen,
               (last_seen > NOW() - ($1 || ' seconds')::interval) AS online
          FROM devices
+        ${includeHidden ? "" : "WHERE is_active = true"}
         ORDER BY device_id`,
       [staleSeconds]
     );
@@ -1410,6 +1598,69 @@ app.get("/devices", requireAuth, async (req, res) => {
   } catch (err) {
     console.error(`[${new Date().toISOString()}] Error fetching devices:`, err.message);
     res.status(500).json({ message: "Error fetching devices", error: err.message });
+  }
+});
+
+// PUT /devices/:id - rename a tank (tank_name), set its location, and/or hide
+// or show it (is_active). The hardware device_id itself never changes. Hiding
+// is non-destructive: rows/sensors stay, /devices just stops listing the tank
+// and the restore panel (include_hidden=1) can bring it back.
+app.put("/devices/:deviceId", requireAuth, async (req, res) => {
+  try {
+    const { tank_name, tank_location, is_active } = req.body;
+    if (tank_name !== undefined && tank_name !== null && typeof tank_name !== "string") {
+      return res.status(400).json({ message: "tank_name must be a string" });
+    }
+    if (tank_location !== undefined && tank_location !== null && typeof tank_location !== "string") {
+      return res.status(400).json({ message: "tank_location must be a string" });
+    }
+    if (is_active !== undefined && is_active !== null && typeof is_active !== "boolean") {
+      return res.status(400).json({ message: "is_active must be a boolean" });
+    }
+    if (tank_name === undefined && tank_location === undefined && is_active === undefined) {
+      return res.status(400).json({ message: "Nothing to update" });
+    }
+
+    const result = await pool.query(
+      `UPDATE devices
+          SET tank_name = COALESCE($1, tank_name),
+              tank_location = COALESCE($2, tank_location),
+              is_active = COALESCE($3, is_active)
+        WHERE device_id = $4
+        RETURNING device_id, name, tank_name, tank_location, ip_address, is_active,
+                  last_seen, last_health_seen`,
+      [
+        typeof tank_name === "string" ? tank_name.trim() : null,
+        typeof tank_location === "string" ? tank_location.trim() : null,
+        is_active !== undefined ? is_active : null,
+        req.params.deviceId,
+      ]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ message: "Device not found" });
+
+    const staleSeconds = Math.max(5, Math.floor(DISCONNECT_STALE_MS / 1000));
+    const onlineResult = await pool.query(
+      `SELECT (last_seen > NOW() - ($2 || ' seconds')::interval) AS online
+         FROM devices WHERE device_id = $1`,
+      [req.params.deviceId, staleSeconds]
+    );
+    const row = result.rows[0];
+    const updated = { ...row, online: !!onlineResult.rows[0]?.online };
+
+    // Audit trail: who renamed/hid/restored which tank.
+    const action =
+      is_active === false ? "hid tank" : is_active === true ? "restored tank" : "renamed tank";
+    const detail = `${action} ${row.device_id}` +
+      (tank_name !== undefined ? ` (name: ${row.tank_name ?? "unchanged"})` : "");
+    await pool.query(
+      "INSERT INTO activity_logs (user_name, action_type, description, module) VALUES ($1, 'TANK_UPDATED', $2, 'devices')",
+      [req.user.username, detail]
+    ).catch(() => {});
+
+    res.json(updated);
+  } catch (err) {
+    console.error(`[${new Date().toISOString()}] Error updating device:`, err.message);
+    res.status(500).json({ message: "Error updating device", error: err.message });
   }
 });
 
@@ -1458,9 +1709,12 @@ app.get("/devices/:deviceId/status", requireAuth, async (req, res) => {
 // WEEKLY REPORT ENDPOINT
 // ========================
 
-// GET /report/weekly - 7-day aggregated report (summary, daily breakdown, alert counts)
+// GET /report/weekly - 7-day aggregated report (summary, daily breakdown, alert counts).
+// Optional ?device_id scopes every query to one tank so the report (and the
+// PDF export built from it) matches the selected tank's on-screen charts.
 app.get("/report/weekly", requireAuth, async (req, res) => {
   try {
+    const deviceId = req.query.device_id ? String(req.query.device_id) : null;
     let summaryResult;
     try {
       summaryResult = await pool.query(`
@@ -1477,7 +1731,8 @@ app.get("/report/weekly", requireAuth, async (req, res) => {
           COUNT(*) AS total_readings
         FROM sensors
         WHERE timestamp >= NOW() - INTERVAL '7 days'
-      `);
+          AND ($1::text IS NULL OR device_id = $1)
+      `, [deviceId]);
     } catch (err) {
       console.error(`[${new Date().toISOString()}] Weekly summary query failed:`, err.message);
       summaryResult = { rows: [{ temp_avg: 0, temp_min: 0, temp_max: 0, water_avg: 0, water_min: 0, water_max: 0, ammonia_avg: 0, ammonia_min: 0, ammonia_max: 0, total_readings: 0 }] };
@@ -1500,9 +1755,10 @@ app.get("/report/weekly", requireAuth, async (req, res) => {
           COUNT(*) AS readings
         FROM sensors
         WHERE timestamp >= NOW() - INTERVAL '7 days'
+          AND ($1::text IS NULL OR device_id = $1)
         GROUP BY DATE(timestamp)
         ORDER BY date
-      `);
+      `, [deviceId]);
     } catch (err) {
       console.error(`[${new Date().toISOString()}] Weekly daily query failed:`, err.message);
       dailyResult = { rows: [] };
@@ -1514,8 +1770,9 @@ app.get("/report/weekly", requireAuth, async (req, res) => {
         SELECT DATE(timestamp) AS date, COUNT(*) AS count
         FROM system_logs
         WHERE timestamp >= NOW() - INTERVAL '7 days' AND action = 'Alert'
+          AND ($1::text IS NULL OR device_id = $1)
         GROUP BY DATE(timestamp)
-      `);
+      `, [deviceId]);
       dailyAlertsResult.rows.forEach(row => {
         const d = typeof row.date === 'string' ? row.date.split('T')[0] : String(row.date);
         dailyAlertsMap[d] = parseInt(row.count) || 0;
@@ -1531,8 +1788,9 @@ app.get("/report/weekly", requireAuth, async (req, res) => {
         SELECT parameter, COUNT(*) AS count
         FROM system_logs
         WHERE timestamp >= NOW() - INTERVAL '7 days' AND action = 'Alert'
+          AND ($1::text IS NULL OR device_id = $1)
         GROUP BY parameter
-      `);
+      `, [deviceId]);
       alertsByParamResult.rows.forEach(row => { byParameter[row.parameter] = parseInt(row.count) || 0; });
     } catch (err) {
       console.error(`[${new Date().toISOString()}] Weekly alerts by param query failed:`, err.message);
@@ -1545,8 +1803,9 @@ app.get("/report/weekly", requireAuth, async (req, res) => {
         SELECT action, COUNT(*)::int AS count
         FROM system_logs
         WHERE timestamp >= NOW() - INTERVAL '7 days'
+          AND ($1::text IS NULL OR device_id = $1)
         GROUP BY action
-      `);
+      `, [deviceId]);
       logActionsResult.rows.forEach(row => { byAction[row.action] = row.count; });
     } catch (err) {
       console.error(`[${new Date().toISOString()}] Weekly log actions query failed:`, err.message);
@@ -1615,17 +1874,21 @@ app.get("/report/weekly", requireAuth, async (req, res) => {
 
 // GET /report/range - aggregated report for a custom window.
 // ?hours=N (positive int) -> last N hours (hourly buckets when N <= 24);
-// omitted/0 -> all time (daily buckets). Exact DB aggregates, admin gated.
+// omitted/0 -> all time (daily buckets). Optional ?device_id scopes the
+// aggregation (and the alert counts) to one tank. Exact DB aggregates,
+// admin gated.
 app.get("/report/range", requireAdmin, async (req, res) => {
   try {
     const parsedHours = parseInt(req.query.hours);
     const hasHours = Number.isFinite(parsedHours) && parsedHours > 0;
     const hours = hasHours ? parsedHours : null;
+    const deviceId = req.query.device_id ? String(req.query.device_id) : null;
     const bucket = hasHours && hours <= 24 ? "hour" : "day";
-    const timeFilter = hasHours ? `WHERE timestamp >= NOW() - INTERVAL '${hours} hours'` : "";
+    const timeFilter = hasHours ? `timestamp >= NOW() - INTERVAL '${hours} hours'` : "TRUE";
     const logTimeFilter = hasHours
       ? ` AND timestamp >= NOW() - INTERVAL '${hours} hours'`
       : "";
+    const deviceFilter = `($1::text IS NULL OR device_id = $1)`;
 
     const bucketExpr =
       bucket === "hour"
@@ -1647,8 +1910,8 @@ app.get("/report/range", requireAdmin, async (req, res) => {
           COALESCE(MAX(ammonia) FILTER (WHERE ammonia >= 0), 0)::float AS ammonia_max,
           COUNT(*) AS total_readings
         FROM sensors
-        ${timeFilter}
-      `);
+        WHERE ${deviceFilter} AND ${timeFilter}
+      `, [deviceId]);
     } catch (err) {
       console.error(`[${new Date().toISOString()}] Range summary query failed:`, err.message);
       summaryResult = { rows: [{ temp_avg: 0, temp_min: 0, temp_max: 0, water_avg: 0, water_min: 0, water_max: 0, ammonia_avg: 0, ammonia_min: 0, ammonia_max: 0, total_readings: 0 }] };
@@ -1670,11 +1933,11 @@ app.get("/report/range", requireAdmin, async (req, res) => {
           COALESCE(MAX(ammonia) FILTER (WHERE ammonia >= 0), 0)::float AS ammonia_max,
           COUNT(*) AS readings
         FROM sensors
-        ${timeFilter}
+        WHERE ${deviceFilter} AND ${timeFilter}
         GROUP BY label
         ORDER BY label DESC
         LIMIT 1000
-      `);
+      `, [deviceId]);
     } catch (err) {
       console.error(`[${new Date().toISOString()}] Range buckets query failed:`, err.message);
       bucketsResult = { rows: [] };
@@ -1686,9 +1949,9 @@ app.get("/report/range", requireAdmin, async (req, res) => {
       const bucketAlertsResult = await pool.query(`
         SELECT ${bucketExpr} AS label, COUNT(*) AS count
         FROM system_logs
-        WHERE action = 'Alert'${logTimeFilter}
+        WHERE action = 'Alert' AND ${deviceFilter}${logTimeFilter}
         GROUP BY label
-      `);
+      `, [deviceId]);
       bucketAlertsResult.rows.forEach(row => {
         bucketAlertsMap[row.label] = parseInt(row.count) || 0;
       });
@@ -1702,9 +1965,9 @@ app.get("/report/range", requireAdmin, async (req, res) => {
       const alertsByParamResult = await pool.query(`
         SELECT parameter, COUNT(*) AS count
         FROM system_logs
-        WHERE action = 'Alert'${logTimeFilter}
+        WHERE action = 'Alert' AND ${deviceFilter}${logTimeFilter}
         GROUP BY parameter
-      `);
+      `, [deviceId]);
       alertsByParamResult.rows.forEach(row => { byParameter[row.parameter] = parseInt(row.count) || 0; });
     } catch (err) {
       console.error(`[${new Date().toISOString()}] Range alerts by param query failed:`, err.message);
@@ -1716,9 +1979,9 @@ app.get("/report/range", requireAdmin, async (req, res) => {
       const logActionsResult = await pool.query(`
         SELECT action, COUNT(*)::int AS count
         FROM system_logs
-        WHERE 1=1${logTimeFilter}
+        WHERE ${deviceFilter}${logTimeFilter}
         GROUP BY action
-      `);
+      `, [deviceId]);
       logActionsResult.rows.forEach(row => { byAction[row.action] = row.count; });
     } catch (err) {
       console.error(`[${new Date().toISOString()}] Range log actions query failed:`, err.message);
@@ -1729,7 +1992,7 @@ app.get("/report/range", requireAdmin, async (req, res) => {
     let startIso = hasHours ? new Date(now.getTime() - hours * 60 * 60 * 1000).toISOString() : null;
     if (!startIso) {
       try {
-        const earliest = await pool.query("SELECT MIN(timestamp) AS first_ts FROM sensors");
+        const earliest = await pool.query("SELECT MIN(timestamp) AS first_ts FROM sensors WHERE ($1::text IS NULL OR device_id = $1)", [deviceId]);
         const firstTs = earliest.rows[0] && earliest.rows[0].first_ts;
         startIso = firstTs ? new Date(firstTs).toISOString() : now.toISOString();
       } catch {
@@ -1813,10 +2076,10 @@ app.post("/auth/login", loginLimiter, async (req, res) => {
       const upgradedHash = hashPassword(password);
       await pool.query(
         "UPDATE users SET token = $1, token_expires_at = $2, password_hash = $3 WHERE id = $4",
-        [token, tokenExpiresAt, upgradedHash, user.id]
+        [hashToken(token), tokenExpiresAt, upgradedHash, user.id]
       );
     } else {
-      await pool.query("UPDATE users SET token = $1, token_expires_at = $2 WHERE id = $3", [token, tokenExpiresAt, user.id]);
+      await pool.query("UPDATE users SET token = $1, token_expires_at = $2 WHERE id = $3", [hashToken(token), tokenExpiresAt, user.id]);
     }
 
     res.json({
@@ -2320,6 +2583,182 @@ app.post("/settings/reset", requireAdmin, async (req, res) => {
 });
 
 // ========================
+// PER-TANK THRESHOLD OVERRIDES (migration 012)
+// ========================
+// Global sensor_settings stays the farm default; device_threshold_overrides
+// layers per-tank values on top (NULL column = inherit global).
+
+const THRESHOLD_FIELDS = ["temp_min", "temp_max", "water_level_min", "water_level_max", "ammonia_min", "ammonia_max"];
+
+// Layered thresholds: override row (nullable columns) over the global row.
+function layerThresholds(globalRow, overrideRow) {
+  const global = globalRow || DEFAULT_THRESHOLDS;
+  const override = overrideRow || {};
+  const out = {};
+  for (const field of THRESHOLD_FIELDS) {
+    out[field] = override[field] != null ? Number(override[field]) : Number(global[field] ?? DEFAULT_THRESHOLDS[field] ?? 0);
+  }
+  return out;
+}
+
+// GET /settings/effective - global row + one entry per tank that HAS an
+// override. The frontend evaluates threshold status per tank from this map;
+// tanks not listed inherit the global row.
+app.get("/settings/effective", requireAuth, async (req, res) => {
+  try {
+    const [globalResult, overridesResult] = await Promise.all([
+      pool.query("SELECT * FROM sensor_settings LIMIT 1"),
+      pool.query("SELECT * FROM device_threshold_overrides ORDER BY device_id").catch(() => ({ rows: [] })),
+    ]);
+    const global = layerThresholds(globalResult.rows[0], null);
+    const devices = {};
+    for (const row of overridesResult.rows) {
+      devices[row.device_id] = layerThresholds(globalResult.rows[0], row);
+    }
+    res.json({ global, devices });
+  } catch (err) {
+    res.status(500).json({ message: "Error fetching effective thresholds", error: err.message });
+  }
+});
+
+// GET /settings/device/:deviceId (Admin) - the tank's effective thresholds,
+// which fields are overridden, and the raw override row.
+app.get("/settings/device/:deviceId", requireAdmin, async (req, res) => {
+  try {
+    const deviceId = req.params.deviceId;
+    const device = await pool.query("SELECT device_id, tank_name, tank_location FROM devices WHERE device_id = $1", [deviceId]);
+    if (device.rows.length === 0) return res.status(404).json({ message: "Device not found" });
+    const [globalResult, overrideResult] = await Promise.all([
+      pool.query("SELECT * FROM sensor_settings LIMIT 1"),
+      pool.query("SELECT * FROM device_threshold_overrides WHERE device_id = $1", [deviceId]).catch(() => ({ rows: [] })),
+    ]);
+    const override = overrideResult.rows[0] || null;
+    const effective = layerThresholds(globalResult.rows[0], override);
+    const overridden = {};
+    for (const field of THRESHOLD_FIELDS) overridden[field] = Boolean(override && override[field] != null);
+    res.json({
+      device_id: deviceId,
+      tank_name: device.rows[0].tank_name,
+      tank_location: device.rows[0].tank_location,
+      global: layerThresholds(globalResult.rows[0], null),
+      effective,
+      overridden,
+      override,
+    });
+  } catch (err) {
+    res.status(500).json({ message: "Error fetching device thresholds", error: err.message });
+  }
+});
+
+// PUT /settings/device/:deviceId (Admin) - upsert a PARTIAL override; only the
+// provided fields change. Effective pairs are validated against the global
+// layer so min < max always holds for the tank. Every changed field logs a
+// system_logs "Change" row attributed to this tank.
+app.put("/settings/device/:deviceId", requireAdmin, async (req, res) => {
+  try {
+    const deviceId = req.params.deviceId;
+    const device = await pool.query("SELECT device_id, tank_name FROM devices WHERE device_id = $1", [deviceId]);
+    if (device.rows.length === 0) return res.status(404).json({ message: "Device not found" });
+
+    let parsed;
+    try {
+      parsed = parseSettingsInput(req.body);
+    } catch (err) {
+      if (err instanceof z.ZodError) {
+        return res.status(400).json({ message: "Invalid settings", errors: zodFieldErrors(err) });
+      }
+      if (err.statusCode === 400) return res.status(400).json({ message: err.message });
+      throw err;
+    }
+    if (Object.keys(parsed).length === 0) return res.status(400).json({ message: "No threshold fields provided" });
+
+    const [globalResult, existingResult] = await Promise.all([
+      pool.query("SELECT * FROM sensor_settings LIMIT 1"),
+      pool.query("SELECT * FROM device_threshold_overrides WHERE device_id = $1", [deviceId]).catch(() => ({ rows: [] })),
+    ]);
+    const existing = existingResult.rows[0] || null;
+
+    // Merge the patch onto the current override, then validate the EFFECTIVE
+    // pairs (override value where set, else the global value).
+    const merged = { ...existing, ...parsed };
+    const effectiveBefore = layerThresholds(globalResult.rows[0], existing);
+    const effectiveAfter = layerThresholds(globalResult.rows[0], merged);
+    const pairChecks = [
+      { label: "Temperature", min: effectiveAfter.temp_min, max: effectiveAfter.temp_max },
+      { label: "Water Level", min: effectiveAfter.water_level_min, max: effectiveAfter.water_level_max },
+      { label: "Ammonia", min: effectiveAfter.ammonia_min, max: effectiveAfter.ammonia_max },
+    ];
+    for (const pair of pairChecks) {
+      if (pair.min >= pair.max) {
+        return res.status(400).json({ message: `${pair.label} effective min must be less than max (override or global)` });
+      }
+    }
+
+    const overrideValues = {};
+    for (const field of THRESHOLD_FIELDS) overrideValues[field] = merged[field] != null ? merged[field] : null;
+    const result = await pool.query(
+      `INSERT INTO device_threshold_overrides
+         (device_id, temp_min, temp_max, water_level_min, water_level_max, ammonia_min, ammonia_max, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+       ON CONFLICT (device_id) DO UPDATE SET
+         temp_min = EXCLUDED.temp_min, temp_max = EXCLUDED.temp_max,
+         water_level_min = EXCLUDED.water_level_min, water_level_max = EXCLUDED.water_level_max,
+         ammonia_min = EXCLUDED.ammonia_min, ammonia_max = EXCLUDED.ammonia_max,
+         updated_at = NOW()
+       RETURNING *`,
+      [deviceId, ...THRESHOLD_FIELDS.map((f) => overrideValues[f])]
+    );
+
+    const changeParamLabels = {
+      temp_min: "Temperature",
+      temp_max: "Temperature",
+      water_level_min: "Water Level",
+      water_level_max: "Water Level",
+      ammonia_min: "Ammonia",
+      ammonia_max: "Ammonia",
+    };
+    for (const [field, newValue] of Object.entries(parsed)) {
+      const paramLabel = changeParamLabels[field] || field;
+      await pool.query(
+        `INSERT INTO system_logs (action, parameter, old_value, new_value, device_id) VALUES ($1, $2, $3, $4, $5)`,
+        ["Change", paramLabel, String(effectiveBefore[field] ?? ""), String(effectiveAfter[field] ?? ""), deviceId]
+      );
+    }
+
+    res.json({
+      message: `Thresholds saved for tank ${device.rows[0].tank_name || deviceId}`,
+      device_id: deviceId,
+      override: result.rows[0],
+      effective: effectiveAfter,
+    });
+  } catch (err) {
+    res.status(500).json({ message: "Error saving device thresholds", error: err.message });
+  }
+});
+
+// DELETE /settings/device/:deviceId (Admin) - clear the tank's overrides so it
+// inherits the global thresholds again.
+app.delete("/settings/device/:deviceId", requireAdmin, async (req, res) => {
+  try {
+    const deviceId = req.params.deviceId;
+    const result = await pool.query("DELETE FROM device_threshold_overrides WHERE device_id = $1 RETURNING *", [deviceId]);
+    if (result.rows.length === 0) return res.status(404).json({ message: "No overrides set for this tank" });
+    await pool.query(
+      `INSERT INTO system_logs (action, parameter, old_value, new_value, device_id) VALUES ($1, $2, $3, $4, $5)`,
+      ["Change", "Thresholds", "custom", "global", deviceId]
+    );
+    const globalResult = await pool.query("SELECT * FROM sensor_settings LIMIT 1");
+    res.json({
+      message: "Overrides cleared — tank now uses global thresholds",
+      device_id: deviceId,
+      effective: layerThresholds(globalResult.rows[0], null),
+    });
+  } catch (err) {
+    res.status(500).json({ message: "Error clearing device thresholds", error: err.message });
+  }
+});
+
+// ========================
 // SMS RECIPIENT ENDPOINTS
 // ========================
 
@@ -2539,11 +2978,14 @@ app.post("/settings/recipients/test/:id", requireAdmin, async (req, res) => {
   }
 });
 
-// POST /alert/status (Admin) - send the status update SMS immediately (manual trigger)
+// POST /alert/status (Admin) - send the status update SMS immediately (manual
+// trigger). ?device_id= scopes the report to one tank; without it the report is
+// a fleet digest with one block per active tank.
 app.post("/alert/status", requireAdmin, async (req, res) => {
   try {
-    if (isSmsMuted()) return res.status(429).json({ message: "SMS alerts are muted" });
-    const content = await buildStatusSms();
+    const deviceId = req.query.device_id ? String(req.query.device_id) : (req.body?.device_id ? String(req.body.device_id) : null);
+    if (isSmsMutedFor(deviceId)) return res.status(429).json({ message: "SMS alerts are muted" });
+    const content = await buildStatusSms(deviceId);
     if (!content) return res.status(409).json({ message: "No sensor data available yet" });
     const { sent, total } = await sendSmsToRecipients(content);
     res.json({ sent, total });
@@ -2553,18 +2995,43 @@ app.post("/alert/status", requireAdmin, async (req, res) => {
   }
 });
 
-// POST /alert/mute (Admin) - suppress all SMS for N hours (0 = unmute)
+// POST /alert/mute (Admin) - suppress SMS for N hours (0 = unmute).
+// ?device_id= (or body device_id) mutes ONE tank; omitted -> global mute.
+// Both layers persist in system_state, so a restart no longer clears them.
 app.post("/alert/mute", requireAdmin, async (req, res) => {
   try {
     const hours = parseInt(req.body?.hours) || 0;
+    const deviceId = req.body?.device_id ? String(req.body.device_id) : (req.query.device_id ? String(req.query.device_id) : null);
+
+    if (deviceId) {
+      const device = await pool.query("SELECT device_id, tank_name FROM devices WHERE device_id = $1", [deviceId]);
+      if (device.rows.length === 0) return res.status(404).json({ message: "Device not found" });
+      const label = device.rows[0].tank_name || deviceId;
+      if (hours <= 0) {
+        deviceSmsMuteUntil.delete(deviceId);
+        await persistMuteState(`sms_mute:${deviceId}`, null);
+        return res.json({ muted: false, muteExpires: null, device_id: deviceId, message: `SMS alerts unmuted for tank ${label}` });
+      }
+      const muteExpires = new Date(Date.now() + hours * 60 * 60 * 1000).toISOString();
+      deviceSmsMuteUntil.set(deviceId, muteExpires);
+      await persistMuteState(`sms_mute:${deviceId}`, muteExpires);
+      await pool.query(
+        "INSERT INTO activity_logs (user_name, action_type, description, module) VALUES ($1, 'SMS_MUTED', $2, 'settings')",
+        [req.adminUser.username, `Tank ${label} (${deviceId}) SMS muted for ${hours}h until ${muteExpires}`]
+      ).catch(() => {});
+      return res.json({ muted: true, muteExpires, device_id: deviceId, message: `SMS alerts muted for tank ${label} (${hours} hours)` });
+    }
+
     if (hours <= 0) {
       smsMuteUntil = null;
+      await persistMuteState("sms_mute_global", null);
       return res.json({ muted: false, muteExpires: null, message: "SMS alerts unmuted" });
     }
     smsMuteUntil = new Date(Date.now() + hours * 60 * 60 * 1000).toISOString();
+    await persistMuteState("sms_mute_global", smsMuteUntil);
     await pool.query(
       "INSERT INTO activity_logs (user_name, action_type, description, module) VALUES ($1, 'SMS_MUTED', $2, 'settings')",
-      [req.adminUser.username, `SMS muted for ${hours}h until ${smsMuteUntil}`]
+      [req.adminUser.username, `SMS muted globally for ${hours}h until ${smsMuteUntil}`]
     );
     res.json({ muted: true, muteExpires: smsMuteUntil, message: `SMS alerts muted for ${hours} hours` });
   } catch (err) {
@@ -2573,12 +3040,30 @@ app.post("/alert/mute", requireAdmin, async (req, res) => {
   }
 });
 
-// GET /alert/mute-status - current mute state (any signed-in user)
+// GET /alert/mute-status - current mute state (any signed-in user). Returns
+// the global mute plus every per-tank mute so the UI can render both layers.
 app.get("/alert/mute-status", requireAuth, async (req, res) => {
   try {
-    if (smsMuteUntil && new Date() >= new Date(smsMuteUntil)) smsMuteUntil = null;
-    const muted = Boolean(smsMuteUntil && new Date() < new Date(smsMuteUntil));
-    res.json(muted ? { muted: true, muteExpires: smsMuteUntil } : { muted: false, muteExpires: null });
+    smsMuteUntil = pruneMuteUntil(smsMuteUntil);
+    const globalMuted = Boolean(smsMuteUntil);
+
+    const devices = [];
+    try {
+      const result = await pool.query("SELECT device_id, tank_name FROM devices WHERE is_active = true ORDER BY device_id");
+      for (const row of result.rows) {
+        const expires = pruneMuteUntil(deviceSmsMuteUntil.get(row.device_id));
+        if (!expires) deviceSmsMuteUntil.delete(row.device_id);
+        devices.push({ device_id: row.device_id, tank_name: row.tank_name, muted: Boolean(expires), muteExpires: expires || null });
+      }
+    } catch {
+      // devices table unavailable -> report the global layer only
+    }
+
+    res.json({
+      muted: globalMuted,
+      muteExpires: globalMuted ? smsMuteUntil : null,
+      devices,
+    });
   } catch (err) {
     console.error(`[${new Date().toISOString()}] Error fetching SMS mute status:`, err.message);
     res.status(500).json({ message: "Error fetching SMS mute status", error: err.message });
@@ -2653,14 +3138,24 @@ app.get("/sms-logs", requireAdmin, async (req, res) => {
 // SYSTEM LOGS ENDPOINTS
 // ========================
 
-// POST /logs - create a system log entry (action + parameter required)
-app.post("/logs", requireAuth, async (req, res) => {
+// POST /logs - create a system log entry (action + parameter required).
+// Admin only: arbitrary log rows appear directly on the Alerts/Sensor Logs
+// pages, so a standard user must not be able to inject entries.
+// Optional device_id attributes the entry to one tank (must exist; verified
+// so a typo'd id doesn't break the FK).
+app.post("/logs", requireAdmin, async (req, res) => {
   try {
-    const { action, parameter, old_value, new_value } = req.body;
+    const { action, parameter, old_value, new_value, device_id } = req.body;
     if (!action || !parameter) return res.status(400).json({ message: "action and parameter required" });
+    let loggedDeviceId = null;
+    if (device_id !== undefined && device_id !== null && String(device_id) !== "") {
+      const deviceCheck = await pool.query("SELECT 1 FROM devices WHERE device_id = $1", [String(device_id)]);
+      if (deviceCheck.rows.length === 0) return res.status(400).json({ message: "Unknown device_id" });
+      loggedDeviceId = String(device_id);
+    }
     const result = await pool.query(
-      "INSERT INTO system_logs (action, parameter, old_value, new_value) VALUES ($1, $2, $3, $4) RETURNING *",
-      [action, parameter, String(old_value ?? ""), String(new_value ?? "")]
+      "INSERT INTO system_logs (action, parameter, old_value, new_value, device_id) VALUES ($1, $2, $3, $4, $5) RETURNING *",
+      [action, parameter, String(old_value ?? ""), String(new_value ?? ""), loggedDeviceId]
     );
     res.status(201).json({ message: "Logged", data: result.rows[0] });
   } catch (err) {
@@ -2692,7 +3187,9 @@ app.post("/logs/:id/ack", requireAuth, async (req, res) => {
   }
 });
 
-// GET /system-logs - paginated logs with per-action counts, optional filters
+// GET /system-logs - paginated logs with per-action counts, optional filters.
+// ?device_id= scopes to one tank (action counts follow the filter so the
+// filter chips stay consistent with the visible rows); omitted = all tanks.
 app.get("/system-logs", requireAuth, async (req, res) => {
   try {
     const page = Math.max(1, parseInt(req.query.page) || 1);
@@ -2700,13 +3197,15 @@ app.get("/system-logs", requireAuth, async (req, res) => {
     const offset = (page - 1) * limit;
     const action = req.query.action || "";
     const parameter = req.query.parameter || "";
+    const deviceId = req.query.device_id ? String(req.query.device_id) : "";
 
-    // Build dynamic WHERE clause for action/parameter filters
+    // Build dynamic WHERE clause for action/parameter/device filters
     let where = [];
     let params = [];
     let paramCount = 1;
     if (action) { where.push(`action = $${paramCount}`); params.push(String(action)); paramCount++; }
     if (parameter) { where.push(`parameter = $${paramCount}`); params.push(String(parameter)); paramCount++; }
+    if (deviceId) { where.push(`device_id = $${paramCount}`); params.push(deviceId); paramCount++; }
     const whereClause = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
 
     const result = await pool.query(
@@ -2714,7 +3213,7 @@ app.get("/system-logs", requireAuth, async (req, res) => {
       [...params, limit, offset]
     );
     const countResult = await pool.query(`SELECT COUNT(*) FROM system_logs ${whereClause}`, params);
-    const countsResult = await pool.query("SELECT action, COUNT(*)::int AS count FROM system_logs GROUP BY action");
+    const countsResult = await pool.query(`SELECT action, COUNT(*)::int AS count FROM system_logs ${whereClause} GROUP BY action`, params);
     const counts = {};
     countsResult.rows.forEach(row => { counts[row.action] = row.count; });
     res.json({ data: result.rows, total: parseInt(countResult.rows[0].count), page, limit, counts });
@@ -2738,7 +3237,7 @@ app.post("/activity-logs", requireAuth, async (req, res) => {
     const token = req.headers.authorization?.replace("Bearer ", "");
     let userName = "admin";
     if (token) {
-      const tokenResult = await pool.query("SELECT username FROM users WHERE token = $1", [token]);
+      const tokenResult = await pool.query("SELECT username FROM users WHERE token = $1", [hashToken(token)]);
       if (tokenResult.rows.length > 0) {
         userName = tokenResult.rows[0].username;
       }
@@ -2842,15 +3341,17 @@ async function queryPeriodStats(startTs, deviceId = null) {
 }
 
 // Alert stats (total/resolved/by_parameter/by_action) within a window.
-async function queryAlertStats(startTs) {
+// Optional deviceId scopes to one tank (NULL rows = global events, included
+// only in the unscoped view).
+async function queryAlertStats(startTs, deviceId = null) {
   const [all, alerts] = await Promise.all([
     pool.query(
-      "SELECT action, COUNT(*)::int AS count FROM system_logs WHERE timestamp >= $1 GROUP BY action",
-      [startTs]
+      "SELECT action, COUNT(*)::int AS count FROM system_logs WHERE timestamp >= $1 AND ($2::text IS NULL OR device_id = $2) GROUP BY action",
+      [startTs, deviceId]
     ),
     pool.query(
-      "SELECT parameter, COUNT(*)::int AS count FROM system_logs WHERE timestamp >= $1 AND action = 'Alert' GROUP BY parameter",
-      [startTs]
+      "SELECT parameter, COUNT(*)::int AS count FROM system_logs WHERE timestamp >= $1 AND action = 'Alert' AND ($2::text IS NULL OR device_id = $2) GROUP BY parameter",
+      [startTs, deviceId]
     ),
   ]);
 
@@ -2872,11 +3373,12 @@ async function queryAlertStats(startTs) {
 // Counts device-disconnect episodes logged by the disconnect monitor within a
 // window. In delta mode the sensors table no longer has one row per reading, so
 // dropouts are measured from devices.last_seen / system_logs instead of gaps.
-async function queryGapEvents(startTs) {
+// Optional deviceId scopes the count to one tank.
+async function queryGapEvents(startTs, deviceId = null) {
   const result = await pool.query(
     `SELECT COUNT(*)::int AS gaps FROM system_logs
-     WHERE action = 'Device Disconnect' AND timestamp >= $1`,
-    [startTs]
+     WHERE action = 'Device Disconnect' AND timestamp >= $1 AND ($2::text IS NULL OR device_id = $2)`,
+    [startTs, deviceId]
   );
   return parseInt(result.rows[0]?.gaps, 10) || 0;
 }
@@ -2901,9 +3403,9 @@ app.get("/analytics/overview", requireAuth, async (req, res) => {
     const [currentStats, prevStats, alerts, readings, gapEvents, latest, deviceHeartbeat] = await Promise.all([
       queryPeriodStats(currentStart, deviceId),
       queryPeriodStats(prevStart, deviceId),
-      queryAlertStats(currentStart),
+      queryAlertStats(currentStart, deviceId),
       pool.query("SELECT COUNT(*)::int AS c FROM sensors WHERE timestamp >= $1 AND ($2::text IS NULL OR device_id = $2)", [currentStart, deviceId]),
-      queryGapEvents(currentStart),
+      queryGapEvents(currentStart, deviceId),
       pool.query("SELECT timestamp FROM sensors WHERE ($1::text IS NULL OR device_id = $1) ORDER BY timestamp DESC LIMIT 1", [deviceId]),
       pool.query("SELECT MAX(last_seen) AS last_seen FROM devices WHERE ($1::text IS NULL OR device_id = $1)", [deviceId]),
     ]);
@@ -2935,10 +3437,12 @@ app.get("/analytics/overview", requireAuth, async (req, res) => {
   }
 });
 
-// GET /analytics/daily?days= - per-day averages for charting (max 90)
+// GET /analytics/daily?days= - per-day averages for charting (max 90).
+// Optional ?device_id scopes the aggregation (and the alert counts) to one tank.
 app.get("/analytics/daily", requireAuth, async (req, res) => {
   try {
     const days = analyticsDays(req);
+    const deviceId = req.query.device_id ? String(req.query.device_id) : null;
     const startTs = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
 
     const [sensorResult, alertResult] = await Promise.all([
@@ -2950,17 +3454,17 @@ app.get("/analytics/daily", requireAuth, async (req, res) => {
            COALESCE(AVG(ammonia) FILTER (WHERE ammonia >= 0), 0)::float AS ammonia_avg,
            COUNT(*)::int AS readings
          FROM sensors
-         WHERE timestamp >= $1
+         WHERE timestamp >= $1 AND ($2::text IS NULL OR device_id = $2)
          GROUP BY DATE(timestamp)
          ORDER BY date`,
-        [startTs]
+        [startTs, deviceId]
       ),
       pool.query(
         `SELECT DATE(timestamp) AS date, COUNT(*)::int AS count
          FROM system_logs
-         WHERE timestamp >= $1 AND action = 'Alert'
+         WHERE timestamp >= $1 AND action = 'Alert' AND ($2::text IS NULL OR device_id = $2)
          GROUP BY DATE(timestamp)`,
-        [startTs]
+        [startTs, deviceId]
       ),
     ]);
 
@@ -3093,24 +3597,25 @@ function generateInsights(overview, thresholds) {
   return insights;
 }
 
-// GET /analytics/insights?days= - rule-engine suggestions for the period
+// GET /analytics/insights?days= - rule-engine suggestions for the period.
+// Optional ?device_id scopes every query AND resolves that tank's effective
+// thresholds (per-tank overrides, migration 012).
 app.get("/analytics/insights", requireAuth, async (req, res) => {
   try {
     const days = analyticsDays(req);
+    const deviceId = req.query.device_id ? String(req.query.device_id) : null;
     const currentStart = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
 
-    const [currentStats, prevStats, alerts, readings, gapEvents, latest, deviceHeartbeat, settingsResult] = await Promise.all([
-      queryPeriodStats(currentStart),
-      queryPeriodStats(new Date(currentStart.getTime() - days * 24 * 60 * 60 * 1000)),
-      queryAlertStats(currentStart),
-      pool.query("SELECT COUNT(*)::int AS c FROM sensors WHERE timestamp >= $1", [currentStart]),
-      queryGapEvents(currentStart),
-      pool.query("SELECT timestamp FROM sensors ORDER BY timestamp DESC LIMIT 1"),
-      pool.query("SELECT MAX(last_seen) AS last_seen FROM devices"),
-      pool.query("SELECT * FROM sensor_settings LIMIT 1"),
+    const [currentStats, prevStats, alerts, readings, gapEvents, latest, deviceHeartbeat, settings] = await Promise.all([
+      queryPeriodStats(currentStart, deviceId),
+      queryPeriodStats(new Date(currentStart.getTime() - days * 24 * 60 * 60 * 1000), deviceId),
+      queryAlertStats(currentStart, deviceId),
+      pool.query("SELECT COUNT(*)::int AS c FROM sensors WHERE timestamp >= $1 AND ($2::text IS NULL OR device_id = $2)", [currentStart, deviceId]),
+      queryGapEvents(currentStart, deviceId),
+      pool.query("SELECT timestamp FROM sensors WHERE ($1::text IS NULL OR device_id = $1) ORDER BY timestamp DESC LIMIT 1", [deviceId]),
+      pool.query("SELECT MAX(last_seen) AS last_seen FROM devices WHERE ($1::text IS NULL OR device_id = $1)", [deviceId]),
+      getThresholdsForDevice(deviceId),
     ]);
-
-    const settings = settingsResult.rows[0] || { temp_min: 20, temp_max: 31, water_level_min: 10, water_level_max: 100, ammonia_min: 0.25, ammonia_max: 1 };
 
     const lastReading = latest.rows[0]?.timestamp ? new Date(latest.rows[0].timestamp) : null;
     const deviceSeen = deviceHeartbeat.rows[0]?.last_seen ? new Date(deviceHeartbeat.rows[0].last_seen) : null;
@@ -3135,12 +3640,12 @@ app.get("/analytics/insights", requireAuth, async (req, res) => {
       period: { start: currentStart.toISOString(), end: new Date().toISOString() },
       days,
       insights: generateInsights(overview, {
-        temp_min: Number(settings.temp_min),
-        temp_max: Number(settings.temp_max),
-        water_level_min: Number(settings.water_level_min),
-        water_level_max: Number(settings.water_level_max),
-        ammonia_min: Number(settings.ammonia_min ?? 0),
-        ammonia_max: Number(settings.ammonia_max ?? 25),
+        temp_min: settings.temp_min,
+        temp_max: settings.temp_max,
+        water_level_min: settings.water_level_min,
+        water_level_max: settings.water_level_max,
+        ammonia_min: settings.ammonia_min,
+        ammonia_max: settings.ammonia_max,
       }),
     });
   } catch (err) {
@@ -3219,6 +3724,28 @@ async function startServer() {
         lastAlertedState[`${row.device_id}:${row.sensor_key}`] = { status: row.status, value: parseFloat(row.value), timestamp: row.timestamp?.toISOString() };
       }
       console.log(`[${new Date().toISOString()}] Loaded ${lastAlertsResult.rows.length} alert states from DB`);
+
+      // Restore SMS mute state (global + per-tank) from system_state so a
+      // restart no longer silently unmutes (the old mute was memory-only).
+      // Expired entries are pruned instead of loaded.
+      try {
+        smsMuteUntil = pruneMuteUntil(await client.query("SELECT value FROM system_state WHERE key = 'sms_mute_global'").then((r) => r.rows[0]?.value ?? null).catch(() => null));
+        const muteRows = await client.query("SELECT key, value FROM system_state WHERE key LIKE 'sms_mute:%'");
+        deviceSmsMuteUntil.clear();
+        for (const row of muteRows.rows) {
+          const deviceId = row.key.slice("sms_mute:".length);
+          const value = pruneMuteUntil(row.value);
+          if (value) {
+            deviceSmsMuteUntil.set(deviceId, value);
+          } else {
+            await client.query("DELETE FROM system_state WHERE key = $1", [row.key]);
+          }
+        }
+        const tankMutes = deviceSmsMuteUntil.size;
+        console.log(`[${new Date().toISOString()}] SMS mute state restored (global: ${smsMuteUntil ? "muted" : "off"}, per-tank: ${tankMutes})`);
+      } catch (muteErr) {
+        console.warn(`[${new Date().toISOString()}] Could not restore SMS mute state:`, muteErr.message);
+      }
 
       // Seed ammonia spike guard with the latest reading per device
       const lastAmmoniaResult = await client.query(
@@ -3312,7 +3839,7 @@ async function startServer() {
       if (shuttingDown) return;
       shuttingDown = true;
       console.log(`\n[${new Date().toISOString()}] ${signal} received — shutting down gracefully...`);
-      for (const client of sseClients) {
+      for (const [client] of sseClients) {
         try { client.end(); } catch { /* already closed */ }
       }
       sseClients.clear();

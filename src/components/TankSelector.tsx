@@ -1,13 +1,14 @@
 // "Live Tank Bar": fleet-wide tank switcher. Each card shows the tank name,
 // online/offline state, and the freshest temp / water / ammonia values (red
-// when out of range), plus rename / hide / live-diagnostics actions. Clicking
-// a card selects that tank for Dashboard / Historical Data / Analytics.
+// when out of that tank's EFFECTIVE thresholds), plus rename / hide /
+// live-diagnostics actions. Clicking a card selects that tank for every page.
+// Readings + thresholds come from the provider's single 5s fleet poll — no
+// per-component fetching here.
 
-import { useState, useCallback } from "react";
+import { useCallback } from "react";
 import { Eye, EyeOff, RotateCcw } from "lucide-react";
-import { useSensorData } from "../hooks/useSensors";
-import { useDevicesLatest } from "../hooks/useDevicesLatest";
-import { fetchDevices, updateDevice } from "../api/client";
+import { useSensorData, useSensorSettings } from "../hooks/useSensors";
+import { useHiddenDevices } from "../hooks/useHiddenDevices";
 import type { DeviceEntry } from "../types";
 import { DeviceHide, DeviceLiveCheck, DeviceRename } from "./deviceActions";
 
@@ -16,56 +17,18 @@ function deviceLabel(device: DeviceEntry): string {
 }
 
 export default function TankSelector() {
-  const { devices, devicesLoading, selectedDeviceId, setSelectedDeviceId, refetch } = useSensorData();
-  const { latestByTank, thresholds } = useDevicesLatest();
-  const [showHidden, setShowHidden] = useState(false);
-  const [hiddenDevices, setHiddenDevices] = useState<DeviceEntry[] | null>(null);
-  const [loadingHidden, setLoadingHidden] = useState(false);
-  const [restoring, setRestoring] = useState<string | null>(null);
+  const { devices, devicesLoading, latestByTank, selectedDeviceId, setSelectedDeviceId, refetch } = useSensorData();
+  const { thresholdsFor } = useSensorSettings();
+  const { showHidden, hiddenDevices, hiddenCount, loadingHidden, restoring, toggleHiddenPanel, restore } = useHiddenDevices(refetch);
 
   const onlineCount = devices.filter((d) => d.online).length;
-  const hiddenCount = hiddenDevices?.length ?? 0;
 
-  const inRange = useCallback((key: string, value: number | null) => {
-    if (value === null) return true;
-    const t = thresholds[key];
-    if (!t) return true;
-    return value >= t.range.min && value <= t.range.max;
-  }, [thresholds]);
-
-  const valueClass = useCallback((key: string, value: number | null) =>
-    inRange(key, value) ? "text-gray-600" : "font-bold text-red-600",
-  [inRange]);
-
-  const toggleHiddenPanel = async () => {
-    if (showHidden) {
-      setShowHidden(false);
-      return;
-    }
-    setShowHidden(true);
-    setLoadingHidden(true);
-    try {
-      const all = await fetchDevices(true);
-      setHiddenDevices(all.filter((d) => !d.is_active));
-    } catch {
-      setHiddenDevices([]);
-    } finally {
-      setLoadingHidden(false);
-    }
-  };
-
-  const restore = async (deviceId: string) => {
-    setRestoring(deviceId);
-    try {
-      await updateDevice(deviceId, { is_active: true });
-      setHiddenDevices((prev) => (prev ?? []).filter((d) => d.device_id !== deviceId));
-      await refetch();
-    } catch {
-      // keep the chip in place; user can retry
-    } finally {
-      setRestoring(null);
-    }
-  };
+  const valueClass = useCallback((deviceId: string, key: string, value: number | null) => {
+    if (value === null) return "text-gray-600";
+    const t = thresholdsFor(deviceId)[key];
+    if (!t) return "text-gray-600";
+    return value >= t.range.min && value <= t.range.max ? "text-gray-600" : "font-bold text-red-600";
+  }, [thresholdsFor]);
 
   // Loading state
   if (devicesLoading && devices.length === 0) {
@@ -166,11 +129,11 @@ export default function TankSelector() {
                   </div>
 
                   <div className="flex flex-wrap items-center gap-x-2 text-[11px]">
-                    <span className={valueClass("temperature", tempC)}>{tempC !== null ? `${tempC.toFixed(1)} °C` : "-- °C"}</span>
+                    <span className={valueClass(device.device_id, "temperature", tempC)}>{tempC !== null ? `${tempC.toFixed(1)} °C` : "-- °C"}</span>
                     <span className="text-gray-300">·</span>
-                    <span className={valueClass("water_level", water)}>{water !== null ? `${water.toFixed(0)}%` : "--%"}</span>
+                    <span className={valueClass(device.device_id, "water_level", water)}>{water !== null ? `${water.toFixed(0)}%` : "--%"}</span>
                     <span className="text-gray-300">·</span>
-                    <span className={valueClass("ammonia", ammonia)}>{ammonia !== null ? `${ammonia.toFixed(2)} ppm` : "-- ppm"}</span>
+                    <span className={valueClass(device.device_id, "ammonia", ammonia)}>{ammonia !== null ? `${ammonia.toFixed(2)} ppm` : "-- ppm"}</span>
                   </div>
 
                   <div className="flex items-center justify-between gap-1.5 transition md:opacity-0 md:focus-within:opacity-100 md:group-hover:opacity-100">

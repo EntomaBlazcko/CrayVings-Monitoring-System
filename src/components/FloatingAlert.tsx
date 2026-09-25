@@ -31,7 +31,8 @@ export function FloatingAlertProvider({ children }: FloatingAlertProviderProps) 
   }, []);
 
   // Sound plays before the state update; an existing notification for the same
-  // sensor+threshold is replaced instead of stacked.
+  // tank+sensor+threshold is replaced instead of stacked. The dedupe key
+  // includes the tank so a breach in tank A never replaces tank B's toast.
   const addNotification = useCallback(async (notification: Omit<AlertNotification, "id">) => {
     const id = `${notification.parameter}-${notification.threshold}-${Date.now()}`;
 
@@ -42,7 +43,11 @@ export function FloatingAlertProvider({ children }: FloatingAlertProviderProps) 
 
     setNotifications((prev) => {
       const filtered = prev.filter(
-        (n) => !(n.parameter === notification.parameter && n.threshold === notification.threshold)
+        (n) => !(
+          n.parameter === notification.parameter &&
+          n.threshold === notification.threshold &&
+          n.deviceId === notification.deviceId
+        )
       );
       return [...filtered, { ...notification, id }];
     });
@@ -116,12 +121,14 @@ function FloatingAlertItem({ notification, onClose }: FloatingAlertItemProps) {
   const textColor = isWarning ? "text-amber-800" : "text-red-800";
 
   // Threshold alerts carry a sensor key + direction, so fix guidance can be
-  // derived without any stored log. Device alerts have no fix guidance.
+  // derived without any stored log. The breaching tank's EFFECTIVE settings
+  // ride on the notification, so the guidance range matches the tank (not the
+  // global defaults). Device alerts have no fix guidance.
   const guidance: AlertGuidance | null =
     notification.parameter !== "device"
       ? buildScenarioGuidance(
           `${notification.parameter}:${notification.threshold === "min" ? "Low" : "High"}`,
-          null,
+          notification.settings ?? null,
           notification.value
         )
       : null;
@@ -141,6 +148,11 @@ function FloatingAlertItem({ notification, onClose }: FloatingAlertItemProps) {
           {isWarning ? <AlertTriangle size={18} /> : <AlertCircle size={18} />}
         </div>
         <div className="flex-1 min-w-0">
+          {notification.tank && (
+            <span className="mb-0.5 inline-block rounded-full bg-white/70 border border-gray-300 px-1.5 py-0.5 text-[10px] font-bold text-gray-700">
+              {notification.tank}
+            </span>
+          )}
           <p className={`text-sm font-medium ${textColor} break-words`}>
             {notification.message}
           </p>

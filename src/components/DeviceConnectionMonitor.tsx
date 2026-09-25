@@ -1,76 +1,96 @@
-// Headless watcher: turns ESP32 connection-status transitions into floating
-// alerts, sounds, and activity-log entries.
+// Headless watcher: turns per-tank online/offline transitions into floating
+// alerts, sounds, and activity-log entries. Fleet-wide: it tracks EVERY
+// tank's online flag from the /devices registry (DB last_seen based, refreshed
+// every 5s), so a tank going offline is announced even when it isn't the
+// selected one. First sight of a tank seeds quietly so transitions that
+// happened while the page was closed are never announced.
 
 import { useEffect, useRef } from "react";
 import { useSensorData, useActivityLogger } from "../hooks/useSensors";
 import { useFloatingAlerts } from "../hooks/useFloatingAlerts";
 import { playCriticalSound } from "../utils/playAlertSound";
 
-type ConnectionStatus = "online" | "offline" | "connecting" | "unknown";
-
 export function DeviceConnectionMonitor() {
-  const { connectionStatus, consecutiveFailures, lastUpdate } = useSensorData();
+  const { devices } = useSensorData();
   const { addNotification, removeNotification } = useFloatingAlerts();
   const logActivity = useActivityLogger();
-  const prevStatusRef = useRef<ConnectionStatus>("connecting");
-  const prevFailuresRef = useRef(0);
-  const disconnectAlertIdRef = useRef<string | null>(null);
+
+  const prevOnlineRef = useRef<Map<string, boolean>>(new Map());
+  const disconnectAlertIdsRef = useRef<Map<string, string>>(new Map());
 
   useEffect(() => {
-    const prevStatus = prevStatusRef.current;
-    const prevFailures = prevFailuresRef.current;
-    prevStatusRef.current = connectionStatus;
-    prevFailuresRef.current = consecutiveFailures;
+    const seenIds = new Set<string>();
 
-    const wentOffline =
-      connectionStatus === "offline" && prevStatus !== "offline";
-    // Also catch when consecutiveFailures drop to 0 (fresh data restored)
-    const cameOnline =
-      (connectionStatus === "online" && prevStatus === "offline") ||
-      (consecutiveFailures === 0 && prevFailures > 0 && connectionStatus === "online");
+    for (const device of devices) {
+      seenIds.add(device.device_id);
+      const id = device.device_id;
+      const label = device.tank_name || device.name || id;
 
-    if (wentOffline) {
-      const id = `device-disconnect-${Date.now()}`;
-      disconnectAlertIdRef.current = id;
+      const prev = prevOnlineRef.current.get(id);
+      if (device.online === prev) continue;
 
-      addNotification({
-        message: "ESP32 device disconnected — no data received",
-        type: "critical",
-        parameter: "device",
-        value: 0,
-        threshold: "min",
-      });
-
-      logActivity(
-        "device_disconnect",
-        `ESP32 device went offline after ${consecutiveFailures} failed polls`,
-        "Sensors"
-      );
-
-      playCriticalSound();
-    }
-
-    if (cameOnline) {
-      if (disconnectAlertIdRef.current) {
-        removeNotification(disconnectAlertIdRef.current);
-        disconnectAlertIdRef.current = null;
+      // First sight of this tank: record its state without announcing.
+      if (prev === undefined) {
+        prevOnlineRef.current.set(id, device.online);
+        continue;
       }
+      prevOnlineRef.current.set(id, device.online);
 
-      logActivity(
-        "device_connect",
-        "ESP32 device reconnected and sending data",
-        "Sensors"
-      );
+      if (!device.online) {
+        const notifId = `device-disconnect-${id}-${Date.now()}`;
+        disconnectAlertIdsRef.current.set(id, notifId);
 
-      addNotification({
-        message: "ESP32 device reconnected — data restored",
-        type: "warning",
-        parameter: "device",
-        value: 1,
-        threshold: "min",
-      });
+        addNotification({
+          message: `${label} went offline — no data received from this tank`,
+          type: "critical",
+          parameter: "device",
+          value: 0,
+          threshold: "min",
+          deviceId: id,
+          tank: label,
+        });
+
+        logActivity(
+          "device_disconnect",
+          `${label} (${id}) went offline — no recent readings received`,
+          "Sensors"
+        );
+
+        playCriticalSound();
+      } else {
+        const notifId = disconnectAlertIdsRef.current.get(id);
+        if (notifId) {
+          removeNotification(notifId);
+          disconnectAlertIdsRef.current.delete(id);
+        }
+
+        logActivity(
+          "device_connect",
+          `${label} (${id}) is back online and sending data`,
+          "Sensors"
+        );
+
+        addNotification({
+          message: `${label} reconnected — data restored`,
+          type: "warning",
+          parameter: "device",
+          value: 1,
+          threshold: "min",
+          deviceId: id,
+          tank: label,
+        });
+      }
     }
-  }, [connectionStatus, consecutiveFailures, lastUpdate, addNotification, logActivity, removeNotification]);
+
+    // Tanks that vanished from the registry (hidden/unregistered) drop
+    // their seeded state so a later re-appearance re-seeds quietly.
+    for (const id of prevOnlineRef.current.keys()) {
+      if (!seenIds.has(id)) {
+        prevOnlineRef.current.delete(id);
+        disconnectAlertIdsRef.current.delete(id);
+      }
+    }
+  }, [devices, addNotification, logActivity, removeNotification]);
 
   return null;
 }

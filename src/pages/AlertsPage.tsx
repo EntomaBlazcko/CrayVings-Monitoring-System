@@ -18,7 +18,7 @@ import {
 import { useSensors, useActivityLogger } from "../hooks/useSensors";
 import { useAuth } from "../contexts/useAuth";
 import { Spinner, LoadingCard, ErrorCard } from "../components/Loading";
-import { parseAlertSeverity, type AlertSeverity } from "../types";
+import { parseAlertSeverity, tankOptionLabel, type AlertSeverity } from "../types";
 import { SENSOR_KEY_TO_DISPLAY, DISPLAY_TO_SENSOR_KEY } from "../types";
 import type { LogEntry, MenuKey } from "../types";
 import { formatFarmDateTime, formatFarmTime, formatTimeAgo } from "../utils/time";
@@ -63,7 +63,8 @@ type AcknowledgeInfo = {
 export default function AlertsPage({ onNavigate }: { onNavigate?: (menu: MenuKey) => void }) {
   const {
     logs,
-    settings,
+    settingsFor,
+    devices,
     logsLoading,
     logsError,
     refetchLogs,
@@ -73,6 +74,9 @@ export default function AlertsPage({ onNavigate }: { onNavigate?: (menu: MenuKey
     setLogsPage,
     logsActionFilter,
     setLogsActionFilter,
+    logsDeviceMode,
+    setLogsDeviceMode,
+    selectedDeviceId,
     connectionStatus,
     lastUpdate,
   } = useSensors();
@@ -86,6 +90,25 @@ export default function AlertsPage({ onNavigate }: { onNavigate?: (menu: MenuKey
   const [legendGuidance, setLegendGuidance] = useState<AlertGuidance | null>(null);
   const [acknowledgements, setAcknowledgements] = useState<Record<string, AcknowledgeInfo>>({});
   const [ackInFlight, setAckInFlight] = useState(false);
+
+  // Friendly tank name for a device_id (falls back to the raw id, then "Farm"
+  // for global rows like settings changes and pre-attribution history). Badges
+  // and the filter use tankOptionLabel so duplicate names stay distinguishable.
+  const tankLabelFor = (deviceId?: string | null) => {
+    if (!deviceId) return null;
+    const device = devices.find((d) => d.device_id === deviceId);
+    return device ? tankOptionLabel(device) : deviceId;
+  };
+
+  const selectedDevice = devices.find((d) => d.device_id === selectedDeviceId) ?? null;
+
+  // Which tank the current list is scoped to (display only).
+  const scopedTankLabel =
+    logsDeviceMode === "all"
+      ? "All tanks"
+      : (logsDeviceMode === "follow" ? selectedDevice?.device_id ?? null : logsDeviceMode) === null
+        ? "Selected tank"
+        : tankLabelFor(logsDeviceMode === "follow" ? selectedDeviceId : logsDeviceMode) ?? "Selected tank";
 
   // Acknowledgement state lives on each alert row in the DB (ack_status). Seed the
   // local map from the server so badges survive reloads; optimistic updates keep
@@ -119,9 +142,11 @@ export default function AlertsPage({ onNavigate }: { onNavigate?: (menu: MenuKey
   const processedLogs = useMemo(() => {
     return logs.map((log) => ({
       ...log,
-      severity: parseAlertSeverity(log, settings),
+      // Each alert is classified against the thresholds that were effective
+      // for ITS tank at evaluation time (per-tank overrides apply).
+      severity: parseAlertSeverity(log, settingsFor(log.device_id)),
     }));
-  }, [logs, settings]);
+  }, [logs, settingsFor]);
 
   // Client-side severity filtering of the currently loaded (action-filtered) page.
   const filteredLogs = useMemo(() => {
@@ -214,7 +239,7 @@ export default function AlertsPage({ onNavigate }: { onNavigate?: (menu: MenuKey
 
   // Opens the shared fix guidance modal for a legend scenario (no specific log).
   const handleLegendFix = (scenarioKey: string) => {
-    const guidance = buildScenarioGuidance(scenarioKey, settings);
+    const guidance = buildScenarioGuidance(scenarioKey, settingsFor(null));
     if (guidance) setLegendGuidance(guidance);
   };
 
@@ -272,7 +297,7 @@ export default function AlertsPage({ onNavigate }: { onNavigate?: (menu: MenuKey
                 </span>
               </h1>
               <p className="text-white/80 text-sm mt-1">
-                Sensor threshold alerts and configuration change events
+                Sensor threshold alerts and configuration change events — showing: {scopedTankLabel}
               </p>
             </div>
           </div>
@@ -328,6 +353,23 @@ export default function AlertsPage({ onNavigate }: { onNavigate?: (menu: MenuKey
 
       {/* Filters */}
       <div className="flex flex-col gap-3">
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="text-xs font-semibold text-gray-500 uppercase tracking-wide mr-1">Tank</span>
+          <select
+            value={logsDeviceMode}
+            onChange={(e) => setLogsDeviceMode(e.target.value)}
+            aria-label="Filter by tank"
+            className="px-3 py-1.5 rounded-lg text-sm font-medium bg-white border border-gray-200 text-gray-700 hover:bg-gray-50 outline-none cursor-pointer"
+          >
+            <option value="follow">Selected tank ({selectedDevice ? tankOptionLabel(selectedDevice) : "—"})</option>
+            <option value="all">All tanks</option>
+            {devices.map((device) => (
+              <option key={device.device_id} value={device.device_id}>
+                {tankOptionLabel(device)}
+              </option>
+            ))}
+          </select>
+        </div>
         <div className="flex flex-wrap items-center gap-2">
           <span className="text-xs font-semibold text-gray-500 uppercase tracking-wide mr-1">Type</span>
           {actionFilters.map((f) => (
@@ -420,6 +462,11 @@ export default function AlertsPage({ onNavigate }: { onNavigate?: (menu: MenuKey
                           <span className={`inline-flex items-center gap-1 text-[10px] font-bold uppercase tracking-wide px-1.5 py-0.5 rounded-full ${meta.pill}`}>
                             {meta.icon} {meta.label}
                           </span>
+                          {(logsDeviceMode === "all" || log.device_id) && (
+                            <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full text-[10px] font-bold bg-slate-100 text-slate-600 border border-slate-200">
+                              {tankLabelFor(log.device_id) ?? "Farm-wide"}
+                            </span>
+                          )}
                           {log.action === "Alert" && isAcked(log) && (
                             <span
                               className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full text-[10px] font-bold uppercase ${
@@ -553,7 +600,9 @@ export default function AlertsPage({ onNavigate }: { onNavigate?: (menu: MenuKey
 
       {selectedAlert &&
         (() => {
-        const guidance = getAlertGuidance(selectedAlert, settings);
+        // Guidance uses the alert's tank effective thresholds so the safe
+        // range shown in the modal matches what that tank actually alerts on.
+        const guidance = getAlertGuidance(selectedAlert, settingsFor(selectedAlert.device_id));
         if (!guidance) return null;
         const severity = guidance.severity;
         const meta = SEVERITY_META[severity];

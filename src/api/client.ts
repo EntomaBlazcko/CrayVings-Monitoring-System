@@ -1,5 +1,5 @@
 import axios, { isAxiosError, type AxiosError } from "axios";
-import type { SensorEntry, ChartPoint, LogEntry, SensorSettings, ActivityLog, ActivityLogEntry, AuthResponse, WeeklyReport, AnalyticsOverview, AnalyticsDailyResponse, AnalyticsInsightsResponse, DeviceEntry, DeviceLiveReading, DeviceStatus } from "../types";
+import type { SensorEntry, ChartPoint, LogEntry, SensorSettings, ActivityLog, ActivityLogEntry, AuthResponse, WeeklyReport, AnalyticsOverview, AnalyticsDailyResponse, AnalyticsInsightsResponse, DeviceEntry, DeviceLiveReading, DeviceStatus, EffectiveThresholdsResponse, DeviceThresholdDetail, DeviceThresholdOverrides } from "../types";
 import { API_BASE } from "../types";
 import { formatFarmTime } from "../utils/time";
 
@@ -171,7 +171,7 @@ export async function fetchDevices(includeHidden = false, signal?: AbortSignal):
 }
 
 // GET /devices/latest - freshest reading per active tank, in one call (the Live
-// Tank Bar's data source). Polled on a 1s cadence; in-memory read on the server.
+// Tank Bar's data source). Polled on a 5s cadence; in-memory read on the server.
 export async function fetchDevicesLatest(signal?: AbortSignal): Promise<DeviceLiveReading[]> {
   const response = await client.get<DeviceLiveReading[]>("/devices/latest", { signal });
   return response.data || [];
@@ -201,16 +201,21 @@ export async function fetchDeviceStatus(deviceId: string, signal?: AbortSignal):
 }
 
 
-// GET /report/weekly - fetch 7-day aggregate report stats
-export async function fetchWeeklyReport(signal?: AbortSignal): Promise<WeeklyReport> {
-  const response = await client.get<WeeklyReport>("/report/weekly", { signal });
+// GET /report/weekly - fetch 7-day aggregate report stats.
+// Optional deviceId scopes the whole report (summary, daily, alerts) to one tank.
+export async function fetchWeeklyReport(deviceId?: string | null, signal?: AbortSignal): Promise<WeeklyReport> {
+  const response = await client.get<WeeklyReport>("/report/weekly", {
+    params: deviceId ? { device_id: deviceId } : undefined,
+    signal,
+  });
   return response.data;
 }
 
 // GET /report/range - aggregate report for a custom window.
 // hours: positive int (last N hours, hourly buckets when <= 24) or null (all time).
-export async function fetchRangeReport(hours: number | null, signal?: AbortSignal): Promise<WeeklyReport> {
-  const params = hours && hours > 0 ? { hours } : {};
+// Optional deviceId scopes the report to one tank.
+export async function fetchRangeReport(hours: number | null, deviceId?: string | null, signal?: AbortSignal): Promise<WeeklyReport> {
+  const params: Record<string, string | number> = { ...(hours && hours > 0 ? { hours } : {}), ...(deviceId ? { device_id: deviceId } : {}) };
   const response = await client.get<WeeklyReport>("/report/range", { params, signal });
   return response.data;
 }
@@ -226,19 +231,21 @@ export async function fetchAnalyticsOverview(days = 7, deviceId?: string | null,
   return response.data;
 }
 
-// GET /analytics/daily - per-day aggregates for charting
-export async function fetchAnalyticsDaily(days = 30, signal?: AbortSignal): Promise<AnalyticsDailyResponse> {
+// GET /analytics/daily - per-day aggregates for charting.
+// Optional deviceId scopes the aggregation (and alert counts) to one tank.
+export async function fetchAnalyticsDaily(days = 30, deviceId?: string | null, signal?: AbortSignal): Promise<AnalyticsDailyResponse> {
   const response = await client.get<AnalyticsDailyResponse>("/analytics/daily", {
-    params: { days },
+    params: deviceId ? { days, device_id: deviceId } : { days },
     signal,
   });
   return response.data;
 }
 
-// GET /analytics/insights - rule-engine suggestions for the selected period
-export async function fetchAnalyticsInsights(days = 7, signal?: AbortSignal): Promise<AnalyticsInsightsResponse> {
+// GET /analytics/insights - rule-engine suggestions for the selected period.
+// Optional deviceId scopes every query and resolves that tank's thresholds.
+export async function fetchAnalyticsInsights(days = 7, deviceId?: string | null, signal?: AbortSignal): Promise<AnalyticsInsightsResponse> {
   const response = await client.get<AnalyticsInsightsResponse>("/analytics/insights", {
-    params: { days },
+    params: deviceId ? { days, device_id: deviceId } : { days },
     signal,
   });
   return response.data;
@@ -258,9 +265,11 @@ export interface LogsResponse {
 export interface LogsFilter {
   action?: string;
   parameter?: string;
+  device_id?: string;
 }
 
-// GET /system-logs - fetch paginated system log entries
+// GET /system-logs - fetch paginated system log entries.
+// filter.device_id scopes to one tank (omitted = all tanks).
 export async function fetchLogs(
   page = 1,
   limit = 20,
@@ -268,7 +277,7 @@ export async function fetchLogs(
   filter?: LogsFilter
 ): Promise<LogsResponse> {
   const response = await client.get<{ data: LogEntry[]; total: number; counts?: Record<string, number> }>("/system-logs", {
-    params: { page, limit, action: filter?.action, parameter: filter?.parameter },
+    params: { page, limit, action: filter?.action, parameter: filter?.parameter, device_id: filter?.device_id },
     signal,
   });
   return {
@@ -307,6 +316,49 @@ export async function resetSettings(signal?: AbortSignal): Promise<SensorSetting
   const response = await client.post<{ data: SensorSettings }>("/settings/reset", {}, { signal });
   return response.data.data;
 }
+
+// ---------------------------------------------------------------------------
+// PER-TANK THRESHOLD OVERRIDES (migration 012)
+// Global /settings stays the farm default; these layer per-tank values on top.
+// ---------------------------------------------------------------------------
+
+// GET /settings/effective - global thresholds + one entry per tank that HAS an
+// override. Tanks absent from `devices` inherit the global row entirely.
+export async function fetchEffectiveThresholds(signal?: AbortSignal): Promise<EffectiveThresholdsResponse> {
+  const response = await client.get<EffectiveThresholdsResponse>("/settings/effective", { signal });
+  return response.data;
+}
+
+// GET /settings/device/:id (Admin) - the tank's effective thresholds, which
+// fields are overridden, and the raw override row.
+export async function fetchDeviceThresholds(deviceId: string, signal?: AbortSignal): Promise<DeviceThresholdDetail> {
+  const response = await client.get<DeviceThresholdDetail>(`/settings/device/${encodeURIComponent(deviceId)}`, { signal });
+  return response.data;
+}
+
+// PUT /settings/device/:id (Admin) - upsert a PARTIAL override; only the
+// provided fields change (absent fields keep inheriting the global row).
+export async function saveDeviceThresholds(
+  deviceId: string,
+  override: Partial<Pick<SensorSettings, "temp_min" | "temp_max" | "water_level_min" | "water_level_max" | "ammonia_min" | "ammonia_max">>,
+  signal?: AbortSignal
+): Promise<DeviceThresholdDetail> {
+  const response = await client.put<DeviceThresholdDetail>(
+    `/settings/device/${encodeURIComponent(deviceId)}`,
+    override,
+    { signal }
+  );
+  return response.data;
+}
+
+// DELETE /settings/device/:id (Admin) - clear the tank's overrides so it
+// inherits the global thresholds again.
+export async function clearDeviceThresholds(deviceId: string, signal?: AbortSignal): Promise<void> {
+  await client.delete(`/settings/device/${encodeURIComponent(deviceId)}`, { signal });
+}
+
+// Convenience: the merged override map shape used by the settings context.
+export type { DeviceThresholdOverrides };
 
 
 // POST /logs - create a new system log entry
@@ -563,6 +615,9 @@ export interface SmsRecipient {
 export interface MuteStatus {
   muted: boolean;
   muteExpires: string | null;
+  // Per-tank mute layer: one entry per active tank (global mute above applies
+  // on top of these).
+  devices?: { device_id: string; tank_name: string | null; muted: boolean; muteExpires: string | null }[];
 }
 
 // GET /settings/recipients (Admin) - list SMS recipients
@@ -638,15 +693,21 @@ export async function sendTestSms(id: number, signal?: AbortSignal): Promise<{ m
   return response.data;
 }
 
-// POST /alert/status (Admin) - send the status update SMS immediately
-export async function sendStatusSms(signal?: AbortSignal): Promise<{ sent: number; total: number }> {
-  const response = await client.post<{ sent: number; total: number }>("/alert/status", {}, { signal });
+// POST /alert/status (Admin) - send the status update SMS immediately.
+// Optional deviceId scopes the report to one tank; omitted = fleet digest.
+export async function sendStatusSms(deviceId?: string | null, signal?: AbortSignal): Promise<{ sent: number; total: number }> {
+  const response = await client.post<{ sent: number; total: number }>(
+    "/alert/status",
+    deviceId ? { device_id: deviceId } : {},
+    { params: deviceId ? { device_id: deviceId } : undefined, signal }
+  );
   return response.data;
 }
 
-// POST /alert/mute (Admin) - silence SMS for N hours (0 = unmute)
-export async function setSmsMute(hours: number, signal?: AbortSignal): Promise<MuteStatus> {
-  const response = await client.post<MuteStatus>("/alert/mute", { hours }, { signal });
+// POST /alert/mute (Admin) - suppress SMS for N hours (0 = unmute).
+// Optional deviceId mutes ONE tank; omitted = the global (fleet-wide) mute.
+export async function setSmsMute(hours: number, deviceId?: string | null, signal?: AbortSignal): Promise<MuteStatus> {
+  const response = await client.post<MuteStatus>("/alert/mute", { hours, ...(deviceId ? { device_id: deviceId } : {}) }, { signal });
   return response.data;
 }
 

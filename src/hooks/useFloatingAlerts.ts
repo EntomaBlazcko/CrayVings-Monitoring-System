@@ -1,4 +1,5 @@
 import { createContext, useContext } from "react";
+import type { SensorSettings } from "../types";
 
 interface AlertNotification {
   id: string;
@@ -7,6 +8,13 @@ interface AlertNotification {
   parameter: string;
   value: number;
   threshold: "min" | "max";
+  // Tank attribution for fleet-wide alerting: toasts for different tanks are
+  // deduped independently and can show a tank badge. Undefined = farm-wide.
+  deviceId?: string;
+  tank?: string;
+  // The breaching tank's EFFECTIVE settings (global + per-tank override) so
+  // the "Fix?" guidance shows the correct safe range for that tank.
+  settings?: SensorSettings | null;
 }
 
 interface FloatingAlertContextType {

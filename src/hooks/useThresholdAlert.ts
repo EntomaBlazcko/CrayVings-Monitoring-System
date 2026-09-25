@@ -1,103 +1,109 @@
-// Watches live readings and fires a floating notification when a value crosses
-// into a breached state. Alerts only on transitions (a value that stays bad is
-// not re-announced) and enforces a 60s cooldown per sensor+threshold.
+// Fleet-wide floating-alert watcher. Polls the freshest reading per tank
+// (latestByTank, fed by the provider's 5s /devices/latest poll) and fires a
+// tank-badged notification whenever ANY tank crosses into a breached state —
+// previously only the selected tank was watched, so a critical breach in
+// another tank was silent. Alerts only on transitions (a value that stays bad
+// is not re-announced) and enforces a 60s cooldown per tank+sensor+threshold.
+// Each tank is evaluated against its own EFFECTIVE thresholds (global defaults
+// + per-tank overrides), and an edit to either re-seeds silently.
 
-import { useEffect, useRef, useCallback, useMemo } from "react";
+import { useEffect, useRef } from "react";
 import { useSensorData, useSensorSettings } from "./useSensors";
 import { useFloatingAlerts } from "./useFloatingAlerts";
-import { getSettingsThresholds, getThresholdStatus, type ThresholdRange, type ThresholdStatus } from "../types";
+import { getThresholdStatus, type SensorThreshold, type ThresholdStatus } from "../types";
 
 const ALERT_COOLDOWN_MS = 60000;
 const SENSOR_KEYS = ["temperature", "water_level", "ammonia"] as const;
 
-function toNumber(value: string | number | undefined): number {
+// Null (failed sensor) is not a reading — return NaN so the caller skips it
+// instead of treating it as 0, which would raise a false "Low" alert.
+function toNumber(value: string | number | null | undefined): number {
   if (typeof value === "number") return value;
   if (typeof value === "string") return parseFloat(value);
-  return 0;
+  return Number.NaN;
 }
 
 export function useThresholdAlert() {
-  const { latestReading, loading } = useSensorData();
-  const { settings } = useSensorSettings();
+  const { latestByTank, devices } = useSensorData();
+  const { thresholdsFor, settingsFor } = useSensorSettings();
   const { addNotification } = useFloatingAlerts();
 
   const lastAlertTimeRef = useRef<Record<string, number>>({});
   const previousStatusRef = useRef<Record<string, ThresholdStatus>>({});
-  // Thresholds the previous-status map was seeded against. A change here means
-  // the user edited settings, not that a sensor crossed anything.
-  const thresholdsRef = useRef<Record<string, { range: ThresholdRange; isMinOnly: boolean }> | null>(null);
-
-  const thresholds = useMemo(
-    () => settings ? getSettingsThresholds(settings) : null,
-    [settings]
-  );
-
-  // Re-seeds the previous-status map. Runs only on the first evaluation and
-  // whenever threshold settings change, so pre-existing out-of-range readings
-  // (and settings edits) are never announced as a fresh crossing.
-  const seedStatuses = useCallback(() => {
-    if (!latestReading || !thresholds) return;
-    for (const key of SENSOR_KEYS) {
-      const config = thresholds[key];
-      const value = toNumber(latestReading[key] as string | number);
-      if (config && !isNaN(value)) {
-        previousStatusRef.current[key] = getThresholdStatus(value, config.range, config.isMinOnly);
-      }
-    }
-    thresholdsRef.current = thresholds;
-  }, [latestReading, thresholds]);
-
-  const checkThresholds = useCallback(() => {
-    if (loading || !latestReading || !thresholds) {
-      return;
-    }
-
-    if (thresholdsRef.current !== thresholds) {
-      seedStatuses();
-    }
-
-    const now = Date.now();
-
-    for (const key of SENSOR_KEYS) {
-      const value = toNumber(latestReading[key] as string | number);
-      if (isNaN(value)) continue;
-
-      const config = thresholds[key];
-      if (!config) continue;
-
-      const newStatus = getThresholdStatus(value, config.range, config.isMinOnly);
-
-      // Alert ONLY on a live transition into a breached state: a missing
-      // previous status (first evaluation) or an already-breached status means
-      // nothing just crossed.
-      const prevStatus = previousStatusRef.current[key];
-      previousStatusRef.current[key] = newStatus;
-
-      if (newStatus === "good") continue;
-      if (prevStatus !== "good") continue;
-
-      const isBelowMin = value < config.range.min;
-      const thresholdType = isBelowMin ? "min" : "max";
-      const alertKey = `${key}-${thresholdType}`;
-
-      if (now - (lastAlertTimeRef.current[alertKey] || 0) > ALERT_COOLDOWN_MS) {
-        const prefix = isBelowMin ? "Low" : "High";
-        const message = `${prefix} ${config.name}: ${value}${config.unit} is ${isBelowMin ? "below" : "above"} threshold (${config.range.min}${config.unit} - ${config.range.max}${config.unit})`;
-
-        lastAlertTimeRef.current[alertKey] = now;
-
-        addNotification({
-          message,
-          type: newStatus === "critical" ? "critical" : "warning",
-          parameter: key,
-          value,
-          threshold: thresholdType,
-        });
-      }
-    }
-  }, [latestReading, thresholds, loading, addNotification, seedStatuses]);
+  // The threshold map each tank's previous-status was seeded against. A change
+  // here means the user edited settings (global or that tank's override), not
+  // that a sensor crossed anything — re-seed silently.
+  const seededThresholdsRef = useRef<Map<string, Record<string, SensorThreshold>>>(new Map());
 
   useEffect(() => {
-    checkThresholds();
-  }, [checkThresholds]);
+    const now = Date.now();
+    const labelFor = (deviceId: string) => {
+      const device = devices.find((d) => d.device_id === deviceId);
+      return device?.tank_name || device?.name || deviceId;
+    };
+
+    for (const [deviceId, reading] of Object.entries(latestByTank)) {
+      const thresholds = thresholdsFor(deviceId);
+
+      // First sight of a tank (or a threshold edit): seed the previous-status
+      // map without announcing, so pre-existing breaches and settings edits are
+      // never reported as fresh crossings.
+      if (seededThresholdsRef.current.get(deviceId) !== thresholds) {
+        seededThresholdsRef.current.set(deviceId, thresholds);
+        for (const key of SENSOR_KEYS) {
+          const config = thresholds[key];
+          const value = toNumber(reading[key]);
+          if (config && !Number.isNaN(value)) {
+            previousStatusRef.current[`${deviceId}:${key}`] = getThresholdStatus(value, config.range, config.isMinOnly);
+          }
+        }
+        continue;
+      }
+
+      for (const key of SENSOR_KEYS) {
+        const value = toNumber(reading[key]);
+        if (Number.isNaN(value)) continue;
+
+        const config = thresholds[key];
+        if (!config) continue;
+
+        const newStatus = getThresholdStatus(value, config.range, config.isMinOnly);
+
+        // Alert ONLY on a live transition into a breached state: a missing
+        // previous status (first evaluation) or an already-breached status
+        // means nothing just crossed.
+        const statusKey = `${deviceId}:${key}`;
+        const prevStatus = previousStatusRef.current[statusKey];
+        previousStatusRef.current[statusKey] = newStatus;
+
+        if (newStatus === "good") continue;
+        if (prevStatus !== "good") continue;
+
+        const isBelowMin = value < config.range.min;
+        const thresholdType = isBelowMin ? "min" : "max";
+        const alertKey = `${deviceId}-${key}-${thresholdType}`;
+
+        if (now - (lastAlertTimeRef.current[alertKey] || 0) > ALERT_COOLDOWN_MS) {
+          const label = labelFor(deviceId);
+          const prefix = isBelowMin ? "Low" : "High";
+          const message = `${prefix} ${config.name}: ${value}${config.unit} is ${isBelowMin ? "below" : "above"} threshold (${config.range.min}${config.unit} - ${config.range.max}${config.unit})`;
+
+          lastAlertTimeRef.current[alertKey] = now;
+
+          addNotification({
+            message,
+            type: newStatus === "critical" ? "critical" : "warning",
+            parameter: key,
+            value,
+            threshold: thresholdType,
+            deviceId,
+            tank: label,
+            // The tank's effective settings ride along so the "Fix?" modal
+            // shows the right safe range for THIS tank.
+            settings: settingsFor(deviceId),
+          });
+        }
+      }
+    }
+  }, [latestByTank, thresholdsFor, settingsFor, devices, addNotification]);
 }

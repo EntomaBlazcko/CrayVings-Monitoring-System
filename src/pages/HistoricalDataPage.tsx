@@ -170,7 +170,7 @@ function buildReportSuggestions(
 }
 
 export default function HistoricalDataPage() {
-  const { history, loading, connectionStatus, lastUpdate, historyStale, historyLastUpdated, settings, selectedDeviceId } = useSensors();
+  const { history, loading, connectionStatus, lastUpdate, historyStale, historyLastUpdated, settingsFor, selectedDeviceId } = useSensors();
   const { user } = useAuth();
   const isAdmin = user?.role === "admin";
   const [timeRange, setTimeRange] = useState<TimeRange>("all");
@@ -246,7 +246,9 @@ export default function HistoricalDataPage() {
     setWeeklyReportLoading(true);
     setWeeklyReportError(null);
 
-    fetchWeeklyReport(controller.signal)
+    // Scoped to the selected tank so the weekly table + PDF export match the
+    // on-screen charts (previously this was farm-wide).
+    fetchWeeklyReport(selectedDeviceId, controller.signal)
       .then(data => {
         setWeeklyReport(data);
         setWeeklyReportLoading(false);
@@ -261,7 +263,7 @@ export default function HistoricalDataPage() {
     return () => {
       controller.abort();
     };
-  }, [timeRange, weeklyRetry]);
+  }, [timeRange, weeklyRetry, selectedDeviceId]);
 
   const activeHistory = dynamicHistory.length > 0 ? dynamicHistory : history;
   const activeLoading = dynamicLoading || loading;
@@ -321,7 +323,12 @@ export default function HistoricalDataPage() {
     return null;
   }, [filteredHistory, activeHistory]);
 
-  const thresholds = useMemo(() => getSettingsThresholds(settings), [settings]);
+  // The SELECTED tank's effective thresholds (global defaults + per-tank
+  // override) — the history being charted is already scoped to that tank.
+  const thresholds = useMemo(
+    () => getSettingsThresholds(settingsFor(selectedDeviceId)),
+    [settingsFor, selectedDeviceId]
+  );
 
   // Safe/warning/critical status of the most recent reading per parameter.
   const latestStatuses = useMemo(() => {
@@ -415,11 +422,13 @@ export default function HistoricalDataPage() {
     const isWeekly = timeRange === "1w";
     let report = isWeekly ? weeklyReport : null;
     if (!report) {
-      setExportingPdf(true);
       try {
+        setExportingPdf(true);
+        // The exported report is scoped to the selected tank so the PDF matches
+        // the on-screen charts (previously this was farm-wide).
         report = isWeekly
-          ? await fetchWeeklyReport()
-          : await fetchRangeReport(timeRange === "all" ? null : timeRange === "1h" ? 1 : timeRange === "6h" ? 6 : 24);
+          ? await fetchWeeklyReport(selectedDeviceId)
+          : await fetchRangeReport(timeRange === "all" ? null : timeRange === "1h" ? 1 : timeRange === "6h" ? 6 : 24, selectedDeviceId);
       } catch {
         alert("Failed to fetch report data.");
         setExportingPdf(false);
@@ -799,7 +808,7 @@ export default function HistoricalDataPage() {
     } finally {
       setExportingPdf(false);
     }
-  }, [weeklyReport, exportingPdf, timeRange, thresholds]);
+  }, [weeklyReport, exportingPdf, timeRange, thresholds, selectedDeviceId]);
 
   // Only show loading skeleton on first load; keep previous charts during re-fetch.
   if (activeLoading && (!activeHistory || activeHistory.length === 0)) {

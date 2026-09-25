@@ -24,15 +24,21 @@ export function useSensors() {
     historyLastUpdated: dataContext.historyLastUpdated,
     devices: dataContext.devices,
     devicesLoading: dataContext.devicesLoading,
+    latestByTank: dataContext.latestByTank,
     selectedDeviceId: dataContext.selectedDeviceId,
     setSelectedDeviceId: dataContext.setSelectedDeviceId,
     refetch: dataContext.refetch,
     settings: settingsContext.settings,
+    deviceOverrides: settingsContext.deviceOverrides,
+    settingsFor: settingsContext.settingsFor,
+    thresholdsFor: settingsContext.thresholdsFor,
     settingsLoading: settingsContext.settingsLoading,
     settingsError: settingsContext.settingsError,
     saveError: settingsContext.saveError,
     refetchSettings: settingsContext.refetchSettings,
     saveSettings: settingsContext.saveSettings,
+    saveDeviceThresholds: settingsContext.saveDeviceThresholds,
+    clearDeviceThresholds: settingsContext.clearDeviceThresholds,
     settingsSaved: settingsContext.settingsSaved,
     settingsSaving: settingsContext.settingsSaving,
     logs: logsContext.logs,
@@ -47,6 +53,8 @@ export function useSensors() {
     setLogsActionFilter: logsContext.setLogsActionFilter,
     logsParameterFilter: logsContext.logsParameterFilter,
     setLogsParameterFilter: logsContext.setLogsParameterFilter,
+    logsDeviceMode: logsContext.logsDeviceMode,
+    setLogsDeviceMode: logsContext.setLogsDeviceMode,
     activityLogs: activityLogsContext.activityLogs,
     activityLogsLoading: activityLogsContext.activityLogsLoading,
     activityLogsError: activityLogsContext.activityLogsError,
@@ -95,11 +103,6 @@ export function useActivityLogs() {
     throw new Error("useActivityLogs must be used within a SensorProvider");
   }
   return context;
-}
-
-export function useConnectionStatus() {
-  const { connectionStatus, lastUpdate, consecutiveFailures } = useSensorData();
-  return { connectionStatus, lastUpdate, consecutiveFailures };
 }
 
 export function useActivityLogger() {

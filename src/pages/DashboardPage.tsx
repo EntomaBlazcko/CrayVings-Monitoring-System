@@ -3,7 +3,7 @@ import { Thermometer, Waves, FlaskConical, AlertTriangle, AlertCircle, CheckCirc
 import type { ThresholdStatus, MenuKey } from "../types";
 import { useSensors } from "../hooks/useSensors";
 import { useAuth } from "../contexts/useAuth";
-import { getSettingsThresholds, getThresholdStatus } from "../types";
+import { getThresholdStatus } from "../types";
 import { formatFarmTime } from "../utils/time";
 import { buildLiveGuidance } from "../utils/alertGuidance";
 import type { AlertGuidance } from "../utils/alertGuidance";
@@ -18,7 +18,7 @@ type Props = {
 };
 
 export default function DashboardPage({ onNavigate }: Props) {
-  const { latestReading, history, connectionStatus, lastUpdate, settings, loading, historyStale, historyLastUpdated, refetch, devices, selectedDeviceId } = useSensors();
+  const { latestReading, history, connectionStatus, lastUpdate, thresholdsFor, settingsFor, loading, historyStale, historyLastUpdated, refetch, devices, selectedDeviceId } = useSensors();
   const { user } = useAuth();
   const isAdmin = user?.role === "admin";
   const [alertsDismissed, setAlertsDismissed] = useState(false);
@@ -26,7 +26,12 @@ export default function DashboardPage({ onNavigate }: Props) {
   const [fixGuidance, setFixGuidance] = useState<AlertGuidance | null>(null);
   const [alertsSoundEnabled, setAlertsSoundEnabled] = useState<boolean>(() => getIsSoundEnabled());
 
-  const thresholds = useMemo(() => getSettingsThresholds(settings), [settings]);
+  // The SELECTED tank's effective thresholds (global defaults + per-tank
+  // override) — every status evaluation on this page follows the tank.
+  const thresholds = useMemo(
+    () => thresholdsFor(selectedDeviceId),
+    [thresholdsFor, selectedDeviceId]
+  );
 
   const currentTank = useMemo(
     () => devices.find((d) => d.device_id === selectedDeviceId) ?? null,
@@ -48,6 +53,8 @@ export default function DashboardPage({ onNavigate }: Props) {
     for (const key of sensorKeys) {
       const threshold = thresholds[key];
       const value = latestReading[key];
+      // Failed sensors arrive as null — no reading, no threshold alert.
+      if (value === null || value === undefined) continue;
       const status = getThresholdStatus(value, threshold.range, threshold.isMinOnly);
 
       if (status === "warning" || status === "critical") {
@@ -67,6 +74,8 @@ export default function DashboardPage({ onNavigate }: Props) {
     if (!latestReading) return out;
     const sensorKeys = ["temperature", "water_level", "ammonia"] as const;
     for (const key of sensorKeys) {
+      // A failed sensor (null) has no status — the tile shows "--" instead.
+      if (latestReading[key] === null || latestReading[key] === undefined) continue;
       const threshold = thresholds[key];
       out[key] = getThresholdStatus(latestReading[key], threshold.range, threshold.isMinOnly);
     }
@@ -136,10 +145,14 @@ export default function DashboardPage({ onNavigate }: Props) {
     ammonia: "text-emerald-500",
   };
 
+  // Failed sensors arrive as null — render "--" instead of "null°C" etc.
+  const fmt = (value: number | null, unit: string) =>
+    loading ? "Loading..." : value !== null && value !== undefined ? `${value}${unit}` : `--${unit}`;
+
   const stats = [
     {
       title: "Water Temperature",
-      value: loading ? "Loading..." : latestReading ? `${latestReading.temperature}°C` : "--°C",
+      value: fmt(latestReading?.temperature ?? null, "°C"),
       color: sensorColors.temperature,
       icon: <Thermometer size={24} />,
       loading,
@@ -148,7 +161,7 @@ export default function DashboardPage({ onNavigate }: Props) {
     },
     {
       title: "Water Level",
-      value: loading ? "Loading..." : latestReading ? `${latestReading.water_level}%` : "--%",
+      value: fmt(latestReading?.water_level ?? null, "%"),
       color: sensorColors.water_level,
       icon: <Waves size={24} />,
       loading,
@@ -157,7 +170,7 @@ export default function DashboardPage({ onNavigate }: Props) {
     },
     {
       title: "Ammonia",
-      value: loading ? "Loading..." : latestReading ? `${latestReading.ammonia} ppm` : "-- ppm",
+      value: fmt(latestReading?.ammonia ?? null, " ppm"),
       color: sensorColors.ammonia,
       icon: <FlaskConical size={24} />,
       loading,
@@ -167,9 +180,9 @@ export default function DashboardPage({ onNavigate }: Props) {
   ];
 
   const highlights = [
-    { label: "Temperature", value: loading ? "..." : latestReading ? `${latestReading.temperature}°C` : "--", color: isOfflineWithData ? "bg-yellow-50 border-yellow-200 text-yellow-700" : latestReading ? "bg-orange-50 border-orange-200 text-orange-700" : "bg-red-50 border-red-200 text-red-700" },
-    { label: "Water Level", value: loading ? "..." : latestReading ? `${latestReading.water_level}%` : "--", color: isOfflineWithData ? "bg-yellow-50 border-yellow-200 text-yellow-700" : latestReading ? "bg-blue-50 border-blue-200 text-blue-700" : "bg-red-50 border-red-200 text-red-700" },
-    { label: "Ammonia", value: loading ? "..." : latestReading ? `${latestReading.ammonia} ppm` : "--", color: isOfflineWithData ? "bg-yellow-50 border-yellow-200 text-yellow-700" : latestReading ? "bg-emerald-50 border-emerald-200 text-emerald-700" : "bg-red-50 border-red-200 text-red-700" },
+    { label: "Temperature", value: loading ? "..." : latestReading?.temperature != null ? `${latestReading.temperature}°C` : "--", color: isOfflineWithData ? "bg-yellow-50 border-yellow-200 text-yellow-700" : latestReading ? "bg-orange-50 border-orange-200 text-orange-700" : "bg-red-50 border-red-200 text-red-700" },
+    { label: "Water Level", value: loading ? "..." : latestReading?.water_level != null ? `${latestReading.water_level}%` : "--", color: isOfflineWithData ? "bg-yellow-50 border-yellow-200 text-yellow-700" : latestReading ? "bg-blue-50 border-blue-200 text-blue-700" : "bg-red-50 border-red-200 text-red-700" },
+    { label: "Ammonia", value: loading ? "..." : latestReading?.ammonia != null ? `${latestReading.ammonia} ppm` : "--", color: isOfflineWithData ? "bg-yellow-50 border-yellow-200 text-yellow-700" : latestReading ? "bg-emerald-50 border-emerald-200 text-emerald-700" : "bg-red-50 border-red-200 text-red-700" },
   ];
 
   const recentAlerts = tankStatus.alerts.filter(alert => alert !== "Tank is Safe").slice(0, 4);
@@ -198,7 +211,9 @@ export default function DashboardPage({ onNavigate }: Props) {
     for (const key of ["temperature", "water_level", "ammonia"] as const) {
       const status = sensorStatuses[key];
       if (!status || status === "good") continue;
-      const direction = latestReading[key] < thresholds[key].range.min ? "Low" : "High";
+      const value = latestReading[key];
+      if (value === null || value === undefined) continue;
+      const direction = value < thresholds[key].range.min ? "Low" : "High";
       keys.push(`${key}:${direction}`);
     }
     return keys;
@@ -206,7 +221,10 @@ export default function DashboardPage({ onNavigate }: Props) {
 
   const openFixModal = (parameter: "temperature" | "water_level" | "ammonia") => {
     if (!latestReading) return;
-    const guidance = buildLiveGuidance(parameter, Number(latestReading[parameter]), settings);
+    const raw = latestReading[parameter];
+    if (raw === null || raw === undefined) return;
+    // The selected tank's effective settings drive the guidance safe range.
+    const guidance = buildLiveGuidance(parameter, Number(raw), settingsFor(selectedDeviceId));
     if (guidance) setFixGuidance(guidance);
   };
 

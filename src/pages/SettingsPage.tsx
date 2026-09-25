@@ -1,6 +1,6 @@
 import { useState, useCallback, useMemo, useEffect } from "react";
 import { isAxiosError } from "axios";
-import { useSensorSettings, useActivityLogger } from "../hooks/useSensors";
+import { useSensorSettings, useSensorData, useActivityLogger } from "../hooks/useSensors";
 import { useAuth } from "../contexts/useAuth";
 import {
   Settings,
@@ -38,7 +38,8 @@ import {
   RotateCcw,
 } from "lucide-react";
 import type { SensorSettings } from "../types";
-import { DEFAULT_SETTINGS, getSettingsThresholds } from "../types";
+import type { DeviceEntry, DeviceThresholdDetail } from "../types";
+import { DEFAULT_SETTINGS, getSettingsThresholds, tankOptionLabel } from "../types";
 import { LoadingCard } from "../components/Loading";
 import { formatFarmDate, formatFarmDateTime } from "../utils/time";
 import { z } from "zod";
@@ -49,6 +50,7 @@ import {
   verifyUserDeletion,
   resetUserPassword,
   resetSettings as apiResetSettings,
+  fetchDeviceThresholds,
   fetchSmsRecipients,
   addSmsRecipient,
   updateSmsRecipient,
@@ -208,17 +210,339 @@ function hasSettingsChanges(currentSettings: SensorSettings, nextSettings: Senso
   });
 }
 
+// Per-tank threshold overrides (migration 012): the global card above stays
+// the farm default; this card layers per-tank values on top. An empty input
+// means "inherit the global value" — typing a value overrides just that field
+// for that tank. "Clear all overrides" reverts the tank to global entirely.
+// The chip strip shows every tank with its overridden-field count so the
+// active selection is always visible (switching tanks visibly changes the
+// card, even between tanks that both inherit global).
+function TankThresholdOverridesCard({
+  devices,
+  globalSettings,
+  overrideCounts,
+  onSave,
+  onClear,
+  saving,
+  onSaved,
+}: {
+  devices: DeviceEntry[];
+  globalSettings: SensorSettings | null;
+  overrideCounts: Record<string, number>;
+  onSave: (deviceId: string, override: Partial<SensorSettings>) => Promise<void>;
+  onClear: (deviceId: string) => Promise<void>;
+  saving: boolean;
+  onSaved: (message: string) => void;
+}) {
+  const [tankId, setTankId] = useState<string | null>(null);
+  const [detail, setDetail] = useState<DeviceThresholdDetail | null>(null);
+  const [draft, setDraft] = useState<Partial<SensorSettings>>({});
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
+
+  // Derived default: the first tank in the fleet until the user picks one —
+  // no state seeding effect needed.
+  const activeTankId = tankId ?? (devices.length > 0
+    ? [...devices].sort((a, b) => a.device_id.localeCompare(b.device_id))[0].device_id
+    : null);
+
+  const loadDetail = useCallback(async (id: string) => {
+    setLoading(true);
+    setError(null);
+    try {
+      const d = await fetchDeviceThresholds(id);
+      setDetail(d);
+      setDraft(d.override ?? {});
+    } catch (err) {
+      setError(getApiError(err));
+      setDetail(null);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (activeTankId) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      loadDetail(activeTankId);
+    }
+  }, [activeTankId, loadDetail]);
+
+  const overriddenCount = detail
+    ? SETTINGS_FIELDS.filter((f) => detail.override && (detail.override as Partial<SensorSettings>)[f] != null).length
+    : 0;
+
+  const handleField = (key: keyof SensorSettings, raw: string) => {
+    setActionError(null);
+    if (raw.trim() === "") {
+      // Empty input = inherit the global value for this field.
+      setDraft((prev) => {
+        const next = { ...prev };
+        delete next[key];
+        return next;
+      });
+      return;
+    }
+    const num = parseFloat(raw);
+    if (!Number.isFinite(num)) return;
+    setDraft((prev) => ({ ...prev, [key]: num }));
+  };
+
+  // Effective values with the current draft applied (for the range tracks).
+  const effective = useMemo(
+    () => ({ ...(detail?.global ?? globalSettings ?? DEFAULT_SETTINGS), ...draft }),
+    [detail, globalSettings, draft]
+  );
+
+  const draftInvalid = useMemo(() => {
+    // Bounds check on provided fields only.
+    for (const field of SETTINGS_FIELDS) {
+      const value = draft[field];
+      if (value == null) continue;
+      // SETTINGS_FIELDS only contains the six numeric threshold keys.
+      const check = validateSetting(field, value as number);
+      if (!check.valid) return check.message ?? "Invalid value";
+    }
+    // Pair check on the effective values (override or global).
+    for (const key of Object.keys(KEY_MAPPING)) {
+      const check = validateRange(key, effective);
+      if (!check.valid) return check.message ?? "Invalid range";
+    }
+    return null;
+  }, [draft, effective]);
+
+  const dirty = detail != null && Object.keys(draft).length > 0;
+
+  const handleSave = async () => {
+    if (!activeTankId || !dirty || draftInvalid) return;
+    setActionError(null);
+    try {
+      await onSave(activeTankId, draft);
+      await loadDetail(activeTankId);
+      onSaved(`Thresholds saved for tank ${detail ? (detail.tank_name || activeTankId) : activeTankId}`);
+    } catch (err) {
+      setActionError(getApiError(err));
+    }
+  };
+
+  const handleClear = async () => {
+    if (!activeTankId) return;
+    setActionError(null);
+    try {
+      await onClear(activeTankId);
+      await loadDetail(activeTankId);
+      onSaved(`Tank ${detail ? (detail.tank_name || activeTankId) : activeTankId} now uses global thresholds`);
+    } catch (err) {
+      setActionError(getApiError(err));
+    }
+  };
+
+  if (devices.length === 0) {
+    return (
+      <div className="bg-white rounded-xl border border-gray-100 p-4 text-sm text-gray-500 shadow-sm">
+        No tanks registered yet — per-tank overrides appear once an ESP32 checks in.
+      </div>
+    );
+  }
+
+  return (
+    <div className="bg-white rounded-xl border border-gray-100 p-4 shadow-sm space-y-4">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div>
+          <h3 className="text-base font-bold text-gray-800 flex items-center gap-2 flex-wrap">
+            Per-Tank Threshold Overrides
+            {detail && overriddenCount > 0 && (
+              <span className="text-[10px] font-bold uppercase tracking-wide px-2 py-0.5 rounded-full bg-orange-100 text-orange-700">
+                {overriddenCount} field{overriddenCount === 1 ? "" : "s"} overridden
+              </span>
+            )}
+          </h3>
+          <p className="text-sm text-gray-500">
+            Leave a field empty to inherit the global value. Overriding a field changes alerting for that tank only.
+          </p>
+        </div>
+        <select
+          value={activeTankId ?? ""}
+          onChange={(e) => setTankId(e.target.value || null)}
+          aria-label="Select tank to configure"
+          className="px-3 py-2 rounded-lg text-sm font-semibold bg-white border border-gray-200 text-gray-700 hover:bg-gray-50 outline-none cursor-pointer"
+        >
+          {devices.map((device) => (
+            <option key={device.device_id} value={device.device_id}>
+              {tankOptionLabel(device)}
+            </option>
+          ))}
+        </select>
+      </div>
+
+      {/* Quick-select chip strip: one chip per tank with its override count.
+          The active tank is highlighted so switching is always visible. */}
+      <div className="flex flex-wrap items-center gap-2">
+        {devices.map((device) => {
+          const count = overrideCounts[device.device_id] ?? 0;
+          const isActive = device.device_id === activeTankId;
+          return (
+            <button
+              key={device.device_id}
+              type="button"
+              onClick={() => setTankId(device.device_id)}
+              className={`inline-flex items-center gap-1.5 rounded-full px-3 py-1 text-xs font-semibold border transition ${
+                isActive
+                  ? "bg-orange-500 text-white border-orange-500 shadow-sm"
+                  : "bg-white text-gray-600 border-gray-200 hover:border-orange-300 hover:text-orange-700"
+              }`}
+            >
+              {tankOptionLabel(device)}
+              {count > 0 && (
+                <span className={`rounded-full px-1.5 py-0.5 text-[10px] font-bold ${isActive ? "bg-white/25" : "bg-orange-100 text-orange-700"}`}>
+                  {count}
+                </span>
+              )}
+            </button>
+          );
+        })}
+      </div>
+
+      {/* Which tank is being edited — repeated in the body so the current
+          target is obvious without scanning the select. */}
+      {detail && (
+        <p className="text-sm text-gray-500">
+          Editing thresholds for <span className="font-bold text-gray-800">{tankOptionLabel({ device_id: detail.device_id, name: null, tank_name: detail.tank_name })}</span>
+        </p>
+      )}
+
+      {loading && (
+        <p className="text-sm text-gray-400 flex items-center gap-2">
+          <Loader2 size={14} className="animate-spin" /> Loading tank thresholds...
+        </p>
+      )}
+      {error && <p className="text-sm text-red-600">{error}</p>}
+
+      {!loading && !error && detail && (
+        <>
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+            {(Object.keys(KEY_MAPPING) as Array<keyof typeof KEY_MAPPING>).map((key) => {
+              const keys = KEY_MAPPING[key];
+              const colors = THRESHOLD_COLORS[key];
+              const meta = THRESHOLD_META[key];
+              const ParamIcon = meta.icon;
+              const bounds = SETTING_BOUNDS[keys.min] ?? { min: 0, max: 100 };
+              const minVal = Number(effective[keys.min]);
+              const maxVal = Number(effective[keys.max]);
+              const minOverridden = detail.override && (detail.override as Partial<SensorSettings>)[keys.min] != null;
+              const maxOverridden = detail.override && (detail.override as Partial<SensorSettings>)[keys.max] != null;
+
+              return (
+                <div key={key} className={`rounded-xl p-4 border ${colors.bg} ${colors.border} space-y-3`}>
+                  <div className="flex items-center gap-2">
+                    <span className="w-8 h-8 rounded-lg bg-white border border-gray-200 flex items-center justify-center shrink-0">
+                      <ParamIcon size={15} className={meta.tint} />
+                    </span>
+                    <div className="min-w-0">
+                      <div className="text-xs font-bold uppercase text-gray-700 leading-tight">
+                        {key === "temperature" ? "Temperature" : key === "water_level" ? "Water Level" : "Ammonia"}
+                        {(minOverridden || maxOverridden) && (
+                          <span className="ml-1.5 text-[9px] font-bold uppercase px-1.5 py-0.5 rounded bg-orange-500 text-white">custom</span>
+                        )}
+                      </div>
+                      <div className="text-[10px] text-gray-400">
+                        Global: {Number(detail.global[keys.min])} – {Number(detail.global[keys.max])}
+                      </div>
+                    </div>
+                  </div>
+                  <div className="grid grid-cols-2 gap-2">
+                    <div>
+                      <label className="block text-[11px] text-gray-500 mb-0.5">Min override</label>
+                      <input
+                        type="number"
+                        step="0.1"
+                        value={draft[keys.min] != null ? Number(draft[keys.min]) : ""}
+                        placeholder={String(Number(detail.global[keys.min]))}
+                        onChange={(e) => handleField(keys.min, e.target.value)}
+                        className="w-full px-2 py-1.5 border border-gray-200 rounded text-sm focus:outline-none focus:ring-2 focus:ring-orange-500 focus:border-transparent"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-[11px] text-gray-500 mb-0.5">Max override</label>
+                      <input
+                        type="number"
+                        step="0.1"
+                        value={draft[keys.max] != null ? Number(draft[keys.max]) : ""}
+                        placeholder={String(Number(detail.global[keys.max]))}
+                        onChange={(e) => handleField(keys.max, e.target.value)}
+                        className="w-full px-2 py-1.5 border border-gray-200 rounded text-sm focus:outline-none focus:ring-2 focus:ring-orange-500 focus:border-transparent"
+                      />
+                    </div>
+                  </div>
+                  <RangeTrack
+                    min={minVal}
+                    max={maxVal}
+                    bounds={bounds}
+                    invalid={minVal >= maxVal}
+                  />
+                  <div className="text-[11px] text-gray-400">
+                    Effective: {minVal} to {maxVal}
+                    {minVal >= maxVal && <span className="ml-1 text-red-500 font-semibold">min must be less than max</span>}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+
+          {(draftInvalid || actionError) && (
+            <p className="text-sm text-red-600">{draftInvalid || actionError}</p>
+          )}
+
+          <div className="flex flex-wrap items-center gap-3">
+            <button
+              onClick={handleSave}
+              disabled={saving || !dirty || Boolean(draftInvalid)}
+              className="flex items-center gap-2 bg-gradient-to-r from-[#d94b1e] to-[#ef6a2e] px-4 py-2 text-white rounded-lg text-sm font-medium hover:from-[#c2410c] hover:to-[#d94b1e] transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              <Save size={16} />
+              {saving ? "Saving..." : "Save Tank Overrides"}
+            </button>
+            <button
+              onClick={handleClear}
+              disabled={saving || overriddenCount === 0}
+              className="flex items-center gap-2 px-4 py-2 bg-gray-600 hover:bg-gray-700 disabled:bg-gray-300 text-white rounded-lg text-sm font-medium transition-colors"
+              title="Revert this tank to the global thresholds"
+            >
+              <RotateCcw size={16} className={saving ? "animate-spin" : ""} />
+              Clear Overrides
+            </button>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
 export default function SettingsPage() {
   const {
     settings,
+    deviceOverrides,
     settingsLoading,
     settingsError,
     saveError,
     saveSettings,
+    saveDeviceThresholds,
+    clearDeviceThresholds,
     settingsSaved,
     settingsSaving,
     refetchSettings,
   } = useSensorSettings();
+  const { devices } = useSensorData();
+
+  // Overridden-field count per tank (drives the chip strip badges).
+  const overrideCounts = useMemo(() => {
+    const counts: Record<string, number> = {};
+    for (const [id, override] of Object.entries(deviceOverrides ?? {})) {
+      counts[id] = SETTINGS_FIELDS.filter((f) => override[f] != null).length;
+    }
+    return counts;
+  }, [deviceOverrides]);
   const { user } = useAuth();
   const logActivity = useActivityLogger();
   const isAdmin = user?.role === "admin";
@@ -502,6 +826,7 @@ export default function SettingsPage() {
   const [editingName, setEditingName] = useState<{ id: number; value: string; original: string } | null>(null);
   const [smsMuteStatus, setSmsMuteStatus] = useState<MuteStatus | null>(null);
   const [muteHours, setMuteHours] = useState(1);
+  const [muteTankId, setMuteTankId] = useState<string | null>(null);
   const [smsActionLoading, setSmsActionLoading] = useState<string | null>(null);
   const [smsLogsOpen, setSmsLogsOpen] = useState(false);
   const [smsLogs, setSmsLogs] = useState<SmsLogEntry[]>([]);
@@ -796,6 +1121,28 @@ export default function SettingsPage() {
     }
   }, [smsMuteStatus, muteHours, showToast]);
 
+  // Per-tank mute: silences that tank's critical-alert + disconnect SMS only;
+  // the fleet digest and other tanks keep sending. Mutes persist server-side.
+  const handleToggleTankMute = useCallback(async () => {
+    if (!muteTankId) return;
+    const tank = smsMuteStatus?.devices?.find((d) => d.device_id === muteTankId);
+    const currentlyMuted = Boolean(tank?.muted);
+    const label = tank?.tank_name || muteTankId;
+    setSmsActionLoading("mute-tank");
+    try {
+      const status = await setSmsMute(currentlyMuted ? 0 : (muteHours || 1), muteTankId);
+      setSmsMuteStatus(status);
+      showToast(
+        currentlyMuted ? `SMS unmuted for tank ${label}` : `SMS muted for tank ${label} (${muteHours || 1} hour(s))`,
+        "success"
+      );
+    } catch (err: unknown) {
+      showToast(getApiError(err), "error");
+    } finally {
+      setSmsActionLoading(null);
+    }
+  }, [muteTankId, smsMuteStatus, muteHours, showToast]);
+
   // Whether local edits differ from what is saved on the server.
   const dirty =
     localSettings != null && hasSettingsChanges(settings ?? DEFAULT_SETTINGS, localSettings);
@@ -1050,6 +1397,24 @@ export default function SettingsPage() {
           <span className="text-sm text-green-600 font-medium">Settings saved!</span>
         )}
       </div>
+
+      {/* Per-tank threshold overrides (admin): layer custom ranges for one
+          tank on top of the global defaults configured above. */}
+      {isAdmin && (
+        <TankThresholdOverridesCard
+          devices={devices}
+          globalSettings={settings}
+          overrideCounts={overrideCounts}
+          onSave={saveDeviceThresholds}
+          onClear={clearDeviceThresholds}
+          saving={settingsSaving}
+          onSaved={(message) => {
+            refetchSettings();
+            showToast(message, "success");
+            logActivity("settings_change", message, "Settings");
+          }}
+        />
+      )}
 
       {isAdmin && (
         <div className="space-y-6 pt-6 border-t border-gray-200">
@@ -1534,6 +1899,61 @@ export default function SettingsPage() {
                 </span>
               )}
             </div>
+
+            {/* Per-tank mute: silences one tank's critical-alert + disconnect
+                SMS without touching the rest of the fleet. */}
+            {smsMuteStatus?.devices && smsMuteStatus.devices.length > 0 && (
+              <div className="flex flex-wrap items-center gap-3 text-sm bg-white rounded-xl border border-gray-100 p-4 shadow-sm">
+                <span className="flex items-center gap-2 text-gray-600">
+                  <BellOff size={14} className="text-gray-500" />
+                  Per-tank mute
+                </span>
+                <select
+                  value={muteTankId ?? ""}
+                  onChange={(e) => setMuteTankId(e.target.value || null)}
+                  aria-label="Select tank to mute"
+                  className="px-3 py-1.5 rounded-lg text-sm font-semibold bg-white border border-gray-200 text-gray-700 hover:bg-gray-50 outline-none cursor-pointer"
+                >
+                  <option value="" disabled>
+                    Select tank…
+                  </option>
+                  {smsMuteStatus.devices.map((device) => (
+                    <option key={device.device_id} value={device.device_id}>
+                      {device.tank_name || device.device_id}
+                      {device.muted ? " (muted)" : ""}
+                    </option>
+                  ))}
+                </select>
+                <button
+                  onClick={handleToggleTankMute}
+                  disabled={smsActionLoading === "mute-tank" || !muteTankId}
+                  className={`flex items-center gap-2 px-3 py-1.5 rounded-lg text-sm font-semibold transition disabled:opacity-50 ${
+                    muteTankId && smsMuteStatus.devices.find((d) => d.device_id === muteTankId)?.muted
+                      ? "bg-gray-600 text-white hover:bg-gray-700"
+                      : "bg-amber-600 text-white hover:bg-amber-700"
+                  }`}
+                >
+                  {smsActionLoading === "mute-tank" ? (
+                    <Loader2 size={14} className="animate-spin" />
+                  ) : (
+                    <BellOff size={14} />
+                  )}
+                  {muteTankId && smsMuteStatus.devices.find((d) => d.device_id === muteTankId)?.muted
+                    ? `Unmute tank`
+                    : `Mute tank for ${muteHours || 1}h`}
+                </button>
+                <div className="flex flex-wrap items-center gap-1.5">
+                  {smsMuteStatus.devices
+                    .filter((d) => d.muted)
+                    .map((d) => (
+                      <span key={d.device_id} className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-bold bg-red-50 text-red-700 border border-red-200">
+                        <BellOff size={10} />
+                        {d.tank_name || d.device_id} until {d.muteExpires ? formatFarmDate(d.muteExpires) : "—"}
+                      </span>
+                    ))}
+                </div>
+              </div>
+            )}
 
             <form onSubmit={handleAddRecipient} noValidate className="bg-amber-50/60 border border-amber-100 rounded-xl p-4 space-y-3">
               <div className="flex flex-col sm:flex-row gap-3">

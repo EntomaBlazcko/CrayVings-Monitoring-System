@@ -17,6 +17,7 @@ import {
   LogsContext,
   ActivityLogsContext,
 } from "./SensorContext";
+import type { LogsDeviceMode } from "./SensorContext";
 import type {
   SensorEntry,
   ChartPoint,
@@ -25,16 +26,24 @@ import type {
   ActivityLog,
   ActivityActionType,
   DeviceEntry,
+  DeviceLiveReading,
+  DeviceThresholdOverrides,
+  SensorThreshold,
 } from "../types";
+import { mergeThresholds, getSettingsThresholds } from "../types";
 import {
   fetchLatestSensor,
   fetchSensorHistory,
   fetchLogs,
   fetchSettings,
+  fetchEffectiveThresholds,
   fetchActivityLogs,
   fetchDevices,
+  fetchDevicesLatest,
   logActivity as apiLogActivity,
   saveSettings as apiSaveSettings,
+  saveDeviceThresholds as apiSaveDeviceThresholds,
+  clearDeviceThresholds as apiClearDeviceThresholds,
 } from "../api/client";
 
 const HISTORY_POLL_INTERVAL = 30000;
@@ -45,6 +54,30 @@ const LOGS_PAGE_SIZE = 10;
 const HEARTBEAT_STALE_MS = 30000; // no heartbeat for 30s -> offline
 const MAX_CONSECUTIVE_FAILURES = 5;
 const SSE_MAX_RECONNECT_ATTEMPTS = 10;
+
+// Selected-tank persistence: survives reloads and re-logins; validated against
+// the live fleet on mount (an unknown id falls back to the first tank).
+const SELECTED_TANK_STORAGE_KEY = "crayvings_selected_tank";
+
+function readStoredSelectedTank(): string | null {
+  try {
+    return localStorage.getItem(SELECTED_TANK_STORAGE_KEY);
+  } catch {
+    return null;
+  }
+}
+
+function writeStoredSelectedTank(deviceId: string | null) {
+  try {
+    if (deviceId) {
+      localStorage.setItem(SELECTED_TANK_STORAGE_KEY, deviceId);
+    } else {
+      localStorage.removeItem(SELECTED_TANK_STORAGE_KEY);
+    }
+  } catch {
+    // Storage unavailable (private mode) — selection stays session-only.
+  }
+}
 
 // 401s are re-thrown so the axios response interceptor can clear the session
 // and route back to the login screen.
@@ -76,6 +109,7 @@ interface SensorDataState {
   historyLastUpdated: Date | null;
   devices: DeviceEntry[];
   devicesLoading: boolean;
+  latestByTank: Record<string, DeviceLiveReading>;
 }
 
 interface SensorSettingsState {
@@ -96,6 +130,7 @@ interface LogsState {
   logsCounts: Record<string, number>;
   logsActionFilter: string;
   logsParameterFilter: string;
+  logsDeviceMode: LogsDeviceMode;
 }
 
 function useSensorDataPolling(
@@ -114,6 +149,7 @@ function useSensorDataPolling(
     historyLastUpdated: null,
     devices: [],
     devicesLoading: true,
+    latestByTank: {},
   });
 
   const historyAbortRef = useRef<AbortController | null>(null);
@@ -148,9 +184,19 @@ function useSensorDataPolling(
     devicesAbortRef.current = new AbortController();
 
     try {
-      const devices = await fetchDevices(false, devicesAbortRef.current.signal);
+      // One tick fetches both the fleet registry and the freshest reading per
+      // tank — a single 5s poll now feeds the tank cards AND the fleet-wide
+      // threshold-alert watcher (useThresholdAlert).
+      const [devices, latest] = await Promise.all([
+        fetchDevices(false, devicesAbortRef.current.signal),
+        fetchDevicesLatest(devicesAbortRef.current.signal),
+      ]);
       if (reqId !== devicesReqIdRef.current) return;
-      setState((prev) => ({ ...prev, devices, devicesLoading: false }));
+      const latestByTank: Record<string, DeviceLiveReading> = {};
+      for (const row of latest) {
+        latestByTank[row.device_id] = row;
+      }
+      setState((prev) => ({ ...prev, devices, latestByTank, devicesLoading: false }));
       onDevicesLoaded(devices);
     } catch (error) {
       if (isAxiosError(error) && error.code === "ERR_CANCELED") return;
@@ -226,6 +272,12 @@ function useSensorDataPolling(
           try {
             const message = JSON.parse(event.data);
             if (message.type === "sensor_update" && message.data) {
+              // Defense in depth: the server already filters the stream per
+              // ?device_id, but never let another tank's reading overwrite
+              // the selected tank's live tiles.
+              if (selectedDeviceId && message.data.device_id && message.data.device_id !== selectedDeviceId) {
+                return;
+              }
               applyLatestReading(message.data);
               consecutiveFailuresRef.current = 0;
             }
@@ -355,11 +407,31 @@ function useSensorDataPolling(
   );
 }
 
-// Threshold settings: fetch on mount, save with optimistic local update and a
-// 2s "saved" confirmation.
-function useSettingsManager(): SensorSettingsState & { refetch: () => void; save: (s: Partial<SensorSettings>) => Promise<void> } {
+// Threshold settings: global (farm default) row + per-tank overrides layered
+// on top. Fetch on mount, save with optimistic local update and a 2s "saved"
+// confirmation. thresholdsFor returns identity-stable maps so consumers can
+// diff them to detect edits (vs. a sensor crossing).
+interface SensorSettingsState {
+  settings: SensorSettings | null;
+  deviceOverrides: DeviceThresholdOverrides;
+  settingsLoading: boolean;
+  settingsError: string | null;
+  saveError: string | null;
+  settingsSaved: boolean;
+  settingsSaving: boolean;
+}
+
+function useSettingsManager(): SensorSettingsState & {
+  refetch: () => void;
+  save: (s: Partial<SensorSettings>) => Promise<void>;
+  saveDeviceThresholds: (deviceId: string, override: Partial<SensorSettings>) => Promise<void>;
+  clearDeviceThresholds: (deviceId: string) => Promise<void>;
+  settingsFor: (deviceId?: string | null) => SensorSettings | null;
+  thresholdsFor: (deviceId?: string | null) => Record<string, SensorThreshold>;
+} {
   const [state, setState] = useState<SensorSettingsState>({
     settings: null,
+    deviceOverrides: {},
     settingsLoading: true,
     settingsError: null,
     saveError: null,
@@ -370,6 +442,15 @@ function useSettingsManager(): SensorSettingsState & { refetch: () => void; save
   const abortControllerRef = useRef<AbortController | null>(null);
   const savedTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
+  const flashSaved = useCallback(() => {
+    if (savedTimeoutRef.current) {
+      clearTimeout(savedTimeoutRef.current);
+    }
+    savedTimeoutRef.current = setTimeout(() => {
+      setState((prev) => ({ ...prev, settingsSaved: false }));
+    }, 2000);
+  }, []);
+
   const fetchData = useCallback(async () => {
     if (abortControllerRef.current) {
       abortControllerRef.current.abort();
@@ -377,10 +458,16 @@ function useSettingsManager(): SensorSettingsState & { refetch: () => void; save
     abortControllerRef.current = new AbortController();
 
     try {
-      const settings = await fetchSettings(abortControllerRef.current.signal);
+      // The overrides map is best-effort: an older backend without
+      // /settings/effective just means "every tank inherits global".
+      const [settings, effective] = await Promise.all([
+        fetchSettings(abortControllerRef.current.signal),
+        fetchEffectiveThresholds(abortControllerRef.current.signal).catch(() => null),
+      ]);
       setState((prev) => ({
         ...prev,
         settings,
+        deviceOverrides: effective?.devices ?? {},
         settingsLoading: false,
         settingsError: null,
       }));
@@ -422,13 +509,7 @@ function useSettingsManager(): SensorSettingsState & { refetch: () => void; save
         settingsSaved: true,
         settings: prev.settings ? { ...prev.settings, ...newSettings } : null,
       }));
-
-      if (savedTimeoutRef.current) {
-        clearTimeout(savedTimeoutRef.current);
-      }
-      savedTimeoutRef.current = setTimeout(() => {
-        setState((prev) => ({ ...prev, settingsSaved: false }));
-      }, 2000);
+      flashSaved();
     } catch (error) {
       if (isSessionExpired(error)) return Promise.reject(error);
       setState((prev) => ({
@@ -437,25 +518,107 @@ function useSettingsManager(): SensorSettingsState & { refetch: () => void; save
         saveError: "Failed to save settings",
       }));
     }
-  }, []);
+  }, [flashSaved]);
+
+  const saveDeviceThresholds = useCallback(async (deviceId: string, override: Partial<SensorSettings>) => {
+    setState((prev) => ({ ...prev, settingsSaving: true, saveError: null }));
+    try {
+      await apiSaveDeviceThresholds(deviceId, override);
+      const effective = await fetchEffectiveThresholds().catch(() => null);
+      setState((prev) => ({
+        ...prev,
+        settingsSaving: false,
+        settingsSaved: true,
+        deviceOverrides: effective?.devices ?? prev.deviceOverrides,
+      }));
+      flashSaved();
+    } catch (error) {
+      if (isSessionExpired(error)) return Promise.reject(error);
+      setState((prev) => ({
+        ...prev,
+        settingsSaving: false,
+        saveError: "Failed to save tank thresholds",
+      }));
+    }
+  }, [flashSaved]);
+
+  const clearDeviceThresholds = useCallback(async (deviceId: string) => {
+    setState((prev) => ({ ...prev, settingsSaving: true, saveError: null }));
+    try {
+      await apiClearDeviceThresholds(deviceId);
+      setState((prev) => {
+        const next = { ...prev.deviceOverrides };
+        delete next[deviceId];
+        return { ...prev, settingsSaving: false, settingsSaved: true, deviceOverrides: next };
+      });
+      flashSaved();
+    } catch (error) {
+      if (isSessionExpired(error)) return Promise.reject(error);
+      setState((prev) => ({
+        ...prev,
+        settingsSaving: false,
+        saveError: "Failed to clear tank thresholds",
+      }));
+    }
+  }, [flashSaved]);
 
   const refetch = useCallback(() => {
     setState((prev) => ({ ...prev, settingsLoading: true, settingsError: null, saveError: null }));
     fetchData();
   }, [fetchData]);
 
+  // Merged effective row for one tank (global row + that tank's override).
+  const settingsFor = useCallback(
+    (deviceId?: string | null): SensorSettings | null =>
+      deviceId ? mergeThresholds(state.settings, state.deviceOverrides[deviceId]) : state.settings,
+    [state.settings, state.deviceOverrides]
+  );
+
+  // Identity-stable threshold maps: a given (settings, overrides) pair always
+  // returns the same object, so useThresholdAlert can detect real edits.
+  const globalThresholds = useMemo(
+    () => getSettingsThresholds(state.settings),
+    [state.settings]
+  );
+  const thresholdsByDevice = useMemo(() => {
+    const map = new Map<string, Record<string, SensorThreshold>>();
+    for (const [id, override] of Object.entries(state.deviceOverrides)) {
+      map.set(id, getSettingsThresholds(mergeThresholds(state.settings, override)));
+    }
+    return map;
+  }, [state.settings, state.deviceOverrides]);
+
+  const thresholdsFor = useCallback(
+    (deviceId?: string | null): Record<string, SensorThreshold> =>
+      (deviceId ? thresholdsByDevice.get(deviceId) : undefined) ?? globalThresholds,
+    [thresholdsByDevice, globalThresholds]
+  );
+
   return useMemo(
     () => ({
       ...state,
       refetch,
       save,
+      saveDeviceThresholds,
+      clearDeviceThresholds,
+      settingsFor,
+      thresholdsFor,
     }),
-    [state, refetch, save]
+    [state, refetch, save, saveDeviceThresholds, clearDeviceThresholds, settingsFor, thresholdsFor]
   );
 }
 
-// Paginated system logs, auto-polled every 5s.
-function useLogsManager(): LogsState & { refetch: () => void; setPage: (page: number) => void; setLogsActionFilter: (filter: string) => void; setLogsParameterFilter: (filter: string) => void } {
+// Paginated system logs, auto-polled every 5s. The device filter has three
+// modes: "follow" (the globally selected tank — the default, so switching
+// tanks in the header instantly re-scopes the Alerts/Logs pages), "all"
+// (every tank incl. farm-wide rows), or a specific device id.
+function useLogsManager(selectedDeviceId: string | null): LogsState & {
+  refetch: () => void;
+  setPage: (page: number) => void;
+  setLogsActionFilter: (filter: string) => void;
+  setLogsParameterFilter: (filter: string) => void;
+  setLogsDeviceMode: (mode: LogsDeviceMode) => void;
+} {
   const [state, setState] = useState<LogsState>({
     logs: [],
     logsLoading: true,
@@ -465,11 +628,20 @@ function useLogsManager(): LogsState & { refetch: () => void; setPage: (page: nu
     logsCounts: {},
     logsActionFilter: "",
     logsParameterFilter: "",
+    logsDeviceMode: "follow",
   });
 
   const abortControllerRef = useRef<AbortController | null>(null);
 
-  const fetchData = useCallback(async (page = 1, actionFilter = "", parameterFilter = "") => {
+  // "follow" resolves to the selected tank at fetch time.
+  const resolvedDeviceId =
+    state.logsDeviceMode === "follow"
+      ? selectedDeviceId
+      : state.logsDeviceMode === "all"
+        ? null
+        : state.logsDeviceMode;
+
+  const fetchData = useCallback(async (page = 1, actionFilter = "", parameterFilter = "", deviceId?: string | null) => {
     if (abortControllerRef.current) {
       abortControllerRef.current.abort();
     }
@@ -483,6 +655,7 @@ function useLogsManager(): LogsState & { refetch: () => void; setPage: (page: nu
         {
           action: actionFilter || undefined,
           parameter: parameterFilter || undefined,
+          device_id: deviceId || undefined,
         }
       );
       setState((prev) => ({
@@ -506,10 +679,10 @@ function useLogsManager(): LogsState & { refetch: () => void; setPage: (page: nu
   }, []);
 
   useEffect(() => {
-    fetchData(state.logsPage, state.logsActionFilter, state.logsParameterFilter);
+    fetchData(state.logsPage, state.logsActionFilter, state.logsParameterFilter, resolvedDeviceId);
     const interval = setInterval(
       () => {
-        if (!document.hidden) fetchData(state.logsPage, state.logsActionFilter, state.logsParameterFilter);
+        if (!document.hidden) fetchData(state.logsPage, state.logsActionFilter, state.logsParameterFilter, resolvedDeviceId);
       },
       LOGS_POLL_INTERVAL
     );
@@ -520,12 +693,12 @@ function useLogsManager(): LogsState & { refetch: () => void; setPage: (page: nu
         abortControllerRef.current.abort();
       }
     };
-  }, [fetchData, state.logsPage, state.logsActionFilter, state.logsParameterFilter]);
+  }, [fetchData, state.logsPage, state.logsActionFilter, state.logsParameterFilter, resolvedDeviceId]);
 
   const refetch = useCallback(() => {
     setState((prev) => ({ ...prev, logsLoading: true, logsError: null }));
-    fetchData(state.logsPage, state.logsActionFilter, state.logsParameterFilter);
-  }, [fetchData, state.logsPage, state.logsActionFilter, state.logsParameterFilter]);
+    fetchData(state.logsPage, state.logsActionFilter, state.logsParameterFilter, resolvedDeviceId);
+  }, [fetchData, state.logsPage, state.logsActionFilter, state.logsParameterFilter, resolvedDeviceId]);
 
   const setPage = useCallback((page: number) => {
     setState((prev) => ({ ...prev, logsPage: page }));
@@ -537,8 +710,8 @@ function useLogsManager(): LogsState & { refetch: () => void; setPage: (page: nu
       logsActionFilter: filter,
       logsPage: 1,
     }));
-    fetchData(1, filter, state.logsParameterFilter);
-  }, [fetchData, state.logsParameterFilter]);
+    fetchData(1, filter, state.logsParameterFilter, resolvedDeviceId);
+  }, [fetchData, state.logsParameterFilter, resolvedDeviceId]);
 
   const setLogsParameterFilter = useCallback((filter: string) => {
     setState((prev) => ({
@@ -546,8 +719,18 @@ function useLogsManager(): LogsState & { refetch: () => void; setPage: (page: nu
       logsParameterFilter: filter,
       logsPage: 1,
     }));
-    fetchData(1, state.logsActionFilter, filter);
-  }, [fetchData, state.logsActionFilter]);
+    fetchData(1, state.logsActionFilter, filter, resolvedDeviceId);
+  }, [fetchData, state.logsActionFilter, resolvedDeviceId]);
+
+  const setLogsDeviceMode = useCallback((mode: LogsDeviceMode) => {
+    setState((prev) => ({
+      ...prev,
+      logsDeviceMode: mode,
+      logsPage: 1,
+    }));
+    const deviceId = mode === "follow" ? selectedDeviceId : mode === "all" ? null : mode;
+    fetchData(1, state.logsActionFilter, state.logsParameterFilter, deviceId);
+  }, [fetchData, state.logsActionFilter, state.logsParameterFilter, selectedDeviceId]);
 
   return useMemo(
     () => ({
@@ -556,8 +739,9 @@ function useLogsManager(): LogsState & { refetch: () => void; setPage: (page: nu
       setPage,
       setLogsActionFilter,
       setLogsParameterFilter,
+      setLogsDeviceMode,
     }),
-    [state, refetch, setPage, setLogsActionFilter, setLogsParameterFilter]
+    [state, refetch, setPage, setLogsActionFilter, setLogsParameterFilter, setLogsDeviceMode]
   );
 }
 
@@ -697,25 +881,36 @@ function useActivityLogsManager() {
 }
 
 export function SensorProvider({ children }: { children: ReactNode }) {
-  // The selected tank lives here so it persists across pages. It defaults to
-  // the first registered device, set from the fleet poll callback (not an
-  // effect — that would cause cascading renders).
-  const [selectedDeviceId, setSelectedDeviceId] = useState<string | null>(null);
+  // The selected tank lives here so it persists across pages AND across
+  // reloads/re-logins (localStorage). It defaults to the first registered
+  // device, set from the fleet poll callback (not an effect — that would
+  // cause cascading renders). An unknown stored id (tank removed/hidden)
+  // falls back to the first visible tank via the same keep-if-in-fleet logic.
+  const [selectedDeviceId, setSelectedDeviceIdState] = useState<string | null>(readStoredSelectedTank);
+
+  const setSelectedDeviceId = useCallback((deviceId: string | null) => {
+    setSelectedDeviceIdState(deviceId);
+    writeStoredSelectedTank(deviceId);
+  }, []);
 
   const handleDevicesLoaded = useCallback((devices: DeviceEntry[]) => {
-    setSelectedDeviceId((current) => {
-      if (!devices || devices.length === 0) return null;
+    setSelectedDeviceIdState((current) => {
+      if (!devices || devices.length === 0) {
+        if (current !== null) writeStoredSelectedTank(null);
+        return null;
+      }
       // Keep the current pick only if it is still in the visible fleet (e.g.
       // it wasn't just hidden); otherwise fall back to the first tank.
       if (current !== null && devices.some((d) => d.device_id === current)) return current;
       const first = [...devices].sort((a, b) => a.device_id.localeCompare(b.device_id))[0];
+      writeStoredSelectedTank(first.device_id);
       return first.device_id;
     });
   }, []);
 
   const sensorData = useSensorDataPolling(selectedDeviceId, handleDevicesLoaded);
   const settingsState = useSettingsManager();
-  const logsState = useLogsManager();
+  const logsState = useLogsManager(selectedDeviceId);
   const activityLogsState = useActivityLogsManager();
 
   const dataContextValue = useMemo(
@@ -731,21 +926,27 @@ export function SensorProvider({ children }: { children: ReactNode }) {
       historyLastUpdated: sensorData.historyLastUpdated,
       devices: sensorData.devices,
       devicesLoading: sensorData.devicesLoading,
+      latestByTank: sensorData.latestByTank,
       selectedDeviceId,
       setSelectedDeviceId,
       refetch: sensorData.refetch,
     }),
-    [sensorData, selectedDeviceId]
+    [sensorData, selectedDeviceId, setSelectedDeviceId]
   );
 
   const settingsContextValue = useMemo(
     () => ({
       settings: settingsState.settings,
+      deviceOverrides: settingsState.deviceOverrides,
+      settingsFor: settingsState.settingsFor,
+      thresholdsFor: settingsState.thresholdsFor,
       settingsLoading: settingsState.settingsLoading,
       settingsError: settingsState.settingsError,
       saveError: settingsState.saveError,
       refetchSettings: settingsState.refetch,
       saveSettings: settingsState.save,
+      saveDeviceThresholds: settingsState.saveDeviceThresholds,
+      clearDeviceThresholds: settingsState.clearDeviceThresholds,
       settingsSaved: settingsState.settingsSaved,
       settingsSaving: settingsState.settingsSaving,
     }),
@@ -766,6 +967,8 @@ export function SensorProvider({ children }: { children: ReactNode }) {
       setLogsActionFilter: logsState.setLogsActionFilter,
       logsParameterFilter: logsState.logsParameterFilter,
       setLogsParameterFilter: logsState.setLogsParameterFilter,
+      logsDeviceMode: logsState.logsDeviceMode,
+      setLogsDeviceMode: logsState.setLogsDeviceMode,
     }),
     [logsState]
   );

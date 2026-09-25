@@ -16,7 +16,7 @@ import {
 import { useSensors } from "../hooks/useSensors";
 import { useAuth } from "../contexts/useAuth";
 import { Spinner, LoadingCard, ErrorCard } from "../components/Loading";
-import { SENSOR_KEY_TO_DISPLAY } from "../types";
+import { SENSOR_KEY_TO_DISPLAY, tankOptionLabel } from "../types";
 import { formatFarmDateTime, formatFarmDate, formatFarmTime, formatTimeAgo } from "../utils/time";
 import { titleCase } from "../utils/text";
 
@@ -38,11 +38,21 @@ const ACTION_META: Record<string, { color: string; icon: typeof AlertTriangle }>
 const PARAMETERS = ["all", "Temperature", "Water Level", "Ammonia"] as const;
 
 export default function LogsPage() {
-  const { logs, logsLoading, logsError, refetchLogs, logsPage, logsTotal, setLogsPage, logsParameterFilter, setLogsParameterFilter, logsCounts, connectionStatus, lastUpdate } = useSensors();
+  const { logs, logsLoading, logsError, refetchLogs, logsPage, logsTotal, setLogsPage, logsParameterFilter, setLogsParameterFilter, logsCounts, connectionStatus, lastUpdate, devices, logsDeviceMode, setLogsDeviceMode, selectedDeviceId } = useSensors();
   const { user } = useAuth();
   const isAdmin = user?.role === "admin";
   const [isChangingPage, setIsChangingPage] = useState(false);
   const [exporting, setExporting] = useState(false);
+
+  // Tank label for a device_id: tankOptionLabel keeps duplicate names
+  // distinguishable; null device_id rows render as "Farm-wide".
+  const tankLabelFor = useCallback((deviceId?: string | null) => {
+    if (!deviceId) return null;
+    const device = devices.find((d) => d.device_id === deviceId);
+    return device ? tankOptionLabel(device) : deviceId;
+  }, [devices]);
+
+  const selectedDevice = devices.find((d) => d.device_id === selectedDeviceId) ?? null;
 
   const getDisplayParameter = (param: string): string => {
     return SENSOR_KEY_TO_DISPLAY[param] ?? param;
@@ -153,6 +163,7 @@ export default function LogsPage() {
       })
       .map((log) => [
         log.timestamp ? formatFarmDateTime(log.timestamp) : "-",
+        tankLabelFor(log.device_id) ?? "Farm-wide",
         getDisplayParameter(log.parameter),
         String(log.old_value),
         String(log.new_value),
@@ -161,7 +172,7 @@ export default function LogsPage() {
 
     autoTable(doc, {
       startY: tableStartY,
-      head: [["Timestamp", "Parameter", "Old Value", "New Value", "Action"]],
+      head: [["Timestamp", "Tank", "Parameter", "Old Value", "New Value", "Action"]],
       body: tableData,
       styles: {
         fontSize: 8,
@@ -178,11 +189,12 @@ export default function LogsPage() {
         fillColor: [248, 250, 252],
       },
       columnStyles: {
-        0: { cellWidth: 45 },
-        1: { cellWidth: 35 },
-        2: { cellWidth: 30, halign: "center" },
-        3: { cellWidth: 30, halign: "center" },
-        4: { cellWidth: 35, halign: "center" },
+        0: { cellWidth: 40 },
+        1: { cellWidth: 30 },
+        2: { cellWidth: 30 },
+        3: { cellWidth: 28, halign: "center" },
+        4: { cellWidth: 28, halign: "center" },
+        5: { cellWidth: 28, halign: "center" },
       },
       margin: { left: 14, right: 14 },
     });
@@ -218,7 +230,7 @@ export default function LogsPage() {
 
     doc.save(`CRAYvings_System_Logs_${new Date().toISOString().split("T")[0]}.pdf`);
     setExporting(false);
-  }, [logs, isAdmin]);
+  }, [logs, isAdmin, tankLabelFor]);
 
   if (logsLoading) {
     return <LoadingCard title="Sensor Logs" message="Loading logs..." />;
@@ -364,7 +376,23 @@ export default function LogsPage() {
         <>
           <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
             <div className="flex flex-wrap items-center justify-between gap-3 p-4 border-b border-gray-100">
-              {filterChips}
+              <div className="flex flex-wrap items-center gap-3">
+                {filterChips}
+                <select
+                  value={logsDeviceMode}
+                  onChange={(e) => setLogsDeviceMode(e.target.value)}
+                  aria-label="Filter by tank"
+                  className="px-3 py-1.5 rounded-lg text-xs font-semibold bg-white border border-gray-200 text-gray-700 hover:bg-gray-50 outline-none cursor-pointer"
+                >
+                  <option value="follow">Selected tank ({selectedDevice ? tankOptionLabel(selectedDevice) : "—"})</option>
+                  <option value="all">All tanks</option>
+                  {devices.map((device) => (
+                    <option key={device.device_id} value={device.device_id}>
+                      {tankOptionLabel(device)}
+                    </option>
+                  ))}
+                </select>
+              </div>
               <button
                 onClick={refetchLogs}
                 className="flex items-center gap-2 px-3 py-1.5 border border-gray-200 rounded-lg text-sm text-gray-600 hover:bg-gray-50"
@@ -381,6 +409,9 @@ export default function LogsPage() {
                     <th className="px-4 py-3 text-left text-xs font-bold text-gray-500 uppercase">
                       <Clock size={14} className="inline mr-1" />
                       Timestamp
+                    </th>
+                    <th className="px-4 py-3 text-left text-xs font-bold text-gray-500 uppercase">
+                      Tank
                     </th>
                     <th className="px-4 py-3 text-left text-xs font-bold text-gray-500 uppercase">
                       Parameter
@@ -410,6 +441,17 @@ export default function LogsPage() {
                           <p className="text-[10px] text-gray-400">
                             {log.timestamp ? formatTimeAgo(log.timestamp) : ""}
                           </p>
+                        </td>
+                        <td className="px-4 py-3">
+                          <span
+                            className={`inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-bold ${
+                              log.device_id
+                                ? "bg-slate-100 text-slate-600 border border-slate-200"
+                                : "bg-gray-50 text-gray-400 border border-gray-200"
+                            }`}
+                          >
+                            {tankLabelFor(log.device_id) ?? "Farm-wide"}
+                          </span>
                         </td>
                         <td className="px-4 py-3">
                           <span className="inline-flex items-center gap-2">

@@ -3,11 +3,14 @@
 // Sensor data types
 
 // Raw data from the ESP32 and transformed data for charts.
+// temperature/water_level/ammonia are null when that sensor's last reading
+// was a failed-sensor sentinel (stored as NULL server-side) — render "--"
+// and never treat null as 0.
 export type SensorEntry = {
   device_id: string;
-  temperature: number;
-  water_level: number;
-  ammonia: number;
+  temperature: number | null;
+  water_level: number | null;
+  ammonia: number | null;
   timestamp?: string;
   recv_at?: string;
 };
@@ -49,6 +52,10 @@ export type LogEntry = {
   parameter: string;
   old_value: string | number;
   new_value: string | number;
+  // Tank this entry belongs to (threshold alerts, resolves, disconnects,
+  // per-tank settings changes). NULL = farm-wide/global row (also covers all
+  // history that predates per-tank attribution).
+  device_id?: string | null;
   timestamp?: string;
   ack_status?: string | null;
   acknowledged_at?: string | null;
@@ -78,6 +85,36 @@ export const DEFAULT_SETTINGS: SensorSettings = {
   ammonia_min: 0.25,
   ammonia_max: 1.0,
 };
+
+// Per-tank threshold overrides (device_threshold_overrides, migration 012).
+// A tank absent from the map inherits the global row entirely; a present tank
+// overrides only the fields it defines. Layering: { ...global, ...override }.
+export type DeviceThresholdOverrides = Record<string, Partial<SensorSettings>>;
+
+// GET /settings/effective — global row + per-tank overrides in one call.
+export type EffectiveThresholdsResponse = {
+  global: SensorSettings;
+  devices: DeviceThresholdOverrides;
+};
+
+// GET /settings/device/:id — effective thresholds + which fields are custom.
+export type DeviceThresholdDetail = {
+  device_id: string;
+  tank_name: string | null;
+  tank_location: string | null;
+  global: SensorSettings;
+  effective: SensorSettings;
+  overridden: Record<string, boolean>;
+  override: Partial<SensorSettings> | null;
+};
+
+// Merges a per-tank override onto the global row; null override = global.
+export function mergeThresholds(
+  base: SensorSettings | null,
+  override?: Partial<SensorSettings> | null
+): SensorSettings {
+  return { ...(base ?? DEFAULT_SETTINGS), ...(override ?? {}) };
+}
 
 // Threshold configuration types
 
@@ -140,6 +177,17 @@ export type DeviceEntry = {
   online: boolean;
 };
 
+// Label for tank pickers (dropdowns, filter selects): friendly name first,
+// with the raw device id appended when it differs — two tanks can share a
+// display name (e.g. a renamed board), and the id is the only way to tell
+// them apart in a list.
+export function tankOptionLabel(
+  device: Pick<DeviceEntry, "device_id" | "name" | "tank_name">
+): string {
+  const label = device.tank_name || device.name || device.device_id;
+  return label !== device.device_id ? `${label} (${device.device_id})` : label;
+}
+
 export type DeviceStatus = {
   device_id: string;
   ip: string;
@@ -167,14 +215,17 @@ export type DeviceLiveReading = {
 export type ThresholdStatus = "good" | "warning" | "critical";
 
 // Evaluates a value against its range; 15% deviation beyond the range = critical.
-// IMPORTANT: must stay in sync with server.cjs getThresholdStatus() â€” changes
+// IMPORTANT: must stay in sync with server.cjs getThresholdStatus() — changes
 // affect Alerts page severity and the threshold cross-check test
-// (src/types/threshold.test.cjs).
+// (src/types/threshold.test.cjs). A null (failed sensor, no reading) can't
+// breach a threshold — mirroring the server's sentinel skip — because
+// Number(null) === 0 would otherwise raise a false "critically low" alert.
 export function getThresholdStatus(
-  value: number,
+  value: number | null,
   range: ThresholdRange,
   isMinOnly: boolean
 ): ThresholdStatus {
+  if (value === null || value === undefined) return "good";
   const min = Number(range.min);
   const max = Number(range.max);
   const val = Number(value);
