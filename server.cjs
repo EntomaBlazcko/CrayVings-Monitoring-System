@@ -985,6 +985,14 @@ const ALERT_COOLDOWN_MS = 120000;
     // Session token expiry (24-hour expiration)
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS token_expires_at TIMESTAMPTZ`);
 
+    // Per-device secret for ESP32 auth (migration 008). Migration 010 back-filled
+    // schema_migrations with 001-010 without running them, so this column was
+    // recorded as applied but never actually created - which made the per-device
+    // branch of POST /sensor silently unreachable. Recreated here so the server
+    // self-heals on boot like the 011/012 mirrors below.
+    await pool.query(`ALTER TABLE devices ADD COLUMN IF NOT EXISTS device_secret VARCHAR(255)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_devices_device_secret ON devices(device_secret) WHERE device_secret IS NOT NULL`);
+
     // Alert acknowledgement (Confirm / Allow) tracked directly on each alert row
     await pool.query(`ALTER TABLE system_logs ADD COLUMN IF NOT EXISTS ack_status VARCHAR(20)`);
     await pool.query(`ALTER TABLE system_logs ADD COLUMN IF NOT EXISTS acknowledged_at TIMESTAMP`);
