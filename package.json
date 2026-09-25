@@ -10,6 +10,8 @@
     "preview": "vite preview",
     "server": "node server.cjs",
     "start": "node server.cjs",
+    "test": "node src/types/threshold.test.cjs",
+    "test:regression": "node tests/regression.cjs",
     "seed:admin": "node seed-admin.cjs"
   },
   "dependencies": {
