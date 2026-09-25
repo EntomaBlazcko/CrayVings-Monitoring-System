@@ -13,9 +13,17 @@ dist-ssr
 *.local
 
 # Environment variables
+# Every .env* variant except the committed template is ignored, so real
+# credentials can never be staged again (e.g. .env.new, .env.production).
 .env
-.env.local
-.env.*.local
+.env.*
+!.env.example
+
+# Scratch session notes. These are working documents, not deliverables, and
+# have previously captured live credentials in plaintext.
+FOR_LATER.txt
+SESSION_NOTES.txt
+*_NOTES.txt
 
 # Editor directories and files
 .vscode/*
