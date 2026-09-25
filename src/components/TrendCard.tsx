@@ -15,8 +15,10 @@ import {
   Tooltip,
   ResponsiveContainer,
 } from "recharts";
+import { Activity } from "lucide-react";
 import { useMemo } from "react";
 import type { ChartPoint, ThresholdRange } from "../types";
+import { CHART_COLORS, BAND_COLORS } from "../utils/tokens";
 
 type Props = {
   title: string;
@@ -61,7 +63,7 @@ function CustomTooltip(props: {
         <p key={i} className="flex items-center gap-1.5 font-semibold text-gray-800">
           <span
             className="inline-block w-2 h-2 rounded-full shrink-0"
-            style={{ background: typeof p.color === "string" ? p.color : "#64748b" }}
+            style={{ background: typeof p.color === "string" ? p.color : CHART_COLORS.dotFallback }}
           />
           <span className="font-normal text-gray-500">
             {p.name != null ? p.name : "Value"}
@@ -103,6 +105,7 @@ export default function TrendCard({
 }: Props) {
   const isLargeDataset = data.length > 50;
   const domain = computeDomain(data, dataKey, range);
+  const isEmpty = data.length === 0;
 
   const chartData = useMemo(
     () =>
@@ -116,24 +119,35 @@ export default function TrendCard({
     <div className="bg-white rounded-xl border border-gray-100 p-4 shadow-sm hover:shadow-md transition">
       <div className="flex items-center justify-between mb-3">
         <h3 className="text-sm font-bold text-gray-700">{title}</h3>
-        <span className="text-xs text-gray-400">{data.length} points</span>
+        <span className="text-xs text-gray-400">{isEmpty ? "no data" : `${data.length} points`}</span>
       </div>
 
+      {/* An empty chart used to render bare axes with "0 points", which reads as
+          "the sensor is fine" rather than "we have nothing to show yet". */}
+      {isEmpty ? (
+        <div className="h-[180px] flex flex-col items-center justify-center gap-1.5 text-center">
+          <Activity size={22} className="text-gray-300" />
+          <p className="text-xs font-semibold text-gray-500">Waiting for readings</p>
+          <p className="text-micro text-gray-400">
+            The chart appears once this sensor reports
+          </p>
+        </div>
+      ) : (
       <ResponsiveContainer width="100%" height={180}>
         <ComposedChart data={chartData}>
-          <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
+          <CartesianGrid strokeDasharray="3 3" stroke={CHART_COLORS.grid} />
           <XAxis
             dataKey="name"
-            tick={{ fontSize: 10, fill: "#9ca3af" }}
+            tick={{ fontSize: 10, fill: CHART_COLORS.tick }}
             interval={isLargeDataset ? Math.floor(data.length / 6) : 0}
             tickLine={false}
-            axisLine={{ stroke: "#e5e7eb" }}
+            axisLine={{ stroke: CHART_COLORS.axis }}
           />
           <YAxis
             domain={domain}
-            tick={{ fontSize: 10, fill: "#9ca3af" }}
+            tick={{ fontSize: 10, fill: CHART_COLORS.tick }}
             tickLine={false}
-            axisLine={{ stroke: "#e5e7eb" }}
+            axisLine={{ stroke: CHART_COLORS.axis }}
             width={40}
           />
           <Tooltip content={<CustomTooltip unit={unit} />} />
@@ -144,14 +158,14 @@ export default function TrendCard({
                 dataKey={BAND_MAX_KEY}
                 baseValue={range.min}
                 stroke="none"
-                fill="#10b981"
+                fill={BAND_COLORS.safe}
                 fillOpacity={0.08}
                 isAnimationActive={false}
                 activeDot={false}
               />
               <Line
                 dataKey={BAND_MIN_KEY}
-                stroke="#ef4444"
+                stroke={BAND_COLORS.breach}
                 strokeWidth={1}
                 strokeDasharray="3 3"
                 dot={false}
@@ -160,7 +174,7 @@ export default function TrendCard({
               />
               <Line
                 dataKey={BAND_MAX_KEY}
-                stroke="#ef4444"
+                stroke={BAND_COLORS.breach}
                 strokeWidth={1}
                 strokeDasharray="3 3"
                 dot={false}
@@ -186,7 +200,7 @@ export default function TrendCard({
               type="monotone"
               dataKey={overlayKey}
               name={overlayName ?? "Moving avg"}
-              stroke={overlayStroke ?? "#94a3b8"}
+              stroke={overlayStroke ?? CHART_COLORS.overlay}
               strokeWidth={1.5}
               strokeDasharray="4 4"
               dot={false}
@@ -196,6 +210,7 @@ export default function TrendCard({
           )}
         </ComposedChart>
       </ResponsiveContainer>
+      )}
     </div>
   );
 }

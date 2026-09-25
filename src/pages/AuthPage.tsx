@@ -66,9 +66,9 @@ export default function AuthPage() {
     <div className="min-h-screen bg-gradient-to-br from-orange-50 via-white to-orange-100 flex items-center justify-center p-4">
       <div className="w-full max-w-md">
         <div className="bg-white rounded-2xl shadow-xl overflow-hidden">
-            <div className="bg-gradient-to-r from-[#d94b1e] to-[#ef6a2e] p-6 text-center text-white">
+            <div className="bg-gradient-to-r from-brand-500 to-brand-400 p-6 text-center text-white">
             <div className="w-20 h-20 mx-auto rounded-full bg-white flex items-center justify-center overflow-hidden border-2 border-white/50 mb-3">
-              <img src={logo} alt="CrayVings Logo" className="w-full h-full object-contain" />
+              <img src={logo} alt="CRAYvings Logo" className="w-full h-full object-contain" />
             </div>
             <h1 className="text-2xl font-extrabold">CRAYvings Monitoring System</h1>
             <p className="text-sm opacity-90 mt-1">Smart aquaculture monitoring dashboard</p>
@@ -99,7 +99,7 @@ export default function AuthPage() {
                       if (loginErrors.username) setLoginErrors((prev) => ({ ...prev, username: "" }));
                       if (apiError) setApiError(null);
                     }}
-                    className={`w-full pl-10 pr-4 py-2.5 border rounded-lg focus:outline-none focus:ring-2 focus:ring-[#d94b1e]/20 focus:border-[#d94b1e] transition-colors ${
+                    className={`w-full pl-10 pr-4 py-2.5 border rounded-lg focus:outline-none focus:ring-2 focus:ring-brand-500/20 focus:border-brand-500 transition-colors ${
                       loginErrors.username ? "border-red-500 bg-red-50" : "border-gray-300"
                     }`}
                     placeholder="Enter your username"
@@ -128,7 +128,7 @@ export default function AuthPage() {
                       if (loginErrors.password) setLoginErrors((prev) => ({ ...prev, password: "" }));
                       if (apiError) setApiError(null);
                     }}
-                    className={`w-full pl-10 pr-10 py-2.5 border rounded-lg focus:outline-none focus:ring-2 focus:ring-[#d94b1e]/20 focus:border-[#d94b1e] transition-colors ${
+                    className={`w-full pl-10 pr-10 py-2.5 border rounded-lg focus:outline-none focus:ring-2 focus:ring-brand-500/20 focus:border-brand-500 transition-colors ${
                       loginErrors.password ? "border-red-500 bg-red-50" : "border-gray-300"
                     }`}
                     placeholder="Enter your password"
@@ -150,7 +150,7 @@ export default function AuthPage() {
               <button
                 type="submit"
                 disabled={isLoading}
-                className="w-full bg-gradient-to-r from-[#d94b1e] to-[#ef6a2e] text-white py-2.5 rounded-lg font-semibold hover:from-[#c2410c] hover:to-[#d94b1e] focus:outline-none focus:ring-2 focus:ring-[#d94b1e]/20 transition-all disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2"
+                className="w-full bg-gradient-to-r from-brand-500 to-brand-400 text-white py-2.5 rounded-lg font-semibold hover:from-brand-600 hover:to-brand-500 focus:outline-none focus:ring-2 focus:ring-brand-500/20 transition-all disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2"
               >
                 {isLoading ? (
                   <div className="w-5 h-5 border-2 border-white/30 border-t-white rounded-full animate-spin" />

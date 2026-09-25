@@ -950,7 +950,7 @@ async function buildStatusSms(deviceId = null) {
     } else if (anyReading) {
       lines.push("STATUS: All readings are within safe ranges.");
     }
-    lines.push("Crayvings Monitoring System");
+    lines.push("CRAYvings Monitoring System");
     return lines.join("\n");
   } catch (err) {
     console.error(`[${new Date().toISOString()}] Error building status SMS:`, err.message);
@@ -2959,7 +2959,7 @@ app.post("/settings/recipients/test/:id", requireAdmin, async (req, res) => {
       "CRAYVINGS AQUACULTURE MONITORING — TEST MESSAGE",
       `Date: ${formatSmsTime()}`,
       "",
-      "This is a test SMS from the Crayvings Monitoring System.",
+      "This is a test SMS from the CRAYvings Monitoring System.",
       `If you received this message, the contact ${recipient.name || recipient.phone_number} is configured correctly.`,
       "",
       "No action is required.",

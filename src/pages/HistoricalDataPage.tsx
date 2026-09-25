@@ -25,6 +25,21 @@ import { isAxiosError } from "axios";
 import { getSettingsThresholds, getThresholdStatus, type ThresholdStatus } from "../types";
 import type { ChartPoint, WeeklyReport } from "../types";
 import { formatFarmTime, formatFarmDate, formatFarmDateTime } from "../utils/time";
+import { SENSOR_COLORS, BAND_COLORS, hexToRgb } from "../utils/tokens";
+import {
+  PDF,
+  BRAND_NAME,
+  BRAND_TAGLINE,
+  fill,
+  text,
+  stroke,
+  drawHeaderBand as brandDrawHeaderBand,
+  drawSlimHeader as brandDrawSlimHeader,
+  drawFooter as brandDrawFooter,
+  drawLogo,
+  loadLogoDataUrl,
+} from "../utils/pdfBrand";
+import brandLogo from "../assets/crayvings.png";
 
 // Detects AbortError from AbortController cancellation (native fetch or axios).
 function isAbortError(err: unknown): boolean {
@@ -38,9 +53,9 @@ type SensorKey = "temperature" | "water_level" | "ammonia";
 const SENSOR_KEYS: SensorKey[] = ["temperature", "water_level", "ammonia"];
 
 const PARAM_META: { label: string; icon: typeof Thermometer; tint: string; stroke: string; unit: string; decimals: number }[] = [
-  { label: "Temperature", icon: Thermometer, tint: "text-orange-500", stroke: "#f97316", unit: "°C", decimals: 1 },
-  { label: "Water Level", icon: Waves, tint: "text-blue-500", stroke: "#2563eb", unit: "%", decimals: 0 },
-  { label: "Ammonia", icon: FlaskConical, tint: "text-emerald-500", stroke: "#10b981", unit: "ppm", decimals: 2 },
+  { label: "Temperature", icon: Thermometer, tint: "text-orange-500", stroke: SENSOR_COLORS.temperature, unit: "°C", decimals: 1 },
+  { label: "Water Level", icon: Waves, tint: "text-blue-500", stroke: SENSOR_COLORS.water_level, unit: "%", decimals: 0 },
+  { label: "Ammonia", icon: FlaskConical, tint: "text-emerald-500", stroke: SENSOR_COLORS.ammonia, unit: "ppm", decimals: 2 },
 ];
 
 const STATUS_PILL: Record<ThresholdStatus, string> = {
@@ -448,66 +463,39 @@ export default function HistoricalDataPage() {
       const pageHeight = doc.internal.pageSize.getHeight();
 
       // ---- Design tokens (mirrors the dashboard's warm orange brand palette) ----
-      const INK: number[] = [30, 41, 59];
-      const GRAY: number[] = [107, 114, 128];
-      const WHITE: number[] = [255, 255, 255];
-      const BRAND: number[] = [217, 75, 30];
-      const BRAND_MID: number[] = [234, 88, 12];
-      const AMBER: number[] = [245, 158, 11];
-      const CARD_FILL: number[] = [255, 250, 245];
-      const CARD_LINE: number[] = [253, 230, 210];
-      const ZEBRA: number[] = [255, 249, 243];
-      const LINE: number[] = [226, 232, 240];
+      // jsPDF cannot resolve var(), so the CSS-side tokens are converted to
+      // numeric triplets by pdfBrand. Names and call sites are unchanged.
+      const {
+        ink: INK, gray: GRAY, white: WHITE, brand: BRAND, amber: AMBER,
+        cardFill: CARD_FILL, cardLine: CARD_LINE, zebra: ZEBRA, line: LINE,
+        onBrand: ON_BRAND, critical: CRITICAL,
+        tableZebra: TABLE_ROW, noteFill: NOTE_FILL, noteLine: NOTE_LINE,
+        alertFill: ALERT_FILL, alertFillOk: ALERT_FILL_OK,
+        alertLine: ALERT_LINE, alertLineOk: ALERT_LINE_OK,
+        gradMid: BRAND_MID,
+      } = PDF;
       const PARAM: Record<string, number[]> = {
-        temperature: [249, 115, 22],
-        water_level: [37, 99, 235],
-        ammonia: [16, 185, 129],
+        temperature: hexToRgb(SENSOR_COLORS.temperature),
+        water_level: hexToRgb(SENSOR_COLORS.water_level),
+        ammonia: hexToRgb(SENSOR_COLORS.ammonia),
       };
 
       const margin = 12;
       const contentW = pageWidth - margin * 2;
 
-      const setFill = (c: number[]) => doc.setFillColor(c[0], c[1], c[2]);
-      const setText = (c: number[]) => doc.setTextColor(c[0], c[1], c[2]);
-      const lerp = (a: number[], b: number[], t: number) =>
-        [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t].map(Math.round);
+      const setFill = (c: number[]) => fill(doc, c);
+      const setText = (c: number[]) => text(doc, c);
+      const setStroke = (c: number[]) => stroke(doc, c);
 
-      // Warm vertical gradient that brands the top of the first page.
-      const drawHeaderBand = (h: number) => {
-        const steps = 32;
-        for (let i = 0; i < steps; i++) {
-          const t = i / (steps - 1);
-          const c =
-            t < 0.5
-              ? lerp([196, 50, 17], BRAND_MID, t * 2)
-              : lerp(BRAND_MID, AMBER, (t - 0.5) * 2);
-          doc.setFillColor(c[0], c[1], c[2]);
-          doc.rect(0, (h / steps) * i, pageWidth, h / steps + 1, "F");
-        }
-      };
+      const documentLabel = isWeekly ? "Weekly Report" : "History Report";
 
       // Slim branded strip reused on every page after the first.
       const drawSlimHeader = () => {
-        setFill([199, 62, 25]);
-        doc.rect(0, 0, pageWidth, 11, "F");
-        setFill(AMBER);
-        doc.rect(0, 11, pageWidth, 1.4, "F");
-        doc.setFont("helvetica", "bold");
-        doc.setFontSize(6.8);
-        setText(WHITE);
-        doc.text(`CRAYvings  ·  ${isWeekly ? "Weekly Report" : "History Report"}`, margin, 7.5);
+        brandDrawSlimHeader(doc, pageWidth, margin, documentLabel);
       };
 
       const drawFooter = (pageNumber: number) => {
-        doc.setDrawColor(226, 232, 240);
-        doc.setLineWidth(0.5);
-        doc.line(margin, pageHeight - 15, pageWidth - margin, pageHeight - 15);
-        doc.setFont("helvetica", "normal");
-        doc.setFontSize(7);
-        doc.setTextColor(148, 163, 184);
-        doc.text("CRAYvings Monitoring System", margin, pageHeight - 7);
-        doc.text(`Page ${pageNumber}`, pageWidth / 2, pageHeight - 7, { align: "center" });
-        doc.text(`Exported: ${formatFarmDate(new Date())}`, pageWidth - margin, pageHeight - 7, { align: "right" });
+        brandDrawFooter(doc, pageWidth, pageHeight, margin, pageNumber, formatFarmDate(new Date()));
       };
 
       const drawSectionTitle = (text: string, y: number): number => {
@@ -531,23 +519,25 @@ export default function HistoricalDataPage() {
       const fmtPeriod = report.bucket === "hour" ? formatFarmDateTime : formatFarmDate;
       const startDate = fmtPeriod(report.period.start);
       const endDate = fmtPeriod(report.period.end);
-      const title = isWeekly ? "CRAYvings Weekly Report" : "CRAYvings History Report";
+      const title = `${BRAND_NAME} ${documentLabel}`;
 
       // ---- Header band ----
       const bandH = 52;
-      drawHeaderBand(bandH);
+      brandDrawHeaderBand(doc, pageWidth, bandH);
       setFill(AMBER);
       doc.rect(0, bandH, pageWidth, 2.2, "F");
+      const logoData = await loadLogoDataUrl(brandLogo);
+      if (logoData) drawLogo(doc, logoData, margin, 6, 30);
       doc.setFont("helvetica", "bold");
       doc.setFontSize(18);
       setText(WHITE);
       doc.text(title, pageWidth / 2, 20, { align: "center" });
       doc.setFont("helvetica", "normal");
       doc.setFontSize(8.5);
-      doc.text("Smart Aquaculture · Water Quality Monitoring", pageWidth / 2, 30, { align: "center" });
+      doc.text(BRAND_TAGLINE, pageWidth / 2, 30, { align: "center" });
       doc.text(`Period: ${startDate} - ${endDate}`, pageWidth / 2, 40, { align: "center" });
       doc.setFontSize(7.5);
-      doc.setTextColor(255, 231, 213);
+      setText(ON_BRAND);
       doc.text(`Generated on ${formatFarmDateTime(new Date())}`, pageWidth / 2, 48, { align: "center" });
 
       const summary = report.summary;
@@ -580,7 +570,7 @@ export default function HistoricalDataPage() {
       cards.forEach((c, i) => {
         const x = margin + i * (cardW + gap);
         setFill(CARD_FILL);
-        doc.setDrawColor(CARD_LINE[0], CARD_LINE[1], CARD_LINE[2]);
+        setStroke(CARD_LINE);
         doc.setLineWidth(0.5);
         doc.roundedRect(x, cardY, cardW, cardH, 3.5, 3.5, "FD");
         setFill(c.color);
@@ -607,13 +597,13 @@ export default function HistoricalDataPage() {
         {
           label: "Total Alerts",
           value: String(report.alerts.total ?? 0),
-          valueColor: (report.alerts.total ?? 0) > 0 ? [217, 68, 30] : [16, 185, 129],
+          valueColor: (report.alerts.total ?? 0) > 0 ? CRITICAL : hexToRgb(BAND_COLORS.safe),
         },
       ];
       totals.forEach((t, i) => {
         const x = margin + i * (chipW + gap);
-        setFill([248, 250, 252]);
-        doc.setDrawColor(LINE[0], LINE[1], LINE[2]);
+        setFill(TABLE_ROW);
+        setStroke(LINE);
         doc.setLineWidth(0.4);
         doc.roundedRect(x, chipY, chipW, chipH, 3, 3, "FD");
         doc.setFont("helvetica", "bold");
@@ -692,8 +682,8 @@ export default function HistoricalDataPage() {
       if (capNote) {
         const boxY = afterTableY + 5;
         const noteH = 12;
-        setFill([255, 247, 237]);
-        doc.setDrawColor(254, 215, 170);
+        setFill(NOTE_FILL);
+        setStroke(NOTE_LINE);
         doc.setLineWidth(0.4);
         doc.roundedRect(margin, boxY, contentW, noteH, 2.5, 2.5, "FD");
         doc.setFont("helvetica", "italic");
@@ -728,9 +718,9 @@ export default function HistoricalDataPage() {
       const drawAlertSection = (topY: number): number => {
         const titleY = drawSectionTitle("Alert Summary", topY + 8);
         const panelTop = titleY + 1;
-        setFill(hasAlerts ? [255, 244, 230] : [240, 253, 244]);
-        const alertBorder = hasAlerts ? [253, 186, 116] : [167, 243, 208];
-        doc.setDrawColor(alertBorder[0], alertBorder[1], alertBorder[2]);
+        setFill(hasAlerts ? ALERT_FILL : ALERT_FILL_OK);
+        const alertBorder = hasAlerts ? ALERT_LINE : ALERT_LINE_OK;
+        setStroke(alertBorder);
         doc.setLineWidth(0.4);
         doc.roundedRect(margin, panelTop, contentW, alertH, 3, 3, "FD");
         let ly = panelTop + 11;
@@ -783,7 +773,7 @@ export default function HistoricalDataPage() {
       const recTitleY = drawSectionTitle("Recommendations", currentY + 8);
       const recPanelTop = recTitleY + 1;
       setFill(CARD_FILL);
-      doc.setDrawColor(CARD_LINE[0], CARD_LINE[1], CARD_LINE[2]);
+      setStroke(CARD_LINE);
       doc.setLineWidth(0.4);
       doc.roundedRect(margin, recPanelTop, contentW, recPanelH, 3, 3, "FD");
       let ly = recPanelTop + 12;
@@ -896,7 +886,7 @@ export default function HistoricalDataPage() {
       )}
 
       {/* Hero banner */}
-      <section className="relative overflow-hidden rounded-3xl bg-gradient-to-br from-[#d94b1e] via-[#ef6a2e] to-amber-600 text-white shadow-sm">
+      <section className="relative overflow-hidden rounded-3xl bg-gradient-to-br from-brand-500 via-brand-400 to-amber-600 text-white shadow-sm">
         <div className="relative p-6 lg:p-7 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
           <div className="flex items-center gap-4">
             <div className="w-14 h-14 rounded-2xl bg-white/15 border border-white/25 flex items-center justify-center shrink-0">
@@ -990,7 +980,7 @@ export default function HistoricalDataPage() {
             <button
               onClick={handleExportPdf}
               disabled={exportingPdf || (timeRange === "1w" && weeklyReportLoading)}
-              className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-semibold bg-[#c2410c] text-white hover:bg-[#a13a0a] disabled:opacity-50 disabled:cursor-not-allowed transition"
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-semibold bg-brand-600 text-white hover:bg-brand-700 disabled:opacity-50 disabled:cursor-not-allowed transition"
             >
             <Download size={14} />
             {exportingPdf ? "Exporting..." : "Export PDF"}
@@ -1021,7 +1011,7 @@ export default function HistoricalDataPage() {
               <Thermometer size={16} className="text-orange-500" />
               <span className="text-xs font-semibold uppercase tracking-wide">Temperature</span>
               {latestStatuses.temperature && (
-                <span className={`text-[10px] font-bold uppercase tracking-wide px-1.5 py-0.5 rounded-full ${STATUS_PILL[latestStatuses.temperature]}`}>
+                <span className={`text-micro font-bold uppercase tracking-wide px-1.5 py-0.5 rounded-full ${STATUS_PILL[latestStatuses.temperature]}`}>
                   {latestStatuses.temperature === "good" ? "Safe" : latestStatuses.temperature === "warning" ? "Warning" : "Critical"}
                 </span>
               )}
@@ -1056,7 +1046,7 @@ export default function HistoricalDataPage() {
             {latestReading?.temperature != null ? Number(latestReading.temperature).toFixed(1) : "--"}<span className="text-base font-normal text-gray-500">°C</span>
           </div>
           <div className="flex items-center justify-between mt-1">
-            <div className={`text-[10px] ${breachCounts.temperature > 0 ? "text-amber-600" : "text-gray-400"}`}>
+            <div className={`text-micro ${breachCounts.temperature > 0 ? "text-amber-600" : "text-gray-400"}`}>
               {filteredHistory.length === 0
                 ? "No readings in this window"
                 : breachCounts.temperature > 0
@@ -1064,7 +1054,7 @@ export default function HistoricalDataPage() {
                   : "All readings in range"}
             </div>
             {trends.temperature && (
-              <span className={`inline-flex items-center gap-0.5 text-[10px] font-semibold px-1.5 py-0.5 rounded-full ${
+              <span className={`inline-flex items-center gap-0.5 text-micro font-semibold px-1.5 py-0.5 rounded-full ${
                 trends.temperature === "up"
                   ? "text-green-600 bg-green-50"
                   : trends.temperature === "down"
@@ -1087,7 +1077,7 @@ export default function HistoricalDataPage() {
               <Waves size={16} className="text-blue-500" />
               <span className="text-xs font-semibold uppercase tracking-wide">Water Level</span>
               {latestStatuses.water_level && (
-                <span className={`text-[10px] font-bold uppercase tracking-wide px-1.5 py-0.5 rounded-full ${STATUS_PILL[latestStatuses.water_level]}`}>
+                <span className={`text-micro font-bold uppercase tracking-wide px-1.5 py-0.5 rounded-full ${STATUS_PILL[latestStatuses.water_level]}`}>
                   {latestStatuses.water_level === "good" ? "Safe" : latestStatuses.water_level === "warning" ? "Warning" : "Critical"}
                 </span>
               )}
@@ -1122,7 +1112,7 @@ export default function HistoricalDataPage() {
             {latestReading?.water_level != null ? Number(latestReading.water_level).toFixed(0) : "--"}<span className="text-base font-normal text-gray-500">%</span>
           </div>
           <div className="flex items-center justify-between mt-1">
-            <div className={`text-[10px] ${breachCounts.water_level > 0 ? "text-amber-600" : "text-gray-400"}`}>
+            <div className={`text-micro ${breachCounts.water_level > 0 ? "text-amber-600" : "text-gray-400"}`}>
               {filteredHistory.length === 0
                 ? "No readings in this window"
                 : breachCounts.water_level > 0
@@ -1130,7 +1120,7 @@ export default function HistoricalDataPage() {
                   : "All readings in range"}
             </div>
             {trends.water_level && (
-              <span className={`inline-flex items-center gap-0.5 text-[10px] font-semibold px-1.5 py-0.5 rounded-full ${
+              <span className={`inline-flex items-center gap-0.5 text-micro font-semibold px-1.5 py-0.5 rounded-full ${
                 trends.water_level === "up"
                   ? "text-green-600 bg-green-50"
                   : trends.water_level === "down"
@@ -1153,7 +1143,7 @@ export default function HistoricalDataPage() {
               <FlaskConical size={16} className="text-emerald-500" />
               <span className="text-xs font-semibold uppercase tracking-wide">Ammonia</span>
               {latestStatuses.ammonia && (
-                <span className={`text-[10px] font-bold uppercase tracking-wide px-1.5 py-0.5 rounded-full ${STATUS_PILL[latestStatuses.ammonia]}`}>
+                <span className={`text-micro font-bold uppercase tracking-wide px-1.5 py-0.5 rounded-full ${STATUS_PILL[latestStatuses.ammonia]}`}>
                   {latestStatuses.ammonia === "good" ? "Safe" : latestStatuses.ammonia === "warning" ? "Warning" : "Critical"}
                 </span>
               )}
@@ -1188,7 +1178,7 @@ export default function HistoricalDataPage() {
             {latestReading?.ammonia != null ? Number(latestReading.ammonia).toFixed(2) : "--"}<span className="text-base font-normal text-gray-500"> ppm</span>
           </div>
           <div className="flex items-center justify-between mt-1">
-            <div className={`text-[10px] ${breachCounts.ammonia > 0 ? "text-amber-600" : "text-gray-400"}`}>
+            <div className={`text-micro ${breachCounts.ammonia > 0 ? "text-amber-600" : "text-gray-400"}`}>
               {filteredHistory.length === 0
                 ? "No readings in this window"
                 : breachCounts.ammonia > 0
@@ -1196,7 +1186,7 @@ export default function HistoricalDataPage() {
                   : "All readings in range"}
             </div>
             {trends.ammonia && (
-              <span className={`inline-flex items-center gap-0.5 text-[10px] font-semibold px-1.5 py-0.5 rounded-full ${
+              <span className={`inline-flex items-center gap-0.5 text-micro font-semibold px-1.5 py-0.5 rounded-full ${
                 trends.ammonia === "up"
                   ? "text-green-600 bg-green-50"
                   : trends.ammonia === "down"
@@ -1230,7 +1220,7 @@ export default function HistoricalDataPage() {
             title="Temperature (°C)"
             data={chartHistory}
             dataKey="temperature"
-            stroke="#f97316"
+            stroke={SENSOR_COLORS.temperature}
             range={thresholds.temperature.range}
             unit="°C"
             overlayKey={showMovingAverage ? "_tempAvg" : undefined}
@@ -1240,7 +1230,7 @@ export default function HistoricalDataPage() {
             title="Water Level (%)"
             data={chartHistory}
             dataKey="water_level"
-            stroke="#2563eb"
+            stroke={SENSOR_COLORS.water_level}
             range={thresholds.water_level.range}
             unit="%"
             overlayKey={showMovingAverage ? "_waterAvg" : undefined}
@@ -1250,7 +1240,7 @@ export default function HistoricalDataPage() {
             title="Ammonia (ppm)"
             data={chartHistory}
             dataKey="ammonia"
-            stroke="#10b981"
+            stroke={SENSOR_COLORS.ammonia}
             range={thresholds.ammonia.range}
             unit=" ppm"
             overlayKey={showMovingAverage ? "_ammoniaAvg" : undefined}
@@ -1293,7 +1283,7 @@ export default function HistoricalDataPage() {
                       {createElement(meta.icon, { size: 15, className: meta.tint })}
                     </span>
                     <span className="text-xs font-bold uppercase tracking-wide text-gray-600">{meta.label}</span>
-                    <span className="text-[10px] text-gray-400 ml-auto">
+                    <span className="text-micro text-gray-400 ml-auto">
                       safe {t.range.min}–{t.range.max}{meta.unit}
                     </span>
                   </div>
@@ -1316,7 +1306,7 @@ export default function HistoricalDataPage() {
                               ) : "—"}
                             </span>
                           </div>
-                          <div className="text-[10px] text-gray-400 text-right mt-0.5">
+                          <div className="text-micro text-gray-400 text-right mt-0.5">
                             {row.what?.time ? formatFarmDateTime(row.what.time) : ""}
                           </div>
                         </div>

@@ -11,8 +11,11 @@
     "server": "node server.cjs",
     "start": "node server.cjs",
     "test": "node src/types/threshold.test.cjs",
+    "check:encoding": "node check-encoding.cjs",
     "test:regression": "node tests/regression.cjs",
-    "seed:admin": "node seed-admin.cjs"
+    "seed:admin": "node seed-admin.cjs",
+    "mock": "node scripts/mock-device.js",
+    "mock:profiles": "node scripts/mock-device.js --list-profiles"
   },
   "dependencies": {
     "axios": "^1.15.2",

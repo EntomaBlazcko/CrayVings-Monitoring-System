@@ -15,6 +15,7 @@ import {
   WifiOff,
   ShieldAlert,
   Wrench,
+  HelpCircle,
 } from "lucide-react";
 import { useSensors } from "../hooks/useSensors";
 import { LoadingCard, ErrorCard } from "../components/Loading";
@@ -27,19 +28,32 @@ import { buildLiveGuidance } from "../utils/alertGuidance";
 import type { AlertGuidance } from "../utils/alertGuidance";
 import { FixLegendModal } from "../components/FixLegend";
 import type { ChartPoint } from "../types";
+import { SENSOR_COLORS } from "../utils/tokens";
 
 type ParamKey = "temperature" | "water_level" | "ammonia";
 
+// A failed sensor (null reading) is a DEVICE fault, not a water-quality
+// warning. Rendering it amber "Warning" sent operators hunting for a chemistry
+// problem that did not exist, so failed gets its own grey "No signal" treatment.
 const STATUS_PILL: Record<string, string> = {
   good: "bg-emerald-100 text-emerald-700",
   warning: "bg-amber-100 text-amber-700",
   critical: "bg-red-100 text-red-700",
+  failed: "bg-gray-200 text-gray-600",
 };
 
 const STATUS_VALUE: Record<string, string> = {
   good: "text-gray-800",
   warning: "text-amber-600",
   critical: "text-red-600",
+  failed: "text-gray-400",
+};
+
+const STATUS_LABEL: Record<string, string> = {
+  good: "Safe",
+  warning: "Warning",
+  critical: "Critical",
+  failed: "No signal",
 };
 
 // Horizontal track showing where the current value sits relative to the safe
@@ -65,11 +79,16 @@ function RangeGauge({ value, range }: { value: number | null; range: ThresholdRa
         {pct !== null && (
           <div
             className="absolute top-1/2 -translate-y-1/2 w-3.5 h-3.5 rounded-full border-2 border-white shadow"
-            style={{ left: `calc(${pct}% - 7px)`, backgroundColor: out ? "#ef4444" : "#10b981" }}
+            style={{
+              left: `calc(${pct}% - 7px)`,
+              backgroundColor: out
+                ? "var(--color-status-critical)"
+                : "var(--color-status-good)",
+            }}
           />
         )}
       </div>
-      <div className="flex justify-between text-[10px] text-gray-400 mt-1">
+      <div className="flex justify-between text-micro text-gray-400 mt-1">
         <span className="font-medium">{range.min}</span>
         <span className="font-medium">{range.max}</span>
       </div>
@@ -95,7 +114,9 @@ export default function SensorsPage() {
   const isOfflineWithData = !isOnline && !isConnecting && hasData;
 
   const sensors = useMemo(() => {
-    const keys: ParamKey[] = ["temperature", "water_level", "ammonia"];
+    // Ammonia first: it is the fastest-acting toxin for crayfish, so it must
+    // be the first card read, not the third.
+    const keys: ParamKey[] = ["ammonia", "temperature", "water_level"];
 
     const meta: Record<ParamKey, { icon: React.ReactNode; color: string; decimals: number }> = {
       temperature: { icon: <Thermometer size={20} />, color: "text-orange-500", decimals: 1 },
@@ -107,7 +128,7 @@ export default function SensorsPage() {
       const threshold = thresholds[key];
       const raw = latestReading?.[key];
       const value = raw !== undefined && raw !== null && Number.isFinite(Number(raw)) ? Number(raw) : null;
-      const status = value !== null ? getThresholdStatus(value, threshold.range, threshold.isMinOnly) : "warning";
+      const status: string = value !== null ? getThresholdStatus(value, threshold.range, threshold.isMinOnly) : "failed";
       const badge = STATUS_PILL[status];
       const valueClass = STATUS_VALUE[status];
 
@@ -207,7 +228,7 @@ export default function SensorsPage() {
       )}
 
       {/* Hero status banner */}
-      <section className="relative overflow-hidden rounded-3xl bg-gradient-to-r from-[#d94b1e] via-[#ef6a2e] to-amber-600 text-white shadow-sm">
+      <section className="relative overflow-hidden rounded-3xl bg-gradient-to-r from-brand-500 via-brand-400 to-amber-600 text-white shadow-sm">
         <div className="absolute inset-0 opacity-10" style={{ backgroundImage: "radial-gradient(circle at 20% 20%, #fff 0px, transparent 40%)" }} />
         <div className="relative p-6 lg:p-8 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
           <div className="flex items-center gap-4">
@@ -236,7 +257,7 @@ export default function SensorsPage() {
             <button
               onClick={handleRefresh}
               disabled={refreshing || loading}
-              className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-white text-slate-900 text-sm font-semibold hover:bg-orange-50 disabled:opacity-50 transition"
+              className="flex items-center gap-1.5 px-3 py-1.5 min-h-11 sm:min-h-0 rounded-lg bg-white text-slate-900 text-sm font-semibold hover:bg-orange-50 disabled:opacity-50 transition"
             >
               <RefreshCw size={14} className={refreshing ? "animate-spin" : ""} />
               {refreshing ? "Refreshing…" : "Refresh"}
@@ -253,11 +274,13 @@ export default function SensorsPage() {
               <div className="flex items-center gap-2">
                 <span className={sensor.color}>{sensor.icon}</span>
                 <span className="text-xs font-semibold text-gray-500 uppercase tracking-wide">{sensor.name}</span>
-                <span className={`text-[10px] font-bold uppercase tracking-wide px-1.5 py-0.5 rounded-full ${sensor.badge}`}>
-                  {sensor.status === "good" ? "Safe" : sensor.status === "warning" ? "Warning" : "Critical"}
+                <span className={`text-micro font-bold uppercase tracking-wide px-1.5 py-0.5 rounded-full ${sensor.badge}`}>
+                  {STATUS_LABEL[sensor.status]}
                 </span>
               </div>
-              {sensor.outOfRange ? (
+              {sensor.status === "failed" ? (
+                <HelpCircle size={16} className="text-gray-400" aria-label="Sensor is not reporting" />
+              ) : sensor.outOfRange ? (
                 <XCircle size={16} className="text-red-500" />
               ) : (
                 <CheckCircle size={16} className="text-green-500" />
@@ -272,12 +295,20 @@ export default function SensorsPage() {
             </div>
 
             <div className="mt-2 md:mt-3 text-xs text-gray-500">
-              Optimal range:{" "}
-              <span className="font-semibold text-gray-700">
-                {sensor.threshold.isMinOnly
-                  ? `≥ ${sensor.threshold.range.min}${sensor.unit}`
-                  : `${sensor.threshold.range.min} – ${sensor.threshold.range.max}${sensor.unit}`}
-              </span>
+              {sensor.status === "failed" ? (
+                <span className="text-gray-500">
+                  Sensor not reporting — check wiring and that the ESP32 is online
+                </span>
+              ) : (
+                <>
+                  Safe:{" "}
+                  <span className="font-semibold text-gray-700">
+                    {sensor.threshold.isMinOnly
+                      ? `≥ ${sensor.threshold.range.min}${sensor.unit}`
+                      : `${sensor.threshold.range.min} – ${sensor.threshold.range.max}${sensor.unit}`}
+                  </span>
+                </>
+              )}
             </div>
 
             <RangeGauge value={sensor.value} range={sensor.threshold.range} />
@@ -292,7 +323,7 @@ export default function SensorsPage() {
                     const guidance = buildLiveGuidance(sensor.key, sensor.value, settingsFor(selectedDeviceId));
                     if (guidance) setFixGuidance(guidance);
                   }}
-                  className="mt-1.5 inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-[11px] font-semibold bg-orange-50 text-[#c2410c] border border-orange-200 hover:bg-orange-100 transition"
+                  className="mt-1.5 inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-semibold bg-orange-50 text-brand-600 border border-orange-200 hover:bg-orange-100 transition"
                 >
                   <Wrench size={12} />
                   How to fix
@@ -314,10 +345,18 @@ export default function SensorsPage() {
           </div>
           <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
             <TrendCard
+              title="Ammonia"
+              data={history}
+              dataKey="ammonia"
+              stroke={SENSOR_COLORS.ammonia}
+              range={thresholds.ammonia.range}
+              unit=" ppm"
+            />
+            <TrendCard
               title="Temperature"
               data={history}
               dataKey="temperature"
-              stroke="#f97316"
+              stroke={SENSOR_COLORS.temperature}
               range={thresholds.temperature.range}
               unit="°C"
             />
@@ -325,17 +364,9 @@ export default function SensorsPage() {
               title="Water Level"
               data={history}
               dataKey="water_level"
-              stroke="#2563eb"
+              stroke={SENSOR_COLORS.water_level}
               range={thresholds.water_level.range}
               unit="%"
-            />
-            <TrendCard
-              title="Ammonia"
-              data={history}
-              dataKey="ammonia"
-              stroke="#10b981"
-              range={thresholds.ammonia.range}
-              unit=" ppm"
             />
           </div>
         </section>

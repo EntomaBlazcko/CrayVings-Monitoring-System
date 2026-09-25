@@ -149,7 +149,7 @@ function FloatingAlertItem({ notification, onClose }: FloatingAlertItemProps) {
         </div>
         <div className="flex-1 min-w-0">
           {notification.tank && (
-            <span className="mb-0.5 inline-block rounded-full bg-white/70 border border-gray-300 px-1.5 py-0.5 text-[10px] font-bold text-gray-700">
+            <span className="mb-0.5 inline-block rounded-full bg-white/70 border border-gray-300 px-1.5 py-0.5 text-micro font-bold text-gray-700">
               {notification.tank}
             </span>
           )}
@@ -164,7 +164,7 @@ function FloatingAlertItem({ notification, onClose }: FloatingAlertItemProps) {
           {guidance && (
             <button
               onClick={() => setFixOpen(true)}
-              className="mt-1.5 inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[10px] font-semibold text-orange-700 bg-white/70 border border-orange-300 hover:bg-white transition"
+              className="mt-1.5 inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-micro font-semibold text-orange-700 bg-white/70 border border-orange-300 hover:bg-white transition"
             >
               Fix?
             </button>

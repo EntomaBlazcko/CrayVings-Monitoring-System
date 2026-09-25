@@ -287,8 +287,14 @@ function useSensorDataPolling(
         };
 
         es.onerror = () => {
+          // The error path must always resolve `loading`. Previously it left
+          // loading=true, so a blocked/failed SSE stream combined with a REST
+          // seed that has no timestamp yet pinned the dashboard on grey
+          // skeletons forever: no values, no error text, no recourse. A farm
+          // operator standing at the tank saw a blank dashboard.
           setState((prev) => ({
             ...prev,
+            loading: false,
             connectionStatus: "offline",
             error: "Real-time connection lost. Attempting to reconnect...",
           }));
@@ -308,6 +314,7 @@ function useSensorDataPolling(
           } else {
             setState((prev) => ({
               ...prev,
+              loading: false,
               error: "Max reconnection attempts reached. Please refresh the page.",
               connectionStatus: "offline",
             }));

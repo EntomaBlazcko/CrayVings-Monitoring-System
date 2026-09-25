@@ -1,5 +1,50 @@
 @import "tailwindcss";
 
+@theme {
+  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
+    "Helvetica Neue", Arial, sans-serif;
+
+  /* Type scale: 10 / 12 / 14 / 16 / 18 / 20 / 24 / 36.
+     `text-micro` is reserved for axis ticks, legends and dense badges;
+     `text-xs` (12px) is the floor for any label a user must read. */
+  --text-micro: 0.625rem;
+  --text-micro--line-height: 1.45;
+
+  --color-brand-50: #fff4ec;
+  --color-brand-100: #ffe7d6;
+  --color-brand-200: #e9d3c6;
+  --color-brand-400: #ef6a2e;
+  --color-brand-500: #d94b1e;
+  --color-brand-600: #c2410c;
+  --color-brand-700: #a13a0a;
+
+  --color-status-good: #10b981;
+  --color-status-warning: #f59e0b;
+  --color-status-critical: #ef4444;
+  --color-status-good-soft: #d1fae5;
+  --color-status-warning-soft: #fef3c7;
+  --color-status-critical-soft: #fee2e2;
+  --color-status-good-text: #047857;
+  --color-status-warning-text: #b45309;
+  --color-status-critical-text: #b91c1c;
+  --color-status-warning-border: #fde68a;
+  --color-status-critical-border: #fecaca;
+
+  --color-surface-sunken: #f5efe9;
+  --color-surface-sunken-border: #eadfd6;
+  --color-surface-sunken-hover: #f8e7db;
+  --color-nav-muted: #9a6b57;
+
+  --radius-control: 0.5rem;
+  --radius-card: 0.75rem;
+  --radius-pill: 9999px;
+
+  --shadow-card: 0 1px 3px 0 rgb(0 0 0 / 0.1),
+    0 1px 2px -1px rgb(0 0 0 / 0.1);
+  --shadow-raised: 0 10px 15px -3px rgb(0 0 0 / 0.1),
+    0 4px 6px -4px rgb(0 0 0 / 0.1);
+}
+
 /* Toast slide-in used by the SettingsPage notifications. */
 @keyframes slide-in {
   from {

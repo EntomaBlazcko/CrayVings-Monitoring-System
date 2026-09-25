@@ -55,7 +55,7 @@ export default function TankSelector() {
         <h3 className="text-xs font-bold text-gray-700 uppercase tracking-wide">Tanks</h3>
         <div className="flex items-center gap-3">
           {devices.length > 0 && (
-            <span className="text-[11px] text-gray-400">
+            <span className="text-xs text-gray-400">
               {onlineCount}/{devices.length} online
             </span>
           )}
@@ -63,7 +63,7 @@ export default function TankSelector() {
             type="button"
             onClick={toggleHiddenPanel}
             title={showHidden ? "Close hidden tanks" : "Show hidden tanks"}
-            className="inline-flex items-center gap-1 rounded-lg border border-gray-200 px-2 py-1 text-[11px] font-semibold text-gray-500 transition hover:border-orange-300 hover:text-orange-700"
+            className="inline-flex items-center gap-1 rounded-lg border border-gray-200 px-2 py-1 min-h-11 sm:min-h-0 text-xs font-semibold text-gray-500 transition hover:border-orange-300 hover:text-orange-700"
           >
             {showHidden ? <EyeOff size={12} /> : <Eye size={12} />}
             Hidden{hiddenCount > 0 ? ` (${hiddenCount})` : ""}
@@ -120,7 +120,7 @@ export default function TankSelector() {
                       </p>
                     </div>
                     <span
-                      className={`shrink-0 rounded-full px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide ${
+                      className={`shrink-0 rounded-full px-2 py-0.5 text-micro font-bold uppercase tracking-wide ${
                         device.online ? "bg-emerald-100 text-emerald-700" : "bg-red-100 text-red-700"
                       }`}
                     >
@@ -128,7 +128,7 @@ export default function TankSelector() {
                     </span>
                   </div>
 
-                  <div className="flex flex-wrap items-center gap-x-2 text-[11px]">
+                  <div className="flex flex-wrap items-center gap-x-2 text-xs">
                     <span className={valueClass(device.device_id, "temperature", tempC)}>{tempC !== null ? `${tempC.toFixed(1)} °C` : "-- °C"}</span>
                     <span className="text-gray-300">·</span>
                     <span className={valueClass(device.device_id, "water_level", water)}>{water !== null ? `${water.toFixed(0)}%` : "--%"}</span>
@@ -169,7 +169,7 @@ export default function TankSelector() {
                     onClick={() => restore(device.device_id)}
                     disabled={restoring === device.device_id}
                     title={`Restore ${device.device_id}`}
-                    className="ml-1 inline-flex items-center gap-1 rounded-lg border border-gray-200 bg-white px-2 py-1 text-[11px] font-semibold text-orange-700 transition hover:border-orange-300 disabled:opacity-50"
+                    className="ml-1 inline-flex items-center gap-1 rounded-lg border border-gray-200 bg-white px-2 py-1 text-xs font-semibold text-orange-700 transition hover:border-orange-300 disabled:opacity-50"
                   >
                     <RotateCcw size={11} className={restoring === device.device_id ? "animate-spin" : ""} />
                     Restore

@@ -24,6 +24,8 @@ import { useAuth } from "./contexts/useAuth";
 import { DeviceConnectionMonitor } from "./components/DeviceConnectionMonitor";
 import { FloatingAlertProvider, FloatingAlertContainer } from "./components/FloatingAlert";
 import { useThresholdAlert } from "./hooks/useThresholdAlert";
+import CriticalAlarmBanner from "./components/CriticalAlarmBanner";
+import { useFleetAlarms } from "./hooks/useFleetAlarms";
 
 // Lazy-loaded pages so heavy deps (recharts, jspdf) download only on demand.
 const DashboardPage = lazy(() => import("./pages/DashboardPage"));
@@ -80,6 +82,21 @@ function DashboardLayout() {
   const [sidebarOpen, setSidebarOpen] = useState(false);
 
   useThresholdAlert();
+
+  // Fleet-wide critical state drives both the persistent banner and the sidebar
+  // count badge, so they can never disagree with each other.
+  const { criticalCount, warningCount } = useFleetAlarms();
+
+  const alarmBadgeFor = (menu: MenuKey) => {
+    if (menu !== "Alerts") return null;
+    if (criticalCount > 0) {
+      return { text: String(criticalCount), cls: "bg-red-600 text-white", title: `${criticalCount} critical reading(s) need attention` };
+    }
+    if (warningCount > 0) {
+      return { text: String(warningCount), cls: "bg-amber-400 text-amber-950", title: `${warningCount} reading(s) outside the safe range` };
+    }
+    return null;
+  };
 
   const allowedKeys = useMemo(
     () => getAllowedMenuKeys(user?.role),
@@ -152,7 +169,9 @@ function DashboardLayout() {
     <div className="flex min-h-screen bg-gray-100 font-sans">
       <button
         onClick={() => setSidebarOpen(!sidebarOpen)}
-        className="fixed top-4 left-4 z-50 p-2 bg-white rounded-lg shadow-lg md:hidden"
+        className="fixed top-4 left-4 z-50 h-11 w-11 flex items-center justify-center bg-white rounded-lg shadow-lg md:hidden"
+        aria-label={sidebarOpen ? "Close navigation menu" : "Open navigation menu"}
+        aria-expanded={sidebarOpen}
       >
         {sidebarOpen ? <X size={24} /> : <Menu size={24} />}
       </button>
@@ -165,11 +184,11 @@ function DashboardLayout() {
       )}
 
       <div
-        className={`fixed md:static inset-y-0 left-0 z-50 w-24 bg-[#f5efe9] border-r border-[#eadfd6] min-h-screen flex flex-col items-center pt-4 transform transition-transform duration-300 ${
+        className={`fixed md:static inset-y-0 left-0 z-50 w-24 bg-surface-sunken border-r border-surface-sunken-border min-h-screen flex flex-col items-center pt-4 transform transition-transform duration-300 ${
           sidebarOpen ? "translate-x-0" : "-translate-x-full md:translate-x-0"
         }`}
       >
-        <div className="w-14 h-14 rounded-full bg-white flex items-center justify-center overflow-hidden border-2 border-[#e9d3c6] mb-4">
+        <div className="w-14 h-14 rounded-full bg-white flex items-center justify-center overflow-hidden border-2 border-brand-200 mb-4">
           <img
             src={logo}
             alt="Logo"
@@ -180,19 +199,28 @@ function DashboardLayout() {
         <div className="w-full flex flex-col gap-1 px-2">
           {menuItems.map((item) => {
             const isActive = activeMenu === item.label;
+            const badge = alarmBadgeFor(item.label);
 
             return (
               <button
                 key={item.label}
                 onClick={() => handleNavigate(item.label)}
-                className={`flex flex-col items-center justify-center gap-1 py-2.5 px-1 rounded-lg text-[10px] font-semibold text-center cursor-pointer border-none w-full transition-colors ${
+                title={badge?.title}
+                className={`relative flex flex-col items-center justify-center gap-1 py-3 px-1 rounded-lg text-micro font-semibold text-center cursor-pointer border-none w-full transition-colors ${
                   isActive
-                    ? "bg-[#ffe7d6] text-[#c2410c] font-bold"
-                    : "text-[#9a6b57] hover:bg-[#f8e7db]"
+                    ? "bg-brand-100 text-brand-600 font-bold"
+                    : "text-nav-muted hover:bg-surface-sunken-hover"
                 }`}
               >
                 {item.icon}
                 <span className="leading-tight">{item.label}</span>
+                {badge && (
+                  <span
+                    className={`absolute top-1 right-2 min-w-[18px] h-[18px] px-1 rounded-full text-[10px] font-extrabold flex items-center justify-center ring-2 ring-surface-sunken ${badge.cls}`}
+                  >
+                    {badge.text}
+                  </span>
+                )}
               </button>
             );
           })}
@@ -206,6 +234,8 @@ function DashboardLayout() {
         }} />
 
         <div className="p-3 md:p-5">
+          <CriticalAlarmBanner onGoToAlerts={() => handleNavigate("Alerts")} />
+
           <div className="text-xl md:text-2xl font-extrabold text-gray-800 mb-4 mt-10 md:mt-0">
             {activeMenu}
           </div>

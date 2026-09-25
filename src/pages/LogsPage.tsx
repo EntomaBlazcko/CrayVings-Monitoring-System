@@ -19,6 +19,19 @@ import { Spinner, LoadingCard, ErrorCard } from "../components/Loading";
 import { SENSOR_KEY_TO_DISPLAY, tankOptionLabel } from "../types";
 import { formatFarmDateTime, formatFarmDate, formatFarmTime, formatTimeAgo } from "../utils/time";
 import { titleCase } from "../utils/text";
+import {
+  PDF,
+  BRAND_NAME,
+  BRAND_TAGLINE,
+  fill,
+  text,
+  drawHeaderBand,
+  drawSlimHeader,
+  drawFooter,
+  drawLogo,
+  loadLogoDataUrl,
+} from "../utils/pdfBrand";
+import brandLogo from "../assets/crayvings.png";
 
 const PARAMETER_ICONS: Record<string, React.ReactNode> = {
   Temperature: <Thermometer size={15} className="text-orange-500" />,
@@ -122,13 +135,25 @@ export default function LogsPage() {
     const pageWidth = doc.internal.pageSize.getWidth();
     const pageHeight = doc.internal.pageSize.getHeight();
 
-    doc.setFontSize(20);
-    doc.setFont("helvetica", "bold");
-    doc.text("CRAYvings System Logs", pageWidth / 2, 20, { align: "center" });
+    const margin = 12;
 
-    doc.setFontSize(10);
+    // ---- Branded cover band, matching the History/Weekly Report export ----
+    const bandH = 44;
+    drawHeaderBand(doc, pageWidth, bandH);
+    fill(doc, PDF.amber);
+    doc.rect(0, bandH, pageWidth, 2.2, "F");
+    const logoData = await loadLogoDataUrl(brandLogo);
+    if (logoData) drawLogo(doc, logoData, margin, 5, 26);
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(18);
+    text(doc, PDF.white);
+    doc.text(`${BRAND_NAME} System Logs`, pageWidth / 2, 18, { align: "center" });
     doc.setFont("helvetica", "normal");
-    doc.text(`Generated on ${formatFarmDateTime(new Date())}`, pageWidth / 2, 28, { align: "center" });
+    doc.setFontSize(8.5);
+    doc.text(BRAND_TAGLINE, pageWidth / 2, 28, { align: "center" });
+    doc.setFontSize(7.5);
+    text(doc, PDF.onBrand);
+    doc.text(`Generated on ${formatFarmDateTime(new Date())}`, pageWidth / 2, 38, { align: "center" });
 
     const parameterCounts = logs.reduce<Record<string, number>>((acc, log) => {
       const displayParam = getDisplayParameter(log.parameter);
@@ -138,19 +163,21 @@ export default function LogsPage() {
       return acc;
     }, { Temperature: 0, "Water Level": 0, Ammonia: 0 });
 
-    const summaryY = 34;
+    const summaryY = bandH + 12;
     doc.setFontSize(11);
     doc.setFont("helvetica", "bold");
-    doc.text("Summary", 14, summaryY);
+    text(doc, PDF.ink);
+    doc.text("Summary", margin + 2, summaryY);
 
     doc.setFontSize(9);
     doc.setFont("helvetica", "normal");
+    text(doc, PDF.ink);
     let summaryLineY = summaryY + 6;
-    doc.text(`Total Entries: ${logs.length}`, 14, summaryLineY);
+    doc.text(`Total Entries: ${logs.length}`, margin + 2, summaryLineY);
     summaryLineY += 5;
 
     Object.entries(parameterCounts).forEach(([param, count]) => {
-      doc.text(`${param}: ${count}`, 14, summaryLineY);
+      doc.text(`${param}: ${count}`, margin + 2, summaryLineY);
       summaryLineY += 5;
     });
 
@@ -180,13 +207,13 @@ export default function LogsPage() {
         valign: "middle",
       },
       headStyles: {
-        fillColor: [241, 245, 249],
-        textColor: [30, 41, 59],
+        fillColor: PDF.tableHead,
+        textColor: PDF.ink,
         fontStyle: "bold",
         halign: "center",
       },
       alternateRowStyles: {
-        fillColor: [248, 250, 252],
+        fillColor: PDF.tableZebra,
       },
       columnStyles: {
         0: { cellWidth: 40 },
@@ -196,39 +223,19 @@ export default function LogsPage() {
         4: { cellWidth: 28, halign: "center" },
         5: { cellWidth: 28, halign: "center" },
       },
-      margin: { left: 14, right: 14 },
+      margin: { left: margin, right: margin },
     });
 
-    // Stamp footers after table drawn so page total is accurate.
+    // Stamp headers/footers after the table is drawn so the page total is known.
     const finalPageCount = doc.getNumberOfPages();
+    const exportedOn = formatFarmDate(new Date());
     for (let i = 1; i <= finalPageCount; i++) {
       doc.setPage(i);
-      doc.setFontSize(8);
-      doc.setFont("helvetica", "normal");
-      doc.setTextColor(128, 128, 128);
-
-      doc.text(
-        `Page ${i} of ${finalPageCount}`,
-        pageWidth / 2,
-        pageHeight - 10,
-        { align: "center" }
-      );
-
-      doc.text(
-        "CRAYvings Monitoring System",
-        14,
-        pageHeight - 10
-      );
-
-      doc.text(
-        `Exported: ${formatFarmDate(new Date())}`,
-        pageWidth - 14,
-        pageHeight - 10,
-        { align: "right" }
-      );
+      if (i > 1) drawSlimHeader(doc, pageWidth, margin, "System Logs");
+      drawFooter(doc, pageWidth, pageHeight, margin, i, exportedOn, finalPageCount);
     }
 
-    doc.save(`CRAYvings_System_Logs_${new Date().toISOString().split("T")[0]}.pdf`);
+    doc.save(`${BRAND_NAME}_System_Logs_${new Date().toISOString().split("T")[0]}.pdf`);
     setExporting(false);
   }, [logs, isAdmin, tankLabelFor]);
 
@@ -284,7 +291,7 @@ export default function LogsPage() {
   return (
     <div className="space-y-4">
       {/* Hero banner */}
-      <section className="relative overflow-hidden rounded-3xl bg-gradient-to-br from-[#d94b1e] via-[#ef6a2e] to-amber-600 text-white shadow-sm">
+      <section className="relative overflow-hidden rounded-3xl bg-gradient-to-br from-brand-500 via-brand-400 to-amber-600 text-white shadow-sm">
         <div className="relative p-6 lg:p-7 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
           <div className="flex items-center gap-4">
             <div className="w-14 h-14 rounded-2xl bg-white/15 border border-white/25 flex items-center justify-center shrink-0">
@@ -313,7 +320,7 @@ export default function LogsPage() {
               <button
                 onClick={handleExport}
                 disabled={exporting || logs.length === 0}
-                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-white text-[#c2410c] text-sm font-semibold hover:bg-orange-50 disabled:opacity-50 disabled:cursor-not-allowed transition"
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-white text-brand-600 text-sm font-semibold hover:bg-orange-50 disabled:opacity-50 disabled:cursor-not-allowed transition"
               >
                 <Download size={14} />
                 {exporting ? "Exporting…" : "Export PDF"}
@@ -341,28 +348,28 @@ export default function LogsPage() {
             <Database size={12} /> Total Entries
           </div>
           <div className="text-2xl font-bold text-gray-800 mt-1">{totalEntries.toLocaleString()}</div>
-          <div className="text-[10px] text-gray-400">across all parameters</div>
+          <div className="text-micro text-gray-400">across all parameters</div>
         </div>
         <div className="bg-white rounded-xl border border-gray-100 p-4">
           <div className="flex items-center gap-1.5 text-xs text-gray-500">
             <AlertTriangle size={12} className="text-red-500" /> Alerts
           </div>
           <div className="text-2xl font-bold text-red-600 mt-1">{alertsTotal.toLocaleString()}</div>
-          <div className="text-[10px] text-gray-400">threshold breaches</div>
+          <div className="text-micro text-gray-400">threshold breaches</div>
         </div>
         <div className="bg-white rounded-xl border border-gray-100 p-4">
           <div className="flex items-center gap-1.5 text-xs text-gray-500">
             <ArrowLeftRight size={12} className="text-orange-500" /> Changes
           </div>
           <div className="text-2xl font-bold text-orange-600 mt-1">{changesTotal.toLocaleString()}</div>
-          <div className="text-[10px] text-gray-400">parameter updates</div>
+          <div className="text-micro text-gray-400">parameter updates</div>
         </div>
         <div className="bg-white rounded-xl border border-gray-100 p-4">
           <div className="flex items-center gap-1.5 text-xs text-gray-500">
             <Activity size={12} className="text-emerald-500" /> Alert Rate
           </div>
           <div className="text-2xl font-bold text-emerald-600 mt-1">{alertRate}%</div>
-          <div className="text-[10px] text-gray-400">of all entries</div>
+          <div className="text-micro text-gray-400">of all entries</div>
         </div>
       </div>
 
@@ -438,13 +445,13 @@ export default function LogsPage() {
                           <p className="text-xs font-medium text-gray-700">
                             {log.timestamp ? formatFarmDateTime(log.timestamp) : "-"}
                           </p>
-                          <p className="text-[10px] text-gray-400">
+                          <p className="text-micro text-gray-400">
                             {log.timestamp ? formatTimeAgo(log.timestamp) : ""}
                           </p>
                         </td>
                         <td className="px-4 py-3">
                           <span
-                            className={`inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-bold ${
+                            className={`inline-flex items-center px-2 py-0.5 rounded-full text-micro font-bold ${
                               log.device_id
                                 ? "bg-slate-100 text-slate-600 border border-slate-200"
                                 : "bg-gray-50 text-gray-400 border border-gray-200"
@@ -467,11 +474,11 @@ export default function LogsPage() {
                         </td>
                         <td className="px-4 py-3">
                           <span className="inline-flex items-center gap-2 flex-wrap">
-                            <span className="px-2 py-1 rounded text-[11px] font-semibold bg-gray-100 text-gray-500 line-through">
+                            <span className="px-2 py-1 rounded text-xs font-semibold bg-gray-100 text-gray-500 line-through">
                               {titleCase(String(log.old_value))}
                             </span>
                             <ArrowLeftRight size={12} className="text-gray-400" />
-                            <span className={`px-2 py-1 rounded text-[11px] font-bold ${
+                            <span className={`px-2 py-1 rounded text-xs font-bold ${
                               log.action === "Alert" ? "bg-red-100 text-red-700" : "bg-orange-100 text-orange-700"
                             }`}>
                               {titleCase(String(log.new_value))}
@@ -483,7 +490,7 @@ export default function LogsPage() {
                             <Icon size={12} />
                             {titleCase(log.action)}
                             {log.action === "Alert" && (
-                              <span className="text-[9px] font-bold uppercase opacity-70">outside</span>
+                              <span className="text-micro font-bold uppercase opacity-70">outside</span>
                             )}
                           </span>
                         </td>

@@ -54,12 +54,12 @@ export function FixLegendPanel({
     <div className="bg-white rounded-xl border border-gray-100 shadow-sm">
       <button
         onClick={() => setOpen((v) => !v)}
-        className="w-full flex items-center justify-between p-4 text-left"
+        className="w-full flex items-center justify-between p-4 min-h-11 text-left"
       >
         <span className="flex items-center gap-2 text-sm font-semibold text-gray-800">
           <Lightbulb size={16} className="text-orange-500" />
           Fix Legend
-          <span className="text-[10px] font-medium text-gray-400">how to respond to each sensor alert</span>
+          <span className="text-micro font-medium text-gray-400">how to respond to each sensor alert</span>
         </span>
         {open ? (
           <ChevronUp size={16} className="text-gray-400" />
@@ -73,8 +73,8 @@ export function FixLegendPanel({
           <div className="mb-4 grid grid-cols-1 sm:grid-cols-3 gap-2">
             {SEVERITY_KEY.map((s) => (
               <div key={s.level} className={`rounded-lg border px-3 py-2 ${s.cls}`}>
-                <p className="text-[11px] font-bold uppercase tracking-wide">{s.level}</p>
-                <p className="text-[11px] opacity-80 mt-0.5">{s.desc}</p>
+                <p className="text-xs font-bold uppercase tracking-wide">{s.level}</p>
+                <p className="text-xs opacity-80 mt-0.5">{s.desc}</p>
               </div>
             ))}
           </div>
@@ -96,14 +96,14 @@ export function FixLegendPanel({
                   <div className="flex items-center gap-2 flex-wrap">
                     {PARAM_ICON[parameterKey] ?? PARAM_ICON[displayParam]}
                     <span className="text-sm font-bold text-gray-800">{scenario.name}</span>
-                    <span className={`px-1.5 py-0.5 rounded-full text-[10px] font-bold uppercase ${isHigh ? "bg-red-100 text-red-700" : "bg-amber-100 text-amber-700"}`}>
+                    <span className={`px-1.5 py-0.5 rounded-full text-micro font-bold uppercase ${isHigh ? "bg-red-100 text-red-700" : "bg-amber-100 text-amber-700"}`}>
                       {direction}
                     </span>
                     {active && (
-                      <span className="px-1.5 py-0.5 rounded-full text-[10px] font-semibold bg-orange-100 text-orange-700">Active now</span>
+                      <span className="px-1.5 py-0.5 rounded-full text-micro font-semibold bg-orange-100 text-orange-700">Active now</span>
                     )}
                     {count > 0 && (
-                      <span className="px-1.5 py-0.5 rounded-full text-[10px] font-semibold bg-blue-100 text-blue-700">
+                      <span className="px-1.5 py-0.5 rounded-full text-micro font-semibold bg-blue-100 text-blue-700">
                         {count} in view
                       </span>
                     )}
@@ -118,14 +118,14 @@ export function FixLegendPanel({
                     ))}
                   </ol>
                   {scenario.preventionTip && (
-                    <p className="mt-1.5 text-[11px] text-emerald-700">
+                    <p className="mt-1.5 text-xs text-emerald-700">
                       <span className="font-semibold">Tip:</span> {scenario.preventionTip}
                     </p>
                   )}
                   {onOpenFix && (
                     <button
                       onClick={() => onOpenFix(key)}
-                      className="mt-2 text-[11px] font-semibold text-orange-600 hover:text-orange-700 transition"
+                      className="mt-2 text-xs font-semibold text-orange-600 hover:text-orange-700 transition"
                     >
                       How to fix →
                     </button>
@@ -182,7 +182,7 @@ export function FixLegendModal({
             {PARAM_ICON[guidance.parameterKey] ?? PARAM_ICON[displayParam]}
             <div>
               <h3 className="font-bold text-gray-800 leading-tight">{guidance.name}</h3>
-              <p className="text-[10px] text-gray-400">{guidance.direction} — {guidance.unit}</p>
+              <p className="text-micro text-gray-400">{guidance.direction} — {guidance.unit}</p>
             </div>
           </div>
           <div className="flex items-center gap-1.5">
@@ -207,13 +207,13 @@ export function FixLegendModal({
 
           <div className="grid grid-cols-2 gap-2">
             <div className="rounded-lg bg-gray-50 border border-gray-100 p-2.5">
-              <p className="text-[10px] font-bold text-gray-400 uppercase">Reading</p>
+              <p className="text-micro font-bold text-gray-400 uppercase">Reading</p>
               <p className="text-lg font-bold text-gray-800">
                 {guidance.currentValue != null ? `${guidance.currentValue} ${guidance.unit}` : "—"}
               </p>
             </div>
             <div className="rounded-lg bg-gray-50 border border-gray-100 p-2.5">
-              <p className="text-[10px] font-bold text-gray-400 uppercase">Safe range</p>
+              <p className="text-micro font-bold text-gray-400 uppercase">Safe range</p>
               <p className="text-lg font-bold text-gray-800">
                 {guidance.safeRange.min} – {guidance.safeRange.max} {guidance.unit}
               </p>
@@ -225,7 +225,7 @@ export function FixLegendModal({
             <ol className="space-y-1.5 text-sm text-gray-700">
               {guidance.fixes.map((fix, i) => (
                 <li key={i} className="flex gap-2">
-                  <span className="w-5 h-5 rounded-full bg-orange-100 text-orange-700 text-[11px] font-bold flex items-center justify-center shrink-0 mt-0.5">
+                  <span className="w-5 h-5 rounded-full bg-orange-100 text-orange-700 text-xs font-bold flex items-center justify-center shrink-0 mt-0.5">
                     {i + 1}
                   </span>
                   <span>{fix}</span>

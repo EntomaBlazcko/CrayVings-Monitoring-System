@@ -78,11 +78,11 @@ export default function FarmOverview() {
         atRisk ? "bg-red-50" : "bg-gray-50"
       }`}
     >
-      <span className="text-[9px] font-bold uppercase tracking-wide text-gray-400">{label}</span>
+      <span className="text-micro font-bold uppercase tracking-wide text-gray-400">{label}</span>
       <span className={`text-sm leading-tight ${atRisk ? "font-bold text-red-600" : "font-semibold text-gray-700"}`}>
         {display}
       </span>
-      <span className="text-[9px] text-gray-400">{unitColor}</span>
+      <span className="text-micro text-gray-400">{unitColor}</span>
     </div>
   );
 
@@ -91,7 +91,7 @@ export default function FarmOverview() {
       <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
         <div>
           <h3 className="text-lg font-bold text-gray-800">Farm Overview</h3>
-          <p className="text-[11px] text-gray-400">
+          <p className="text-xs text-gray-400">
             {devices.length === 0
               ? "No tanks registered yet"
               : onlineCount === 0
@@ -106,7 +106,7 @@ export default function FarmOverview() {
           type="button"
           onClick={toggleHiddenPanel}
           title={showHidden ? "Close hidden tanks" : "Show hidden tanks"}
-          className="inline-flex items-center gap-1 rounded-lg border border-gray-200 px-2.5 py-1.5 text-[11px] font-semibold text-gray-500 transition hover:border-orange-300 hover:text-orange-700"
+          className="inline-flex items-center gap-1 rounded-lg border border-gray-200 px-2.5 py-1.5 text-xs font-semibold text-gray-500 transition hover:border-orange-300 hover:text-orange-700"
         >
           {showHidden ? <EyeOff size={12} /> : <Eye size={12} />}
           Hidden{hiddenCount > 0 ? ` (${hiddenCount})` : ""}
@@ -165,12 +165,12 @@ export default function FarmOverview() {
                           {deviceLabel(device)}
                         </p>
                         {device.tank_location && (
-                          <p className="truncate text-[10px] text-gray-400">{device.tank_location}</p>
+                          <p className="truncate text-micro text-gray-400">{device.tank_location}</p>
                         )}
                       </div>
                     </div>
                     <span
-                      className={`shrink-0 rounded-full px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide ${
+                      className={`shrink-0 rounded-full px-2 py-0.5 text-micro font-bold uppercase tracking-wide ${
                         device.online ? "bg-emerald-100 text-emerald-700" : "bg-red-100 text-red-700"
                       }`}
                     >
@@ -185,14 +185,14 @@ export default function FarmOverview() {
                   </div>
 
                   {tempAtRisk || waterAtRisk || ammoniaAtRisk ? (
-                    <p className="flex items-center gap-1 text-[10px] font-semibold text-red-600">
+                    <p className="flex items-center gap-1 text-micro font-semibold text-red-600">
                       <TriangleAlert size={11} />
                       Reading outside safe range — check this tank
                     </p>
                   ) : null}
 
                   <div className="mt-auto flex items-center justify-between gap-2 border-t border-gray-100 pt-2">
-                    <span className="text-[10px] text-gray-400">
+                    <span className="text-micro text-gray-400">
                       {device.device_id} · {reading?.recv_at ? `updated ${formatFarmTime(reading.recv_at)}` : "no readings yet"}
                     </span>
                     <div className="flex items-center gap-1.5 transition md:opacity-0 md:focus-within:opacity-100 md:group-hover:opacity-100">
@@ -227,7 +227,7 @@ export default function FarmOverview() {
                     onClick={() => restore(device.device_id)}
                     disabled={restoring === device.device_id}
                     title={`Restore ${device.device_id}`}
-                    className="ml-1 inline-flex items-center gap-1 rounded-lg border border-gray-200 bg-white px-2 py-1 text-[11px] font-semibold text-orange-700 transition hover:border-orange-300 disabled:opacity-50"
+                    className="ml-1 inline-flex items-center gap-1 rounded-lg border border-gray-200 bg-white px-2 py-1 text-xs font-semibold text-orange-700 transition hover:border-orange-300 disabled:opacity-50"
                   >
                     <RotateCcw size={11} className={restoring === device.device_id ? "animate-spin" : ""} />
                     Restore

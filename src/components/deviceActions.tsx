@@ -43,7 +43,7 @@ export function DeviceLiveCheck({ deviceId, ipAddress, compact }: { deviceId: st
           runCheck();
         }}
         title="Live check (reads the device directly)"
-        className="rounded-md border border-gray-200 bg-white p-1 text-gray-400 transition hover:border-orange-300 hover:text-orange-700"
+        className="rounded-md border border-gray-200 bg-white p-1 text-gray-400 transition hover:border-orange-300 min-h-11 min-w-11 sm:min-h-0 sm:min-w-0 md:min-h-0 md:min-w-000 hover:text-orange-700"
       >
         <Activity size={13} />
       </button>
@@ -52,7 +52,7 @@ export function DeviceLiveCheck({ deviceId, ipAddress, compact }: { deviceId: st
 
   if (live.status === "loading") {
     return (
-      <span title={`Querying ${ipAddress || deviceId}...`} className="inline-flex items-center gap-1 text-[10px] text-gray-400">
+      <span title={`Querying ${ipAddress || deviceId}...`} className="inline-flex items-center gap-1 text-micro text-gray-400">
         <RefreshCw size={11} className="animate-spin" />
         {compact ? "" : "Querying..."}
       </span>
@@ -61,7 +61,7 @@ export function DeviceLiveCheck({ deviceId, ipAddress, compact }: { deviceId: st
 
   if (live.status === "error") {
     return (
-      <span title={`${live.message} - device may be powered off`} className="inline-flex items-center gap-1 text-[10px] font-semibold text-red-600">
+      <span title={`${live.message} - device may be powered off`} className="inline-flex items-center gap-1 text-micro font-semibold text-red-600">
         <X size={11} />
         {compact ? "No response" : "No response from device"}
       </span>
@@ -69,7 +69,7 @@ export function DeviceLiveCheck({ deviceId, ipAddress, compact }: { deviceId: st
   }
 
   return (
-    <div className="rounded-lg border border-gray-200 bg-white p-2 text-[11px] text-gray-600">
+    <div className="rounded-lg border border-gray-200 bg-white p-2 text-xs text-gray-600">
       <p className="font-semibold text-gray-700">Device {live.data.device_id}</p>
       <p>
         Uptime {Math.floor(live.data.uptime_ms / 1000 / 60)}m · RSSI {live.data.wifi_rssi} dBm · Heap{" "}
@@ -146,7 +146,7 @@ export function DeviceRename({ device, onSaved }: { device: DeviceEntry; onSaved
           type="submit"
           disabled={saving || !value.trim()}
           title="Save name"
-          className="inline-flex shrink-0 items-center gap-1 rounded-lg bg-orange-600 px-2.5 py-1.5 text-[11px] font-semibold text-white transition hover:bg-orange-700 disabled:opacity-50"
+          className="inline-flex shrink-0 items-center gap-1 rounded-lg bg-orange-600 px-2.5 py-1.5 text-xs font-semibold text-white transition hover:bg-orange-700 disabled:opacity-50"
         >
           {saving ? <Loader2 size={12} className="animate-spin" /> : <Check size={12} />}
           Save
@@ -155,11 +155,11 @@ export function DeviceRename({ device, onSaved }: { device: DeviceEntry; onSaved
           type="button"
           onClick={(e) => close(e)}
           title="Cancel"
-          className="inline-flex shrink-0 items-center gap-1 rounded-lg border border-gray-200 bg-white px-2.5 py-1.5 text-[11px] font-semibold text-gray-600 transition hover:border-gray-300"
+          className="inline-flex shrink-0 items-center gap-1 rounded-lg border border-gray-200 bg-white px-2.5 py-1.5 text-xs font-semibold text-gray-600 transition hover:border-gray-300"
         >
           <X size={12} />
         </button>
-        {error && <span className="shrink-0 text-[11px] text-red-600">{error}</span>}
+        {error && <span className="shrink-0 text-xs text-red-600">{error}</span>}
       </form>
     );
   }
@@ -170,7 +170,7 @@ export function DeviceRename({ device, onSaved }: { device: DeviceEntry; onSaved
       onClick={open}
       aria-label={`Rename tank ${device.device_id}`}
       title="Rename tank"
-      className="rounded-md border border-gray-200 bg-white p-1 text-gray-400 transition hover:border-orange-300 hover:text-orange-700"
+      className="rounded-md border border-gray-200 bg-white p-1 text-gray-400 transition hover:border-orange-300 min-h-11 min-w-11 sm:min-h-0 sm:min-w-0 md:min-h-0 md:min-w-000 hover:text-orange-700"
     >
       <Pencil size={13} />
     </button>
@@ -187,7 +187,7 @@ export function DeviceHide({ device, onHidden }: { device: DeviceEntry; onHidden
   if (confirming) {
     return (
       <div className="inline-flex items-center gap-1.5 rounded-lg border border-red-200 bg-red-50 px-2 py-1">
-        <span className="text-[11px] font-semibold text-red-700">Hide tank?</span>
+        <span className="text-xs font-semibold text-red-700">Hide tank?</span>
         <button
           type="button"
           disabled={saving}
@@ -201,7 +201,7 @@ export function DeviceHide({ device, onHidden }: { device: DeviceEntry; onHidden
               setSaving(false);
             }
           }}
-          className="inline-flex items-center gap-1 rounded-md bg-red-600 px-2 py-0.5 text-[11px] font-semibold text-white transition hover:bg-red-700 disabled:opacity-50"
+          className="inline-flex items-center gap-1 rounded-md bg-red-600 px-2 py-0.5 text-xs font-semibold text-white transition hover:bg-red-700 disabled:opacity-50"
         >
           {saving ? <Loader2 size={11} className="animate-spin" /> : <EyeOff size={11} />}
           Hide
@@ -213,7 +213,7 @@ export function DeviceHide({ device, onHidden }: { device: DeviceEntry; onHidden
             e.stopPropagation();
             setConfirming(false);
           }}
-          className="inline-flex items-center gap-1 rounded-md border border-gray-200 bg-white px-2 py-0.5 text-[11px] font-semibold text-gray-600 transition hover:border-gray-300 disabled:opacity-50"
+          className="inline-flex items-center gap-1 rounded-md border border-gray-200 bg-white px-2 py-0.5 text-xs font-semibold text-gray-600 transition hover:border-gray-300 disabled:opacity-50"
         >
           <X size={11} />
           Cancel
@@ -231,7 +231,7 @@ export function DeviceHide({ device, onHidden }: { device: DeviceEntry; onHidden
       }}
       aria-label={`Hide tank ${device.device_id}`}
       title="Remove from tanks section (data kept, restorable)"
-      className="rounded-md border border-gray-200 bg-white p-1 text-gray-400 transition hover:border-red-300 hover:text-red-700"
+      className="rounded-md border border-gray-200 bg-white p-1 text-gray-400 transition hover:border-red-300 min-h-11 min-w-11 sm:min-h-0 sm:min-w-0 md:min-h-0 md:min-w-0 hover:text-red-700"
     >
       <EyeOff size={13} />
     </button>

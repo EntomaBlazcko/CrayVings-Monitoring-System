@@ -138,7 +138,7 @@ export function getSettingsThresholds(settings: SensorSettings | null): Record<s
   return {
     temperature: {
       name: "Temperature",
-      unit: "Â°C",
+      unit: "°C",
       range: { min: defaults.temp_min, max: defaults.temp_max },
       isMinOnly: false,
       color: "text-orange-500",

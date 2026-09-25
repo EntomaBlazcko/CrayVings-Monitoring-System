@@ -326,28 +326,28 @@ export default function AlertsPage({ onNavigate }: { onNavigate?: (menu: MenuKey
             <Bell size={12} /> Total Entries
           </div>
           <div className="text-2xl font-bold text-gray-800 mt-1">{totalEntries.toLocaleString()}</div>
-          <div className="text-[10px] text-gray-400">across all action types</div>
+          <div className="text-micro text-gray-400">across all action types</div>
         </div>
         <div className="bg-white rounded-xl border border-gray-100 p-4">
           <div className="flex items-center gap-1.5 text-xs text-gray-500">
             <AlertTriangle size={12} className="text-red-500" /> Alerts
           </div>
           <div className="text-2xl font-bold text-red-600 mt-1">{activeAlerts.toLocaleString()}</div>
-          <div className="text-[10px] text-gray-400">threshold breaches</div>
+          <div className="text-micro text-gray-400">threshold breaches</div>
         </div>
         <div className="bg-white rounded-xl border border-gray-100 p-4">
           <div className="flex items-center gap-1.5 text-xs text-gray-500">
             <ShieldAlert size={12} className="text-red-500" /> Critical (page)
           </div>
           <div className="text-2xl font-bold text-red-600 mt-1">{severityCounts.critical}</div>
-          <div className="text-[10px] text-gray-400">on current page</div>
+          <div className="text-micro text-gray-400">on current page</div>
         </div>
         <div className="bg-white rounded-xl border border-gray-100 p-4">
           <div className="flex items-center gap-1.5 text-xs text-gray-500">
             <Activity size={12} className="text-orange-500" /> Changes
           </div>
           <div className="text-2xl font-bold text-orange-600 mt-1">{activeChanges.toLocaleString()}</div>
-          <div className="text-[10px] text-gray-400">threshold settings updated</div>
+          <div className="text-micro text-gray-400">threshold settings updated</div>
         </div>
       </div>
 
@@ -459,17 +459,17 @@ export default function AlertsPage({ onNavigate }: { onNavigate?: (menu: MenuKey
                           >
                             {titleCase(log.action)}
                           </span>
-                          <span className={`inline-flex items-center gap-1 text-[10px] font-bold uppercase tracking-wide px-1.5 py-0.5 rounded-full ${meta.pill}`}>
+                          <span className={`inline-flex items-center gap-1 text-micro font-bold uppercase tracking-wide px-1.5 py-0.5 rounded-full ${meta.pill}`}>
                             {meta.icon} {meta.label}
                           </span>
                           {(logsDeviceMode === "all" || log.device_id) && (
-                            <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full text-[10px] font-bold bg-slate-100 text-slate-600 border border-slate-200">
+                            <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full text-micro font-bold bg-slate-100 text-slate-600 border border-slate-200">
                               {tankLabelFor(log.device_id) ?? "Farm-wide"}
                             </span>
                           )}
                           {log.action === "Alert" && isAcked(log) && (
                             <span
-                              className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full text-[10px] font-bold uppercase ${
+                              className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full text-micro font-bold uppercase ${
                                 isAcked(log)?.status === "confirmed" ? "bg-emerald-100 text-emerald-700" : "bg-gray-100 text-gray-600"
                               }`}
                             >
@@ -485,7 +485,7 @@ export default function AlertsPage({ onNavigate }: { onNavigate?: (menu: MenuKey
                       <p className="text-xs font-medium text-gray-500">
                         {log.timestamp ? formatFarmDateTime(log.timestamp) : "N/A"}
                       </p>
-                      <p className="text-[10px] text-gray-400">
+                      <p className="text-micro text-gray-400">
                         {formatTimeAgo(log.timestamp ?? "")}
                       </p>
                     </div>
@@ -523,13 +523,13 @@ export default function AlertsPage({ onNavigate }: { onNavigate?: (menu: MenuKey
                           e.stopPropagation();
                           setSelectedAlert(log);
                         }}
-                        className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-orange-50 text-[#c2410c] border border-orange-200 hover:bg-orange-100 transition"
+                        className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-orange-50 text-brand-600 border border-orange-200 hover:bg-orange-100 transition"
                       >
                         <Wrench size={13} />
                         How to fix
                       </button>
                       {isAcked(log) ? (
-                        <span className="text-[11px] text-gray-400">
+                        <span className="text-xs text-gray-400">
                           {isAcked(log)?.status === "confirmed" ? "Fix marked as done" : "Fix approved — no action taken yet"}
                         </span>
                       ) : (
@@ -626,7 +626,7 @@ export default function AlertsPage({ onNavigate }: { onNavigate?: (menu: MenuKey
                   {PARAM_ICON[selectedAlert.parameter] ?? PARAM_ICON[displayParam]}
                   <div>
                     <h3 className="font-bold text-gray-800 leading-tight">{guidance.name}</h3>
-                    <p className="text-[10px] text-gray-400">{guidance.direction} — {guidance.unit}</p>
+                    <p className="text-micro text-gray-400">{guidance.direction} — {guidance.unit}</p>
                   </div>
                 </div>
                 <div className="flex items-center gap-1.5">
@@ -644,7 +644,7 @@ export default function AlertsPage({ onNavigate }: { onNavigate?: (menu: MenuKey
 
               <div className="p-4 space-y-4 overflow-y-auto">
                 {selectedAlert.timestamp && (
-                  <p className="text-[11px] text-gray-400">Occurred {formatFarmDateTime(selectedAlert.timestamp)}</p>
+                  <p className="text-xs text-gray-400">Occurred {formatFarmDateTime(selectedAlert.timestamp)}</p>
                 )}
 
                 <div>
@@ -654,13 +654,13 @@ export default function AlertsPage({ onNavigate }: { onNavigate?: (menu: MenuKey
 
                 <div className="grid grid-cols-2 gap-2">
                   <div className="rounded-lg bg-gray-50 border border-gray-100 p-2.5">
-                    <p className="text-[10px] font-bold text-gray-400 uppercase">Reading</p>
+                    <p className="text-micro font-bold text-gray-400 uppercase">Reading</p>
                     <p className="text-lg font-bold text-gray-800">
                       {guidance.currentValue != null ? `${guidance.currentValue} ${guidance.unit}` : "—"}
                     </p>
                   </div>
                   <div className="rounded-lg bg-gray-50 border border-gray-100 p-2.5">
-                    <p className="text-[10px] font-bold text-gray-400 uppercase">Safe range</p>
+                    <p className="text-micro font-bold text-gray-400 uppercase">Safe range</p>
                     <p className="text-lg font-bold text-gray-800">
                       {guidance.safeRange.min} – {guidance.safeRange.max} {guidance.unit}
                     </p>
@@ -672,7 +672,7 @@ export default function AlertsPage({ onNavigate }: { onNavigate?: (menu: MenuKey
                   <ol className="space-y-1.5 text-sm text-gray-700">
                     {guidance.fixes.map((fix, i) => (
                       <li key={i} className="flex gap-2">
-                        <span className="w-5 h-5 rounded-full bg-orange-100 text-orange-700 text-[11px] font-bold flex items-center justify-center shrink-0 mt-0.5">
+                        <span className="w-5 h-5 rounded-full bg-orange-100 text-orange-700 text-xs font-bold flex items-center justify-center shrink-0 mt-0.5">
                           {i + 1}
                         </span>
                         <span>{fix}</span>
@@ -707,7 +707,7 @@ export default function AlertsPage({ onNavigate }: { onNavigate?: (menu: MenuKey
                       {acked.status === "confirmed" ? "Fix confirmed as done" : "Fix allowed / approved"}
                     </span>
                     {(acked.by || acked.at) && (
-                      <span className="text-[10px] text-gray-400">
+                      <span className="text-micro text-gray-400">
                         {[acked.by, acked.at ? formatFarmDateTime(acked.at) : null].filter(Boolean).join(" · ")}
                       </span>
                     )}

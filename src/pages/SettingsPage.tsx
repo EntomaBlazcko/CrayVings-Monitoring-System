@@ -353,7 +353,7 @@ function TankThresholdOverridesCard({
           <h3 className="text-base font-bold text-gray-800 flex items-center gap-2 flex-wrap">
             Per-Tank Threshold Overrides
             {detail && overriddenCount > 0 && (
-              <span className="text-[10px] font-bold uppercase tracking-wide px-2 py-0.5 rounded-full bg-orange-100 text-orange-700">
+              <span className="text-micro font-bold uppercase tracking-wide px-2 py-0.5 rounded-full bg-orange-100 text-orange-700">
                 {overriddenCount} field{overriddenCount === 1 ? "" : "s"} overridden
               </span>
             )}
@@ -395,7 +395,7 @@ function TankThresholdOverridesCard({
             >
               {tankOptionLabel(device)}
               {count > 0 && (
-                <span className={`rounded-full px-1.5 py-0.5 text-[10px] font-bold ${isActive ? "bg-white/25" : "bg-orange-100 text-orange-700"}`}>
+                <span className={`rounded-full px-1.5 py-0.5 text-micro font-bold ${isActive ? "bg-white/25" : "bg-orange-100 text-orange-700"}`}>
                   {count}
                 </span>
               )}
@@ -443,17 +443,17 @@ function TankThresholdOverridesCard({
                       <div className="text-xs font-bold uppercase text-gray-700 leading-tight">
                         {key === "temperature" ? "Temperature" : key === "water_level" ? "Water Level" : "Ammonia"}
                         {(minOverridden || maxOverridden) && (
-                          <span className="ml-1.5 text-[9px] font-bold uppercase px-1.5 py-0.5 rounded bg-orange-500 text-white">custom</span>
+                          <span className="ml-1.5 text-micro font-bold uppercase px-1.5 py-0.5 rounded bg-orange-500 text-white">custom</span>
                         )}
                       </div>
-                      <div className="text-[10px] text-gray-400">
+                      <div className="text-micro text-gray-400">
                         Global: {Number(detail.global[keys.min])} – {Number(detail.global[keys.max])}
                       </div>
                     </div>
                   </div>
                   <div className="grid grid-cols-2 gap-2">
                     <div>
-                      <label className="block text-[11px] text-gray-500 mb-0.5">Min override</label>
+                      <label className="block text-xs text-gray-500 mb-0.5">Min override</label>
                       <input
                         type="number"
                         step="0.1"
@@ -464,7 +464,7 @@ function TankThresholdOverridesCard({
                       />
                     </div>
                     <div>
-                      <label className="block text-[11px] text-gray-500 mb-0.5">Max override</label>
+                      <label className="block text-xs text-gray-500 mb-0.5">Max override</label>
                       <input
                         type="number"
                         step="0.1"
@@ -481,7 +481,7 @@ function TankThresholdOverridesCard({
                     bounds={bounds}
                     invalid={minVal >= maxVal}
                   />
-                  <div className="text-[11px] text-gray-400">
+                  <div className="text-xs text-gray-400">
                     Effective: {minVal} to {maxVal}
                     {minVal >= maxVal && <span className="ml-1 text-red-500 font-semibold">min must be less than max</span>}
                   </div>
@@ -498,7 +498,7 @@ function TankThresholdOverridesCard({
             <button
               onClick={handleSave}
               disabled={saving || !dirty || Boolean(draftInvalid)}
-              className="flex items-center gap-2 bg-gradient-to-r from-[#d94b1e] to-[#ef6a2e] px-4 py-2 text-white rounded-lg text-sm font-medium hover:from-[#c2410c] hover:to-[#d94b1e] transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+              className="flex items-center gap-2 bg-gradient-to-r from-brand-500 to-brand-400 px-4 py-2 text-white rounded-lg text-sm font-medium hover:from-brand-600 hover:to-brand-500 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
             >
               <Save size={16} />
               {saving ? "Saving..." : "Save Tank Overrides"}
@@ -1163,7 +1163,7 @@ export default function SettingsPage() {
       )}
 
       {/* Hero banner */}
-      <section className="relative overflow-hidden rounded-3xl bg-gradient-to-br from-[#d94b1e] via-[#ef6a2e] to-amber-600 text-white shadow-sm">
+      <section className="relative overflow-hidden rounded-3xl bg-gradient-to-br from-brand-500 via-brand-400 to-amber-600 text-white shadow-sm">
         <div className="relative p-6 lg:p-7 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
           <div className="flex items-center gap-4">
             <div className="w-14 h-14 rounded-2xl bg-white/15 border border-white/25 flex items-center justify-center shrink-0">
@@ -1187,7 +1187,7 @@ export default function SettingsPage() {
           <div className="flex items-center gap-3 text-sm">
             <button
               onClick={refetchSettings}
-              className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-white text-[#c2410c] text-sm font-semibold hover:bg-orange-50 transition"
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-white text-brand-600 text-sm font-semibold hover:bg-orange-50 transition"
             >
               <RefreshCw size={14} />
               Refresh
@@ -1214,21 +1214,21 @@ export default function SettingsPage() {
                 <Users size={12} className="text-orange-500" /> User Accounts
               </div>
               <div className="text-2xl font-bold text-orange-600 mt-1">{users.length}</div>
-              <div className="text-[11px] text-gray-400">on the system</div>
+              <div className="text-xs text-gray-400">on the system</div>
             </div>
             <div className="bg-white rounded-xl border border-gray-100 p-4">
               <div className="flex items-center gap-1.5 text-xs text-gray-500">
                 <Shield size={12} className="text-amber-500" /> Admins
               </div>
               <div className="text-2xl font-bold text-amber-600 mt-1">{adminCount}</div>
-              <div className="text-[11px] text-gray-400">administrator accounts</div>
+              <div className="text-xs text-gray-400">administrator accounts</div>
             </div>
             <div className="bg-white rounded-xl border border-gray-100 p-4">
               <div className="flex items-center gap-1.5 text-xs text-gray-500">
                 <Archive size={12} className="text-sky-500" /> Archived
               </div>
               <div className="text-2xl font-bold text-sky-600 mt-1">{archivedUsers.length + archivedRecipients.length}</div>
-              <div className="text-[11px] text-gray-400">
+              <div className="text-xs text-gray-400">
                 {archivedUsers.length} account{archivedUsers.length === 1 ? "" : "s"} · {archivedRecipients.length} number{archivedRecipients.length === 1 ? "" : "s"} restorable
               </div>
             </div>
@@ -1237,7 +1237,7 @@ export default function SettingsPage() {
                 <SlidersHorizontal size={12} className="text-orange-500" /> Thresholds
               </div>
               <div className="text-2xl font-bold text-orange-600 mt-1">{SETTINGS_FIELDS.length}</div>
-              <div className="text-[11px] text-gray-400">min/max per parameter</div>
+              <div className="text-xs text-gray-400">min/max per parameter</div>
             </div>
           </>
         ) : (
@@ -1247,14 +1247,14 @@ export default function SettingsPage() {
                 <Lock size={12} className="text-gray-500" /> Access
               </div>
               <div className="text-2xl font-bold text-gray-800 mt-1">View</div>
-              <div className="text-[11px] text-gray-400">read-only access</div>
+              <div className="text-xs text-gray-400">read-only access</div>
             </div>
             <div className="bg-white rounded-xl border border-gray-100 p-4">
               <div className="flex items-center gap-1.5 text-xs text-gray-500">
                 <AlertTriangle size={12} className="text-amber-500" /> Alerts Active
               </div>
               <div className="text-2xl font-bold text-amber-600 mt-1">Yes</div>
-              <div className="text-[11px] text-gray-400">thresholds enforced</div>
+              <div className="text-xs text-gray-400">thresholds enforced</div>
             </div>
           </>
         )}
@@ -1267,7 +1267,7 @@ export default function SettingsPage() {
               <AlertTriangle size={20} className="text-orange-500" />
               Alert Thresholds
               {dirty && isAdmin && (
-                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-bold bg-amber-100 text-amber-700">
+                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-bold bg-amber-100 text-amber-700">
                   <span className="w-1.5 h-1.5 rounded-full bg-amber-500 animate-pulse" />
                   Unsaved changes
                 </span>
@@ -1304,12 +1304,12 @@ export default function SettingsPage() {
                       {threshold.name}
                       <span className="font-normal text-gray-500 ml-1">({threshold.unit})</span>
                     </div>
-                    <div className="text-[10px] text-gray-400">Alerting safe range</div>
+                    <div className="text-micro text-gray-400">Alerting safe range</div>
                   </div>
                 </div>
                 <div className="grid grid-cols-2 gap-2">
                   <div>
-                    <label className="block text-[11px] text-gray-500 mb-0.5">Min</label>
+                    <label className="block text-xs text-gray-500 mb-0.5">Min</label>
                     <input
                       type="number"
                       step="0.1"
@@ -1325,13 +1325,13 @@ export default function SettingsPage() {
                       }`}
                     />
                     {validationErrors[keys.min] && isAdmin && (
-                      <div className="text-[10px] text-red-500 mt-1">
+                      <div className="text-micro text-red-500 mt-1">
                         {validationErrors[keys.min]}
                       </div>
                     )}
                   </div>
                   <div>
-                    <label className="block text-[11px] text-gray-500 mb-0.5">Max</label>
+                    <label className="block text-xs text-gray-500 mb-0.5">Max</label>
                     <input
                       type="number"
                       step="0.1"
@@ -1354,7 +1354,7 @@ export default function SettingsPage() {
                   bounds={bounds}
                   invalid={rangeInvalid}
                 />
-                <div className="text-[11px] text-gray-400">
+                <div className="text-xs text-gray-400">
                   Permitted bounds: {bounds.min} to {bounds.max} {threshold.unit}
                   {rangeInvalid && (
                     <span className="ml-1 text-red-500 font-semibold">min must be less than max</span>
@@ -1373,7 +1373,7 @@ export default function SettingsPage() {
             <button
               onClick={handleSave}
               disabled={settingsSaving || Object.keys(validationErrors).length > 0}
-              className="flex items-center gap-2 bg-gradient-to-r from-[#d94b1e] to-[#ef6a2e] px-4 py-2 text-white rounded-lg text-sm font-medium hover:from-[#c2410c] hover:to-[#d94b1e] transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+              className="flex items-center gap-2 bg-gradient-to-r from-brand-500 to-brand-400 px-4 py-2 text-white rounded-lg text-sm font-medium hover:from-brand-600 hover:to-brand-500 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
             >
               <Save size={16} />
               {settingsSaving ? "Saving..." : "Save Settings"}
@@ -1423,7 +1423,7 @@ export default function SettingsPage() {
               <h2 className="text-lg font-bold text-gray-800 flex items-center gap-2">
                 <Users size={20} className="text-orange-500" />
                 User Management
-                <span className="text-[10px] font-bold uppercase tracking-wide px-2 py-0.5 rounded-full bg-orange-100 text-orange-700">
+                <span className="text-micro font-bold uppercase tracking-wide px-2 py-0.5 rounded-full bg-orange-100 text-orange-700">
                   {users.length} account{users.length === 1 ? "" : "s"}
                 </span>
               </h2>
@@ -1432,7 +1432,7 @@ export default function SettingsPage() {
             {!showCreateForm && (
               <button
                 onClick={() => setShowCreateForm(true)}
-                className="flex items-center gap-2 bg-gradient-to-r from-[#d94b1e] to-[#ef6a2e] text-white px-4 py-2 rounded-lg font-semibold text-sm hover:from-[#c2410c] hover:to-[#d94b1e] transition-all"
+                className="flex items-center gap-2 bg-gradient-to-r from-brand-500 to-brand-400 text-white px-4 py-2 rounded-lg font-semibold text-sm hover:from-brand-600 hover:to-brand-500 transition-all"
               >
                 <UserPlus size={16} />
                 Add User
@@ -1470,7 +1470,7 @@ export default function SettingsPage() {
                         setForm((prev) => ({ ...prev, name: e.target.value }));
                         if (formErrors.name) setFormErrors((prev) => ({ ...prev, name: "" }));
                       }}
-                      className={`w-full px-3 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-[#d94b1e]/20 focus:border-[#d94b1e] ${
+                      className={`w-full px-3 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-brand-500/20 focus:border-brand-500 ${
                         formErrors.name ? "border-red-500 bg-red-50" : "border-gray-300"
                       }`}
                       placeholder="John Doe"
@@ -1490,7 +1490,7 @@ export default function SettingsPage() {
                         setForm((prev) => ({ ...prev, username: e.target.value }));
                         if (formErrors.username) setFormErrors((prev) => ({ ...prev, username: "" }));
                       }}
-                      className={`w-full px-3 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-[#d94b1e]/20 focus:border-[#d94b1e] ${
+                      className={`w-full px-3 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-brand-500/20 focus:border-brand-500 ${
                         formErrors.username ? "border-red-500 bg-red-50" : "border-gray-300"
                       }`}
                       placeholder="john_doe"
@@ -1510,7 +1510,7 @@ export default function SettingsPage() {
                         setForm((prev) => ({ ...prev, email: e.target.value }));
                         if (formErrors.email) setFormErrors((prev) => ({ ...prev, email: "" }));
                       }}
-                      className={`w-full px-3 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-[#d94b1e]/20 focus:border-[#d94b1e] ${
+                      className={`w-full px-3 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-brand-500/20 focus:border-brand-500 ${
                         formErrors.email ? "border-red-500 bg-red-50" : "border-gray-300"
                       }`}
                       placeholder="john@example.com"
@@ -1528,7 +1528,7 @@ export default function SettingsPage() {
                         onClick={() => setForm((prev) => ({ ...prev, role: "user" }))}
                         className={`flex-1 flex items-center justify-center gap-2 py-2 px-4 border-2 rounded-lg text-sm font-semibold transition-all ${
                           form.role === "user"
-                            ? "border-[#d94b1e] bg-[#d94b1e]/5 text-[#d94b1e]"
+                            ? "border-brand-500 bg-brand-500/5 text-brand-500"
                             : "border-gray-200 text-gray-500 hover:border-gray-300"
                         }`}
                       >
@@ -1540,7 +1540,7 @@ export default function SettingsPage() {
                         onClick={() => setForm((prev) => ({ ...prev, role: "admin" }))}
                         className={`flex-1 flex items-center justify-center gap-2 py-2 px-4 border-2 rounded-lg text-sm font-semibold transition-all ${
                           form.role === "admin"
-                            ? "border-[#d94b1e] bg-[#d94b1e]/5 text-[#d94b1e]"
+                            ? "border-brand-500 bg-brand-500/5 text-brand-500"
                             : "border-gray-200 text-gray-500 hover:border-gray-300"
                         }`}
                       >
@@ -1563,7 +1563,7 @@ export default function SettingsPage() {
                           setForm((prev) => ({ ...prev, password: e.target.value }));
                           if (formErrors.password) setFormErrors((prev) => ({ ...prev, password: "" }));
                         }}
-                        className={`w-full px-3 py-2 pr-10 border rounded-lg focus:outline-none focus:ring-2 focus:ring-[#d94b1e]/20 focus:border-[#d94b1e] ${
+                        className={`w-full px-3 py-2 pr-10 border rounded-lg focus:outline-none focus:ring-2 focus:ring-brand-500/20 focus:border-brand-500 ${
                           formErrors.password ? "border-red-500 bg-red-50" : "border-gray-300"
                         }`}
                         placeholder="Create a secure password"
@@ -1605,7 +1605,7 @@ export default function SettingsPage() {
                   <button
                     type="submit"
                     disabled={actionLoading === "create"}
-                    className="flex items-center gap-2 bg-gradient-to-r from-[#d94b1e] to-[#ef6a2e] text-white px-6 py-2 rounded-lg font-semibold text-sm hover:from-[#c2410c] hover:to-[#d94b1e] transition-all disabled:opacity-50 disabled:cursor-not-allowed"
+                    className="flex items-center gap-2 bg-gradient-to-r from-brand-500 to-brand-400 text-white px-6 py-2 rounded-lg font-semibold text-sm hover:from-brand-600 hover:to-brand-500 transition-all disabled:opacity-50 disabled:cursor-not-allowed"
                   >
                     {actionLoading === "create" ? (
                       <Loader2 size={16} className="animate-spin" />
@@ -1808,11 +1808,11 @@ export default function SettingsPage() {
                 <h3 className="text-lg font-bold text-gray-800 flex items-center gap-2 flex-wrap">
                   <MessageSquare size={20} className="text-orange-500" />
                   SMS Alerts
-                  <span className="text-[10px] font-bold uppercase tracking-wide px-2 py-0.5 rounded-full bg-orange-100 text-orange-700">
+                  <span className="text-micro font-bold uppercase tracking-wide px-2 py-0.5 rounded-full bg-orange-100 text-orange-700">
                     {recipients.filter((r) => r.is_active).length}/{recipients.length} active
                   </span>
                   {smsHealth && (
-                    <span className="text-[10px] font-bold uppercase tracking-wide px-2 py-0.5 rounded-full bg-blue-100 text-blue-700">
+                    <span className="text-micro font-bold uppercase tracking-wide px-2 py-0.5 rounded-full bg-blue-100 text-blue-700">
                       {smsHealth.smsCap > 0 ? `${smsHealth.smsToday}/${smsHealth.smsCap} today` : `${smsHealth.smsToday} sent today`}
                     </span>
                   )}
@@ -1946,7 +1946,7 @@ export default function SettingsPage() {
                   {smsMuteStatus.devices
                     .filter((d) => d.muted)
                     .map((d) => (
-                      <span key={d.device_id} className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-bold bg-red-50 text-red-700 border border-red-200">
+                      <span key={d.device_id} className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-bold bg-red-50 text-red-700 border border-red-200">
                         <BellOff size={10} />
                         {d.tank_name || d.device_id} until {d.muteExpires ? formatFarmDate(d.muteExpires) : "—"}
                       </span>
@@ -1990,7 +1990,7 @@ export default function SettingsPage() {
                 <button
                   type="submit"
                   disabled={smsActionLoading === "add"}
-                  className="flex items-center justify-center gap-2 bg-gradient-to-r from-[#d94b1e] to-[#ef6a2e] text-white px-5 py-2 rounded-lg font-semibold text-sm hover:from-[#c2410c] hover:to-[#d94b1e] transition-all disabled:opacity-50 disabled:cursor-not-allowed"
+                  className="flex items-center justify-center gap-2 bg-gradient-to-r from-brand-500 to-brand-400 text-white px-5 py-2 rounded-lg font-semibold text-sm hover:from-brand-600 hover:to-brand-500 transition-all disabled:opacity-50 disabled:cursor-not-allowed"
                 >
                   {smsActionLoading === "add" ? <Loader2 size={16} className="animate-spin" /> : <UserPlus size={16} />}
                   Add Recipient
@@ -2291,17 +2291,17 @@ export default function SettingsPage() {
                             <td className="px-4 py-2">
                               <span
                                 title={badge.hint}
-                                className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[11px] font-bold uppercase tracking-wide ${badge.cls}`}
+                                className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-xs font-bold uppercase tracking-wide ${badge.cls}`}
                               >
                                 {badge.dot && <span className={`w-1.5 h-1.5 rounded-full ${badge.dot}`} />}
                                 {badge.label}
                               </span>
                               {log.failure_reason && (
-                                <p className="text-[11px] text-red-600 mt-1 max-w-[190px] truncate" title={log.failure_reason}>
+                                <p className="text-xs text-red-600 mt-1 max-w-[190px] truncate" title={log.failure_reason}>
                                   {log.failure_reason}
                                 </p>
                               )}
-                              {log.status === "queued" && <p className="text-[11px] text-gray-400 mt-0.5">waiting for delivery...</p>}
+                              {log.status === "queued" && <p className="text-xs text-gray-400 mt-0.5">waiting for delivery...</p>}
                             </td>
                             <td className="px-4 py-2 text-gray-700 font-mono text-xs whitespace-nowrap">{formatDisplayPhone(log.recipient_phone)}</td>
                             <td className="px-4 py-2 text-gray-600 max-w-[280px]">
@@ -2373,7 +2373,7 @@ export default function SettingsPage() {
                 type="password"
                 value={resetModal.password}
                 onChange={(e) => setResetModal((prev) => prev ? { ...prev, password: e.target.value, errors: {} } : null)}
-                className={`w-full px-3 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-[#d94b1e]/20 focus:border-[#d94b1e] ${
+                className={`w-full px-3 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-brand-500/20 focus:border-brand-500 ${
                   resetModal.errors.password ? "border-red-500 bg-red-50" : "border-gray-300"
                 }`}
                 placeholder="New password"
@@ -2394,7 +2394,7 @@ export default function SettingsPage() {
               <button
                 onClick={() => handleResetPassword(resetModal.id)}
                 disabled={actionLoading === `reset-${resetModal.id}`}
-                className="flex items-center gap-2 bg-gradient-to-r from-[#d94b1e] to-[#ef6a2e] text-white px-4 py-2 rounded-lg text-sm font-semibold hover:from-[#c2410c] hover:to-[#d94b1e] disabled:opacity-50"
+                className="flex items-center gap-2 bg-gradient-to-r from-brand-500 to-brand-400 text-white px-4 py-2 rounded-lg text-sm font-semibold hover:from-brand-600 hover:to-brand-500 disabled:opacity-50"
               >
                 {actionLoading === `reset-${resetModal.id}` ? <Loader2 size={16} className="animate-spin" /> : <KeyRound size={16} />}
                 Reset

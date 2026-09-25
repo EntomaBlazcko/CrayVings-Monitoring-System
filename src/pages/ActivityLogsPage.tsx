@@ -141,7 +141,7 @@ export default function ActivityLogsPage() {
   return (
     <div className="space-y-4">
       {/* Hero banner */}
-      <section className="relative overflow-hidden rounded-3xl bg-gradient-to-br from-[#d94b1e] via-[#ef6a2e] to-amber-600 text-white shadow-sm">
+      <section className="relative overflow-hidden rounded-3xl bg-gradient-to-br from-brand-500 via-brand-400 to-amber-600 text-white shadow-sm">
         <div className="relative p-6 lg:p-7 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
           <div className="flex items-center gap-4">
             <div className="w-14 h-14 rounded-2xl bg-white/15 border border-white/25 flex items-center justify-center shrink-0">
@@ -190,28 +190,28 @@ export default function ActivityLogsPage() {
             <FileText size={12} /> Total Entries
           </div>
           <div className="text-2xl font-bold text-gray-800 mt-1">{activityLogsTotal.toLocaleString()}</div>
-          <div className="text-[10px] text-gray-400">across all activity types</div>
+          <div className="text-micro text-gray-400">across all activity types</div>
         </div>
         <div className="bg-white rounded-xl border border-gray-100 p-4">
           <div className="flex items-center gap-1.5 text-xs text-gray-500">
             <Users size={12} className="text-orange-500" /> Users (this page)
           </div>
           <div className="text-2xl font-bold text-orange-600 mt-1">{distinctUsers}</div>
-          <div className="text-[10px] text-gray-400">distinct accounts</div>
+          <div className="text-micro text-gray-400">distinct accounts</div>
         </div>
         <div className="bg-white rounded-xl border border-gray-100 p-4">
           <div className="flex items-center gap-1.5 text-xs text-gray-500">
             <Settings size={12} className="text-orange-500" /> Settings Changes
           </div>
           <div className="text-2xl font-bold text-orange-600 mt-1">{settingsChanges}</div>
-          <div className="text-[10px] text-gray-400">on current page</div>
+          <div className="text-micro text-gray-400">on current page</div>
         </div>
         <div className="bg-white rounded-xl border border-gray-100 p-4">
           <div className="flex items-center gap-1.5 text-xs text-gray-500">
             <Cable size={12} className="text-green-500" /> Connect Events
           </div>
           <div className="text-2xl font-bold text-green-600 mt-1">{connectEvents}</div>
-          <div className="text-[10px] text-gray-400">on current page</div>
+          <div className="text-micro text-gray-400">on current page</div>
         </div>
       </div>
 
@@ -255,7 +255,7 @@ export default function ActivityLogsPage() {
       {/* Action type breakdown chips */}
       {Object.keys(actionCounts).length > 0 && (
         <div className="flex flex-wrap gap-2 items-center">
-          <span className="inline-flex items-center gap-1.5 text-[11px] font-semibold text-gray-500 uppercase tracking-wide">
+          <span className="inline-flex items-center gap-1.5 text-xs font-semibold text-gray-500 uppercase tracking-wide">
             <ListFilter size={12} /> This page:
           </span>
           {Object.entries(actionCounts).map(([type, count]) => {
@@ -322,7 +322,7 @@ export default function ActivityLogsPage() {
                           <p className="text-xs font-medium text-gray-700">
                             {log.timestamp ? formatFarmDateTime(log.timestamp) : "-"}
                           </p>
-                          <p className="text-[10px] text-gray-400">
+                          <p className="text-micro text-gray-400">
                             {log.timestamp ? formatTimeAgo(log.timestamp) : ""}
                           </p>
                         </td>

@@ -12,13 +12,15 @@ import { getIsSoundEnabled, setSoundEnabled } from "../utils/playAlertSound";
 import TrendCard from "../components/TrendCard";
 import FarmOverview from "../components/FarmOverview";
 import StatCard from "../components/StatCard";
+import { SENSOR_COLORS } from "../utils/tokens";
+import brandBackground from "../assets/crayvings.png";
 
 type Props = {
   onNavigate?: (menu: MenuKey) => void;
 };
 
 export default function DashboardPage({ onNavigate }: Props) {
-  const { latestReading, history, connectionStatus, lastUpdate, thresholdsFor, settingsFor, loading, historyStale, historyLastUpdated, refetch, devices, selectedDeviceId } = useSensors();
+  const { latestReading, history, connectionStatus, lastUpdate, thresholdsFor, settingsFor, loading, historyStale, historyLastUpdated, refetch, devices, selectedDeviceId, error } = useSensors();
   const { user } = useAuth();
   const isAdmin = user?.role === "admin";
   const [alertsDismissed, setAlertsDismissed] = useState(false);
@@ -109,15 +111,17 @@ export default function DashboardPage({ onNavigate }: Props) {
     }
     if (tankStatus.safe && isOnline) {
       return (
-        <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold bg-emerald-100 text-emerald-700">
+        <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-sm font-semibold bg-emerald-100 text-emerald-700">
           <CheckCircle size={14} />
           Tank Safe
         </span>
       );
     }
     if (hasData && !tankStatus.safe) {
+      // Pulsing so the one badge that must not be missed reads at a glance from
+      // arm's length, and text-sm (was text-xs) so it survives a phone screen.
       return (
-        <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold bg-red-100 text-red-700">
+        <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-sm font-bold bg-red-100 text-red-700 ring-1 ring-red-300 animate-pulse">
           <AlertTriangle size={14} />
           Attention Needed
         </span>
@@ -149,7 +153,19 @@ export default function DashboardPage({ onNavigate }: Props) {
   const fmt = (value: number | null, unit: string) =>
     loading ? "Loading..." : value !== null && value !== undefined ? `${value}${unit}` : `--${unit}`;
 
+  // Ammonia leads everywhere: it is the fastest-acting toxin for crayfish, so
+  // it must be the first number read rather than the third. Same order in the
+  // stat cards, the hero highlights, the key-metric tiles and the trend row.
   const stats = [
+    {
+      title: "Ammonia",
+      value: fmt(latestReading?.ammonia ?? null, " ppm"),
+      color: sensorColors.ammonia,
+      icon: <FlaskConical size={24} />,
+      loading,
+      status: latestReading ? sensorStatuses.ammonia : undefined,
+      rangeLabel: `Safe: ${thresholds.ammonia.range.min}-${thresholds.ammonia.range.max} ppm`,
+    },
     {
       title: "Water Temperature",
       value: fmt(latestReading?.temperature ?? null, "°C"),
@@ -157,7 +173,7 @@ export default function DashboardPage({ onNavigate }: Props) {
       icon: <Thermometer size={24} />,
       loading,
       status: latestReading ? sensorStatuses.temperature : undefined,
-      rangeLabel: `Threshold: ${thresholds.temperature.range.min}-${thresholds.temperature.range.max}°C`,
+      rangeLabel: `Safe: ${thresholds.temperature.range.min}-${thresholds.temperature.range.max}°C`,
     },
     {
       title: "Water Level",
@@ -166,23 +182,14 @@ export default function DashboardPage({ onNavigate }: Props) {
       icon: <Waves size={24} />,
       loading,
       status: latestReading ? sensorStatuses.water_level : undefined,
-      rangeLabel: `Threshold: ${thresholds.water_level.range.min}-${thresholds.water_level.range.max}%`,
-    },
-    {
-      title: "Ammonia",
-      value: fmt(latestReading?.ammonia ?? null, " ppm"),
-      color: sensorColors.ammonia,
-      icon: <FlaskConical size={24} />,
-      loading,
-      status: latestReading ? sensorStatuses.ammonia : undefined,
-      rangeLabel: `Threshold: ${thresholds.ammonia.range.min}-${thresholds.ammonia.range.max} ppm`,
+      rangeLabel: `Safe: ${thresholds.water_level.range.min}-${thresholds.water_level.range.max}%`,
     },
   ];
 
   const highlights = [
+    { label: "Ammonia", value: loading ? "..." : latestReading?.ammonia != null ? `${latestReading.ammonia} ppm` : "--", color: isOfflineWithData ? "bg-yellow-50 border-yellow-200 text-yellow-700" : latestReading ? "bg-emerald-50 border-emerald-200 text-emerald-700" : "bg-red-50 border-red-200 text-red-700" },
     { label: "Temperature", value: loading ? "..." : latestReading?.temperature != null ? `${latestReading.temperature}°C` : "--", color: isOfflineWithData ? "bg-yellow-50 border-yellow-200 text-yellow-700" : latestReading ? "bg-orange-50 border-orange-200 text-orange-700" : "bg-red-50 border-red-200 text-red-700" },
     { label: "Water Level", value: loading ? "..." : latestReading?.water_level != null ? `${latestReading.water_level}%` : "--", color: isOfflineWithData ? "bg-yellow-50 border-yellow-200 text-yellow-700" : latestReading ? "bg-blue-50 border-blue-200 text-blue-700" : "bg-red-50 border-red-200 text-red-700" },
-    { label: "Ammonia", value: loading ? "..." : latestReading?.ammonia != null ? `${latestReading.ammonia} ppm` : "--", color: isOfflineWithData ? "bg-yellow-50 border-yellow-200 text-yellow-700" : latestReading ? "bg-emerald-50 border-emerald-200 text-emerald-700" : "bg-red-50 border-red-200 text-red-700" },
   ];
 
   const recentAlerts = tankStatus.alerts.filter(alert => alert !== "Tank is Safe").slice(0, 4);
@@ -239,6 +246,29 @@ export default function DashboardPage({ onNavigate }: Props) {
         <FarmOverview />
       </section>
 
+      {error && !hasData && (
+        // Without this the connection error was never rendered anywhere on the
+        // dashboard, so a lost backend looked identical to a loading app.
+        <div className="bg-red-50 border border-red-200 rounded-xl p-3 flex items-start gap-2">
+          <AlertCircle size={16} className="text-red-500 shrink-0 mt-0.5" />
+          <div className="min-w-0">
+            <p className="text-xs font-bold text-red-800">Cannot reach the monitoring service</p>
+            <p className="text-xs text-red-700 mt-0.5">{error}</p>
+            <p className="text-xs text-red-700 mt-0.5">
+              Readings below cannot be trusted. Check that the server is running, then retry.
+            </p>
+          </div>
+          <button
+            onClick={handleRefresh}
+            disabled={isRefreshing}
+            className="ml-auto shrink-0 inline-flex items-center gap-1.5 rounded-lg bg-red-600 px-2.5 py-1.5 text-xs font-bold text-white hover:bg-red-700 disabled:opacity-50"
+          >
+            <RefreshCw size={13} className={isRefreshing ? "animate-spin" : ""} />
+            Retry
+          </button>
+        </div>
+      )}
+
       {isOfflineWithData && (
         <div className="bg-yellow-50 border border-yellow-200 rounded-xl p-3 flex items-center gap-2">
           <AlertTriangle size={16} className="text-yellow-600 shrink-0" />
@@ -251,7 +281,7 @@ export default function DashboardPage({ onNavigate }: Props) {
       <section className="relative overflow-hidden rounded-3xl border border-gray-200 bg-gradient-to-r from-orange-50 via-amber-50 to-orange-100 shadow-sm">
         <div
           className="absolute inset-0 bg-cover bg-center opacity-10"
-          style={{ backgroundImage: "url('/crayvings background.png')" }}
+          style={{ backgroundImage: `url(${brandBackground})` }}
         />
         <div className="absolute inset-0 bg-white/20" />
 
@@ -352,7 +382,12 @@ export default function DashboardPage({ onNavigate }: Props) {
       {/* Live stat cards */}
       <section className={`grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3 ${isOfflineWithData ? "opacity-60" : ""}`}>
         {stats.map((stat) => (
-          <StatCard key={stat.title} {...stat} />
+          <StatCard
+            key={stat.title}
+            {...stat}
+            updatedAt={lastUpdate}
+            stale={historyStale && isOfflineWithData}
+          />
         ))}
       </section>
 
@@ -383,10 +418,18 @@ export default function DashboardPage({ onNavigate }: Props) {
         )}
         <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
           <TrendCard
+            title="Ammonia"
+            data={history}
+            dataKey="ammonia"
+            stroke={SENSOR_COLORS.ammonia}
+            range={thresholds.ammonia.range}
+            unit=" ppm"
+          />
+          <TrendCard
             title="Temperature"
             data={history}
             dataKey="temperature"
-            stroke="#f97316"
+            stroke={SENSOR_COLORS.temperature}
             range={thresholds.temperature.range}
             unit="°C"
           />
@@ -394,17 +437,9 @@ export default function DashboardPage({ onNavigate }: Props) {
             title="Water Level"
             data={history}
             dataKey="water_level"
-            stroke="#2563eb"
+            stroke={SENSOR_COLORS.water_level}
             range={thresholds.water_level.range}
             unit="%"
-          />
-          <TrendCard
-            title="Ammonia"
-            data={history}
-            dataKey="ammonia"
-            stroke="#10b981"
-            range={thresholds.ammonia.range}
-            unit=" ppm"
           />
         </div>
       </section>
@@ -458,25 +493,25 @@ export default function DashboardPage({ onNavigate }: Props) {
             </div>
           ) : (
             <div className={`grid grid-cols-1 gap-4 sm:grid-cols-3 ${isOfflineWithData ? "opacity-60" : ""}`}>
+              <div className="rounded-xl bg-emerald-50 p-4">
+                <p className="text-xs text-gray-500">Ammonia</p>
+                <p className="mt-1 text-2xl font-bold text-emerald-600">{latestReading?.ammonia ?? "--"} ppm</p>
+                <p className="mt-1 text-xs text-gray-400">
+                  Safe: {thresholds.ammonia.range.min}-{thresholds.ammonia.range.max} ppm
+                </p>
+              </div>
               <div className="rounded-xl bg-orange-50 p-4">
                 <p className="text-xs text-gray-500">Temperature</p>
                 <p className="mt-1 text-2xl font-bold text-orange-600">{latestReading?.temperature ?? "--"}°C</p>
                 <p className="mt-1 text-xs text-gray-400">
-                  Optimal: {thresholds.temperature.range.min}-{thresholds.temperature.range.max}°C
+                  Safe: {thresholds.temperature.range.min}-{thresholds.temperature.range.max}°C
                 </p>
               </div>
               <div className="rounded-xl bg-blue-50 p-4">
                 <p className="text-xs text-gray-500">Water Level</p>
                 <p className="mt-1 text-2xl font-bold text-blue-600">{latestReading?.water_level ?? "--"}%</p>
                 <p className="mt-1 text-xs text-gray-400">
-                  Optimal: {thresholds.water_level.range.min}-{thresholds.water_level.range.max}%
-                </p>
-              </div>
-              <div className="rounded-xl bg-emerald-50 p-4">
-                <p className="text-xs text-gray-500">Ammonia</p>
-                <p className="mt-1 text-2xl font-bold text-emerald-600">{latestReading?.ammonia ?? "--"} ppm</p>
-                <p className="mt-1 text-xs text-gray-400">
-                  Optimal: {thresholds.ammonia.range.min}-{thresholds.ammonia.range.max} ppm
+                  Safe: {thresholds.water_level.range.min}-{thresholds.water_level.range.max}%
                 </p>
               </div>
             </div>

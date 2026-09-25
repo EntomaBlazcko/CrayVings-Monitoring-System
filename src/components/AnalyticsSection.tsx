@@ -35,6 +35,7 @@ import { isAxiosError } from "axios";
 import type { AnalyticsOverview, AnalyticsDailyEntry, Insight } from "../types";
 import { getThresholdStatus, SENSOR_KEY_TO_DISPLAY } from "../types";
 import { formatFarmDateTime, formatFarmDate } from "../utils/time";
+import { SENSOR_COLORS, CHART_COLORS, BAND_COLORS, BAR_COLORS } from "../utils/tokens";
 
 type RangeKey = 7 | 30 | 90;
 type ParamKey = "temperature" | "water_level" | "ammonia";
@@ -49,10 +50,10 @@ const RANGES: { value: RangeKey; label: string }[] = [
 const BAND_KEYS = ["bandMin", "bandMax"];
 
 const PARAM_META: Record<ParamKey, { label: string; unit: string; color: string; icon: React.ReactNode; yAxisId: string }> = {
-  temperature: { label: "Temperature", unit: "°C", color: "#f97316", icon: <Thermometer size={14} />, yAxisId: "left" },
+  temperature: { label: "Temperature", unit: "°C", color: SENSOR_COLORS.temperature, icon: <Thermometer size={14} />, yAxisId: "left" },
   // Water Level gets its own (hidden) axis so % doesn't share a scale with °C.
-  water_level: { label: "Water Level", unit: "%", color: "#2563eb", icon: <Waves size={14} />, yAxisId: "water" },
-  ammonia: { label: "Ammonia", unit: "ppm", color: "#10b981", icon: <FlaskConical size={14} />, yAxisId: "right" },
+  water_level: { label: "Water Level", unit: "%", color: SENSOR_COLORS.water_level, icon: <Waves size={14} />, yAxisId: "water" },
+  ammonia: { label: "Ammonia", unit: "ppm", color: SENSOR_COLORS.ammonia, icon: <FlaskConical size={14} />, yAxisId: "right" },
 };
 
 const STATUS_TEXT: Record<string, string> = {
@@ -183,7 +184,7 @@ function ParamCard({
         <div className="flex items-center gap-2 text-gray-500">
           {icon}
           <span className="text-xs font-semibold uppercase tracking-wide">{name}</span>
-          <span className={`text-[10px] font-bold uppercase tracking-wide px-1.5 py-0.5 rounded-full ${STATUS_PILL[status]}`}>
+          <span className={`text-micro font-bold uppercase tracking-wide px-1.5 py-0.5 rounded-full ${STATUS_PILL[status]}`}>
             {STATUS_LABEL[status]}
           </span>
         </div>
@@ -209,10 +210,10 @@ function ParamCard({
       </div>
       {breached ? (
         <div className="mt-2 border-t border-gray-100 pt-2">
-          <div className="text-[10px] text-gray-400 mb-1">
+          <div className="text-micro text-gray-400 mb-1">
             Safe range: {safeRange.min} – {safeRange.max} {unit}
           </div>
-          <span className={`inline-flex items-center gap-1 text-[10px] font-bold px-1.5 py-0.5 rounded-full ${breach.below > 0 && breach.above > 0 ? "bg-red-100 text-red-700" : "bg-amber-100 text-amber-700"}`}>
+          <span className={`inline-flex items-center gap-1 text-micro font-bold px-1.5 py-0.5 rounded-full ${breach.below > 0 && breach.above > 0 ? "bg-red-100 text-red-700" : "bg-amber-100 text-amber-700"}`}>
             <AlertTriangle size={10} />
             {breach.below > 0 && breach.above > 0
               ? `${breach.below} below · ${breach.above} above`
@@ -223,10 +224,10 @@ function ParamCard({
         </div>
       ) : (
         <div className="mt-2 border-t border-gray-100 pt-2">
-          <div className="text-[10px] text-gray-400 mb-1">
+          <div className="text-micro text-gray-400 mb-1">
             Safe range: {safeRange.min} – {safeRange.max} {unit}
           </div>
-          <span className="inline-flex items-center gap-1 text-[10px] font-semibold text-emerald-600">
+          <span className="inline-flex items-center gap-1 text-micro font-semibold text-emerald-600">
             <CheckCircle2 size={10} /> all days within safe range
           </span>
         </div>
@@ -428,7 +429,7 @@ const tooltipSeriesFilter = (payload: readonly TooltipEntry[]): TooltipEntry[] =
             ))}
             <button
               onClick={() => setRetry((n) => n + 1)}
-              className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-semibold bg-[#c2410c] text-white hover:bg-[#a13a0a] transition"
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-semibold bg-brand-600 text-white hover:bg-brand-700 transition"
             >
               <RefreshCw size={14} />
               Refresh
@@ -453,21 +454,21 @@ const tooltipSeriesFilter = (payload: readonly TooltipEntry[]): TooltipEntry[] =
               <Database size={12} /> Total Readings
             </div>
             <div className="text-xl font-bold text-gray-800 mt-0.5">{uptime.readings.toLocaleString()}</div>
-            <div className="text-[10px] text-gray-400">~{avgDailyReadings.toLocaleString()} / day</div>
+            <div className="text-micro text-gray-400">~{avgDailyReadings.toLocaleString()} / day</div>
           </div>
           <div className="rounded-lg bg-gray-50 p-3">
             <div className="flex items-center gap-1.5 text-xs text-gray-500">
               <BellRing size={12} /> Alerts
             </div>
             <div className="text-xl font-bold text-gray-800 mt-0.5">{alerts.total}</div>
-            <div className="text-[10px] text-gray-400">~{avgDailyAlerts} / day</div>
+            <div className="text-micro text-gray-400">~{avgDailyAlerts} / day</div>
           </div>
           <div className="rounded-lg bg-gray-50 p-3">
             <div className="flex items-center gap-1.5 text-xs text-gray-500">
               <CheckCircle2 size={12} /> Resolved
             </div>
             <div className="text-xl font-bold text-gray-800 mt-0.5">{alerts.resolved}</div>
-            <div className="text-[10px] text-gray-400">
+            <div className="text-micro text-gray-400">
               {alerts.total > 0 ? `${Math.round((alerts.resolved / alerts.total) * 100)}% of alerts` : "no alerts"}
             </div>
           </div>
@@ -478,7 +479,7 @@ const tooltipSeriesFilter = (payload: readonly TooltipEntry[]): TooltipEntry[] =
             <div className={`text-xl font-bold mt-0.5 ${uptime.device_offline ? "text-red-600" : "text-emerald-600"}`}>
               {uptime.device_offline ? "Offline" : "Online"}
             </div>
-            <div className="text-[10px] text-gray-400">Last data {formatAgo(uptime.last_reading)}</div>
+            <div className="text-micro text-gray-400">Last data {formatAgo(uptime.last_reading)}</div>
           </div>
         </div>
       </div>
@@ -580,7 +581,7 @@ const tooltipSeriesFilter = (payload: readonly TooltipEntry[]): TooltipEntry[] =
             )}
           </div>
           {daily.length > 0 && (
-            <p className="text-[11px] text-gray-400 mt-1">
+            <p className="text-xs text-gray-400 mt-1">
               {alertDays > 0
                 ? `${alertDays} of ${daily.length} day${daily.length === 1 ? "" : "s"} had at least one alert`
                 : "No alert days in this window"}
@@ -606,26 +607,26 @@ const tooltipSeriesFilter = (payload: readonly TooltipEntry[]): TooltipEntry[] =
           <h2 className="text-lg font-bold text-gray-800 mb-4">Daily Readings &amp; Alerts</h2>
           <ResponsiveContainer width="100%" height={200}>
             <ComposedChart data={chartData}>
-              <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
+              <CartesianGrid strokeDasharray="3 3" stroke={CHART_COLORS.grid} />
               <XAxis
                 dataKey="name"
-                tick={{ fontSize: 10, fill: "#9ca3af" }}
+                tick={{ fontSize: 10, fill: CHART_COLORS.tick }}
                 tickFormatter={fmtAxisDate}
                 interval={Math.max(0, Math.floor(chartData.length / 10) - 1)}
                 tickLine={false}
-                axisLine={{ stroke: "#e5e7eb" }}
+                axisLine={{ stroke: CHART_COLORS.axis }}
               />
               <YAxis
-                tick={{ fontSize: 10, fill: "#9ca3af" }}
+                tick={{ fontSize: 10, fill: CHART_COLORS.tick }}
                 tickLine={false}
-                axisLine={{ stroke: "#e5e7eb" }}
+                axisLine={{ stroke: CHART_COLORS.axis }}
                 width={40}
                 yAxisId="left"
               />
               <YAxis
-                tick={{ fontSize: 10, fill: "#9ca3af" }}
+                tick={{ fontSize: 10, fill: CHART_COLORS.tick }}
                 tickLine={false}
-                axisLine={{ stroke: "#e5e7eb" }}
+                axisLine={{ stroke: CHART_COLORS.axis }}
                 width={40}
                 yAxisId="right"
                 orientation="right"
@@ -647,8 +648,8 @@ const tooltipSeriesFilter = (payload: readonly TooltipEntry[]): TooltipEntry[] =
                   );
                 }}
               />
-              <Bar dataKey="readings" name="Readings" fill="#93c5fd" fillOpacity={0.7} maxBarSize={28} yAxisId="left" radius={[3, 3, 0, 0]} isAnimationActive={false} />
-              <Bar dataKey="alerts" name="Alerts" fill="#fca5a5" fillOpacity={0.85} maxBarSize={28} yAxisId="right" radius={[3, 3, 0, 0]} isAnimationActive={false} />
+              <Bar dataKey="readings" name="Readings" fill={BAR_COLORS.readings} fillOpacity={0.7} maxBarSize={28} yAxisId="left" radius={[3, 3, 0, 0]} isAnimationActive={false} />
+              <Bar dataKey="alerts" name="Alerts" fill={BAR_COLORS.alerts} fillOpacity={0.85} maxBarSize={28} yAxisId="right" radius={[3, 3, 0, 0]} isAnimationActive={false} />
             </ComposedChart>
           </ResponsiveContainer>
           <div className="mt-2 flex flex-wrap justify-end gap-4 text-xs text-gray-500">
@@ -699,26 +700,26 @@ const tooltipSeriesFilter = (payload: readonly TooltipEntry[]): TooltipEntry[] =
 
           <ResponsiveContainer width="100%" height={280}>
             <ComposedChart data={displayData}>
-              <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
+              <CartesianGrid strokeDasharray="3 3" stroke={CHART_COLORS.grid} />
               <XAxis
                 dataKey="name"
-                tick={{ fontSize: 10, fill: "#9ca3af" }}
+                tick={{ fontSize: 10, fill: CHART_COLORS.tick }}
                 tickFormatter={fmtAxisDate}
                 interval={Math.max(0, Math.floor(displayData.length / 10) - 1)}
                 tickLine={false}
-                axisLine={{ stroke: "#e5e7eb" }}
+                axisLine={{ stroke: CHART_COLORS.axis }}
               />
               <YAxis
-                tick={{ fontSize: 10, fill: "#9ca3af" }}
+                tick={{ fontSize: 10, fill: CHART_COLORS.tick }}
                 tickLine={false}
-                axisLine={{ stroke: "#e5e7eb" }}
+                axisLine={{ stroke: CHART_COLORS.axis }}
                 width={42}
                 yAxisId="left"
               />
               <YAxis
-                tick={{ fontSize: 10, fill: "#9ca3af" }}
+                tick={{ fontSize: 10, fill: CHART_COLORS.tick }}
                 tickLine={false}
-                axisLine={{ stroke: "#e5e7eb" }}
+                axisLine={{ stroke: CHART_COLORS.axis }}
                 width={42}
                 yAxisId="right"
                 orientation="right"
@@ -757,7 +758,7 @@ const tooltipSeriesFilter = (payload: readonly TooltipEntry[]): TooltipEntry[] =
                     dataKey="bandMax"
                     baseValue={thresholds[focused].range.min}
                     stroke="none"
-                    fill="#10b981"
+                    fill={BAND_COLORS.safe}
                     fillOpacity={0.08}
                     isAnimationActive={false}
                     activeDot={false}
@@ -765,7 +766,7 @@ const tooltipSeriesFilter = (payload: readonly TooltipEntry[]): TooltipEntry[] =
                   />
                   <Line
                     dataKey="bandMin"
-                    stroke="#ef4444"
+                    stroke={BAND_COLORS.breach}
                     strokeWidth={1}
                     strokeDasharray="3 3"
                     dot={false}
@@ -775,7 +776,7 @@ const tooltipSeriesFilter = (payload: readonly TooltipEntry[]): TooltipEntry[] =
                   />
                   <Line
                     dataKey="bandMax"
-                    stroke="#ef4444"
+                    stroke={BAND_COLORS.breach}
                     strokeWidth={1}
                     strokeDasharray="3 3"
                     dot={false}
@@ -791,7 +792,7 @@ const tooltipSeriesFilter = (payload: readonly TooltipEntry[]): TooltipEntry[] =
                 <Line
                   dataKey={rollKey as string}
                   name={`${PARAM_META[focused].label} (7d avg)`}
-                  stroke="#6b7280"
+                  stroke={CHART_COLORS.muted}
                   strokeWidth={1.5}
                   strokeDasharray="4 3"
                   dot={false}
@@ -843,39 +844,39 @@ const tooltipSeriesFilter = (payload: readonly TooltipEntry[]): TooltipEntry[] =
           {dayHighlights && (
             <div className="mt-4 grid grid-cols-2 sm:grid-cols-5 gap-2">
               <div className="rounded-lg bg-orange-50 border border-orange-100 p-2.5">
-                <p className="flex items-center gap-1 text-[10px] text-orange-600 font-bold uppercase">
+                <p className="flex items-center gap-1 text-micro text-orange-600 font-bold uppercase">
                   <Flame size={12} /> Hottest Day
                 </p>
                 <p className="text-sm font-bold text-gray-800">{Number(dayHighlights.hottest.temp_avg).toFixed(1)}°C</p>
-                <p className="text-[10px] text-gray-400">{formatFarmDate(dayHighlights.hottest.date)}</p>
+                <p className="text-micro text-gray-400">{formatFarmDate(dayHighlights.hottest.date)}</p>
               </div>
               <div className="rounded-lg bg-amber-50 border border-amber-100 p-2.5">
-                <p className="flex items-center gap-1 text-[10px] text-amber-600 font-bold uppercase">
+                <p className="flex items-center gap-1 text-micro text-amber-600 font-bold uppercase">
                   <Snowflake size={12} /> Coolest Day
                 </p>
                 <p className="text-sm font-bold text-gray-800">{Number(dayHighlights.coldest.temp_avg).toFixed(1)}°C</p>
-                <p className="text-[10px] text-gray-400">{formatFarmDate(dayHighlights.coldest.date)}</p>
+                <p className="text-micro text-gray-400">{formatFarmDate(dayHighlights.coldest.date)}</p>
               </div>
               <div className="rounded-lg bg-emerald-50 border border-emerald-100 p-2.5">
-                <p className="flex items-center gap-1 text-[10px] text-emerald-600 font-bold uppercase">
+                <p className="flex items-center gap-1 text-micro text-emerald-600 font-bold uppercase">
                   <FlaskConical size={12} /> Peak Ammonia
                 </p>
                 <p className="text-sm font-bold text-gray-800">{Number(dayHighlights.highestAmmonia.ammonia_avg).toFixed(2)} ppm</p>
-                <p className="text-[10px] text-gray-400">{formatFarmDate(dayHighlights.highestAmmonia.date)}</p>
+                <p className="text-micro text-gray-400">{formatFarmDate(dayHighlights.highestAmmonia.date)}</p>
               </div>
               <div className="rounded-lg bg-red-50 border border-red-100 p-2.5">
-                <p className="flex items-center gap-1 text-[10px] text-red-600 font-bold uppercase">
+                <p className="flex items-center gap-1 text-micro text-red-600 font-bold uppercase">
                   <BellRing size={12} /> Most Alerts
                 </p>
                 <p className="text-sm font-bold text-gray-800">{Number(dayHighlights.mostAlerts.alerts)}</p>
-                <p className="text-[10px] text-gray-400">{formatFarmDate(dayHighlights.mostAlerts.date)}</p>
+                <p className="text-micro text-gray-400">{formatFarmDate(dayHighlights.mostAlerts.date)}</p>
               </div>
               <div className="rounded-lg bg-gray-50 border border-gray-100 p-2.5">
-                <p className="flex items-center gap-1 text-[10px] text-gray-600 font-bold uppercase">
+                <p className="flex items-center gap-1 text-micro text-gray-600 font-bold uppercase">
                   <Database size={12} /> Busiest Day
                 </p>
                 <p className="text-sm font-bold text-gray-800">{Number(dayHighlights.busiest.readings).toLocaleString()} reads</p>
-                <p className="text-[10px] text-gray-400">{formatFarmDate(dayHighlights.busiest.date)}</p>
+                <p className="text-micro text-gray-400">{formatFarmDate(dayHighlights.busiest.date)}</p>
               </div>
             </div>
           )}
@@ -931,13 +932,13 @@ const tooltipSeriesFilter = (payload: readonly TooltipEntry[]): TooltipEntry[] =
                   <div className="min-w-0 flex-1">
                     <div className="flex items-center gap-2">
                       <h3 className="font-bold text-sm text-gray-800">{insight.title}</h3>
-                      <span className={`text-[10px] font-bold uppercase tracking-wide px-1.5 py-0.5 rounded ${style.badge}`}>
+                      <span className={`text-micro font-bold uppercase tracking-wide px-1.5 py-0.5 rounded ${style.badge}`}>
                         {style.label}
                       </span>
                     </div>
                     <p className="text-xs text-gray-600 mt-0.5">{insight.message}</p>
                     {insight.action && (
-                      <p className="text-xs text-[#c2410c] mt-1 font-medium">{insight.action}</p>
+                      <p className="text-xs text-brand-600 mt-1 font-medium">{insight.action}</p>
                     )}
                   </div>
                 </div>

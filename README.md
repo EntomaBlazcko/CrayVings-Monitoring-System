@@ -1,4 +1,4 @@
-<img width="2048" height="2048" alt="CRAYVINGS" src="https://github.com/user-attachments/assets/57608e73-686f-4dfb-9b6a-3ceba1092add" />
+<img width="2048" height="2048" alt="CRAYvings" src="https://github.com/user-attachments/assets/57608e73-686f-4dfb-9b6a-3ceba1092add" />
 
 # CRAYvings Monitoring System
 

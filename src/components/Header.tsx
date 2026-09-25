@@ -56,10 +56,10 @@ function TankDropdown() {
 export default function Header({ user, onLogout }: HeaderProps) {
   const roleLabel = user.owner ? "owner" : user.role;
   return (
-    <div className="h-16 bg-gradient-to-r from-[#d94b1e] to-[#ef6a2e] text-white flex items-center justify-between px-5 shadow-md">
+    <div className="h-16 bg-gradient-to-r from-brand-500 to-brand-400 text-white flex items-center justify-between px-5 shadow-raised">
       <div>
         <div className="text-xl font-extrabold">CRAYvings Monitoring System</div>
-        <div className="text-[11px] opacity-90">Smart aquaculture monitoring dashboard</div>
+        <div className="text-xs opacity-90">Smart aquaculture monitoring dashboard</div>
       </div>
 
       <div className="flex items-center gap-3">
@@ -71,7 +71,7 @@ export default function Header({ user, onLogout }: HeaderProps) {
         </div>
         <button
           onClick={onLogout}
-          className="text-xs bg-white/20 hover:bg-white/30 px-3 py-1.5 rounded-md font-semibold transition-colors"
+            className="text-xs bg-white/20 hover:bg-white/30 px-3 py-1.5 min-h-11 sm:min-h-0 rounded-md font-semibold transition-colors"
         >
           Logout
         </button>
