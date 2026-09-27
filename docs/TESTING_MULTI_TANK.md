@@ -130,7 +130,7 @@ poller behaves (start log, warn on dead device, never writes sensors).
 npm run server
 ```
 
-`=>` boot logs end with `[POLL] ESP32 status poller started (every 5s, concurrency 3, timeout 2000ms)`
+`=>` boot logs end with `[POLL] ESP32 status poller started (every 5s, up to 10 concurrent, timeout 2000ms)`
 `=>` `Server listening on port 3000`
 
 ### C2. Get an auth token
