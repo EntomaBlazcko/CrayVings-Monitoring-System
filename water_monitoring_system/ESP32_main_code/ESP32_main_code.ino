@@ -125,6 +125,18 @@ float lastShownPpm = -1.0;  // Last ppm painted to the screen (deadbanded)
 bool ammoniaReady = false;  // True once a valid reading has been produced
 int mq137SpikeStreak = 0;   // Consecutive spike count for spike rejection
 
+// Self-healing R0 retry. If the clean-air calibration never produced a usable R0
+// (module not fitted at boot, unpowered, or the sensor drifted out of the sane
+// window), the ammonia page used to sit on ERROR forever with no path back
+// except a reflash. Instead, quietly re-probe on a long interval. Capped so a
+// genuinely absent module costs a handful of serial lines over ~an hour rather
+// than an endless retry loop, and skipped entirely in simulation.
+#define MQ137_RECAL_RETRY_MS  240000UL
+#define MQ137_RECAL_MAX_TRIES 12
+
+unsigned long lastMq137RecalMs = 0;
+int mq137RecalTries = 0;
+
 // =============================================================================
 // SENSOR VALUES
 // =============================================================================
@@ -149,6 +161,19 @@ float lastGoodAmmonia = -1.0;
 unsigned long lastGoodMillis = 0;
 bool safeLedOn = false;
 unsigned long lastSafeBlinkMs = 0;
+
+// NVS wear budget for the Safe Mode snapshot. The old change-only check used a
+// single 0.01 epsilon for all three values, which is 6x FINER than one LSB of
+// the DS18B20 itself (0.0625 C) - so temperature alone tripped it on every
+// single 1 Hz read, i.e. ~86k flash writes a day, and the 'safe' NVS page wears
+// out in a couple of months. The snapshot is now both rate-limited and compared
+// per-sensor with epsilons still finer than what the Safe Mode screen renders.
+#define SAFE_SNAPSHOT_MIN_INTERVAL_MS 30000UL
+#define SAFE_SNAPSHOT_EPS_TEMP    0.1f
+#define SAFE_SNAPSHOT_EPS_LEVEL   0.5f
+#define SAFE_SNAPSHOT_EPS_AMMONIA 0.05f
+
+unsigned long lastSnapshotSaveMs = 0;
 
 // WiFi reconnection backoff (1s, 2s, 4s, ... capped at 5 min).
 unsigned long wifiBackoffMs = 1000;
@@ -188,6 +213,7 @@ unsigned long lastSensorRead = 0;
 // =============================================================================
 
 bool touching = false;
+bool navButtonHighlighted = false; // True while an arrow button shows its pressed state
 uint16_t lastTouchX = 0;
 uint16_t lastTouchY = 0;
 unsigned long lastPageChange = 0;
@@ -371,22 +397,61 @@ void saveSystemConfig()
 // server sits at <wifi-subnet>.10 (192.168.4.10, 192.168.1.10, 10.0.0.10, ...).
 // A portal-saved explicit IP always wins because serverIP no longer equals the
 // placeholder.
+// The backend address is published by the config portal and by autoDeriveServerIp()
+// (both on the Arduino loop task) and read by sendSensorData() (its own task, which
+// the scheduler may place on the other core). Unlocked, that send task could observe
+// a half-updated pair - new IP with old port, or a string still mid-strncpy - and
+// POST every reading to a garbage URL. All cross-task access therefore goes through
+// these two helpers, so each side always sees a consistent snapshot.
+portMUX_TYPE serverAddrMux = portMUX_INITIALIZER_UNLOCKED;
+
+void publishServerAddress(const char *ip, const char *port)
+{
+    portENTER_CRITICAL(&serverAddrMux);
+    strncpy(serverIP, ip, sizeof(serverIP) - 1);
+    serverIP[sizeof(serverIP) - 1] = '\0';
+    strncpy(serverPort, port, sizeof(serverPort) - 1);
+    serverPort[sizeof(serverPort) - 1] = '\0';
+    portEXIT_CRITICAL(&serverAddrMux);
+}
+
+void copyServerAddress(char *ipOut, size_t ipLen, char *portOut, size_t portLen)
+{
+    portENTER_CRITICAL(&serverAddrMux);
+    strncpy(ipOut, serverIP, ipLen - 1);
+    ipOut[ipLen - 1] = '\0';
+    strncpy(portOut, serverPort, portLen - 1);
+    portOut[portLen - 1] = '\0';
+    portEXIT_CRITICAL(&serverAddrMux);
+}
+
 void autoDeriveServerIp()
 {
-    if (strcmp(serverIP, SERVER_IP_DEFAULT) != 0)
-    {
-        return;
-    }
+    char derived[sizeof(serverIP)] = SERVER_IP_DEFAULT;
+    bool published = false;
 
     IPAddress local = WiFi.localIP();
-    if (local == IPAddress(0, 0, 0, 0))
+    if (local != IPAddress(0, 0, 0, 0))
     {
-        return;
+        snprintf(derived, sizeof(derived), "%d.%d.%d.%d",
+                 local[0], local[1], local[2], SERVER_IP_HOST_OCTET);
     }
 
-    snprintf(serverIP, sizeof(serverIP), "%d.%d.%d.%d",
-             local[0], local[1], local[2], SERVER_IP_HOST_OCTET);
-    Serial.printf("[WIFI] Backend IP auto-derived from WiFi: %s\n", serverIP);
+    // Re-check the placeholder *inside* the lock: a portal value saved a moment
+    // ago always wins, otherwise this would overwrite the explicit IP.
+    portENTER_CRITICAL(&serverAddrMux);
+    if (strcmp(serverIP, SERVER_IP_DEFAULT) == 0 && derived[0] != '\0')
+    {
+        strncpy(serverIP, derived, sizeof(serverIP) - 1);
+        serverIP[sizeof(serverIP) - 1] = '\0';
+        published = true;
+    }
+    portEXIT_CRITICAL(&serverAddrMux);
+
+    if (published)
+    {
+        Serial.printf("[WIFI] Backend IP auto-derived from WiFi: %s\n", derived);
+    }
 }
 
 // =============================================================================
@@ -707,6 +772,12 @@ void saveMq137R0()
     Preferences prefs;
     prefs.begin("mq137", false);
     prefs.putFloat("r0_kohm", mq137R0);
+    // Mark the one-time reset as done ONLY now that a real R0 exists. This used
+    // to be set up front by refreshMq137R0Once(), which meant a calibration that
+    // failed (module unpowered, or R0 outside the sane window) burned the single
+    // attempt and every later boot skipped straight to loadMq137R0() with no R0
+    // to load - leaving the ammonia page stuck on ERROR with no way out.
+    prefs.putBool("r0_refreshed", true);
     prefs.end();
     Serial.printf("[MQ-137] Saved R0 = %.2f kOhm to NVS\n", mq137R0);
 }
@@ -750,18 +821,25 @@ void loadLastKnownValues()
 bool refreshMq137R0Once()
 {
     Preferences prefs;
-    prefs.begin("mq137", false);
-    bool done = prefs.getBool("r0_refreshed", false);
-    if (!done)
-    {
-        prefs.remove("r0_kohm");
-        prefs.putBool("r0_refreshed", true);
-        prefs.end();
-        Serial.println("[MQ-137] One-time R0 refresh: clearing stored R0 for fresh calibration");
-        return true;
-    }
+    prefs.begin("mq137", true);
+    const bool done = prefs.getBool("r0_refreshed", false);
     prefs.end();
-    return false;
+
+    if (done)
+    {
+        return false;
+    }
+
+    // Discard any R0 stored under the old RL assumption. Note we do NOT write
+    // "r0_refreshed" here - saveMq137R0() does that, so this one-shot reset
+    // stays pending until a calibration has actually succeeded and a failed
+    // attempt is simply retried on the next boot.
+    prefs.begin("mq137", false);
+    prefs.remove("r0_kohm");
+    prefs.end();
+
+    Serial.println("[MQ-137] One-time R0 refresh: clearing stored R0 for fresh calibration");
+    return true;
 }
 
 // Instantaneous sensor resistance (kOhm) from the current analog voltage,
@@ -773,6 +851,48 @@ float mq137RsFromVoltage()
         return -1.0f;
     }
     return MQ137_RL_KOHM * (MQ137_VC_VOLTS / mq137Voltage - 1.0f);
+}
+
+// Silent R0 probe used ONLY by the automatic retry in loop(). It samples the
+// module a few times with short gaps and derives R0 from the average - no screen
+// takeover, no ~7s stall - so the touchscreen keeps responding while it runs.
+// Returns true (and persists) only when a sane R0 is derived.
+bool probeMq137R0Quietly()
+{
+    const int samples = 5;
+    float sum = 0.0f;
+    int good = 0;
+
+    for (int i = 0; i < samples; i++)
+    {
+        mq137Raw = analogRead(MQ137_PIN);
+        mq137Voltage = analogReadMilliVolts(MQ137_PIN) / 1000.0f;
+
+        const float rs = mq137RsFromVoltage();
+        if (rs > 0.0f)
+        {
+            sum += rs;
+            good++;
+        }
+
+        vTaskDelay(20 / portTICK_PERIOD_MS);
+    }
+
+    if (good == 0)
+    {
+        return false;
+    }
+
+    const float r0Candidate = (sum / good) / MQ137_CLEAN_AIR_RATIO;
+
+    if (r0Candidate < 5.0f || r0Candidate > 200.0f)
+    {
+        return false;
+    }
+
+    mq137R0 = r0Candidate;
+    saveMq137R0();
+    return true;
 }
 
 // Average several readings in clean air and derive R0 = Rs_clean / 3.6, then
@@ -1060,8 +1180,10 @@ void readAllSensors()
     Serial.println("========================================");
 
     // Keep the last-good snapshot for Safe Mode recovery after a watchdog reset.
-    // Persisted to NVS only when a value actually changes (change-only), so the
-    // flash does not wear out from writing every read cycle (~86k writes/day).
+    // Only persist a value that moved by more than its own epsilon, and never
+    // more than once per SAFE_SNAPSHOT_MIN_INTERVAL_MS (see the wear note
+    // above). lastSnapshotSaveMs == 0 forces the very first snapshot through
+    // even when boot lands inside the interval, so NVS is always seeded.
     const float prevTemp = lastGoodTemperature;
     const float prevLevel = lastGoodWaterLevel;
     const float prevAmmonia = lastGoodAmmonia;
@@ -1072,19 +1194,29 @@ void readAllSensors()
     lastGoodMillis = millis();
 
     const bool snapshotChanged =
-        fabsf(lastGoodTemperature - prevTemp) > 0.01f ||
-        fabsf(lastGoodWaterLevel - prevLevel) > 0.01f ||
-        fabsf(lastGoodAmmonia - prevAmmonia) > 0.01f;
+        fabsf(lastGoodTemperature - prevTemp) > SAFE_SNAPSHOT_EPS_TEMP ||
+        fabsf(lastGoodWaterLevel - prevLevel) > SAFE_SNAPSHOT_EPS_LEVEL ||
+        fabsf(lastGoodAmmonia - prevAmmonia) > SAFE_SNAPSHOT_EPS_AMMONIA;
 
-    if (snapshotChanged)
+    const unsigned long snapshotNowMs = millis();
+    const bool intervalElapsed =
+        lastSnapshotSaveMs == 0 ||
+        (snapshotNowMs - lastSnapshotSaveMs) >= SAFE_SNAPSHOT_MIN_INTERVAL_MS;
+
+    if (snapshotChanged && intervalElapsed)
     {
         saveLastKnownValues();
+        lastSnapshotSaveMs = snapshotNowMs;
     }
 }
 
 // =============================================================================
 // HEADER
 // =============================================================================
+
+// Tracks the colour the header dot currently shows, so updateWifiDot() only
+// repaints when the link state actually flips.
+bool lastWifiDot = false;
 
 void drawHeader(const char *title)
 {
@@ -1093,14 +1225,22 @@ void drawHeader(const char *title)
     tft.setTextColor(TFT_WHITE, TFT_BLUE);
     tft.drawString(title, 240, 27, 4);
 
-    if (wifiConnected)
+    lastWifiDot = wifiConnected;
+    tft.fillCircle(465, 27, 5, wifiConnected ? TFT_GREEN : TFT_RED);
+}
+
+// The dot is painted by drawHeader() only, so without this it would keep
+// showing the colour from the last page redraw - a green dot on a device that
+// dropped off the network. Repaint just the 11px dot on change (no flash churn).
+void updateWifiDot()
+{
+    if (wifiConnected == lastWifiDot)
     {
-        tft.fillCircle(465, 27, 5, TFT_GREEN);
+        return;
     }
-    else
-    {
-        tft.fillCircle(465, 27, 5, TFT_RED);
-    }
+
+    lastWifiDot = wifiConnected;
+    tft.fillCircle(465, 27, 5, wifiConnected ? TFT_GREEN : TFT_RED);
 }
 
 // =============================================================================
@@ -1492,6 +1632,13 @@ void updateCurrentPage()
             updateAmmoniaPage();
             break;
     }
+
+    // The header dot is the only header element that can go stale between page
+    // redraws, so refresh it here. Deliberately no drawNavigation(): none of the
+    // update*() erase rectangles reach the arrow buttons (they all end at
+    // y=235, the buttons start at y=248), so repainting them once a second
+    // would only cost SPI traffic.
+    updateWifiDot();
 }
 
 void nextPage()
@@ -1541,6 +1688,7 @@ void handleTouch()
             )
             {
                 drawNavigation(true);
+                navButtonHighlighted = true;
             }
         }
         return;
@@ -1560,7 +1708,14 @@ void handleTouch()
     Serial.print(" Y=");
     Serial.println(endY);
 
-    drawNavigation();
+    // Only undo the highlight if this touch actually pressed an arrow. A tap
+    // anywhere else never redrew the buttons, so repainting both arrows here was
+    // pure SPI traffic on every single tap on the panel.
+    if (navButtonHighlighted)
+    {
+        navButtonHighlighted = false;
+        drawNavigation();
+    }
 
     if (millis() - lastPageChange < PAGE_CHANGE_COOLDOWN)
     {
@@ -1666,17 +1821,22 @@ void startWifiConfigPortal()
     WiFi.mode(WIFI_AP_STA);
     WiFiManager wm;
 
+    // Pre-fill the backend fields with what the device is ACTUALLY using, not
+    // the compiled-in placeholder. Opening the portal used to reset both fields
+    // to SERVER_IP_DEFAULT / SERVER_PORT_DEFAULT, so hitting Save without
+    // retyping them silently pinned the stale 192.168.4.10 over an IP that
+    // autoDeriveServerIp() had just worked out from the real subnet.
     WiFiManagerParameter serverIPParam(
         "server_ip",
         "Backend Server IP (e.g. 192.168.1.100)",
-        SERVER_IP_DEFAULT,
+        serverIP,
         50
     );
 
     WiFiManagerParameter serverPortParam(
         "server_port",
         "Backend Server Port",
-        SERVER_PORT_DEFAULT,
+        serverPort,
         6
     );
 
@@ -1766,11 +1926,7 @@ void startWifiConfigPortal()
         Serial.print("[WIFI] IP: ");
         Serial.println(WiFi.localIP());
 
-        strncpy(serverIP, serverIPParam.getValue(), sizeof(serverIP) - 1);
-        strncpy(serverPort, serverPortParam.getValue(), sizeof(serverPort) - 1);
-
-        serverIP[sizeof(serverIP) - 1] = '\0';
-        serverPort[sizeof(serverPort) - 1] = '\0';
+        publishServerAddress(serverIPParam.getValue(), serverPortParam.getValue());
 
         // If the portal field still holds the placeholder IP, fall back to the
         // auto-derived <wifi-subnet>.10 address instead of the stale default.
@@ -1886,15 +2042,25 @@ void startStatusServer()
         return;
     }
 
-    statusServer.on("/status", HTTP_GET, [](AsyncWebServerRequest *request)
+    // Register the routes exactly once. stopStatusServer() calls end(), and
+    // re-running these on() calls every time the portal opened (once per
+    // top-left triple tap) piled up duplicate handlers for the same paths in
+    // AsyncWebServer's internal list - it grows for the life of the process.
+    static bool routesRegistered = false;
+    if (!routesRegistered)
     {
-        request->send(200, "application/json", buildStatusJson());
-    });
+        statusServer.on("/status", HTTP_GET, [](AsyncWebServerRequest *request)
+        {
+            request->send(200, "application/json", buildStatusJson());
+        });
 
-    statusServer.on("/", HTTP_GET, [](AsyncWebServerRequest *request)
-    {
-        request->send(200, "application/json", buildStatusJson());
-    });
+        statusServer.on("/", HTTP_GET, [](AsyncWebServerRequest *request)
+        {
+            request->send(200, "application/json", buildStatusJson());
+        });
+
+        routesRegistered = true;
+    }
 
     statusServer.begin();
     statusServerRunning = true;
@@ -2000,10 +2166,16 @@ void sendSensorData()
         wifiBackoffMs = 1000;
     }
 
+    // Snapshot the backend address under the lock: the config portal runs on the
+    // loop task and can rewrite serverIP/serverPort while this task is mid-POST.
+    char backendIp[sizeof(serverIP)];
+    char backendPort[sizeof(serverPort)];
+    copyServerAddress(backendIp, sizeof(backendIp), backendPort, sizeof(backendPort));
+
     String baseUrl = "http://";
-    baseUrl += serverIP;
+    baseUrl += backendIp;
     baseUrl += ":";
-    baseUrl += serverPort;
+    baseUrl += backendPort;
     baseUrl += "/sensor";
 
     // Flush any buffered readings, bounded per call so a long backlog never
@@ -2068,7 +2240,11 @@ void sendSensorData()
         Serial.print("[HTTP] Error: ");
         Serial.println(String(httpResponseCode));
 
-        wifiConnected = false;
+        // The WiFi link is fine here - we got far enough to get a response
+        // code, so the backend rejected the reading or the POST timed out.
+        // Leave wifiConnected alone: clearing it here made the header dot blink
+        // red and /status report "offline" on a perfectly healthy link. The
+        // re-queue below is the actual retry mechanism.
         sendBufPush(tempToSend, levelToSend, ammoniaToSend);
     }
 }
@@ -2191,9 +2367,32 @@ void setup()
     Serial.println("for Crayfish Production");
     Serial.println("================================================");
 
+    // Prime the DS18B20 with one real (blocking) conversion. With
+    // setWaitForConversion(false) the library issues STARTCONVO and returns
+    // immediately, and getTempCByIndex() then reads the scratchpad while the
+    // 12-bit conversion is still in flight. A DS18B20 powers up with its
+    // scratchpad at the 85 C default, so that first read returned 85 C, failed
+    // the <= 50 C sanity window and painted a false "SENSOR ERROR" for a full
+    // second on boot. One blocking conversion here makes the very first frame
+    // show the real temperature, and boot already spends 15s on WiFi.
+    // The device count is logged too: 0 means the sensor is not being seen, and
+    // every reading will legitimately be SENSOR ERROR. (DallasTemperature 4.x:
+    // begin() returns void, the count comes from getDeviceCount().)
     sensors.begin();
+    const uint8_t ds18b20Count = sensors.getDeviceCount();
+    Serial.print("[OK] DS18B20 -> GPIO13 (");
+    Serial.print(ds18b20Count);
+    Serial.println(ds18b20Count == 1 ? " sensor found)" : " sensors found)");
+
+    if (ds18b20Count == 0)
+    {
+        Serial.println("[WARN] No DS18B20 detected - temperature readings will show SENSOR ERROR");
+    }
+
+    sensors.setWaitForConversion(true);
+    sensors.requestTemperatures();
+    delay(750);
     sensors.setWaitForConversion(false);
-    Serial.println("[OK] DS18B20 -> GPIO13");
 
     pinMode(TRIG_PIN, OUTPUT);
     pinMode(ECHO_PIN, INPUT);
@@ -2202,17 +2401,19 @@ void setup()
 
     pinMode(MQ137_PIN, INPUT);
     analogReadResolution(12);
-    // Explicitly apply the widest input range (11dB, ~0-3.3V) to GPIO34. Most
-    // Arduino-ESP32 cores default to 11dB, but some setups keep a pin on a
-    // lower attenuation, which clips the module's ~1-3.3V analog output and
-    // produces wrong readings. Guarded with #if so it compiles on both old
-    // (ADC_ATTEN_11db) and new (ADC_ATTENDB_11) core enums.
-#if defined(ADC_ATTEN_11db)
-    analogSetPinAttenuation(MQ137_PIN, ADC_ATTEN_11db);
-#elif defined(ADC_ATTENDB_11)
-    analogSetPinAttenuation(MQ137_PIN, ADC_ATTENDB_11);
-#endif
-    Serial.println("[OK] MQ-137 -> GPIO34 (11dB attenuation explicitly set)");
+    // Explicitly apply the widest input range (~0-3.3V) to GPIO34. Most cores
+    // default to full range, but some setups keep a pin on a lower attenuation,
+    // which clips the module's analog output and produces wrong readings.
+    //
+    // The enum value in the Arduino ESP32 core has always been spelled ADC_11db
+    // (see esp32-hal-adc.h). The old guard tested
+    //   #if  defined(ADC_ATTEN_11db)
+    //   #elif defined(ADC_ATTENDB_11)
+    // Neither name exists, and both are enum VALUES rather than macros, so
+    // defined() could never be true - the call never ran and the "[OK] 11dB
+    // attenuation explicitly set" line below was a lie. Now called unconditionally.
+    analogSetPinAttenuation(MQ137_PIN, ADC_11db);
+    Serial.println("[OK] MQ-137 -> GPIO34 (widest ADC attenuation explicitly set)");
 
     if (headlessMode)
     {
@@ -2474,8 +2675,11 @@ void loop()
 
     // Touch is serviced FIRST on every tick so a tap never waits behind
     // sensor reads, screen redraws, or Wi-Fi sends. Skipped in headless mode
-    // (no touch panel attached - a floating CS pin can register phantom taps).
-    if (!headlessMode)
+    // (no touch panel attached - a floating CS pin can register phantom taps)
+    // and while Safe Mode is up: a tap there used to navigate to a normal page
+    // and paint over the SAFE MODE recovery screen, hiding the last-known-good
+    // values. Safe Mode always leaves on its own, via the first good uplink.
+    if (!headlessMode && !safeModeActive)
     {
         handleTouch();
     }
@@ -2512,6 +2716,29 @@ void loop()
         if (!safeModeActive && !headlessMode)
         {
             updateCurrentPage();
+        }
+    }
+
+    // Self-healing MQ-137: no usable R0 yet means every ammonia read is an
+    // error. Re-probe quietly (no screen takeover, ~100ms) on a long interval
+    // so plugging the module in later revives the page on its own. Once mq137R0
+    // is set this whole block is skipped forever, so the retry budget can only
+    // ever be spent while the sensor is genuinely unusable.
+    if (!simulateDevice && mq137R0 <= 0.0f && mq137RecalTries < MQ137_RECAL_MAX_TRIES &&
+        now - lastMq137RecalMs >= MQ137_RECAL_RETRY_MS)
+    {
+        lastMq137RecalMs = now;
+        mq137RecalTries++;
+
+        if (probeMq137R0Quietly())
+        {
+            Serial.printf("[MQ-137] Auto-recovered R0 = %.2f kOhm (attempt %d) - ammonia readings live\n",
+                          mq137R0, mq137RecalTries);
+        }
+        else
+        {
+            Serial.printf("[MQ-137] Still no usable R0 (attempt %d/%d, raw=%d) - ammonia reads stay ERROR\n",
+                          mq137RecalTries, MQ137_RECAL_MAX_TRIES, mq137Raw);
         }
     }
 

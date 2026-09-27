@@ -570,6 +570,47 @@ function zodFieldErrors(err) {
   return flat.fieldErrors || {};
 }
 
+// Normalises the peer address of an inbound request into a bare address that
+// can be handed to the device poller and put straight into a URL.
+//
+// Node reports an IPv4 peer on a dual-stack listener as the IPv4-mapped IPv6
+// address "::ffff:192.168.100.27", which is useless as a URL host and does not
+// match what an admin would type into the devices table. Link-local addresses
+// can also carry a zone index ("fe80::1%eth0") that has no meaning off-host.
+// Collapsing both means devices.ip_address always holds something the poller
+// can actually dial.
+//
+// This is re-derived from the live socket on EVERY sensor POST rather than
+// configured once, because a device that roams between WiFi networks - or an
+// end user who re-points their own router - changes address without warning.
+// Refreshing it per POST makes the registry self-healing instead of leaving a
+// stale address that silently breaks fleet health checks.
+function normalizeClientIp(req) {
+  const raw = (req && (req.ip || (req.socket && req.socket.remoteAddress))) || "";
+  let ip = String(raw).trim();
+  if (ip.startsWith("::ffff:")) {
+    ip = ip.slice(7);
+  }
+  const zone = ip.indexOf("%");
+  if (zone !== -1) {
+    ip = ip.slice(0, zone);
+  }
+  if (ip === "::1") {
+    ip = "127.0.0.1";
+  }
+  // A loopback peer is never a real device on the farm - it is a local test
+  // (curl, scripts/mock-device.js) talking to us from this same machine.
+  // Recording it would point the health poller back at ourselves, so it would
+  // dial http://127.0.0.1/status, get ECONNREFUSED or - worse - this server's
+  // own /status, and raise a device_id mismatch warning for a device that is
+  // perfectly healthy. Returning null lets the upsert's COALESCE keep whatever
+  // real address the device last reported.
+  if (ip === "127.0.0.1") {
+    return null;
+  }
+  return ip.length > 0 ? ip : null;
+}
+
 // =============================================================================
 // SMS ALERTS (HTTPSMS)
 // =============================================================================
@@ -1391,10 +1432,16 @@ app.post("/sensor", sensorIngestLimiter, async (req, res) => {
     // capture time (device clock when sane, else arrival) — stored on the row.
     const arrivalTs = new Date();
     const rowTs = readAt ?? arrivalTs;
-    // Auto-register the device so the sensors.device_id FK never fails
+    // Auto-register the device so the sensors.device_id FK never fails.
+    // ip_address is refreshed from the live peer on every POST so the registry
+    // follows the device across WiFi changes; COALESCE keeps a previously good
+    // address if this particular request somehow has no usable source IP.
+    const clientIp = normalizeClientIp(req);
     await pool.query(
-      `INSERT INTO devices (device_id, last_seen) VALUES ($1, $2) ON CONFLICT (device_id) DO UPDATE SET last_seen = $2`,
-      [device_id, arrivalTs]
+      `INSERT INTO devices (device_id, ip_address, last_seen) VALUES ($1, $2, $3)
+         ON CONFLICT (device_id) DO UPDATE
+            SET last_seen = $3, ip_address = COALESCE($2, devices.ip_address)`,
+      [device_id, clientIp, arrivalTs]
     );
     // A fresh reading means the device is online again: re-arm its disconnect
     // alert and timestamp the recovery so reconnecting flaps don't re-alert.
