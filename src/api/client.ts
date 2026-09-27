@@ -1,5 +1,5 @@
 import axios, { isAxiosError, type AxiosError } from "axios";
-import type { SensorEntry, ChartPoint, LogEntry, SensorSettings, ActivityLog, ActivityLogEntry, AuthResponse, WeeklyReport, AnalyticsOverview, AnalyticsDailyResponse, AnalyticsInsightsResponse, DeviceEntry, DeviceLiveReading, DeviceStatus, EffectiveThresholdsResponse, DeviceThresholdDetail, DeviceThresholdOverrides } from "../types";
+import type { SensorEntry, ChartPoint, LogEntry, SensorSettings, ActivityLog, ActivityLogEntry, AuthResponse, WeeklyReport, AnalyticsOverview, AnalyticsDailyResponse, AnalyticsInsightsResponse, DeviceEntry, DeviceLiveReading, DeviceStatus, EffectiveThresholdsResponse, DeviceThresholdDetail, DeviceThresholdOverrides, CreateDevicePayload, DeviceArchiveResult } from "../types";
 import { API_BASE } from "../types";
 import { formatFarmTime } from "../utils/time";
 
@@ -161,13 +161,67 @@ export async function fetchSensorHistory(limit = 1000, deviceId?: string | null,
 
 // GET /devices - fleet registry with online flags (drives the tank selector
 // and fleet grid; polled on an interval, not per second). Hidden tanks are
-// excluded unless includeHidden is requested (restore panel).
-export async function fetchDevices(includeHidden = false, signal?: AbortSignal): Promise<DeviceEntry[]> {
+// excluded unless includeHidden is requested (restore panel). Archived devices
+// are excluded unless includeArchived is requested; asking for the archive
+// implies "show me everything", since archiving also clears is_active.
+export async function fetchDevices(
+  includeHidden = false,
+  signal?: AbortSignal,
+  includeArchived = false
+): Promise<DeviceEntry[]> {
+  const params: Record<string, number> = {};
+  if (includeHidden) params.include_hidden = 1;
+  if (includeArchived) params.include_archived = 1;
   const response = await client.get<DeviceEntry[]>("/devices", {
-    params: includeHidden ? { include_hidden: 1 } : undefined,
+    params: Object.keys(params).length > 0 ? params : undefined,
     signal,
   });
   return response.data || [];
+}
+
+// POST /devices - register a device (admin only).
+//
+// This is a registration record, not a provisioning step: the ESP32 firmware is
+// still flashed offline by hand, and the board simply starts pushing data under
+// the identity created here. Throws ApiError with statusCode 409 when the
+// device_id is already taken - including case-insensitively and including when
+// the existing device is archived, since a retired id is never released.
+export async function createDevice(
+  payload: CreateDevicePayload,
+  signal?: AbortSignal
+): Promise<DeviceEntry> {
+  const response = await client.post<DeviceEntry>("/devices", payload, { signal });
+  return response.data;
+}
+
+// POST /devices/:id/archive - retire a device without destroying anything.
+// Every reading it ever produced stays in the database; the device only drops
+// out of the active surfaces. Admin only.
+export async function archiveDevice(
+  deviceId: string,
+  signal?: AbortSignal
+): Promise<DeviceArchiveResult> {
+  const response = await client.post<DeviceArchiveResult>(
+    `/devices/${encodeURIComponent(deviceId)}/archive`,
+    {},
+    { signal }
+  );
+  return response.data;
+}
+
+// POST /devices/:id/restore - bring an archived device back into service.
+// Admin only. This is the only way to reuse a retired device slot: the
+// device_id itself is never released to another board.
+export async function restoreDevice(
+  deviceId: string,
+  signal?: AbortSignal
+): Promise<DeviceEntry> {
+  const response = await client.post<DeviceEntry>(
+    `/devices/${encodeURIComponent(deviceId)}/restore`,
+    {},
+    { signal }
+  );
+  return response.data;
 }
 
 // GET /devices/latest - freshest reading per active tank, in one call (the Live

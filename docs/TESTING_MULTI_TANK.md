@@ -1,0 +1,557 @@
+# Testing Guide — Multi-Tank / Star-Topology Changes
+
+**Scope:** firmware (ESP32), database migration 007, backend API + device poller,
+and the frontend tank-selector / fleet-buildout added for the six-tank star
+topology (server `192.168.4.10`, tanks `192.168.4.100-105`).
+
+## How to use this file
+
+- Work top to bottom. Phases A–E can be run whenever hardware appears; they are
+  ordered so software can be proven before a single ESP32 is flashed.
+- Phase F is the end-to-end run on the real `192.168.4.0/24` LAN.
+- Each step has a `[ ]` checkbox. Log actual output next to `=>`.
+
+## Prerequisites
+
+Anything checked that you do **not** have yet just means that step is deferred —
+the guide is written so software checks come first.
+
+- [ ] Node.js 18+, PostgreSQL 15+, `package.json` deps installed (`npm install`)
+- [ ] `.env` present with `PG_*` set and, for a hardened run, `DEVICE_SECRET` set
+- [ ] Arduino IDE with ESP32 core + ESPAsyncWebServer + AsyncTCP installed
+- [ ] At least one ESP32 + DS18B20 + HC-SR04 + MQ-137 wired
+- [ ] Router/AP, ideally configurable to `192.168.4.0/24` (for Phase F)
+
+## Notes
+
+- All curl examples below are Windows PowerShell 5.1 friendly (`curl.exe`).
+- Requiring auth: every endpoint below except `POST /sensor` uses `requireAuth`,
+  so you need a bearer token from Step C2. Device secret (`X-Device-Secret`) is
+  only needed if `DEVICE_SECRET` is set in `.env`.
+- Commands marked `[ADMIN]` need the owner account if you use a restricted user.
+
+---
+
+## Phase A — Static Checks (no DB, no server)
+
+**Purpose:** prove the code compiles and still lints/builds before anything runs.
+
+### A1. Lint
+
+```bash
+npm run lint
+```
+
+`=>` no errors (exit 0, empty output)
+
+### A2. Build
+
+```bash
+npm run build
+```
+
+`=>` "built in Xs" (`dist/` regenerates)
+
+### A3. No stale single-server IP remains in docs/code
+
+```bash
+rg "192\.168\.100" .
+```
+
+`=>` no matches (old server LAN IP was `192.168.100.152`)
+
+### A4. New source files exist
+
+```bash
+ls services\devicePoller.cjs
+ls db\migrations\007_multi_device.cjs
+ls src\components\TankSelector.tsx
+ls src\components\FleetGrid.tsx
+```
+
+`=>` four files present
+
+---
+
+## Phase B — Database Migration 007 (needs live PostgreSQL)
+
+**Purpose:** prove migration applies cleanly, is idempotent, and leaves the right
+columns/types/index.
+
+### B1. Run the migration (from the repo root, `.env` must be loadable)
+
+```bash
+node db/migrations/007_multi_device.cjs
+```
+
+`=>` `"devices columns ->"` listing includes
+
+```text
+ip_address  text
+tank_name   character varying(100)
+tank_location character varying(100)
+last_health_seen  timestamp with time zone
+```
+
+`=>` `"composite index -> idx_sensors_device_timestamp"`
+`=>` `"sensors.timestamp -> timestamp with time zone"`
+`=>` `"system_logs.timestamp -> timestamp with time zone"`
+`=>` `"[migration] 007_multi_device applied"`
+
+### B2. Idempotency — run the **same** command again
+
+`=>` identical success output, no `ERROR: column ... already exists` etc.
+
+### B3. Optional psql spot-check
+
+```sql
+\d devices
+```
+
+`=>` columns above present; `created_at` / `last_seen` show `timestamp with time zone`
+
+```sql
+SELECT indexname FROM pg_indexes WHERE tablename='sensors'
+  AND indexname='idx_sensors_device_timestamp';
+```
+
+`=>` 1 row
+
+---
+
+## Phase C — Backend API + Device Poller (server running)
+
+**Purpose:** prove the new endpoints scope by tank, the registry loads, and the
+poller behaves (start log, warn on dead device, never writes sensors).
+
+### C1. Start the backend
+
+```bash
+npm run server
+```
+
+`=>` boot logs end with `[POLL] ESP32 status poller started (every 5s, concurrency 3, timeout 2000ms)`
+`=>` `Server listening on port 3000`
+
+### C2. Get an auth token
+
+```powershell
+$u="YOUR_OWNER_USERNAME"; $p="YOUR_PASSWORD"
+$body = '{"username":"'+$u+'","password":"'+$p+'"}'
+$r = curl.exe -s -X POST http://localhost:3000/auth/login -H
+  "Content-Type: application/json" -d $body | ConvertFrom-Json
+$tok = $r.token
+$H = @("Authorization: Bearer $tok")
+```
+
+`=>` `$tok` non-empty (token / session token)
+
+### C3. Fleet registry — empty DB
+
+```powershell
+curl.exe -s -H $H http://localhost:3000/devices
+```
+
+`=>` `[]`
+`=>` (validation: endpoint responds, no 500)
+
+### C4. Ingest a fake tank (`X-Device-Secret` only if `DEVICE_SECRET` is in `.env`)
+
+```powershell
+curl.exe -s -X POST http://localhost:3000/sensor -H
+  "Content-Type: application/json" -H "X-Device-Secret: <your secret>" -d
+  '{"device_id":"tank-test","temperature":25.4,"water_level":72.0,"ammonia":0.35}'
+```
+
+`=>` `{"message":"Saved",...}` and the device row is auto-created
+
+### C5. Ingest an **unchanged** reading → delta skip (heartbeat still refreshed)
+
+```powershell
+curl.exe -s -X POST http://localhost:3000/sensor -H
+  "Content-Type: application/json" -H "X-Device-Secret: <your secret>" -d
+  '{"device_id":"tank-test","temperature":25.4,"water_level":72.0,"ammonia":0.35}'
+```
+
+`=>` `{"message":"No change, skipped","skipped":true,...}` and **no** new `sensors` row
+
+### C6. Ingest a second tank
+
+```powershell
+curl.exe -s -X POST http://localhost:3000/sensor -H
+  "Content-Type: application/json" -H "X-Device-Secret: <your secret>" -d
+  '{"device_id":"tank-test2","temperature":23.1,"water_level":40.0,"ammonia":0.62}'
+```
+
+`=>` `{"message":"Saved",...}`
+
+### C7. `/devices` now lists both tanks
+
+```powershell
+curl.exe -s -H $H http://localhost:3000/devices
+```
+
+`=>` two rows, each with `device_id`, `name`, `tank_name` (null), `tank_location`
+(null), `ip_address` (null), `last_seen`, `last_health_seen` (null), `is_active`
+(true), `online` (true because `last_seen` is fresh)
+
+### C8. Latest reading is per-tank
+
+```powershell
+curl.exe -s -H $H "http://localhost:3000/sensor/latest?device_id=tank-test"
+```
+
+`=>` row with `device_id` `tank-test`
+
+```powershell
+curl.exe -s -H $H "http://localhost:3000/sensor/latest?device_id=tank-test2"
+```
+
+`=>` row with `device_id` `tank-test2` (proves scoping, not farm-wide-first)
+
+```powershell
+curl.exe -s -H $H "http://localhost:3000/sensor/latest?device_id=tank-ghost"
+```
+
+`=>` `{"message":"No sensor data found"}` (404)
+
+### C9. History is per-tank
+
+```powershell
+curl.exe -s -H $H "http://localhost:3000/sensor?device_id=tank-test&limit=50"
+```
+
+`=>` **only** `tank-test` rows
+
+```powershell
+curl.exe -s -H $H "http://localhost:3000/sensor"
+```
+
+`=>` farm-wide rows for both tanks (no filter = all)
+
+### C10. `/devices/:id/status` — error ladder
+
+**a) No IP configured**
+
+```powershell
+curl.exe -s -H $H http://localhost:3000/devices/tank-test/status
+```
+
+`=>` `400 {"message":"Device has no IP address configured"}`
+
+**b) Unreachable IP**
+
+```sql
+UPDATE devices SET ip_address='192.168.4.99' WHERE device_id='tank-test';
+```
+
+```powershell
+curl.exe -s -H $H http://localhost:3000/devices/tank-test/status
+```
+
+`=>` `502 {"message":"Device unreachable",...}`
+
+**c) Unknown device**
+
+```powershell
+curl.exe -s -H $H http://localhost:3000/devices/nope/status
+```
+
+`=>` `404 {"message":"Device not found"}`
+
+A live 200 case is covered in Phase E once an ESP32 exists.
+
+### C11. Analytics overview is per-tank
+
+```powershell
+curl.exe -s -H $H "http://localhost:3000/analytics/overview?days=7&device_id=tank-test"
+curl.exe -s -H $H "http://localhost:3000/analytics/overview?days=7&device_id=tank-test2"
+```
+
+`=>` the two payloads' averages/trends reflect only their own tank
+
+### C12. Poller warns on a dead device (no ESP32 needed — use the bogus IP from C10b)
+
+- [ ] `=>` within ~15–30 s (3 consecutive 5 s polls) the server log shows:
+
+  ```text
+  [POLL] Device tank-test (192.168.4.99) unreachable for 3 consecutive polls: ...
+  ```
+
+- [ ] `=>` `last_health_seen` stays NULL; **no** `sensors` row is ever written by
+      the poller (you prove this by counting rows before/after; the count does
+      **not** move)
+
+### C13. Poller warning backoff
+
+- [ ] `=>` after the first warn, no **new** warning for that device for at least
+      30 s (backoff gate) even though polls keep failing every 5 s
+
+### C14. Poller recovers when reachable
+
+- [ ] `=>` `UPDATE devices SET ip_address='<something on port 80 that answers>' ...`
+      e.g. point it at an ESP32 (Phase E) or a dev machine serving the same JSON
+      on port 80; within ~5 s `last_health_seen` advances and the failure counter
+      resets.
+
+### C15. `device_id` echo cross-check (needs two reachable states or one real tank)
+
+- [ ] `=>` point `tank-test`'s `ip_address` at a host whose `/status` reports a
+      **different** `device_id`; server logs:
+
+      ```text
+      [POLL] IP <ip> reported device_id "<other>", expected "tank-test" - check registry
+      ```
+
+      and does **not** mark it healthy (`last_health_seen` not advanced)
+
+---
+
+## Phase D — Frontend UI (dev servers running)
+
+**Purpose:** prove the tank selector, fleet grid, and per-tank scoping in the UI.
+
+### D1. Start frontend
+
+```bash
+npm run dev
+```
+
+`=>` <http://localhost:5173> ; log in with any account
+
+### D2. Dashboard — tank selector
+
+- [ ] `=>` chip bar under the header showing `tank-test` / `tank-test2` (name
+      falls back to `device_id`), a green online dot per chip, and "2/2 online"
+
+### D3. Dashboard — fleet grid
+
+- [ ] `=>` `FleetGrid` section lists both tanks with online dots; each card has a
+      "Live check" button
+
+### D4. Per-chip scoping
+
+- [ ] `=>` click `tank-test`: charts + "currently viewing" chip show `tank-test`
+      values (25.4 °C / 72.0% / 0.35 ppm)
+- [ ] `=>` click `tank-test2`: they switch to 23.1 °C / 40.0% / 0.62 ppm
+
+### D5. Poll cadence check (DevTools → Network)
+
+- [ ] `=>` a 1 s repeating `GET /sensor/latest?device_id=<selected>`
+- [ ] `=>` a 5 s repeating `GET /devices` (fleet)
+- [ ] `=>` a ~30 s repeating `GET /sensor?device_id=<selected>&limit=...`
+- [ ] `=>` history/latest requests carry the selected `device_id` query param
+
+### D6. Selection persistence across pages
+
+- [ ] `=>` select `tank-test2` on Dashboard, navigate to Historical Data and
+      Analytics
+- [ ] `=>` the selector still shows `tank-test2` selected (state lives in provider)
+
+### D7. Historical Data scoping
+
+- [ ] `=>` with `tank-test2` selected, chart shows only `tank-test2` data
+- [ ] `=>` create a never-written tank (post one reading for `tank-test3` then
+      delete it via psql, or add a `devices` row without `sensors`) → select it →
+      clean empty state message, no crash
+
+### D8. Analytics scoping
+
+- [ ] `=>` overview numbers change when you switch tanks; Daily breakdown +
+      Insights stay farm-wide (by design)
+
+### D9. FleetGrid Live check error ladder (no ESP32 yet)
+
+- [ ] `=>` on `tank-test` (ip `192.168.4.99`) click Live check → card shows
+      "Device unreachable" (502) state after the request resolves
+- [ ] `=>` if a device has no ip set: "no IP" → error/empty state (400)
+
+### D10. Lint + build again after any UI tweaks
+
+```bash
+npm run lint; npm run build
+```
+
+`=>` clean
+
+---
+
+## Phase E — Firmware (Arduino IDE + flashed ESP32)
+
+**Purpose:** prove the firmware changes compile, serve `GET /status`, honor the new
+config fields, buffer against outages, and emit the `-1` sentinel.
+
+### E1. Compile
+
+- [ ] `=>` Arduino IDE opens
+      `water_monitoring_system/ESP32_main_code/ESP32_main_code.ino` (tank 1) or
+      `water_monitoring_system/NODE_main_code/NODE_main_code.ino` (spare /
+      NodeMCU), installs ESPAsyncWebServer + AsyncTCP (Library Manager), board
+      ESP32 Dev Module, and compiles clean. Watch for
+      `#include <ESPAsyncWebServer.h>` being satisfied.
+
+### E2. Flash one tank
+
+- [ ] `=>` give `device_id` `tank01`, `server_ip` = dev machine LAN IP (or
+      `192.168.4.10` in staging), `device_secret` = same as `.env`, and if wanted
+      a static IP in `192.168.4.100-105` via the portal fields (`static_ip` /
+      `static_gateway` / `static_subnet`)
+- [ ] `=>` Serial (115200) shows WiFi connected IP +
+      `[HTTP] Status server on port 80 (GET /status | /)`
+
+### E3. Portal offers the new config fields
+
+- [ ] `=>` triple-tap top-left corner (or serial `W`) to open the
+      Aquaculture-Setup portal at <http://192.168.4.1>; confirm fields:
+      `device_secret`, `tank_height_cm`, `static_ip`, `static_gateway`,
+      `static_subnet` (`device_id`, `server_ip`, `server_port` also present)
+
+### E4. `/status` serves the health JSON (from any LAN PC)
+
+```powershell
+curl.exe -s http://<esp-ip>/status
+```
+
+`=>`
+
+```json
+{"device_id":"tank01","ip":"<esp-ip>","uptime_ms":<n>,
+ "wifi_rssi":<n>,"free_heap":<n>,"temperature":<n>,"water_level":<n>,
+ "ammonia":<n>}
+```
+
+- [ ] `=>` `curl.exe -s http://<esp-ip>/` returns the same payload (root alias)
+
+### E5. Live endpoint through the server
+
+```sql
+UPDATE devices SET ip_address='<esp-ip>', tank_name='Tank 1',
+  tank_location='Tank Room A' WHERE device_id='tank01';
+```
+
+- [ ] `=>` `curl.exe -s -H $H http://localhost:3000/devices/tank01/status` → 200 +
+      the device JSON from E4
+- [ ] `=>` `GET /devices` now shows `tank01` with `tank_name`/`tank_location`
+      filled, `online` true, and `last_health_seen` advancing every ~5 s
+
+### E6. FleetGrid Live check for `tank01`
+
+- [ ] `=>` dashboard `FleetGrid` card for `tank01` → Live check → shows uptime,
+      RSSI, free heap, and current temperature/water_level/ammonia
+
+### E7. Offline detection (health poll)
+
+- [ ] `=>` power off the ESP32; server logs show
+      `[POLL] Device tank01 (<esp-ip>) unreachable for 3 consecutive polls` after
+      ~15–30 s; `devices.last_health_seen` stops advancing; dashboard tank
+      chip/flag goes offline within the stale window
+- [ ] `=>` power back on; within ~5 s `last_health_seen` resumes and flag returns
+
+### E8. `device_id` echo guard
+
+- [ ] `=>` point another registry device (e.g. `tank-test`) at `tank01`'s IP
+- [ ] `=>` poller logs:
+
+      ```text
+      [POLL] IP <esp-ip> reported device_id "tank01", expected "tank-test" - check registry
+      ```
+
+### E9. Outage buffer flush
+
+- [ ] `=>` stop the backend; keep the ESP32 running for ~60 s (it queues by default)
+- [ ] `=>` restart the backend
+- [ ] `=>` (psql) `SELECT count(*) FROM sensors WHERE device_id='tank01';` → count
+      **jumps** by ~60 (queued readings flushed oldest-first, capped at
+      `SEND_BUFFER_CAP` 600); once caught up, delta skip resumes and the count
+      stops moving for constant water
+
+### E10. Water-level sentinel
+
+- [ ] `=>` cover/rotate the HC-SR04 so it returns garbage/beyond range
+- [ ] `=>` `curl.exe -s http://<esp-ip>/status` → `"water_level":-1.0`
+- [ ] `=>` TFT screen shows ERROR for the level value (not a bogus number)
+
+### E11. Ammonia warm-up behavior (visual check only)
+
+- [ ] `=>` MQ-137 reports `-1.0` on `/status` until R0 calibration completes, then
+      a real ppm (matches existing behavior)
+
+---
+
+## Phase F — End-to-End Star Topology (staging LAN 192.168.4.0/24)
+
+**Purpose:** the full six-tank scenario on its own subnet. Run only when the
+router supports the subnet (NVS static IP or DHCP reservations).
+
+### F1. Prepare the network
+
+- [ ] `=>` router/AP LAN set to `192.168.4.0/24`, gateway `192.168.4.1`, DHCP pool
+      avoiding 100-105; server IP reserved to `192.168.4.10` (or set static)
+- [ ] `=>` backend `.env` + server bound on `192.168.4.10:3000` (or `0.0.0.0`)
+
+### F2. Flash the fleet
+
+- [ ] `=>` each of 6 boards: `device_id` `tank01`..`tank06`, static IP
+      `192.168.4.100-105`, `server_ip` `192.168.4.10`, matching `device_secret`,
+      `tank_name` + `tank_location` set in `devices` via psql for each tank
+
+### F3. Registry + fleet view
+
+- [ ] `=>` `GET /devices` lists all 6 with correct names/locations/IPs; each
+      `online` = true; dashboard `TankSelector` "6/6 online" and `FleetGrid` shows
+      all green
+
+### F4. Per-tank delta write test
+
+- [ ] `=>` leave water still for a minute
+- [ ] `=>` (psql) `SELECT count(*) FROM sensors WHERE device_id='tank01';` →
+      snapshot, wait 60 s, snapshot again
+- [ ] `=>` second count ~ equal to first (only heartbeat refreshes; few/none rows)
+- [ ] `=>` wave a hand near the HC-SR04 → one row appears for `tank01` only
+
+### F5. Fleet offline behaviour
+
+- [ ] `=>` unplug `tank03` → within ~15–30 s poller warns,
+      `devices.last_health_seen` stops, dashboard chip/card for `tank03` goes
+      offline, others stay online
+- [ ] `=>` replug `tank03` → recovers, all online again
+
+### F6. Home / history / analytics scoping
+
+- [ ] `=>` on a laptop on the same LAN open <http://192.168.4.10:5173> (or the
+      tunnel hostname) and switch tanks through Dashboard, Historical Data,
+      Analytics
+- [ ] `=>` values/history/overview follow the selected tank
+
+### F7. One server-outage recovery
+
+- [ ] `=>` stop backend 60 s while all tanks run; restart
+- [ ] `=>` each tank's queued rows flush (oldest-first); all 6 come back online
+      within ~5–15 s; `sensors` row counts stop growing after catch-up
+
+### F8. Optional disconnect SMS
+
+- [ ] `=>` with SMS unmuted + recipients configured, unplug one tank
+- [ ] `=>` a disconnect SMS arrives (subject to the rearm grace period)
+
+---
+
+## Troubleshooting Quick Table
+
+| Symptom | What to check |
+|---|---|
+| Migration error "column X exists" | B2 expectations: idempotent; if ERROR appears on **second** run it is a bug |
+| `/devices` shows empty until first POST | Devices are created on first sensor contact (C4) or seeded via psql |
+| `POST /sensor` returns 401 | `DEVICE_SECRET` set in `.env` but header missing/wrong — add `X-Device-Secret` |
+| `/devices/:id/status` 400 | `ip_address` NULL in `devices` table |
+| `/devices/:id/status` 502/504 | Device powered off / NAT / domain issue; device must be reachable on port 80 |
+| No `[POLL]` start line | `server.cjs` older build; poller only starts after the server is listening |
+| Poller warnings every 5s forever | Recovery gate (C14) not possible until something serves `/status` on port 80 |
+| Tank chip shows offline on dashboard | Stale window = `DISCONNECT_STALE_MS` (~15 s); wait, then check firmware NTP? |
+| History won't filter per tank | Frontend built before Phase D? Rebuild |
+| Firmware won't compile | ESPAsyncWebServer + AsyncTCP not installed (E1) |
+| `device_id` mismatches | `192.168.4.x` static IP not actually assigned to that board — fix portal `static_ip` / DHCP reservation (F1) |
+
+---
+
+*End of guide.*

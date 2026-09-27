@@ -53,7 +53,9 @@ const LOGS_PAGE_SIZE = 10;
 
 const HEARTBEAT_STALE_MS = 30000; // no heartbeat for 30s -> offline
 const MAX_CONSECUTIVE_FAILURES = 5;
-const SSE_MAX_RECONNECT_ATTEMPTS = 10;
+// Reconnect backoff ceiling. Attempts are unbounded (the stream must never be
+// abandoned), so this also stops a dead backend from being hammered.
+const SSE_MAX_RECONNECT_DELAY_MS = 30000;
 
 // Selected-tank persistence: survives reloads and re-logins; validated against
 // the live fleet on mount (an unknown id falls back to the first tank).
@@ -77,6 +79,22 @@ function writeStoredSelectedTank(deviceId: string | null) {
   } catch {
     // Storage unavailable (private mode) — selection stays session-only.
   }
+}
+
+// Which tank the dashboard opens on when no valid id is stored. Land on one
+// that is actually reporting instead of the alphabetically first: an offline
+// tank, or one whose probes have died, renders a frozen "No signal" dashboard
+// that reads as broken hardware rather than a stale selection. Order: online
+// first, then the most recently seen, then alphabetical so the choice is
+// stable and predictable when the rest ties.
+function pickDefaultTank(devices: DeviceEntry[]): DeviceEntry {
+  return [...devices].sort((a, b) => {
+    if (a.online !== b.online) return a.online ? -1 : 1;
+    const aSeen = a.last_seen ? Date.parse(a.last_seen) : 0;
+    const bSeen = b.last_seen ? Date.parse(b.last_seen) : 0;
+    if (aSeen !== bSeen) return bSeen - aSeen;
+    return a.device_id.localeCompare(b.device_id);
+  })[0];
 }
 
 // 401s are re-thrown so the axios response interceptor can clear the session
@@ -209,15 +227,26 @@ function useSensorDataPolling(
 
   const applyLatestReading = useCallback((reading: SensorEntry) => {
     const sensorTime = new Date(reading.recv_at || reading.timestamp || "");
-    setState((prev) => ({
-      ...prev,
-      latestReading: reading,
-      loading: false,
-      error: null,
-      connectionStatus: computeConnectionStatus(false, sensorTime),
-      lastUpdate: sensorTime,
-      consecutiveFailures: 0,
-    }));
+    setState((prev) => {
+      // A slower path (the REST seed, a manual refetch) must never overwrite a
+      // value SSE already delivered, or the tiles visibly jump backwards: the
+      // seed's DB round-trip can resolve after a live frame. SSE frames carry
+      // recv_at = server arrival time, so on a tie the live frame is kept.
+      // An unparseable timestamp yields NaN, fails this comparison, and is
+      // therefore still applied - the safe direction.
+      if (prev.lastUpdate && sensorTime.getTime() < prev.lastUpdate.getTime()) {
+        return prev;
+      }
+      return {
+        ...prev,
+        latestReading: reading,
+        loading: false,
+        error: null,
+        connectionStatus: computeConnectionStatus(false, sensorTime),
+        lastUpdate: sensorTime,
+        consecutiveFailures: 0,
+      };
+    });
   }, []);
 
   const refetch = useCallback(() => {
@@ -237,6 +266,7 @@ function useSensorDataPolling(
     let eventSource: EventSource | null = null;
     let reconnectTimeout: ReturnType<typeof setTimeout> | null = null;
     let reconnectAttempts = 0;
+    let isOpen = false;
 
     const connectSSE = () => {
       if (eventSource) {
@@ -260,6 +290,7 @@ function useSensorDataPolling(
 
         es.onopen = () => {
           reconnectAttempts = 0;
+          isOpen = true;
           setState((prev) => ({
             ...prev,
             loading: false,
@@ -292,6 +323,7 @@ function useSensorDataPolling(
           // seed that has no timestamp yet pinned the dashboard on grey
           // skeletons forever: no values, no error text, no recourse. A farm
           // operator standing at the tank saw a blank dashboard.
+          isOpen = false;
           setState((prev) => ({
             ...prev,
             loading: false,
@@ -300,25 +332,24 @@ function useSensorDataPolling(
           }));
           es.close();
 
-          if (reconnectAttempts < SSE_MAX_RECONNECT_ATTEMPTS) {
-            const delay = Math.min(1000 * Math.pow(2, reconnectAttempts), 30000) + Math.random() * 1000;
-            reconnectAttempts++;
-            setState((prev) => ({
-              ...prev,
-              error: `Reconnecting in ${Math.round(delay / 1000)}s... (attempt ${reconnectAttempts}/${SSE_MAX_RECONNECT_ATTEMPTS})`,
-            }));
+          // Retry FOREVER. The dashboard must heal itself after a backend
+          // restart, a laptop that slept through one, or a network blip -
+          // reloading the page is not an acceptable recovery path for a tank
+          // operator. The previous 10-attempt cap abandoned the stream after
+          // ~3 minutes and left the UI silently falling back to the 5s REST
+          // poll, which reads as "the data stopped being realtime".
+          reconnectAttempts += 1;
+          const delay =
+            Math.min(1000 * Math.pow(2, reconnectAttempts - 1), SSE_MAX_RECONNECT_DELAY_MS) +
+            Math.random() * 1000;
+          setState((prev) => ({
+            ...prev,
+            error: `Reconnecting in ${Math.round(delay / 1000)}s... (attempt ${reconnectAttempts})`,
+          }));
 
-            reconnectTimeout = setTimeout(() => {
-              connectSSE();
-            }, delay);
-          } else {
-            setState((prev) => ({
-              ...prev,
-              loading: false,
-              error: "Max reconnection attempts reached. Please refresh the page.",
-              connectionStatus: "offline",
-            }));
-          }
+          reconnectTimeout = setTimeout(() => {
+            connectSSE();
+          }, delay);
         };
       } catch {
         setState((prev) => ({
@@ -332,8 +363,28 @@ function useSensorDataPolling(
 
     connectSSE();
 
+    // Re-arm the moment the tab becomes visible, the browser regains network,
+    // or the window regains focus. These are the paths a sleeping laptop or a
+    // restarted backend actually take: the socket dies silently while the tab
+    // is backgrounded, so on return nothing triggers a retry and the dashboard
+    // sits on stale numbers until it is manually reloaded. No-op while the
+    // stream is healthy, so ordinary focus changes cost nothing.
+    const rearm = () => {
+      if (document.visibilityState === "hidden") return;
+      if (isOpen) return;
+      if (reconnectTimeout) {
+        clearTimeout(reconnectTimeout);
+        reconnectTimeout = null;
+      }
+      connectSSE();
+    };
+    document.addEventListener("visibilitychange", rearm);
+    window.addEventListener("online", rearm);
+    window.addEventListener("focus", rearm);
+
     // Seed the latest reading via REST so a freshly opened dashboard has data
-    // before the next device POST arrives.
+    // before the next device POST arrives. applyLatestReading drops this if a
+    // live SSE frame has already arrived, so the seed can never rewind a value.
     fetchLatestSensor(selectedDeviceId)
       .then((result) => {
         if (result.data && result.data.timestamp) applyLatestReading(result.data);
@@ -343,6 +394,10 @@ function useSensorDataPolling(
       });
 
     return () => {
+      isOpen = false;
+      document.removeEventListener("visibilitychange", rearm);
+      window.removeEventListener("online", rearm);
+      window.removeEventListener("focus", rearm);
       if (eventSource) {
         eventSource.close();
       }
@@ -889,10 +944,10 @@ function useActivityLogsManager() {
 
 export function SensorProvider({ children }: { children: ReactNode }) {
   // The selected tank lives here so it persists across pages AND across
-  // reloads/re-logins (localStorage). It defaults to the first registered
-  // device, set from the fleet poll callback (not an effect — that would
-  // cause cascading renders). An unknown stored id (tank removed/hidden)
-  // falls back to the first visible tank via the same keep-if-in-fleet logic.
+  // reloads/re-logins (localStorage). When nothing valid is stored it defaults
+  // to a tank that is actually reporting (see pickDefaultTank), set from the
+  // fleet poll callback (not an effect — that would cause cascading renders).
+  // An unknown stored id (tank removed/hidden) is re-picked the same way.
   const [selectedDeviceId, setSelectedDeviceIdState] = useState<string | null>(readStoredSelectedTank);
 
   const setSelectedDeviceId = useCallback((deviceId: string | null) => {
@@ -907,9 +962,12 @@ export function SensorProvider({ children }: { children: ReactNode }) {
         return null;
       }
       // Keep the current pick only if it is still in the visible fleet (e.g.
-      // it wasn't just hidden); otherwise fall back to the first tank.
+      // it wasn't just hidden); otherwise fall back to a tank that is actually
+      // reporting. Picking alphabetically meant landing on ESP32_01 purely
+      // because "0" < "1" < "2", even though that tank's DS18B20 and HC-SR04
+      // were dead and the operator's own live tank was ignored.
       if (current !== null && devices.some((d) => d.device_id === current)) return current;
-      const first = [...devices].sort((a, b) => a.device_id.localeCompare(b.device_id))[0];
+      const first = pickDefaultTank(devices);
       writeStoredSelectedTank(first.device_id);
       return first.device_id;
     });

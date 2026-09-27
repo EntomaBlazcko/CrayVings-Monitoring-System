@@ -564,6 +564,64 @@ function parseSettingsInput(body) {
   return parsed;
 }
 
+// POST /devices (Owner-issued registration from the Devices page).
+//
+// Registration is a MANUAL, offline-adjacent process: the team flashes each
+// ESP32 by hand, so the board is only ever "known" to the server once an Owner
+// types its identity here. There is no auto-provisioning and no web flasher.
+//
+// device_id must be unique SYSTEM-WIDE, including against archived rows: a
+// device_id is permanently retired once used. Reusing one would make a
+// replacement board silently inherit the dead board's entire `sensors` history
+// through the FK. Enforced by the PK, by idx_devices_device_id_ci (case-
+// insensitive), and by an explicit pre-check in the handler.
+//
+// The charset mirrors what the firmware compiles into the board (ESP32_main_code.ino
+// uses ids like "ESP32_01"); it stays permissive enough for a MAC-style or
+// dotted id but rejects whitespace and anything that would need escaping.
+
+// True for a bare IPv4 literal. The health poller interpolates this value
+// straight into a URL (http://<ip>/status), so it is validated as a real
+// address rather than free text — that stops a rogue value from redirecting the
+// poller somewhere unintended.
+function isIpv4(value) {
+  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(value);
+  return !!m && m.slice(1).every((octet) => Number(octet) >= 0 && Number(octet) <= 255);
+}
+
+// An empty form field means "not supplied", not "empty string".
+const blankToUndefined = (v) => (typeof v === "string" && v.trim() === "" ? undefined : v);
+
+const createDeviceSchema = z.object({
+  device_id: z.string()
+    .trim()
+    .min(1, "Device ID is required")
+    .max(50, "Device ID must be 50 characters or fewer")
+    .regex(/^[A-Za-z0-9._-]+$/, "Device ID may contain only letters, numbers, dots, dashes and underscores"),
+  // The form's single "Device Name" field. `tank_name` is the label every
+  // surface already renders (tankOptionLabel on the client); `name` is the
+  // column the schema documents as the friendly name but which no code path ever
+  // wrote, so it is filled here too rather than staying permanently NULL.
+  device_name: z.string()
+    .trim()
+    .min(1, "Device name is required")
+    .max(100, "Device name must be 100 characters or fewer"),
+  // Optional. Left as 'auto' when blank so the first ingest can learn the
+  // address instead of us guessing.
+  ip_address: z.preprocess(
+    blankToUndefined,
+    z.string().trim()
+      .refine(isIpv4, "IP address must be a valid IPv4 address (e.g. 192.168.100.27)")
+      .optional()
+  ),
+  tank_location: z.preprocess(
+    blankToUndefined,
+    z.string().trim()
+      .max(100, "Location must be 100 characters or fewer")
+      .optional()
+  ),
+});
+
 // Converts a ZodError into a readable field-errors object
 function zodFieldErrors(err) {
   const flat = err.flatten();
@@ -932,7 +990,7 @@ async function buildStatusSms(deviceId = null) {
   try {
     const devicesResult = deviceId
       ? await pool.query("SELECT device_id, tank_name FROM devices WHERE device_id = $1 AND is_active = true", [deviceId])
-      : await pool.query("SELECT device_id, tank_name FROM devices WHERE is_active = true ORDER BY device_id");
+      : await pool.query("SELECT device_id, tank_name FROM devices WHERE is_active = true AND archived_at IS NULL ORDER BY device_id");
     if (devicesResult.rows.length === 0) return null;
 
     const statusLabel = (s) => (s === "good" ? "NORMAL" : s === "warning" ? "WARNING" : "CRITICAL");
@@ -1330,6 +1388,25 @@ function scheduleAlertProcessing(device_id, ts, temperature, water_level, ammoni
 const sseClients = new Map(); // res -> device_id filter (string | null)
 const latestDeviceReadings = new Map(); // device_id -> { ...readings, recv_at }
 
+// Forgets every in-memory trace of one device. Called when a device is archived
+// (so a retired board stops feeding the live tile, the SSE stream and the delta
+// baseline) and when one is restored (so a stale pre-archive reading cannot
+// immediately re-trigger a disconnect alert).
+//
+// This only touches process memory — the `devices` row and every `sensors` row
+// referencing it are left completely intact, which is the point of archiving.
+// The Maps/objects are keyed by device_id and never pruned otherwise, so without
+// this a long-lived server would accumulate one entry per device_id ever seen.
+function evictDeviceFromMemory(deviceId) {
+  latestDeviceReadings.delete(deviceId);
+  disconnectedDevices.delete(deviceId);
+  deviceOnlineSince.delete(deviceId);
+  // These three are plain objects, not Maps.
+  delete lastSensorReading[deviceId];
+  delete lastAmmoniaReading[deviceId];
+  delete lastAlertedState[deviceId];
+}
+
 function broadcastSensorUpdate(deviceId, readings, ts) {
   if (sseClients.size === 0) return;
   const payload = `data: ${JSON.stringify({ type: "sensor_update", data: { device_id: deviceId, ...readings, timestamp: ts.toISOString(), recv_at: ts.toISOString() } })}\n\n`;
@@ -1362,7 +1439,7 @@ app.post("/sensor", sensorIngestLimiter, async (req, res) => {
         // crashing the request with a 500.
         try {
           const perDevice = await pool.query(
-            "SELECT device_secret FROM devices WHERE device_id = $1 AND is_active = true",
+            "SELECT device_secret FROM devices WHERE device_id = $1 AND is_active = true AND archived_at IS NULL",
             [req.body?.device_id ?? ""]
           );
           if (perDevice.rows.length > 0 && perDevice.rows[0].device_secret && presented === perDevice.rows[0].device_secret) {
@@ -1432,15 +1509,29 @@ app.post("/sensor", sensorIngestLimiter, async (req, res) => {
     // capture time (device clock when sane, else arrival) — stored on the row.
     const arrivalTs = new Date();
     const rowTs = readAt ?? arrivalTs;
-    // Auto-register the device so the sensors.device_id FK never fails.
+
+    // Auto-register the device so the sensors.device_id FK never fails. This is
+    // a SAFETY NET, not the registration path: a board that was never added on
+    // the Devices page still gets a row (tagged registered_via = 'auto' so the
+    // Devices page can flag it as "auto-discovered, needs attention"), but an
+    // Owner-registered row is never downgraded or overwritten here.
+    //
     // ip_address is refreshed from the live peer on every POST so the registry
-    // follows the device across WiFi changes; COALESCE keeps a previously good
-    // address if this particular request somehow has no usable source IP.
+    // follows the device across WiFi changes — but ONLY when the address was
+    // itself learned that way. If an Owner typed the address at registration
+    // (ip_source = 'manual'), their value wins: the health poller dials
+    // http://<ip>/status and needs a LAN-reachable address, whereas the observed
+    // peer address is the router/NAT address whenever the API server is not on
+    // the tanks' subnet. COALESCE keeps a previously good address if this
+    // particular request has no usable source IP (loopback/local tooling).
     const clientIp = normalizeClientIp(req);
     await pool.query(
-      `INSERT INTO devices (device_id, ip_address, last_seen) VALUES ($1, $2, $3)
-         ON CONFLICT (device_id) DO UPDATE
-            SET last_seen = $3, ip_address = COALESCE($2, devices.ip_address)`,
+      `INSERT INTO devices (device_id, ip_address, last_seen, registered_via, ip_source)
+       VALUES ($1, $2, $3, 'auto', 'auto')
+       ON CONFLICT (device_id) DO UPDATE
+          SET last_seen = $3,
+              ip_address = CASE WHEN devices.ip_source = 'manual' THEN devices.ip_address
+                                ELSE COALESCE($2, devices.ip_address) END`,
       [device_id, clientIp, arrivalTs]
     );
     // A fresh reading means the device is online again: re-arm its disconnect
@@ -1625,21 +1716,105 @@ app.get("/sensor/stream", requireAuth, (req, res) => {
 // DEVICE REGISTRY ENDPOINTS
 // ========================
 
+// Columns every device read/write returns. Kept in one place so the create,
+// update, archive and restore paths can never drift from GET /devices.
+const DEVICE_COLUMNS = `device_id, name, tank_name, tank_location, ip_address,
+       is_active, registered_via, ip_source, archived_at, archived_by,
+       last_seen, last_health_seen`;
+
+// POST /devices (Admin) - register a device from the Devices page.
+//
+// This is a REGISTRATION record, not a provisioning step: the ESP32 firmware is
+// still flashed offline by hand. All this does is tell the server that a board
+// with a given identity is expected, and attach the metadata the Owner supplied
+// so the board can start pushing data under that identity.
+//
+// Uniqueness is enforced system-wide and case-insensitively. An archived device
+// still occupies its device_id permanently (see 014_device_registration.cjs) so
+// a replacement board can never inherit the old board's reading history.
+app.post("/devices", requireAdmin, async (req, res) => {
+  try {
+    const parsed = createDeviceSchema.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      return res.status(400).json({ message: "Invalid device data", errors: zodFieldErrors(parsed.error) });
+    }
+    const { device_id, device_name, ip_address, tank_location } = parsed.data;
+
+    // Explicit pre-check so the Owner gets a precise, actionable message
+    // (409 Conflict) instead of a generic DB error. The unique index and the
+    // 23505 catch below are the race-condition backstop, since two Owners (or
+    // two tabs) can pass this check simultaneously.
+    const existing = await pool.query(
+      "SELECT device_id, archived_at FROM devices WHERE lower(device_id) = lower($1)",
+      [device_id]
+    );
+    if (existing.rows.length > 0) {
+      const prior = existing.rows[0];
+      return res.status(409).json({
+        message: prior.archived_at
+          ? `Device ID "${prior.device_id}" is already registered and archived. Device IDs are permanently retired — choose a different ID for the new board.`
+          : `Device ID "${prior.device_id}" is already registered. Device IDs must be unique system-wide.`,
+        errors: { device_id: ["This device ID is already in use"] },
+      });
+    }
+
+    // An Owner-typed address is authoritative: flag it 'manual' so the ingest
+    // upsert stops overwriting it with whatever peer address it observes (which
+    // is a NAT/router address whenever the API server is not on the tanks'
+    // subnet, and useless to the health poller). With no address supplied, stay
+    // 'auto' and let the first ingest learn it.
+    const hasManualIp = typeof ip_address === "string" && ip_address.length > 0;
+
+    const result = await pool.query(
+      `INSERT INTO devices (device_id, name, tank_name, tank_location, ip_address, is_active, registered_via, ip_source)
+       VALUES ($1, $2, $2, $3, $4, true, 'manual', $5)
+       RETURNING ${DEVICE_COLUMNS}`,
+      [device_id, device_name, tank_location ?? null, hasManualIp ? ip_address : null, hasManualIp ? "manual" : "auto"]
+    );
+
+    await pool.query(
+      "INSERT INTO activity_logs (user_name, action_type, description, module) VALUES ($1, 'DEVICE_REGISTERED', $2, 'devices')",
+      [req.adminUser.username, `Registered device ${device_id} (${device_name})${hasManualIp ? ` at ${ip_address}` : ""}`]
+    ).catch(() => {});
+
+    const row = result.rows[0];
+    console.log(`[${new Date().toISOString()}] Device registered by ${req.adminUser.username}: ${device_id} (${device_name})${hasManualIp ? ` @ ${ip_address}` : ""}`);
+    res.status(201).json({ ...row, online: false });
+  } catch (err) {
+    if (err.code === "23505") {
+      return res.status(409).json({
+        message: "That device ID is already registered. Device IDs must be unique system-wide.",
+        errors: { device_id: ["This device ID is already in use"] },
+      });
+    }
+    console.error(`[${new Date().toISOString()}] Error registering device:`, err.message);
+    res.status(500).json({ message: "Error registering device", error: err.message });
+  }
+});
+
 // GET /devices - fleet registry with online flag (scoped to the sensor-path
-// heartbeat, matching the disconnect monitor's staleness window). Hidden tanks
-// (is_active = false) are excluded unless ?include_hidden=1 (restore panel).
+// heartbeat, matching the disconnect monitor's staleness window).
+//
+//   (default)              -> active, non-archived devices (the normal fleet)
+//   ?include_hidden=1      -> + hidden tanks, for the restore panel
+//   ?include_archived=1    -> everything, archived included (the Devices page
+//                             archive view). Asking for the archive implies
+//                             "show me all of it": archiving always forces
+//                             is_active = false, so without the bypass an
+//                             archived device could never be listed.
 app.get("/devices", requireAuth, async (req, res) => {
   try {
     const staleSeconds = Math.max(5, Math.floor(DISCONNECT_STALE_MS / 1000));
     const includeHidden = req.query.include_hidden === "1" || req.query.include_hidden === "true";
+    const includeArchived = req.query.include_archived === "1" || req.query.include_archived === "true";
     const result = await pool.query(
-      `SELECT device_id, name, tank_name, tank_location, ip_address, is_active,
-              last_seen, last_health_seen,
+      `SELECT ${DEVICE_COLUMNS},
               (last_seen > NOW() - ($1 || ' seconds')::interval) AS online
          FROM devices
-        ${includeHidden ? "" : "WHERE is_active = true"}
-        ORDER BY device_id`,
-      [staleSeconds]
+        WHERE ($3 OR archived_at IS NULL)
+          AND ($2 OR $3 OR is_active = true)
+        ORDER BY archived_at NULLS FIRST, device_id`,
+      [staleSeconds, includeHidden, includeArchived]
     );
     res.json(result.rows.map((row) => ({ ...row, online: !!row.online })));
   } catch (err) {
@@ -1648,11 +1823,16 @@ app.get("/devices", requireAuth, async (req, res) => {
   }
 });
 
-// PUT /devices/:id - rename a tank (tank_name), set its location, and/or hide
-// or show it (is_active). The hardware device_id itself never changes. Hiding
-// is non-destructive: rows/sensors stay, /devices just stops listing the tank
-// and the restore panel (include_hidden=1) can bring it back.
-app.put("/devices/:deviceId", requireAuth, async (req, res) => {
+// PUT /devices/:id (Admin) - rename a tank (tank_name), set its location, and/or
+// hide or show it (is_active). The hardware device_id itself never changes, and
+// neither does any archived state — use the archive/restore endpoints below for
+// that. Hiding is non-destructive: rows/sensors stay, /devices just stops
+// listing the tank and the restore panel (include_hidden=1) brings it back.
+//
+// Admin-only: renaming or hiding a tank is a registry/config change, and this
+// route previously accepted any authenticated user (including plain 'user'
+// role accounts). device_config / device_hide are likewise owner decisions.
+app.put("/devices/:deviceId", requireAdmin, async (req, res) => {
   try {
     const { tank_name, tank_location, is_active } = req.body;
     if (tank_name !== undefined && tank_name !== null && typeof tank_name !== "string") {
@@ -1674,8 +1854,7 @@ app.put("/devices/:deviceId", requireAuth, async (req, res) => {
               tank_location = COALESCE($2, tank_location),
               is_active = COALESCE($3, is_active)
         WHERE device_id = $4
-        RETURNING device_id, name, tank_name, tank_location, ip_address, is_active,
-                  last_seen, last_health_seen`,
+        RETURNING ${DEVICE_COLUMNS}`,
       [
         typeof tank_name === "string" ? tank_name.trim() : null,
         typeof tank_location === "string" ? tank_location.trim() : null,
@@ -1701,7 +1880,7 @@ app.put("/devices/:deviceId", requireAuth, async (req, res) => {
       (tank_name !== undefined ? ` (name: ${row.tank_name ?? "unchanged"})` : "");
     await pool.query(
       "INSERT INTO activity_logs (user_name, action_type, description, module) VALUES ($1, 'TANK_UPDATED', $2, 'devices')",
-      [req.user.username, detail]
+      [req.adminUser.username, detail]
     ).catch(() => {});
 
     res.json(updated);
@@ -1711,11 +1890,104 @@ app.put("/devices/:deviceId", requireAuth, async (req, res) => {
   }
 });
 
+// POST /devices/:id/archive (Admin) - soft-delete a decommissioned device.
+//
+// NOTHING IS DELETED. The row stays forever, and so does every reading that
+// references it: sensors, last_alerts, system_logs and device_threshold_overrides
+// all point at devices(device_id) and none of them cascade on delete. That is
+// the whole point — the Owner retires a board without destroying the history
+// that explains what it saw.
+//
+// Archiving is distinct from hiding:
+//   hide   (is_active = false)  -> reversible, "not shown right now"
+//   archive (archived_at set)   -> terminal, "this board is retired"
+// Archive forces is_active = false, so all the existing `WHERE is_active = true`
+// guards immediately stop picking it up: the per-device ingestion secret
+// (server.cjs:1365), /devices/latest, the SMS alert list, and the device health
+// poller (services/devicePoller.cjs:32).
+//
+// A board that keeps pushing after being archived is NOT rejected. Its readings
+// are still recorded (no data is ever thrown away) but it stays invisible to
+// every active surface. Rejecting would make the ESP32 requeue and retry
+// forever, which is the exact failure mode the ammonia-spike fix removed.
+app.post("/devices/:deviceId/archive", requireAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `UPDATE devices
+          SET archived_at = NOW(),
+              archived_by = $1,
+              is_active = false
+        WHERE device_id = $2
+        RETURNING ${DEVICE_COLUMNS}`,
+      [req.adminUser.username, req.params.deviceId]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ message: "Device not found" });
+
+    const row = result.rows[0];
+
+    // Drop the in-memory per-device caches so a retired board cannot keep
+    // feeding the live tile, the SSE stream or the delta baseline. The DB rows
+    // and all historical readings are untouched.
+    evictDeviceFromMemory(req.params.deviceId);
+
+    const readings = await pool.query(
+      "SELECT COUNT(*)::int AS n FROM sensors WHERE device_id = $1",
+      [req.params.deviceId]
+    );
+
+    await pool.query(
+      "INSERT INTO activity_logs (user_name, action_type, description, module) VALUES ($1, 'DEVICE_ARCHIVED', $2, 'devices')",
+      [req.adminUser.username, `Archived device ${row.device_id} (${row.tank_name ?? "unnamed"}); ${readings.rows[0].n} historical readings retained`]
+    ).catch(() => {});
+
+    console.log(`[${new Date().toISOString()}] Device archived by ${req.adminUser.username}: ${row.device_id} (${readings.rows[0].n} readings retained)`);
+    res.json({ ...row, online: false, retained_readings: readings.rows[0].n });
+  } catch (err) {
+    console.error(`[${new Date().toISOString()}] Error archiving device:`, err.message);
+    res.status(500).json({ message: "Error archiving device", error: err.message });
+  }
+});
+
+// POST /devices/:id/restore (Admin) - bring an archived device back.
+//
+// Restoring is the ONLY way to reuse a retired board slot; the device_id itself
+// is never released, so no other device can inherit this row's history.
+app.post("/devices/:deviceId/restore", requireAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `UPDATE devices
+          SET archived_at = NULL,
+              archived_by = NULL,
+              is_active = true
+        WHERE device_id = $1
+        RETURNING ${DEVICE_COLUMNS}`,
+      [req.params.deviceId]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ message: "Device not found" });
+
+    const row = result.rows[0];
+    // last_seen may be stale from before the archive, which would otherwise flash
+    // a disconnect alert on the first poll. The next ingest corrects it.
+    evictDeviceFromMemory(req.params.deviceId);
+
+    await pool.query(
+      "INSERT INTO activity_logs (user_name, action_type, description, module) VALUES ($1, 'DEVICE_RESTORED', $2, 'devices')",
+      [req.adminUser.username, `Restored device ${row.device_id} (${row.tank_name ?? "unnamed"})`]
+    ).catch(() => {});
+
+    console.log(`[${new Date().toISOString()}] Device restored by ${req.adminUser.username}: ${row.device_id}`);
+    res.json(row);
+  } catch (err) {
+    console.error(`[${new Date().toISOString()}] Error restoring device:`, err.message);
+    res.status(500).json({ message: "Error restoring device", error: err.message });
+  }
+});
+
 // GET /devices/latest - freshest in-memory reading per active tank, in one
 // lightweight call (in-memory read, no DB). Drives the Live Tank Bar.
 app.get("/devices/latest", requireAuth, async (req, res) => {
   try {
-    const result = await pool.query("SELECT device_id FROM devices WHERE is_active = true");
+    const result = await pool.query("SELECT device_id FROM devices WHERE is_active = true AND archived_at IS NULL");
     const rows = [];
     for (const device of result.rows) {
       const latest = latestDeviceReadings.get(device.device_id);
@@ -3096,7 +3368,7 @@ app.get("/alert/mute-status", requireAuth, async (req, res) => {
 
     const devices = [];
     try {
-      const result = await pool.query("SELECT device_id, tank_name FROM devices WHERE is_active = true ORDER BY device_id");
+      const result = await pool.query("SELECT device_id, tank_name FROM devices WHERE is_active = true AND archived_at IS NULL ORDER BY device_id");
       for (const row of result.rows) {
         const expires = pruneMuteUntil(deviceSmsMuteUntil.get(row.device_id));
         if (!expires) deviceSmsMuteUntil.delete(row.device_id);

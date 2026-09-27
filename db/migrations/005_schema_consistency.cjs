@@ -1,5 +1,5 @@
 // =============================================================================
-// 005_schema_consistency.cjs - Align live schema with docs/DATABASE_SCHEMA.txt
+// 005_schema_consistency.cjs - Align live schema with docs/DATABASE_SCHEMA.md
 // Idempotent (safe to run repeatedly). Run:  node db/migrations/005_schema_consistency.cjs
 //
 // Reconciles a few drifting bits between the live DB and the documented schema:

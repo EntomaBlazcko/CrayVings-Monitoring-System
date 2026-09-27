@@ -170,7 +170,7 @@ PG_USER=postgres
 PG_PASSWORD=your_password
 ALLOWED_ORIGINS=http://localhost:5173
 
-# SMS via HTTPSMS (optional Android gateway; see docs/HTTPSMS_SETUP.txt)
+# SMS via HTTPSMS (optional Android gateway; see docs/HTTPSMS_SETUP.md)
 HTTPSMS_API_KEY=your_httpsms_api_key
 HTTPSMS_FROM=+639XXXXXXXXXX
 
@@ -474,7 +474,7 @@ a capstone demo can fail a component and show automatic recovery.
 | "Too many login attempts" | Login rate limit (5/15 min/IP) — wait or restart the server in dev |
 | Sensor POST returns 401 | `DEVICE_SECRET` mismatch — send it in the `X-Device-Secret` header, or set `devices.device_secret` for the device |
 | Sensor POST returns 400 | Reading rejected by validation (bad range or ammonia spike guard) — sentinels are fine, out-of-bounds values are not |
-| SMS not sending | Verify HTTPSMS_API_KEY / HTTPSMS_FROM in .env; see docs/HTTPSMS_SETUP.txt |
+| SMS not sending | Verify HTTPSMS_API_KEY / HTTPSMS_FROM in .env; see docs/HTTPSMS_SETUP.md |
 | Can't log in | First-time setup requires `npm run seed:admin` (ADMIN_INITIAL_PASSWORD) |
 | AudioContext warning | Click anywhere on the page to unlock audio |
 
@@ -518,4 +518,14 @@ ISC
 
 ## Support
 
-For detailed documentation see docs/HOW_IT_WORKS.txt. For the database schema see docs/DATABASE_SCHEMA.txt. For SMS configuration see docs/HTTPSMS_SETUP.txt.
+### Documentation (all in [docs/](docs/))
+
+| Doc | What it covers |
+|---|---|
+| [HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md) | Detailed documentation: architecture, data flow, alert/SMS logic, hardware integration, performance, security |
+| [DATABASE_SCHEMA.md](docs/DATABASE_SCHEMA.md) | Every table, column, index, FK, plus a copy-paste DBML diagram for dbdiagram.io |
+| [HTTPSMS_SETUP.md](docs/HTTPSMS_SETUP.md) | SMS configuration: gateway phone, `.env` keys, recipients, delivery tracking, troubleshooting |
+| [MOCK_DEVICE.md](docs/MOCK_DEVICE.md) | Simulate an ESP32 with `npm run mock` — 8 scenario profiles, CLI options, recipes |
+| [TESTING_MULTI_TANK.md](docs/TESTING_MULTI_TANK.md) | Step-by-step verification of the multi-tank star topology (phases A–F) |
+| [LAST_NIGHT_SESSION.md](docs/LAST_NIGHT_SESSION.md) | Session log: what changed, what was verified, what is still deferred |
+| [full-audit-27092026.md](docs/full-audit-27092026.md) | Full system audit — 4 critical, 9 moderate, 9 minor findings + suggested order of work |

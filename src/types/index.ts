@@ -32,6 +32,7 @@ export const VALID_MENU_KEYS = [
   "Alerts",
   "Historical Data",
   "Analytics",
+  "Devices",
   "Activity Logs",
   "Settings",
   "Sensor Logs",
@@ -172,9 +173,34 @@ export type DeviceEntry = {
   tank_location: string | null;
   ip_address: string | null;
   is_active: boolean;
+  // How the row came to exist: 'manual' = an Owner added it on the Devices page,
+  // 'auto' = a board first pushed data with the shared DEVICE_SECRET and was
+  // never registered by hand (so the Devices page flags it for attention).
+  registered_via: "manual" | "auto";
+  // Whether ip_address was typed by an Owner ('manual', so ingestion must not
+  // overwrite it) or learned from the live peer ('auto').
+  ip_source: "manual" | "auto";
+  // Soft-delete state. archived_at !== null means the device was retired: it
+  // stays in the database and keeps all of its readings, but it is hidden from
+  // every active surface. Distinct from is_active, which is a reversible "hide".
+  archived_at: string | null;
+  archived_by: string | null;
   last_seen: string | null;
   last_health_seen: string | null;
   online: boolean;
+};
+
+// How many historical readings an archived device kept, returned by the archive
+// call so the UI can reassure the Owner that nothing was destroyed.
+export type DeviceArchiveResult = DeviceEntry & { retained_readings: number };
+
+// Payload for POST /devices. Device name maps to tank_name on the server (the
+// label every surface already renders); `name` is filled from the same value.
+export type CreateDevicePayload = {
+  device_id: string;
+  device_name: string;
+  ip_address?: string;
+  tank_location?: string;
 };
 
 // Label for tank pickers (dropdowns, filter selects): friendly name first,

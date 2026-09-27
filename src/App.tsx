@@ -10,6 +10,7 @@ import {
   FileText,
   ClipboardList,
   BarChart3,
+  Cpu,
 } from "lucide-react";
 import logo from "./assets/crayvings.png";
 import type { MenuKey, UserRole } from "./types";
@@ -36,6 +37,7 @@ const SettingsPage = lazy(() => import("./pages/SettingsPage"));
 const LogsPage = lazy(() => import("./pages/LogsPage"));
 const ActivityLogsPage = lazy(() => import("./pages/ActivityLogsPage"));
 const AnalyticsPage = lazy(() => import("./pages/AnalyticsPage"));
+const DevicesPage = lazy(() => import("./pages/DevicesPage"));
 
 const menuDefinitions: { label: MenuKey; icon: React.ReactNode }[] = [
   { label: "Dashboard", icon: <LayoutDashboard size={18} /> },
@@ -43,6 +45,7 @@ const menuDefinitions: { label: MenuKey; icon: React.ReactNode }[] = [
   { label: "Sensors", icon: <Activity size={18} /> },
   { label: "Alerts", icon: <Bell size={18} /> },
   { label: "Historical Data", icon: <History size={18} /> },
+  { label: "Devices", icon: <Cpu size={18} /> },
   { label: "Activity Logs", icon: <ClipboardList size={18} /> },
   { label: "Sensor Logs", icon: <FileText size={18} /> },
   { label: "Settings", icon: <Settings size={18} /> },
@@ -52,6 +55,9 @@ const menuDefinitions: { label: MenuKey; icon: React.ReactNode }[] = [
 // the UI here and by requireAuth/requireAdmin on the server.
 const ADMIN_MENU_KEYS: MenuKey[] = [...VALID_MENU_KEYS];
 
+// "Devices" is deliberately absent: every write on that page (register, rename,
+// hide, archive) is requireAdmin server-side, so exposing it to a plain 'user'
+// would only show a page full of controls that all fail.
 const USER_MENU_KEYS: MenuKey[] = [
   "Dashboard",
   "Analytics",
@@ -134,6 +140,9 @@ function DashboardLayout() {
         break;
       case "Historical Data":
         page = <HistoricalDataPage />;
+        break;
+      case "Devices":
+        page = <DevicesPage />;
         break;
       case "Analytics":
         page = <AnalyticsPage />;

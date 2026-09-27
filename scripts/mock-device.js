@@ -7,7 +7,7 @@
  * without physical hardware.
  *
  * USAGE
- *   node scripts/mock-device.js                          # ESP32_01, healthy, 5s
+ *   node scripts/mock-device.js       # ESP32_03 Mock Device, healthy, 5s
  *   node scripts/mock-device.js --profile ammonia_spike
  *   node scripts/mock-device.js --device ESP32_02 --profile warming
  *   node scripts/mock-device.js --profile fleet          # two tanks in parallel
@@ -16,7 +16,7 @@
  *   node scripts/mock-device.js --list-devices           # query the live API
  *
  * Run `node scripts/mock-device.js --help` for the full flag list, or read
- * docs/MOCK_DEVICE.txt.
+ * docs/MOCK_DEVICE.md.
  */
 
 import fs from "node:fs";
@@ -37,7 +37,7 @@ dotenv.config({ path: path.join(ROOT, ".env") });
 const API_BASE = process.env.VITE_API_BASE || "http://localhost:3000";
 const DEVICE_SECRET = process.env.DEVICE_SECRET || "";
 const SENSOR_URL = `${API_BASE}/sensor`;
-const DEFAULT_DEVICE = "ESP32_01";
+const DEFAULT_DEVICE = "ESP32_03 Mock Device";
 
 const PARAM_KEYS = ["temperature", "water_level", "ammonia"];
 
@@ -298,14 +298,19 @@ function runDevice({ deviceId, profile, profileName, interval, cycles, secret, a
       const col = statusColour(res);
       const okMark = res.ok ? `${c.green}POST 201${c.reset}` : `${col}POST ${res.status}${c.reset}`;
       const detail = res.ok ? "" : ` ${c.red}${JSON.stringify(res.body)}${c.reset}`;
+      // Round-trip time is printed because the gap between posts is
+      // interval + this value: when the cadence stretches to 10s/15s, a ~5s
+      // latency here points at the server and a ~0ms one points at this
+      // process. Without it the two are indistinguishable.
+      const rt = res.ms >= 1000 ? `${c.yellow}${(res.ms / 1000).toFixed(1)}s${c.reset}` : `${c.grey}${res.ms}ms${c.reset}`;
       console.log(
         `${c.grey}${new Date().toISOString().slice(11, 19)}${c.reset} ${tag} ` +
-        `cyc ${String(cycle).padStart(3)}  ${formatPayload(payload)}  ${okMark}${detail}`
+        `cyc ${String(cycle).padStart(3)}  ${formatPayload(payload)}  ${okMark} ${rt}${detail}`
       );
 
       if (logStream) {
         logStream.write(
-          JSON.stringify({ ts: new Date().toISOString(), device_id: deviceId, profile: profileName, cycle, payload, response: { status: res.status, body: res.body } }) + "\n"
+          JSON.stringify({ ts: new Date().toISOString(), device_id: deviceId, profile: profileName, cycle, payload, response: { status: res.status, ms: res.ms, body: res.body } }) + "\n"
         );
       }
 

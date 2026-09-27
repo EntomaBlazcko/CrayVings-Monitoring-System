@@ -16,7 +16,11 @@
 
 const axios = require("axios");
 
-const CONCURRENCY = 3; // max simultaneous HTTP GETs to ESP32s
+// Max simultaneous HTTP GETs to ESP32s. Scales with the fleet: a fixed 3 would
+// make a 12-device farm need four sequential batches, so one unreachable board
+// (REQ_TIMEOUT_MS) would stall a third of the fleet's health checks each cycle.
+// Capped so a large farm still cannot flood the LAN with simultaneous requests.
+const MAX_CONCURRENCY = 10;
 const REQ_TIMEOUT_MS = 2000; // fail fast on a hung device
 const POLL_INTERVAL_MS = 5000; // cadence
 const FAILURE_THRESHOLD = 3; // consecutive failures before a warning is logged
@@ -30,6 +34,7 @@ async function getRegisteredDevices(pool) {
     `SELECT device_id, ip_address, tank_name
        FROM devices
       WHERE is_active = true
+        AND archived_at IS NULL
         AND ip_address IS NOT NULL
         AND ip_address <> ''`
   );
@@ -83,9 +88,12 @@ async function pollOnce(pool) {
   if (devices.length === 0) return;
 
   // Batched bounded concurrency: Promise.allSettled means a timeout on one
-  // device can never reject the batch and delay the next one.
-  for (let i = 0; i < devices.length; i += CONCURRENCY) {
-    const batch = devices.slice(i, i + CONCURRENCY);
+  // device can never reject the batch and delay the next one. The batch size
+  // follows the fleet size so a 2-device farm is not throttled and a 20-device
+  // farm is not serialised into seven rounds.
+  const concurrency = Math.max(1, Math.min(MAX_CONCURRENCY, devices.length));
+  for (let i = 0; i < devices.length; i += concurrency) {
+    const batch = devices.slice(i, i + concurrency);
     await Promise.allSettled(batch.map((dev) => checkDevice(pool, dev)));
   }
 }
@@ -98,7 +106,9 @@ function startDevicePoller(pool) {
   setInterval(() => {
     pollOnce(pool).catch(() => {}); // swallow: interval must never crash
   }, POLL_INTERVAL_MS);
-  console.log(`[POLL] ESP32 status poller started (every ${POLL_INTERVAL_MS / 1000}s, concurrency ${CONCURRENCY}, timeout ${REQ_TIMEOUT_MS}ms)`);
+  console.log(`[POLL] ESP32 status poller started (every ${POLL_INTERVAL_MS / 1000}s, up to ${MAX_CONCURRENCY} concurrent, timeout ${REQ_TIMEOUT_MS}ms)`);
 }
 
-module.exports = { startDevicePoller };
+// pollOnce is exported so the batching/concurrency behaviour can be unit tested
+// without a database or a running interval. It is not part of the boot path.
+module.exports = { startDevicePoller, pollOnce, MAX_CONCURRENCY };

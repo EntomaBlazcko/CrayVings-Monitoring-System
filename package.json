@@ -13,6 +13,9 @@
     "test": "node src/types/threshold.test.cjs",
     "check:encoding": "node check-encoding.cjs",
     "test:regression": "node tests/regression.cjs",
+    "test:devices": "node tests/devices.cjs",
+    "test:poller": "node tests/devicePoller.cjs",
+    "test:all": "npm test && npm run test:poller && npm run test:devices && npm run test:regression",
     "seed:admin": "node seed-admin.cjs",
     "mock": "node scripts/mock-device.js",
     "mock:profiles": "node scripts/mock-device.js --list-profiles"
