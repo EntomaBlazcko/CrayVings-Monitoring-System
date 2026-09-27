@@ -149,6 +149,143 @@ That’s it — the board is now a first-class citizen of the fleet.
 
 ---
 
+## Complete Step-by-Step: Adding a New Device (Real ESP32 or Mock)
+
+### A. Real ESP32 (your spare hardware)
+
+#### 1. Prepare the ESP32 hardware
+| Action | Details |
+|--------|---------|
+| **Flash firmware** | Use the ESP32 firmware repo (separate). Compile with your Wi-Fi credentials. |
+| **Set `DEVICE_SECRET`** | In firmware config: `#define DEVICE_SECRET "your_shared_secret"` — must match `.env` on server. |
+| **Static IP (recommended)** | Configure DHCP reservation on your router, or set static IP in firmware: `IPAddress(192,168,4,107)` |
+| **Power on** | Connect to power. Watch serial monitor — it should connect to Wi-Fi and start posting to `/sensor`. |
+
+#### 2. Verify it's talking to the server (before registering)
+```bash
+# Check server logs for auto-registration
+grep "Auto-registered\|devices.*ON CONFLICT" server.log
+
+# Or via API (admin token needed)
+curl -H "Authorization: Bearer $TOKEN" http://localhost:3000/devices
+```
+You should see the new board with:
+- **Device ID**: whatever firmware reports (e.g., `ESP32_07`)
+- **Badge**: **Auto** (auto-discovered)
+- **IP**: whatever the server saw (may be NAT address if server not on same subnet)
+- **Name**: empty
+
+#### 3. Register it properly on the Dashboard (Devices page)
+| Field | What to enter | Why |
+|-------|---------------|-----|
+| **Device ID** | Exact ID from firmware (case-sensitive): `ESP32_07` | Must match exactly or ingest will create a second row |
+| **Device Name** | Friendly label: `Grow-out Tank 3` | Shows everywhere — Dashboard, Sensors, Reports |
+| **IP Address** | **Your static LAN IP**: `192.168.4.107` | Locks it (`ip_source=manual`); health poller needs LAN-reachable IP |
+| **Location** (optional) | `Greenhouse B, Row 2` | Extra context |
+
+Click **Register** → row gets **Manual** badge, **Online** status (green) within ~5s.
+
+#### 4. Verify end-to-end
+| Check | How |
+|-------|-----|
+| **Dashboard** | Tank appears in selector, live readings show |
+| **Sensors page** | Tank in dropdown, history loads |
+| **Live Check** (Devices page) | Click Wi-Fi icon → see firmware version, RSSI, uptime |
+| **Alerts** | Set thresholds in Settings → trigger test alert |
+| **Reports** | Weekly/range reports include the new tank |
+
+---
+
+### B. Mock Device (no hardware, for dev/demo)
+
+#### 1. Start backend + frontend (if not running)
+```bash
+# Terminal 1
+npm run server
+
+# Terminal 2
+npm run dev
+```
+
+#### 2. Run the mock script
+```bash
+# Basic: single tank, healthy readings
+npm run mock
+
+# Or with options:
+npm run mock -- --device ESP32_09 --profile healthy --interval 5000
+npm run mock -- --profile fleet    # two tanks in parallel
+npm run mock -- --profile ammonia_spike
+npm run mock -- --list-profiles   # see all 8 profiles
+```
+
+| Option | Meaning |
+|--------|---------|
+| `--device ESP32_09` | Device ID to use (auto-registers if new) |
+| `--profile healthy` | Normal readings (temp 28°C, water 60%) |
+| `--profile warming` | Temp slowly rises → triggers warning |
+| `--profile ammonia_spike` | Ammonia spikes → critical alert + SMS |
+| `--interval 5000` | Post every 5s (default) |
+
+#### 3. Watch it auto-register
+- First POST → server creates row with `registered_via=auto`, badge **Auto**
+- Check Devices page → new row appears with **Auto** badge
+
+#### 4. (Optional) Promote to Manual registration
+1. Open **Devices** page
+2. Find the mock device (e.g., `ESP32_09`)
+3. Click **pencil** → enter a friendly **Name** and **static IP** (`192.0.2.99` for TEST-NET)
+4. Click **Save** → badge flips to **Manual**, IP locked
+
+#### 5. Test scenarios without hardware
+| Scenario | Command |
+|----------|---------|
+| Normal operation | `npm run mock -- --device ESP32_09 --profile healthy` |
+| Warning alert | `npm run mock -- --device ESP32_09 --profile warming` |
+| Critical + SMS | `npm run mock -- --device ESP32_09 --profile ammonia_spike` |
+| Two tanks | `npm run mock -- --profile fleet` |
+| Disconnect test | Ctrl+C mock → watch poller mark **Offline** after ~15s |
+
+---
+
+### Quick Comparison
+
+| Step | Real ESP32 | Mock Device |
+|------|------------|-------------|
+| **Identity** | Flashed in firmware (`device_id` compile-time) | Passed via `--device` flag |
+| **Auth** | `X-Device-Secret` header (shared or per-device) | Same, uses `DEVICE_SECRET` from `.env` |
+| **IP** | Real LAN IP (health poller must reach it) | Any IP (health check will fail unless real) |
+| **Auto-reg** | Happens on first sensor post | Same |
+| **Manual reg** | Devices page → Add Device | Same |
+| **IP lock** | Enter static IP in Dashboard → `ip_source=manual` | Same |
+| **Alerts** | Real thresholds | Profile-driven (warming, ammonia_spike) |
+
+---
+
+### Common Gotchas
+
+| Problem | Fix |
+|---------|-----|
+| **Duplicate ID error** | ID already exists (active, hidden, **or archived**). Check Archived tab. |
+| **IP keeps reverting** | You didn't save, or board is `ip_source=auto`. Edit → enter IP → Save. |
+| **Status = Unknown forever** | No IP configured. Edit row, add static LAN IP. |
+| **Live Check = "Cannot reach server"** | Wrong IP, board offline, or server not on same VLAN. |
+| **Mock shows Auto but no readings** | Mock script not running, or wrong `DEVICE_SECRET`. |
+
+---
+
+### For Your Capstone Demo Script
+
+> **60-second live demo:**
+> 1. "Here's the Devices page — two real tanks."
+> 2. "Add Device → `DEMO_01`, `Demo Tank`, `192.0.2.50` → Register."
+> 3. "Instantly appears with **Manual** badge. Now in every dropdown."
+> 4. "Live Check → shows firmware, RSSI."
+> 5. "Archive → gone from selectors, history retained."
+> 6. "Try to re-add `DEMO_01` → rejected: *ID permanently retired*."
+
+---
+
 ## How to verify the module is working
 
 ### 1. Quick UI sanity check (30 seconds)
