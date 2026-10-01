@@ -415,8 +415,9 @@ async function main() {
 
   if (!args.secret) {
     console.log(
-      `${c.yellow}warning${c.reset} DEVICE_SECRET is not set in .env - posting without X-Device-Secret.\n` +
-      `         If the server was started with DEVICE_SECRET it will reply 401.\n`
+      `${c.yellow}warning${c.reset} posting without X-Device-Secret.\n` +
+      `         POST /sensor always requires it now, so the server will reply 401.\n` +
+      `         Pass --secret <s>, or start the mock where DEVICE_SECRET is set.\n`
     );
   }
 

@@ -214,6 +214,25 @@ function hashToken(token) {
 }
 
 // =============================================================================
+// ERROR RESPONSES
+// =============================================================================
+// Every 5xx used to answer with `{ message, error: err.message }`, which handed
+// the client raw Postgres and Express internals: constraint names, column lists,
+// and on /auth/login enough to fingerprint the authentication query itself. The
+// detail belongs in the server log, where it is actionable, not in a JSON body
+// that gets copied into a bug report.
+//
+// `message` stays exactly as specific as it was - it is written by us and says
+// what the caller can do about it - so clients keep their existing handling.
+function fail(res, status, message, err, req) {
+  console.error(
+    `[${new Date().toISOString()}] ${req ? `${req.method} ${req.originalUrl}` : "server"} -> ${status}: ${message}`,
+    err
+  );
+  return res.status(status).json({ message });
+}
+
+// =============================================================================
 // AUTHENTICATION MIDDLEWARE
 // =============================================================================
 // requireAdmin validates the Bearer token AND checks the admin role;
@@ -236,7 +255,7 @@ function requireAdmin(req, res, next) {
       req.adminUser = user;
       next();
     })
-    .catch(err => res.status(500).json({ message: "Auth error", error: err.message }));
+    .catch(err => fail(res, 500, "Auth error", err, req));
 }
 
 // Validates the token and attaches the user to req.adminUser (admin role required)
@@ -258,9 +277,17 @@ app._deleteUserHard = async (userId, actorUsername) => {
 };
 function requireAuth(req, res, next) {
   // Token normally arrives as "Authorization: Bearer <token>". EventSource (SSE)
-  // cannot set custom headers, so a `?token=` query parameter is also accepted.
+  // cannot set custom headers, so `?token=` is accepted on the stream route and
+  // nowhere else.
+  //
+  // Why the restriction matters: a token in a URL is recorded by every access
+  // log, proxy and CDN hop along the path, and rides along in the Referer header
+  // of anything the response links to. Scoping it to the one route that has no
+  // alternative keeps that exposure to a single endpoint instead of all 50+.
+  // Phase 6 removes it entirely by moving SSE onto the session cookie.
   const headerToken = req.headers.authorization?.replace("Bearer ", "");
-  const queryToken = typeof req.query?.token === "string" ? req.query.token : null;
+  const isStreamRoute = req.path === "/sensor/stream";
+  const queryToken = isStreamRoute && typeof req.query?.token === "string" ? req.query.token : null;
   const token = headerToken || queryToken;
   if (!token) return res.status(401).json({ message: "Authentication required" });
 
@@ -275,7 +302,7 @@ function requireAuth(req, res, next) {
       req.user = user;
       next();
     })
-    .catch(err => res.status(500).json({ message: "Auth error", error: err.message }));
+    .catch(err => fail(res, 500, "Auth error", err, req));
 }
 
 // =============================================================================
@@ -1156,10 +1183,13 @@ async function getThresholdsForDevice(deviceId) {
 }
 
 // DEVICE_SECRET: ESP32 must send matching X-Device-Secret header for POST /sensor.
-// When set, requests without it are rejected; when unset (local dev), ingestion
-// is allowed but a warning is logged. Set DEVICE_SECRET in production.
+// This used to be optional outside production, which meant a deployment with
+// neither DEVICE_SECRET nor NODE_ENV=production accepted data from anyone. The
+// requirement is now unconditional so the server always fails closed. With no
+// DEVICE_SECRET set the shared comparison can never match, so the only boards
+// accepted are those carrying a per-device secret (migration 008).
 const DEVICE_SECRET = process.env.DEVICE_SECRET;
-let deviceSecretWarned = false;
+const REQUIRE_DEVICE_SECRET = true;
 
 // In-memory alert dedup state; last-alert per sensor, disconnect spam guard
 let lastAlertedState = {};
@@ -1388,6 +1418,26 @@ function scheduleAlertProcessing(device_id, ts, temperature, water_level, ammoni
 const sseClients = new Map(); // res -> device_id filter (string | null)
 const latestDeviceReadings = new Map(); // device_id -> { ...readings, recv_at }
 
+// Ceiling on concurrent dashboard streams. Each client costs an open socket plus
+// a 25s timer, so an unbounded map leaks with a slow fuse: a dashboard left open
+// on a flaky Wi-Fi link never emits 'close', so the entry is only reclaimed when
+// a write eventually fails. A farm is a handful of operators, so this is
+// deliberately generous; going past it means something is wrong and is better
+// refused loudly than absorbed.
+const SSE_MAX_CLIENTS = 50;
+
+// Drops one SSE client AND its keep-alive timer. Clearing the timer is the point:
+// it is otherwise only cleared from the keep-alive catch or the request's close
+// event, so a client pruned by the broadcast loop kept a timer alive writing to
+// a dead socket every 25s, forever, and neither event was coming.
+function dropSseClient(res) {
+  sseClients.delete(res);
+  if (res.sseKeepAlive) {
+    clearInterval(res.sseKeepAlive);
+    res.sseKeepAlive = null;
+  }
+}
+
 // Forgets every in-memory trace of one device. Called when a device is archived
 // (so a retired board stops feeding the live tile, the SSE stream and the delta
 // baseline) and when one is restored (so a stale pre-archive reading cannot
@@ -1413,10 +1463,16 @@ function broadcastSensorUpdate(deviceId, readings, ts) {
   for (const [client, filter] of sseClients) {
     // Subscribed dashboards only receive their own tank's frames.
     if (filter && filter !== deviceId) continue;
+    // A socket can be finished without throwing on write (half-open after a
+    // network drop), so check the flags rather than trusting write() to throw.
+    if (client.writableEnded || client.destroyed) {
+      dropSseClient(client);
+      continue;
+    }
     try {
       client.write(payload);
     } catch {
-      sseClients.delete(client); // dead connection
+      dropSseClient(client); // dead connection
     }
   }
 }
@@ -1427,7 +1483,7 @@ app.post("/sensor", sensorIngestLimiter, async (req, res) => {
     // Device auth: prefer the per-device secret from the devices registry, fall
     // back to the shared DEVICE_SECRET so existing firmware keeps working.
     const presented = req.headers["x-device-secret"];
-    if (DEVICE_SECRET || process.env.NODE_ENV === "production") {
+    if (REQUIRE_DEVICE_SECRET) {
       if (!presented) {
         console.warn(`[${new Date().toISOString()}] POST /sensor 401 from ${req.ip}: missing X-Device-Secret header (device_id: ${req.body?.device_id ?? "?"})`);
         return res.status(401).json({ message: "Device secret required" });
@@ -1480,9 +1536,6 @@ app.post("/sensor", sensorIngestLimiter, async (req, res) => {
         console.warn(`[${new Date().toISOString()}] POST /sensor 401 from ${req.ip}: wrong X-Device-Secret (device_id: ${req.body?.device_id ?? "?"})`);
         return res.status(401).json({ message: "Invalid device secret" });
       }
-    } else if (!deviceSecretWarned) {
-      deviceSecretWarned = true;
-      console.warn(`[${new Date().toISOString()}] DEVICE_SECRET not set - sensor ingestion is unauthenticated. Set DEVICE_SECRET in production.`);
     }
     const parsed = sensorSchema.safeParse(req.body);
     if (!parsed.success) {
@@ -1646,7 +1699,7 @@ app.post("/sensor", sensorIngestLimiter, async (req, res) => {
     scheduleAlertProcessing(device_id, rowTs, temperature, water_level, ammonia);
   } catch (err) {
     console.error(`[${new Date().toISOString()}] Error saving sensor:`, err.message);
-    res.status(500).json({ message: "Error saving data", error: process.env.NODE_ENV === "production" ? undefined : err.message });
+    res.status(500).json({ message: "Error saving data" });
   }
 });
 
@@ -1676,7 +1729,7 @@ app.get("/sensor", requireAuth, async (req, res) => {
     res.json(result.rows);
   } catch (err) {
     console.error(`[${new Date().toISOString()}] Error fetching sensors:`, err.message);
-    res.status(500).json({ message: "Error fetching data", error: err.message });
+    res.status(500).json({ message: "Error fetching data" });
   }
 });
 
@@ -1718,7 +1771,7 @@ app.get("/sensor/latest", requireAuth, async (req, res) => {
     });
   } catch (err) {
     console.error(`[${new Date().toISOString()}] Error fetching latest:`, err.message);
-    res.status(500).json({ message: "Error", error: process.env.NODE_ENV === "production" ? undefined : err.message });
+    res.status(500).json({ message: "Error" });
   }
 });
 
@@ -1729,6 +1782,14 @@ app.get("/sensor/latest", requireAuth, async (req, res) => {
 // session token as a ?token= query parameter because EventSource cannot set
 // Authorization headers. Broadcasts happen on every accepted POST /sensor.
 app.get("/sensor/stream", requireAuth, (req, res) => {
+  // Refuse before any SSE header is flushed: once the response has started we can
+  // no longer change the status code, and the client would sit on a dead stream
+  // retrying forever. 503 is also what the reconnect backoff handles cleanly.
+  if (sseClients.size >= SSE_MAX_CLIENTS) {
+    console.warn(`[${new Date().toISOString()}] SSE refused: ${sseClients.size} live clients already at the ${SSE_MAX_CLIENTS} cap`);
+    return res.status(503).json({ message: "Too many live dashboard connections" });
+  }
+
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache");
   res.setHeader("Connection", "keep-alive");
@@ -1754,13 +1815,15 @@ app.get("/sensor/stream", requireAuth, (req, res) => {
     try {
       res.write(": keep-alive\n\n");
     } catch {
-      clearInterval(keepAlive);
+      dropSseClient(res);
     }
   }, 25000); // comment ping prevents proxy idle timeouts
+  // Parked on the response so dropSseClient() can cancel it from the broadcast
+  // loop, which is the only path that reaps clients whose close never fires.
+  res.sseKeepAlive = keepAlive;
 
   req.on("close", () => {
-    clearInterval(keepAlive);
-    sseClients.delete(res);
+    dropSseClient(res);
   });
 });
 
@@ -1895,7 +1958,7 @@ app.post("/devices", requireAdmin, async (req, res) => {
       });
     }
     console.error(`[${new Date().toISOString()}] Error registering device:`, err.message);
-    res.status(500).json({ message: "Error registering device", error: err.message });
+    res.status(500).json({ message: "Error registering device" });
   }
 });
 
@@ -1926,7 +1989,7 @@ app.get("/devices", requireAuth, async (req, res) => {
     res.json(result.rows.map((row) => ({ ...row, online: !!row.online })));
   } catch (err) {
     console.error(`[${new Date().toISOString()}] Error fetching devices:`, err.message);
-    res.status(500).json({ message: "Error fetching devices", error: err.message });
+    res.status(500).json({ message: "Error fetching devices" });
   }
 });
 
@@ -2004,7 +2067,7 @@ app.put("/devices/:deviceId", requireAdmin, async (req, res) => {
     res.json(updated);
   } catch (err) {
     console.error(`[${new Date().toISOString()}] Error updating device:`, err.message);
-    res.status(500).json({ message: "Error updating device", error: err.message });
+    res.status(500).json({ message: "Error updating device" });
   }
 });
 
@@ -2174,7 +2237,7 @@ app.post("/devices/:deviceId/rotate-secret", requireAdmin, async (req, res) => {
     });
   } catch (err) {
     console.error(`[${new Date().toISOString()}] Error rotating device secret:`, err.message);
-    res.status(500).json({ message: "Error rotating device secret", error: err.message });
+    res.status(500).json({ message: "Error rotating device secret" });
   }
 });
 
@@ -2232,7 +2295,7 @@ app.post("/devices/:deviceId/archive", requireAdmin, async (req, res) => {
     res.json({ ...row, online: false, retained_readings: readings.rows[0].n });
   } catch (err) {
     console.error(`[${new Date().toISOString()}] Error archiving device:`, err.message);
-    res.status(500).json({ message: "Error archiving device", error: err.message });
+    res.status(500).json({ message: "Error archiving device" });
   }
 });
 
@@ -2267,7 +2330,7 @@ app.post("/devices/:deviceId/restore", requireAdmin, async (req, res) => {
     res.json(row);
   } catch (err) {
     console.error(`[${new Date().toISOString()}] Error restoring device:`, err.message);
-    res.status(500).json({ message: "Error restoring device", error: err.message });
+    res.status(500).json({ message: "Error restoring device" });
   }
 });
 
@@ -2286,7 +2349,7 @@ app.get("/devices/latest", requireAuth, async (req, res) => {
     res.json(rows);
   } catch (err) {
     console.error(`[${new Date().toISOString()}] Error fetching latest device readings:`, err.message);
-    res.status(500).json({ message: "Error fetching latest readings", error: err.message });
+    res.status(500).json({ message: "Error fetching latest readings" });
   }
 });
 
@@ -2308,7 +2371,7 @@ app.get("/devices/:deviceId/status", requireAuth, async (req, res) => {
     if (err.code === "ECONNABORTED") {
       return res.status(504).json({ message: "Device timed out" });
     }
-    res.status(502).json({ message: "Device unreachable", error: err.message });
+    fail(res, 502, "Device unreachable", err, req);
   }
 });
 
@@ -2471,7 +2534,7 @@ app.get("/report/weekly", requireAuth, async (req, res) => {
     });
   } catch (err) {
     console.error(`[${new Date().toISOString()}] Error fetching weekly report:`, err.message);
-    res.status(500).json({ message: "Error fetching weekly report", error: err.message });
+    res.status(500).json({ message: "Error fetching weekly report" });
   }
 });
 
@@ -2653,7 +2716,7 @@ app.get("/report/range", requireAdmin, async (req, res) => {
     });
   } catch (err) {
     console.error(`[${new Date().toISOString()}] Error fetching range report:`, err.message);
-    res.status(500).json({ message: "Error fetching range report", error: err.message });
+    res.status(500).json({ message: "Error fetching range report" });
   }
 });
 
@@ -2697,7 +2760,7 @@ app.post("/auth/login", loginLimiter, async (req, res) => {
     });
   } catch (err) {
     console.error(`[${new Date().toISOString()}] Login error:`, err.message);
-    res.status(500).json({ message: "Login failed", error: err.message });
+    res.status(500).json({ message: "Login failed" });
   }
 });
 
@@ -2707,7 +2770,7 @@ app.post("/auth/logout", requireAuth, async (req, res) => {
     await pool.query("UPDATE users SET token = NULL, token_expires_at = NULL WHERE id = $1", [req.user.id]);
     res.json({ message: "Logged out" });
   } catch (err) {
-    res.status(500).json({ message: "Error logging out", error: err.message });
+    return fail(res, 500, "Error logging out", err, req);
   }
 });
 
@@ -2726,7 +2789,7 @@ app.get("/auth/users", requireAdmin, async (req, res) => {
     }));
     res.json(rows);
   } catch (err) {
-    res.status(500).json({ message: "Error fetching users", error: err.message });
+    fail(res, 500, "Error fetching users", err, req);
   }
 });
 
@@ -2748,7 +2811,7 @@ app.get("/auth/users/archived", requireAdmin, async (req, res) => {
     );
     res.json(result.rows);
   } catch (err) {
-    res.status(500).json({ message: "Error fetching archived users", error: err.message });
+    fail(res, 500, "Error fetching archived users", err, req);
   }
 });
 
@@ -2809,7 +2872,7 @@ app.post("/auth/users/:id/restore", requireAdmin, async (req, res) => {
   } catch (err) {
     if (client) await client.query("ROLLBACK");
     console.error(`[${new Date().toISOString()}] Error restoring user:`, err.message);
-    res.status(500).json({ message: "Error restoring user", error: err.message });
+    res.status(500).json({ message: "Error restoring user" });
   } finally {
     if (client) client.release();
   }
@@ -2832,7 +2895,7 @@ app.delete("/auth/users/archived/:id", requireAdmin, async (req, res) => {
     res.json({ message: "User permanently deleted", username: result.rows[0].username });
   } catch (err) {
     console.error(`[${new Date().toISOString()}] Error purging archived user:`, err.message);
-    res.status(500).json({ message: "Error purging archived user", error: err.message });
+    res.status(500).json({ message: "Error purging archived user" });
   }
 });
 
@@ -2851,7 +2914,7 @@ app.post("/auth/users", requireAdmin, async (req, res) => {
   } catch (err) {
     // PostgreSQL error code 23505 = unique constraint violation
     if (err.code === "23505") return res.status(409).json({ message: "Username or email already exists" });
-    res.status(500).json({ message: "Error creating user", error: err.message });
+    return fail(res, 500, "Error creating user", err, req);
   }
 });
 
@@ -2950,7 +3013,7 @@ app.post("/auth/users/:id/deletion-request", requireAdmin, async (req, res) => {
     });
   } catch (err) {
     console.error(`[${new Date().toISOString()}] Error requesting user deletion:`, err.message);
-    res.status(500).json({ message: "Error requesting user deletion", error: err.message });
+    res.status(500).json({ message: "Error requesting user deletion" });
   }
 });
 
@@ -3048,7 +3111,7 @@ app.post("/auth/users/:id/deletion-verify", requireAdmin, async (req, res) => {
   } catch (err) {
     await client.query("ROLLBACK");
     console.error(`[${new Date().toISOString()}] Error verifying deletion OTP:`, err.message);
-    res.status(500).json({ message: "Error verifying deletion OTP", error: err.message });
+    res.status(500).json({ message: "Error verifying deletion OTP" });
   } finally {
     client.release();
   }
@@ -3065,7 +3128,7 @@ app.get("/auth/users/deletion-requests", requireAdmin, async (req, res) => {
     );
     res.json(result.rows);
   } catch (err) {
-    res.status(500).json({ message: "Error fetching deletion requests", error: err.message });
+    fail(res, 500, "Error fetching deletion requests", err, req);
   }
 });
 
@@ -3078,7 +3141,7 @@ app.put("/auth/users/:id/password", requireAdmin, async (req, res) => {
     await pool.query("UPDATE users SET password_hash = $1 WHERE id = $2", [passwordHash, req.params.id]);
     res.json({ message: "Password updated" });
   } catch (err) {
-    res.status(500).json({ message: "Error updating password", error: err.message });
+    fail(res, 500, "Error updating password", err, req);
   }
 });
 
@@ -3105,7 +3168,7 @@ app.get("/settings", requireAuth, async (req, res) => {
       updated_at: row.updated_at,
     });
   } catch (err) {
-    res.status(500).json({ message: "Error fetching settings", error: err.message });
+    fail(res, 500, "Error fetching settings", err, req);
   }
 });
 
@@ -3160,7 +3223,7 @@ app.post("/settings", requireAdmin, async (req, res) => {
     }
     res.json({ message: "Settings saved", changed: true, data: savedSettings });
   } catch (err) {
-    res.status(500).json({ message: "Error saving settings", error: err.message });
+    fail(res, 500, "Error saving settings", err, req);
   }
 });
 
@@ -3185,7 +3248,7 @@ app.post("/settings/reset", requireAdmin, async (req, res) => {
     }
     res.json({ message: "Settings reset to defaults", data: savedSettings });
   } catch (err) {
-    res.status(500).json({ message: "Error resetting settings", error: err.message });
+    fail(res, 500, "Error resetting settings", err, req);
   }
 });
 
@@ -3224,7 +3287,7 @@ app.get("/settings/effective", requireAuth, async (req, res) => {
     }
     res.json({ global, devices });
   } catch (err) {
-    res.status(500).json({ message: "Error fetching effective thresholds", error: err.message });
+    fail(res, 500, "Error fetching effective thresholds", err, req);
   }
 });
 
@@ -3253,7 +3316,7 @@ app.get("/settings/device/:deviceId", requireAdmin, async (req, res) => {
       override,
     });
   } catch (err) {
-    res.status(500).json({ message: "Error fetching device thresholds", error: err.message });
+    fail(res, 500, "Error fetching device thresholds", err, req);
   }
 });
 
@@ -3339,7 +3402,7 @@ app.put("/settings/device/:deviceId", requireAdmin, async (req, res) => {
       effective: effectiveAfter,
     });
   } catch (err) {
-    res.status(500).json({ message: "Error saving device thresholds", error: err.message });
+    fail(res, 500, "Error saving device thresholds", err, req);
   }
 });
 
@@ -3361,7 +3424,7 @@ app.delete("/settings/device/:deviceId", requireAdmin, async (req, res) => {
       effective: layerThresholds(globalResult.rows[0], null),
     });
   } catch (err) {
-    res.status(500).json({ message: "Error clearing device thresholds", error: err.message });
+    fail(res, 500, "Error clearing device thresholds", err, req);
   }
 });
 
@@ -3376,7 +3439,7 @@ app.get("/settings/recipients", requireAdmin, async (req, res) => {
     res.json(result.rows);
   } catch (err) {
     console.error(`[${new Date().toISOString()}] Error fetching SMS recipients:`, err.message);
-    res.status(500).json({ message: "Error fetching SMS recipients", error: err.message });
+    res.status(500).json({ message: "Error fetching SMS recipients" });
   }
 });
 
@@ -3401,7 +3464,7 @@ app.post("/settings/recipients", requireAdmin, async (req, res) => {
   } catch (err) {
     if (err.code === "23505") return res.status(400).json({ message: "Phone number already exists" });
     console.error(`[${new Date().toISOString()}] Error adding SMS recipient:`, err.message);
-    res.status(500).json({ message: "Error adding SMS recipient", error: err.message });
+    res.status(500).json({ message: "Error adding SMS recipient" });
   }
 });
 
@@ -3432,7 +3495,7 @@ app.put("/settings/recipients/:id", requireAdmin, async (req, res) => {
     res.json(result.rows[0]);
   } catch (err) {
     console.error(`[${new Date().toISOString()}] Error updating SMS recipient:`, err.message);
-    res.status(500).json({ message: "Error updating SMS recipient", error: err.message });
+    res.status(500).json({ message: "Error updating SMS recipient" });
   }
 });
 
@@ -3454,7 +3517,7 @@ app.delete("/settings/recipients/:id", requireAdmin, async (req, res) => {
     res.json({ message: "SMS recipient archived (restorable)", phone_number: result.rows[0].phone_number });
   } catch (err) {
     console.error(`[${new Date().toISOString()}] Error archiving SMS recipient:`, err.message);
-    res.status(500).json({ message: "Error archiving SMS recipient", error: err.message });
+    res.status(500).json({ message: "Error archiving SMS recipient" });
   }
 });
 
@@ -3473,7 +3536,7 @@ app.get("/settings/recipients/archived", requireAdmin, async (req, res) => {
     res.json(result.rows);
   } catch (err) {
     console.error(`[${new Date().toISOString()}] Error fetching archived SMS recipients:`, err.message);
-    res.status(500).json({ message: "Error fetching archived SMS recipients", error: err.message });
+    res.status(500).json({ message: "Error fetching archived SMS recipients" });
   }
 });
 
@@ -3494,7 +3557,7 @@ app.post("/settings/recipients/:id/archive", requireAdmin, async (req, res) => {
     res.json({ message: "SMS recipient archived (restorable)", phone_number: result.rows[0].phone_number });
   } catch (err) {
     console.error(`[${new Date().toISOString()}] Error archiving SMS recipient:`, err.message);
-    res.status(500).json({ message: "Error archiving SMS recipient", error: err.message });
+    res.status(500).json({ message: "Error archiving SMS recipient" });
   }
 });
 
@@ -3531,7 +3594,7 @@ app.post("/settings/recipients/:id/restore", requireAdmin, async (req, res) => {
     res.json({ message: "SMS recipient restored", data: result.rows[0] });
   } catch (err) {
     console.error(`[${new Date().toISOString()}] Error restoring SMS recipient:`, err.message);
-    res.status(500).json({ message: "Error restoring SMS recipient", error: err.message });
+    res.status(500).json({ message: "Error restoring SMS recipient" });
   }
 });
 
@@ -3552,7 +3615,7 @@ app.delete("/settings/recipients/archived/:id", requireAdmin, async (req, res) =
     res.json({ message: "SMS recipient permanently deleted", phone_number: result.rows[0].phone_number });
   } catch (err) {
     console.error(`[${new Date().toISOString()}] Error purging SMS recipient:`, err.message);
-    res.status(500).json({ message: "Error purging SMS recipient", error: err.message });
+    res.status(500).json({ message: "Error purging SMS recipient" });
   }
 });
 
@@ -3577,11 +3640,11 @@ app.post("/settings/recipients/test/:id", requireAdmin, async (req, res) => {
       return res.json({ success: true, message: "Test SMS sent", recipient: recipient.name || recipient.phone_number });
     } catch (err) {
       await logSms(recipient.phone_number, content, "failed", err.message);
-      return res.status(500).json({ message: "Failed to send test SMS", error: err.message });
+      return fail(res, 500, "Failed to send test SMS", err, req);
     }
   } catch (err) {
     console.error(`[${new Date().toISOString()}] Error sending test SMS:`, err.message);
-    res.status(500).json({ message: "Error sending test SMS", error: err.message });
+    res.status(500).json({ message: "Error sending test SMS" });
   }
 });
 
@@ -3598,17 +3661,43 @@ app.post("/alert/status", requireAdmin, async (req, res) => {
     res.json({ sent, total });
   } catch (err) {
     console.error(`[${new Date().toISOString()}] Error sending status SMS:`, err.message);
-    res.status(500).json({ message: "Error sending status SMS", error: err.message });
+    res.status(500).json({ message: "Error sending status SMS" });
   }
 });
 
 // POST /alert/mute (Admin) - suppress SMS for N hours (0 = unmute).
 // ?device_id= (or body device_id) mutes ONE tank; omitted -> global mute.
 // Both layers persist in system_state, so a restart no longer clears them.
+//
+// SMS mute exists for "that sensor is broken, stop texting me", so it is capped
+// the same way the secret-rotation grace window is (7 days). Without a ceiling a
+// single request could silence every alert indefinitely, and an operator who
+// forgets they muted it gets a farm that looks healthy because nothing is being
+// reported. Capping also makes the worst case recoverable on its own.
+const SMS_MUTE_MAX_HOURS = 7 * 24;
+
+const muteRequestSchema = z.object({
+  // Absent/blank means "unmute", which is what the old parseInt(..) || 0 did.
+  // That is why this is a preprocess and not a .catch(0): a catch would also
+  // swallow an out-of-range value and quietly unmute instead of rejecting it.
+  hours: z.preprocess(
+    (v) => (v === undefined || v === null || v === "" ? 0 : v),
+    z.coerce.number().int().min(0).max(SMS_MUTE_MAX_HOURS)
+  ),
+  device_id: z.string().min(1).max(50).optional(),
+});
+
 app.post("/alert/mute", requireAdmin, async (req, res) => {
   try {
-    const hours = parseInt(req.body?.hours) || 0;
-    const deviceId = req.body?.device_id ? String(req.body.device_id) : (req.query.device_id ? String(req.query.device_id) : null);
+    const parsed = muteRequestSchema.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      return res.status(400).json({
+        message: `Invalid mute request: hours must be a whole number between 0 and ${SMS_MUTE_MAX_HOURS}`,
+        errors: zodFieldErrors(parsed.error),
+      });
+    }
+    const hours = parsed.data.hours;
+    const deviceId = parsed.data.device_id ?? (req.query.device_id ? String(req.query.device_id) : null);
 
     if (deviceId) {
       const device = await pool.query("SELECT device_id, tank_name FROM devices WHERE device_id = $1", [deviceId]);
@@ -3643,7 +3732,7 @@ app.post("/alert/mute", requireAdmin, async (req, res) => {
     res.json({ muted: true, muteExpires: smsMuteUntil, message: `SMS alerts muted for ${hours} hours` });
   } catch (err) {
     console.error(`[${new Date().toISOString()}] Error setting SMS mute:`, err.message);
-    res.status(500).json({ message: "Error setting SMS mute", error: err.message });
+    res.status(500).json({ message: "Error setting SMS mute" });
   }
 });
 
@@ -3673,7 +3762,7 @@ app.get("/alert/mute-status", requireAuth, async (req, res) => {
     });
   } catch (err) {
     console.error(`[${new Date().toISOString()}] Error fetching SMS mute status:`, err.message);
-    res.status(500).json({ message: "Error fetching SMS mute status", error: err.message });
+    res.status(500).json({ message: "Error fetching SMS mute status" });
   }
 });
 
@@ -3713,7 +3802,7 @@ app.get("/alert/sms-health", requireAuth, async (req, res) => {
     });
   } catch (err) {
     console.error(`[${new Date().toISOString()}] Error fetching SMS health:`, err.message);
-    res.status(500).json({ message: "Error fetching SMS health", error: err.message });
+    res.status(500).json({ message: "Error fetching SMS health" });
   }
 });
 
@@ -3737,7 +3826,7 @@ app.get("/sms-logs", requireAdmin, async (req, res) => {
     res.json({ rows: result.rows, total: total.rows[0].n, page, pageSize });
   } catch (err) {
     console.error(`[${new Date().toISOString()}] Error fetching SMS logs:`, err.message);
-    res.status(500).json({ message: "Error fetching SMS logs", error: err.message });
+    res.status(500).json({ message: "Error fetching SMS logs" });
   }
 });
 
@@ -3766,7 +3855,7 @@ app.post("/logs", requireAdmin, async (req, res) => {
     );
     res.status(201).json({ message: "Logged", data: result.rows[0] });
   } catch (err) {
-    res.status(500).json({ message: "Error logging", error: err.message });
+    fail(res, 500, "Error logging", err, req);
   }
 });
 
@@ -3790,7 +3879,7 @@ app.post("/logs/:id/ack", requireAuth, async (req, res) => {
     res.json({ message: "Alert acknowledged", data: result.rows[0] });
   } catch (err) {
     console.error(`[${new Date().toISOString()}] Error acknowledging alert:`, err.message);
-    res.status(500).json({ message: "Error acknowledging alert", error: err.message });
+    res.status(500).json({ message: "Error acknowledging alert" });
   }
 });
 
@@ -3825,7 +3914,7 @@ app.get("/system-logs", requireAuth, async (req, res) => {
     countsResult.rows.forEach(row => { counts[row.action] = row.count; });
     res.json({ data: result.rows, total: parseInt(countResult.rows[0].count), page, limit, counts });
   } catch (err) {
-    res.status(500).json({ message: "Error fetching logs", error: err.message });
+    fail(res, 500, "Error fetching logs", err, req);
   }
 });
 
@@ -3856,7 +3945,7 @@ app.post("/activity-logs", requireAuth, async (req, res) => {
     );
     res.status(201).json({ message: "Logged", data: result.rows[0] });
   } catch (err) {
-    res.status(500).json({ message: "Error logging activity", error: err.message });
+    fail(res, 500, "Error logging activity", err, req);
   }
 });
 
@@ -3886,7 +3975,7 @@ app.get("/activity-logs", requireAdmin, async (req, res) => {
     const total = parseInt(countResult.rows[0].count);
     res.json({ data: result.rows, total, page, limit, totalPages: Math.ceil(total / limit) });
   } catch (err) {
-    res.status(500).json({ message: "Error fetching activity logs", error: err.message });
+    fail(res, 500, "Error fetching activity logs", err, req);
   }
 });
 
@@ -4040,7 +4129,7 @@ app.get("/analytics/overview", requireAuth, async (req, res) => {
     });
   } catch (err) {
     console.error(`[${new Date().toISOString()}] Error fetching analytics overview:`, err.message);
-    res.status(500).json({ message: "Error fetching analytics overview", error: err.message });
+    res.status(500).json({ message: "Error fetching analytics overview" });
   }
 });
 
@@ -4096,7 +4185,7 @@ app.get("/analytics/daily", requireAuth, async (req, res) => {
     });
   } catch (err) {
     console.error(`[${new Date().toISOString()}] Error fetching analytics daily:`, err.message);
-    res.status(500).json({ message: "Error fetching analytics daily", error: err.message });
+    res.status(500).json({ message: "Error fetching analytics daily" });
   }
 });
 
@@ -4257,7 +4346,7 @@ app.get("/analytics/insights", requireAuth, async (req, res) => {
     });
   } catch (err) {
     console.error(`[${new Date().toISOString()}] Error fetching analytics insights:`, err.message);
-    res.status(500).json({ message: "Error fetching analytics insights", error: err.message });
+    res.status(500).json({ message: "Error fetching analytics insights" });
   }
 });
 
@@ -4433,6 +4522,13 @@ async function startServer() {
     // Listen for HTTP requests on all network interfaces
     const server = app.listen(PORT, "::", () => {
       console.log(`[${new Date().toISOString()}] Server running on port ${PORT} (dual-stack)`);
+      // Sensor ingestion now always requires X-Device-Secret, so an unset
+      // DEVICE_SECRET is not a dev convenience any more - it silently narrows
+      // the fleet to boards that have their own per-device secret. Say so once,
+      // loudly, at boot rather than letting boards 401 with no explanation.
+      if (!DEVICE_SECRET) {
+        console.warn(`[${new Date().toISOString()}] DEVICE_SECRET is not set: the shared-secret path is disabled and only devices with a per-device secret can post to /sensor.`);
+      }
     });
 
     // Star topology: poll the registered ESP32 /status endpoints for health.
@@ -4446,10 +4542,13 @@ async function startServer() {
       if (shuttingDown) return;
       shuttingDown = true;
       console.log(`\n[${new Date().toISOString()}] ${signal} received — shutting down gracefully...`);
-      for (const [client] of sseClients) {
+      for (const client of [...sseClients.keys()]) {
         try { client.end(); } catch { /* already closed */ }
+        // dropSseClient rather than sseClients.clear() so the keep-alive timers
+        // die with the sockets; a clear() would orphan every one of them until
+        // process.exit(), which hides the pattern from anyone reading this.
+        dropSseClient(client);
       }
-      sseClients.clear();
       server.close(async () => {
         try {
           await pool.end();
