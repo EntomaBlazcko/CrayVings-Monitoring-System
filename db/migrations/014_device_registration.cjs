@@ -67,6 +67,11 @@ async function ensureCheck(client, name, ddl) {
   console.log(`[migration] added CHECK ${name}`);
 }
 
+// Tracks whether the case-insensitive UNIQUE index actually got built. Declared
+// out here so the process-exit handler can report the outcome: a migration that
+// silently skipped a required constraint must not exit 0.
+let ciUniqueEnsured = false;
+
 (async () => {
   const client = await pool.connect();
   try {
@@ -125,17 +130,45 @@ async function ensureCheck(client, name, ddl) {
        HAVING count(*) > 1`
     );
     if (ciDupes.rows.length > 0) {
-      // Never fail the migration on pre-existing data; surface it loudly so an
-      // Owner can rename the duplicates by hand before the index can be added.
+      // Never fail the migration on pre-existing data: the columns and checks
+      // above are still wanted, and rolling them back would be worse than the
+      // problem. Instead keep the app's lower(device_id) lookups index-backed
+      // and make the missing constraint impossible to overlook.
+      //
+      // This fallback index is deliberately NOT named idx_devices_device_id_ci.
+      // `CREATE UNIQUE INDEX IF NOT EXISTS` is a no-op when *any* index of that
+      // name exists, so reusing the name would leave a non-unique index sitting
+      // on the target forever — the constraint silently missing even after the
+      // duplicates were resolved and the migration re-run.
+      await client.query(
+        `CREATE INDEX IF NOT EXISTS idx_devices_device_id_folded ON devices (LOWER(device_id))`
+      );
       console.error("[migration] BLOCKED: case-variant device_id duplicates exist:");
       for (const d of ciDupes.rows) {
         console.error(`  ${d.folded} -> ${d.ids.join(", ")} (${d.n} rows)`);
       }
-      console.error("[migration] idx_devices_device_id_ci NOT created. Resolve the above, then re-run.");
+      console.error("[migration] idx_devices_device_id_ci NOT created (a non-unique folded index was added instead).");
+      console.error("[migration] Case-insensitive uniqueness is NOT enforced until this is resolved. Re-run this migration afterwards.");
     } else {
+      // An earlier blocked run may have left a NON-unique index sitting on the
+      // target name (e.g. hand-created, or left by an older version of this
+      // script). IF NOT EXISTS would then skip the unique build and leave the
+      // database unprotected with no error, so drop it first.
+      const existingCi = await client.query(
+        `SELECT i.indisunique
+           FROM pg_index i
+           JOIN pg_class c ON c.oid = i.indexrelid
+          WHERE c.relname = 'idx_devices_device_id_ci'
+            AND i.indrelid = 'devices'::regclass`
+      );
+      if (existingCi.rows.length > 0 && !existingCi.rows[0].indisunique) {
+        await client.query("DROP INDEX idx_devices_device_id_ci");
+        console.log("[migration] dropped a NON-unique idx_devices_device_id_ci left by an earlier blocked run");
+      }
       await client.query(
         `CREATE UNIQUE INDEX IF NOT EXISTS idx_devices_device_id_ci ON devices (LOWER(device_id))`
       );
+      ciUniqueEnsured = true;
     }
 
     // ---- 4. backfill ------------------------------------------------------
@@ -161,11 +194,22 @@ async function ensureCheck(client, name, ddl) {
         (backfilled.rows.length ? `: ${backfilled.rows.map((r) => r.device_id).join(", ")}` : "")
     );
 
-    await client.query(
-      `INSERT INTO schema_migrations (version, name)
-         VALUES ('014', 'device_registration')
-       ON CONFLICT (version) DO NOTHING`
-    );
+    // Recorded in schema_migrations ONLY when the unique index is genuinely in
+    // place. Recording it while the constraint is missing is what made this fail
+    // open: the runner saw 014 as done, never retried, and the console error
+    // scrolled away unnoticed while case-insensitive uniqueness stayed unenforced.
+    if (ciUniqueEnsured) {
+      await client.query(
+        `INSERT INTO schema_migrations (version, name)
+           VALUES ('014', 'device_registration')
+         ON CONFLICT (version) DO NOTHING`
+      );
+    } else {
+      console.error(
+        "[migration] 014 NOT recorded in schema_migrations - idx_devices_device_id_ci is still missing. " +
+          "A migration runner must not treat this version as complete."
+      );
+    }
 
     await client.query("COMMIT");
 
@@ -197,11 +241,31 @@ async function ensureCheck(client, name, ddl) {
     );
     console.log("idx_devices_archived_at ->", idx.rows[0] ? "present" : "MISSING");
 
+    // Report the index the way it must be judged: UNIQUE, or not there at all.
+    // pg_indexes only lists the name, so a non-unique index of the same name
+    // would otherwise read as "present".
     const ciIdx = await client.query(
-      `SELECT indexname FROM pg_indexes
-        WHERE tablename = 'devices' AND indexname = 'idx_devices_device_id_ci'`
+      `SELECT i.indisunique
+         FROM pg_index i
+         JOIN pg_class c ON c.oid = i.indexrelid
+        WHERE c.relname = 'idx_devices_device_id_ci'
+          AND i.indrelid = 'devices'::regclass`
     );
-    console.log("idx_devices_device_id_ci ->", ciIdx.rows[0] ? "present" : "MISSING");
+    if (ciIdx.rows.length === 0) {
+      console.log("idx_devices_device_id_ci -> MISSING (case-insensitive uniqueness NOT enforced)");
+    } else if (!ciIdx.rows[0].indisunique) {
+      console.log("idx_devices_device_id_ci -> present but NOT UNIQUE (case-insensitive uniqueness NOT enforced)");
+    } else {
+      console.log("idx_devices_device_id_ci -> present and UNIQUE");
+    }
+
+    const foldedIdx = await client.query(
+      `SELECT indexname FROM pg_indexes
+        WHERE tablename = 'devices' AND indexname = 'idx_devices_device_id_folded'`
+    );
+    if (foldedIdx.rows.length > 0) {
+      console.log("idx_devices_device_id_folded -> present (fallback from a blocked run)");
+    }
 
     const counts = await client.query(
       `SELECT registered_via, ip_source, count(*)::int AS n,
@@ -224,14 +288,24 @@ async function ensureCheck(client, name, ddl) {
       pkey.rows.map((r) => `${r.attname} ${r.type}`).join(", ")
     );
 
-    console.log("[migration] 014_device_registration applied");
+    if (ciUniqueEnsured) {
+      console.log("[migration] 014_device_registration applied");
+    } else {
+      console.error(
+        "[migration] 014_device_registration INCOMPLETE: the columns, checks and backfill above were committed, " +
+          "but case-insensitive device_id uniqueness is NOT enforced. Resolve the duplicates, then re-run this migration."
+      );
+    }
   } catch (err) {
     await client.query("ROLLBACK");
     throw err;
   } finally {
     client.release();
   }
-})().catch((err) => {
+  await pool.end();
+  if (!ciUniqueEnsured) process.exit(1);
+})().catch(async (err) => {
   console.error("[migration] 014_device_registration failed:", err.message);
+  await pool.end().catch(() => {});
   process.exit(1);
 });
