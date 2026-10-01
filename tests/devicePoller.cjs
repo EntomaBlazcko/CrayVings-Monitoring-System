@@ -21,7 +21,7 @@ const assert = require("assert");
 // poller captures the stub through the shared module instance.
 const axios = require("axios");
 
-const { pollOnce, MAX_CONCURRENCY } = require("../services/devicePoller.cjs");
+const { pollOnce, createTick, MAX_CONCURRENCY, REQ_TIMEOUT_MS } = require("../services/devicePoller.cjs");
 
 let checks = 0;
 let failures = 0;
@@ -63,11 +63,13 @@ function stubAxios({ delayMs = 40, fail = false } = {}) {
   let inFlight = 0;
   let peakInFlight = 0;
   const called = [];
+  const timeouts = [];
 
-  axios.get = (url) => {
+  axios.get = (url, opts) => {
     inFlight++;
     peakInFlight = Math.max(peakInFlight, inFlight);
     called.push(url);
+    if (opts && opts.timeout !== undefined) timeouts.push(opts.timeout);
     return new Promise((resolve, reject) => {
       setTimeout(() => {
         inFlight--;
@@ -79,6 +81,7 @@ function stubAxios({ delayMs = 40, fail = false } = {}) {
 
   return {
     called,
+    timeouts,
     get peak() {
       return peakInFlight;
     },
@@ -199,20 +202,67 @@ async function main() {
     "no last_health_seen write"
   );
 
-  // --- G. Timing: a 12-device fleet finishes well inside one poll interval --
-  console.log("\n--- G. Cycle timing (vs the 5 s poll interval) ---");
+  // --- G. Timing: the timeout is forwarded, and stays bounded ---------------
+  console.log("\n--- G. Cycle timing and request timeout ---");
 
   const stubG = stubAxios({ delayMs: 2000 }); // every board hangs, worst case
-  const t0 = Date.now();
   await pollOnce(makePool(Array.from({ length: 12 }, (_, i) => makeDevice(i + 1))));
-  const elapsed = Date.now() - t0;
-  // 12 hung boards = 2 batches of 2 s = ~4 s, still under the 5 s interval, so
-  // cycles cannot pile up. With the old fixed 3 it would have been 4 x 2 s = 8 s.
   check(
-    "worst-case 12-device cycle stays under the 5 s poll interval",
-    elapsed < 5000,
-    `${elapsed} ms (old fixed-3 batching would need ~8000 ms)`
+    "the configured per-request timeout is passed to axios",
+    stubG.timeouts.length > 0 && stubG.timeouts.every((t) => t === REQ_TIMEOUT_MS),
+    `timeouts=${JSON.stringify(stubG.timeouts)} REQ_TIMEOUT_MS=${REQ_TIMEOUT_MS}`
   );
+  // The default is deliberately kept at 2s (env-tunable via POLL_TIMEOUT_MS).
+  // At 2s a 12-board worst case is 2 batches = ~4s, inside the 5s interval. The
+  // original finding proposed 5000ms, which would push this to ~10s and let
+  // cycles overlap the next tick - the overlap guard in H is what makes a longer
+  // timeout safe, not the arithmetic.
+  check(
+    "default timeout keeps a 12-device cycle inside the poll interval",
+    REQ_TIMEOUT_MS * 2 < 5000,
+    `2 batches x ${REQ_TIMEOUT_MS}ms`
+  );
+
+  // --- H. Overlap safety: cycles must never stack ---------------------------
+  console.log("\n--- H. Overlap safety (re-entrancy guard) ---");
+
+  // A slow cycle must make the next tick a no-op rather than a second cycle.
+  // 12 boards at a 300ms stub delay = 2 batches ~600ms, enough to overlap a
+  // second run() call issued immediately after the first.
+  const stubH = stubAxios({ delayMs: 300 });
+  const tickH = createTick(makePool(Array.from({ length: 12 }, (_, i) => makeDevice(i + 1))));
+  const first = tickH.run();
+  await sleep(50);
+  check("tick reports running while a cycle is in flight", tickH.running === true);
+  const second = await tickH.run();
+  check("a tick during an in-flight cycle is skipped", second === false);
+  check("the skip is counted", tickH.skippedStreak === 1, `streak=${tickH.skippedStreak}`);
+  check("the skipped tick issued no extra requests", stubH.called.length <= MAX_CONCURRENCY, `${stubH.called.length} calls`);
+  const firstResult = await first;
+  check("the first cycle completed", firstResult === true);
+  check("tick is idle again once the cycle finished", tickH.running === false);
+  check("skip streak resets after a completed cycle", tickH.skippedStreak === 0, `streak=${tickH.skippedStreak}`);
+
+  // Sequential ticks still work - the guard must not permanently wedge the poller.
+  const stubH2 = stubAxios({ delayMs: 5 });
+  const tickH2 = createTick(makePool([makeDevice(1)]));
+  check("a fresh tick runs", (await tickH2.run()) === true);
+  check("a following tick also runs", (await tickH2.run()) === true);
+  check("both sequential cycles hit the device", stubH2.called.length === 2, `${stubH2.called.length} calls`);
+
+  // A rejected device-list query is absorbed by pollOnce itself, so the cycle
+  // completes normally and the tick must be released.
+  const dbDownPool = { query: () => Promise.reject(new Error("db down")) };
+  const tickDb = createTick(dbDownPool);
+  check("a rejected device-list query does not reject the tick", (await tickDb.run()) === true);
+  check("tick is released after a swallowed DB error", tickDb.running === false);
+
+  // A cycle that throws *outside* pollOnce's own try/catch must still release the
+  // tick, or the guard would wedge the poller permanently after one bad cycle.
+  const brokenPool = { query: () => Promise.resolve({ rows: null }) }; // rows null -> .length throws
+  const tickBroken = createTick(brokenPool);
+  check("a cycle that throws does not reject the tick", (await tickBroken.run()) === false);
+  check("tick is released after a thrown cycle", tickBroken.running === false);
 
   console.log(
     `\n${failures === 0 ? "=== ALL DEVICE POLLER TESTS PASSED ===" : `=== ${failures} FAILED ===`} (${checks} checks)`

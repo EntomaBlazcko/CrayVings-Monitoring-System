@@ -290,9 +290,89 @@ async function purge(deviceId) {
     const autoRow = await pool.query("SELECT registered_via FROM devices WHERE device_id = $1", [autoId]);
     check("unregistered board is auto-registered", autoRow.rows.length === 1, `${autoRow.rows.length} rows`);
     check("auto-registered board tagged registered_via=auto", autoRow.rows[0]?.registered_via === "auto", autoRow.rows[0]?.registered_via);
-    // ...and it can be reported against as a duplicate, because it now exists.
+
+    // F3: the ingest response has to say whether it CREATED the registry row or
+    // matched one that already existed. This is the only signal that closes the
+    // firmware/registration-mismatch loop - the firmware shouts it on its serial
+    // monitor, and without it a board posting under an unknown ID is only
+    // visible as an "Auto-discovered" badge nobody is looking at.
+    const againId = `${PREFIX}AUTO2`;
+    const firstPost = await ingest(againId, 26.5, 55, deviceSecret);
+    check("first POST from an unknown board reports auto_registered=true", firstPost.body?.auto_registered === true, JSON.stringify(firstPost.body).slice(0, 160));
+    const secondPost = await ingest(againId, 27.5, 55, deviceSecret);
+    check("second POST from the same board reports auto_registered=false", secondPost.body?.auto_registered === false, JSON.stringify(secondPost.body).slice(0, 160));
+    // The heartbeat path (delta logging: an unchanged reading writes no sensors
+    // row but still refreshes last_seen) must carry the field too, or the board
+    // would stop warning after its first reading. Reachable only with ammonia in
+    // the payload: the delta baseline treats a null channel as "always
+    // changed", so a temperature-only post never takes the skipped path.
+    const beatId = `${PREFIX}HB`;
+    const postFull = async (temperature, waterLevel, ammonia) => {
+      const res = await axios({
+        method: "post",
+        url: `${API}/sensor`,
+        data: { device_id: beatId, temperature, water_level: waterLevel, ammonia },
+        headers: { "X-Device-Secret": deviceSecret },
+        validateStatus: () => true,
+      });
+      return { status: res.status, body: res.data };
+    };
+    const hbFirst = await postFull(26.5, 55, 0.1);
+    check("first full POST auto-registers", hbFirst.body?.auto_registered === true, JSON.stringify(hbFirst.body).slice(0, 160));
+    const hbSecond = await postFull(26.5, 55, 0.1);
+    check(
+      "unchanged repeat takes the heartbeat path and still reports auto_registered=false",
+      hbSecond.status === 200 && hbSecond.body?.skipped === true && hbSecond.body?.auto_registered === false,
+      `status=${hbSecond.status} ${JSON.stringify(hbSecond.body).slice(0, 160)}`
+    );
+    await purge(beatId);
+
+    const manualId = `${PREFIX}AUTO3`;
+    await api("post", "/devices", { device_id: manualId, device_name: "Registered First" });
+    const manualPost = await ingest(manualId, 26, 55, deviceSecret);
+    check("a board that WAS registered reports auto_registered=false", manualPost.body?.auto_registered === false, JSON.stringify(manualPost.body).slice(0, 160));
+    const manualRow = await pool.query("SELECT registered_via FROM devices WHERE device_id = $1", [manualId]);
+    check("a registered board is never downgraded to auto by its POST", manualRow.rows[0]?.registered_via === "manual", manualRow.rows[0]?.registered_via);
+    await purge(againId);
+    await purge(manualId);
+
+    // B5 changed this contract deliberately: a board that auto-registered itself
+    // is now *claimable* through the same POST that used to return 409, so an
+    // Owner can name and address a discovered board without hand-editing the DB.
+    // The row must be adopted in place - same device_id, no duplicate row - and
+    // keep the readings and learned address it already had.
+    const beforeClaim = await pool.query(
+      "SELECT ip_address, ip_source FROM devices WHERE device_id = $1",
+      [autoId]
+    );
     r = await api("post", "/devices", { device_id: autoId, device_name: "Late Registration" });
-    check("auto-registered id cannot be re-registered -> 409", r.status === 409, `status=${r.status}`);
+    check("auto-registered id can be claimed -> 200", r.status === 200, `status=${r.status} ${JSON.stringify(r.body).slice(0, 120)}`);
+
+    const claimedRow = await pool.query(
+      "SELECT registered_via, name, tank_name, ip_address, ip_source FROM devices WHERE device_id = $1",
+      [autoId]
+    );
+    check("claim adopts the existing row (no duplicate)", claimedRow.rows.length === 1, `${claimedRow.rows.length} rows`);
+    check("claim flips registered_via to manual", claimedRow.rows[0]?.registered_via === "manual", claimedRow.rows[0]?.registered_via);
+    check("claim applies the friendly name", claimedRow.rows[0]?.tank_name === "Late Registration", claimedRow.rows[0]?.tank_name);
+    // The legacy `name` column is written by the normal create path, so a claim
+    // that only fills tank_name would leave the row half-populated.
+    check("claim also sets the legacy name column", claimedRow.rows[0]?.name === "Late Registration", claimedRow.rows[0]?.name);
+    check("claim without an IP leaves ip_source=auto", claimedRow.rows[0]?.ip_source === "auto", claimedRow.rows[0]?.ip_source);
+    check(
+      "claim preserves the learned IP",
+      claimedRow.rows[0]?.ip_address === beforeClaim.rows[0]?.ip_address,
+      `${beforeClaim.rows[0]?.ip_address} -> ${claimedRow.rows[0]?.ip_address}`
+    );
+    // The board just posted, so the claim response must report it online - this
+    // response replaces the row in the UI until the next reload, and a hardcoded
+    // false made a live device flash "Offline".
+    check("claim response reports the just-seen board as online", r.body?.online === true, `online=${r.body?.online}`);
+
+    // Once claimed it is an ordinary registered device, so a second POST is a
+    // plain duplicate again - the claim path must not become a rename endpoint.
+    r = await api("post", "/devices", { device_id: autoId, device_name: "Second Attempt" });
+    check("claimed id is a normal duplicate -> 409", r.status === 409, `status=${r.status}`);
 
     // =====================================================================
     console.log("--- G. Archiving ---");
