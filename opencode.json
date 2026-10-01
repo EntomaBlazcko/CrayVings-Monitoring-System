@@ -10,7 +10,13 @@
       "**/.env": "deny",
       "**/.env.*": "deny",
       "*.env.example": "allow",
-      "*.env.sample": "allow"
+      "*.env.sample": "allow",
+
+      "**/.claude/**": "deny",
+      "**/.qodo/**": "deny",
+      "**/.opencode/**": "deny",
+      "*.dump": "deny",
+      "*.sql": "deny"
     },
     "edit": "ask",
     "webfetch": "ask",

@@ -25,6 +25,19 @@ FOR_LATER.txt
 SESSION_NOTES.txt
 *_NOTES.txt
 
+# Database artifacts. A pg_dump is schema plus whatever rows were selected, so
+# committing one is how credentials, emails, and phone numbers end up in git.
+*.dump
+*.sql
+pgdata/
+pgdata*/
+
+# Local agent/editor state. None of this belongs in the repo: prompts and plans
+# are working documents, and .opencode/ can hold server logs and DB backups.
+.claude/
+.qodo/
+.opencode/
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
