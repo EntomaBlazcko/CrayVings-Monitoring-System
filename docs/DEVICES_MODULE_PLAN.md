@@ -40,7 +40,7 @@ conflict** that needs a decision before implementation.
 | Remove fixed/hardcoded device limit (was 3) | **No device cap exists anywhere.** Zero matches for `MAX_DEVICES`, `deviceLimit`, `slice(0, 3)`, `limit: 3`. `GET /devices` has no `LIMIT` (`server.cjs:1631`); the frontend tank list is built dynamically from the response. | Nothing to remove — see §2.1 |
 | Add Device form (ID, Name, IP) | Nothing. `devices.name` exists (`DATABASE_SCHEMA.md:68`) but **no code path ever writes it** — it is dead. The real display label is `tank_name`. | New endpoint + page |
 | No auto-provisioning / no web flasher | Nothing to do — there is no web flasher. Firmware is `.ino` files flashed manually. | None |
-| Device archiving (soft delete) | **Already works** via `is_active = false`. `PUT /devices/:deviceId { is_active: false }` (`server.cjs:1655`), UI in `src/components/deviceActions.tsx:183` (`DeviceHide`), restore in `src/hooks/useHiddenDevices.ts`. FKs from `sensors` / `last_alerts` / `system_logs` / `device_threshold_overrides` are all `NO ACTION` (no CASCADE), so history survives. | Semantics only — see §2.3 |
+| Device archiving (soft delete) | **Already works** via `is_active = false`. `PUT /devices/:deviceId { is_active: false }` (`server.cjs:1655`), UI in `src/components/deviceActions.tsx:183` (`DeviceHide`), restore in `src/hooks/useHiddenDevices.ts`. The FKs from `sensors` / `last_alerts` are `NO ACTION` and `system_logs` is `SET NULL`, so history survives; only `device_threshold_overrides` cascades, and it holds configuration rather than history. See §1.3 | Semantics only — see §2.3 |
 
 ### 1.2 Existing `devices` table
 
@@ -65,10 +65,15 @@ From `docs/DATABASE_SCHEMA.md:65-76`:
 |---|---|---|
 | `sensors` | `device_id` | `NO ACTION` — history preserved on archive |
 | `last_alerts` | `device_id` (composite PK) | `NO ACTION` |
-| `system_logs` | `device_id` (nullable, migration 011) | `NO ACTION` |
-| `device_threshold_overrides` | `device_id` (PK, migration 012) | `NO ACTION` |
+| `system_logs` | `device_id` (nullable, migration 011) | `SET NULL` — a log row survives, its tank attribution is dropped |
+| `device_threshold_overrides` | `device_id` (PK, migration 012) | `CASCADE` — configuration, not history, so it goes with the device |
 
-No CASCADE anywhere. This is why archiving already preserves historical data.
+No CASCADE into history: `sensors` and `last_alerts` are `NO ACTION` and
+`system_logs` is `SET NULL`, so archiving preserves every reading and every log
+row. The only `CASCADE` is `device_threshold_overrides`, and it holds per-tank
+threshold configuration rather than data worth keeping — a restored device simply
+falls back to the global `sensor_settings` values. In practice none of these fire,
+because the system has no hard delete or purge endpoint for a device.
 
 ### 1.4 Existing device API surface
 
