@@ -188,6 +188,32 @@ export type DeviceEntry = {
   last_seen: string | null;
   last_health_seen: string | null;
   online: boolean;
+  // Secret-rotation metadata (migration 015). Metadata ONLY - no secret value is
+  // ever included in a device read. rotated_at is null for a device that has
+  // never been rotated; prev_expires_at is non-null only while a previous secret
+  // is still inside its grace window, so the UI can warn that the old secret is
+  // still live and the board has not been reconfigured yet.
+  device_secret_rotated_at: string | null;
+  device_secret_prev_expires_at: string | null;
+};
+
+// Result of POST /devices/:id/rotate-secret. The new secret is returned exactly
+// once, by this call, and can never be retrieved again.
+export type DeviceSecretRotation = {
+  device_id: string;
+  device_secret: string;
+  rotated_at: string;
+  previous_secret_expires_at: string | null;
+  previous_secret_grace_hours: number;
+  previous_secret_revoked: boolean;
+  // True when this was the board's FIRST per-device secret (migrated off the
+  // shared DEVICE_SECRET) rather than a rotation of an existing one. The grace
+  // window does not apply in that case.
+  first_secret: boolean;
+  // After a first-secret migration, how many active devices are STILL on the
+  // shared secret - i.e. how much exposure is left. null on a real rotation.
+  devices_still_on_shared_secret: number | null;
+  message: string;
 };
 
 // How many historical readings an archived device kept, returned by the archive

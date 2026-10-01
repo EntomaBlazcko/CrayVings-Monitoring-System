@@ -1437,13 +1437,40 @@ app.post("/sensor", sensorIngestLimiter, async (req, res) => {
         // Per-device secret (migration 008). If the column/migration is
         // missing, fail gracefully to the shared-secret decision instead of
         // crashing the request with a 500.
+        //
+        // The previous secret is also accepted, but ONLY inside its grace
+        // window (migration 015). Rotation has to keep the outgoing secret
+        // briefly because a board can only learn a new one through its config
+        // portal, which means somebody has to physically reach the tank. The
+        // deadline is compared in SQL, so an expired secret stops working the
+        // moment it lapses without depending on any cleanup job.
         try {
           const perDevice = await pool.query(
-            "SELECT device_secret FROM devices WHERE device_id = $1 AND is_active = true AND archived_at IS NULL",
-            [req.body?.device_id ?? ""]
+            `SELECT device_secret,
+                    device_secret_prev
+               FROM devices
+              WHERE device_id = $1
+                AND is_active = true
+                AND archived_at IS NULL
+                AND (
+                      device_secret = $2
+                   OR (device_secret_prev = $2
+                       AND device_secret_prev_expires_at IS NOT NULL
+                       AND device_secret_prev_expires_at > NOW())
+                )`,
+            [req.body?.device_id ?? "", presented]
           );
-          if (perDevice.rows.length > 0 && perDevice.rows[0].device_secret && presented === perDevice.rows[0].device_secret) {
-            authorized = true;
+          if (perDevice.rows.length > 0) {
+            const row = perDevice.rows[0];
+            if (row.device_secret && presented === row.device_secret) {
+              authorized = true;
+            } else if (row.device_secret_prev && presented === row.device_secret_prev) {
+              authorized = true;
+              console.warn(
+                `[${new Date().toISOString()}] POST /sensor: device ${req.body?.device_id} authenticated with its PREVIOUS secret ` +
+                  `(grace window still open) - the board has not been reconfigured yet`
+              );
+            }
           }
         } catch (perDeviceErr) {
           console.warn(`[${new Date().toISOString()}] Per-device secret check skipped (migration 008 not applied?): ${perDeviceErr.message}`);
@@ -1525,15 +1552,29 @@ app.post("/sensor", sensorIngestLimiter, async (req, res) => {
     // the tanks' subnet. COALESCE keeps a previously good address if this
     // particular request has no usable source IP (loopback/local tooling).
     const clientIp = normalizeClientIp(req);
-    await pool.query(
+    // RETURNING xmax = 0 distinguishes a row this request CREATED from one it
+    // merely refreshed, which is the only reliable way to tell a board "the
+    // dashboard did not know you" - the classic firmware/registration mismatch
+    // (F3). The firmware shouts this on its serial monitor, where the operator
+    // is standing; without it the mismatch is only visible as an
+    // "Auto-discovered" badge nobody is looking at.
+    const upsert = await pool.query(
       `INSERT INTO devices (device_id, ip_address, last_seen, registered_via, ip_source)
        VALUES ($1, $2, $3, 'auto', 'auto')
        ON CONFLICT (device_id) DO UPDATE
           SET last_seen = $3,
               ip_address = CASE WHEN devices.ip_source = 'manual' THEN devices.ip_address
-                                ELSE COALESCE($2, devices.ip_address) END`,
+                                ELSE COALESCE($2, devices.ip_address) END
+       RETURNING (xmax = 0) AS auto_registered`,
       [device_id, clientIp, arrivalTs]
     );
+    const autoRegistered = upsert.rows[0]?.auto_registered === true;
+    if (autoRegistered) {
+      // Logged server-side too: this is the one ingest event an operator will
+      // want in the server log as well, since the board may be on a bench with
+      // no serial monitor attached.
+      console.warn(`[${new Date().toISOString()}] Auto-registered unknown device_id '${device_id}' from its first POST /sensor. Claim it on the Devices page (or fix Device ID in its config portal) to name the tank.`);
+    }
     // A fresh reading means the device is online again: re-arm its disconnect
     // alert and timestamp the recovery so reconnecting flaps don't re-alert.
     if (disconnectedDevices.delete(device_id)) {
@@ -1541,10 +1582,21 @@ app.post("/sensor", sensorIngestLimiter, async (req, res) => {
     }
     const baseline = lastSensorReading[device_id];
     const paramChanged = (key) => {
-      if (!baseline || baseline[key] == null) return true;
+      // No baseline at all = first reading this server has ever seen for this
+      // device, so it must be written.
+      //
+      // A baseline that EXISTS but holds null for this key is different: it is
+      // a real stored value meaning "this sensor failed". Treating it as a
+      // change made delta logging permanently inert for a device with dead
+      // sensors - every POST re-triggered the write and the table filled with
+      // null rows, one per request, forever. The isValid comparison below
+      // already answers the null case correctly; it just has to be reached.
+      if (!baseline) return true;
       const newVal = readings[key];
       const lastVal = baseline[key];
       const isValid = (val) => val != null;
+      // A real transition between valid and failed (or back) IS a change, so
+      // sensor recovery still gets logged.
       if (isValid(newVal) !== isValid(lastVal)) return true;
       if (!isValid(newVal)) return false;
       return Math.abs(newVal - lastVal) > DELTA_TOLERANCES[key];
@@ -1559,7 +1611,7 @@ app.post("/sensor", sensorIngestLimiter, async (req, res) => {
     // already updated above) but writes no new sensors row.
     if (DELTA_LOGGING_ENABLED && !hasDelta) {
       console.log(`[${new Date().toISOString()}] Sensor heartbeat from ${device_id} (unchanged - no row written)`);
-      res.status(200).json({ message: "No change, skipped", skipped: true, data: { device_id, ...readings, timestamp: rowTs.toISOString() } });
+      res.status(200).json({ message: "No change, skipped", skipped: true, auto_registered: autoRegistered, data: { device_id, ...readings, timestamp: rowTs.toISOString() } });
       broadcastSensorUpdate(device_id, readings, arrivalTs);
       scheduleAlertProcessing(device_id, rowTs, temperature, water_level, ammonia);
       return;
@@ -1588,7 +1640,7 @@ app.post("/sensor", sensorIngestLimiter, async (req, res) => {
 
     // Respond immediately; timestamp returned as UTC ISO-8601 so the frontend
     // renders it in the farm timezone without silent timezone conversion.
-    res.status(201).json({ message: "Saved", data: { ...result.rows[0], timestamp: rowTs.toISOString() } });
+    res.status(201).json({ message: "Saved", auto_registered: autoRegistered, data: { ...result.rows[0], timestamp: rowTs.toISOString() } });
 
     broadcastSensorUpdate(device_id, readings, arrivalTs);
     scheduleAlertProcessing(device_id, rowTs, temperature, water_level, ammonia);
@@ -1718,9 +1770,16 @@ app.get("/sensor/stream", requireAuth, (req, res) => {
 
 // Columns every device read/write returns. Kept in one place so the create,
 // update, archive and restore paths can never drift from GET /devices.
+//
+// SECURITY: this list is what every read endpoint hands out, so it must never
+// gain a secret column (device_secret, device_secret_prev). Rotation is surfaced
+// as metadata only - when it happened, and whether a previous secret is still
+// inside its grace window - which is enough for an operator to act on without
+// exposing anything usable.
 const DEVICE_COLUMNS = `device_id, name, tank_name, tank_location, ip_address,
        is_active, registered_via, ip_source, archived_at, archived_by,
-       last_seen, last_health_seen`;
+       last_seen, last_health_seen, device_secret_rotated_at,
+       device_secret_prev_expires_at`;
 
 // POST /devices (Admin) - register a device from the Devices page.
 //
@@ -1745,18 +1804,66 @@ app.post("/devices", requireAdmin, async (req, res) => {
     // 23505 catch below are the race-condition backstop, since two Owners (or
     // two tabs) can pass this check simultaneously.
     const existing = await pool.query(
-      "SELECT device_id, archived_at FROM devices WHERE lower(device_id) = lower($1)",
+      "SELECT device_id, archived_at, registered_via, tank_name, ip_address, ip_source FROM devices WHERE lower(device_id) = lower($1)",
       [device_id]
     );
     if (existing.rows.length > 0) {
       const prior = existing.rows[0];
-      return res.status(409).json({
-        message: prior.archived_at
-          ? `Device ID "${prior.device_id}" is already registered and archived. Device IDs are permanently retired — choose a different ID for the new board.`
-          : `Device ID "${prior.device_id}" is already registered. Device IDs must be unique system-wide.`,
-        errors: { device_id: ["This device ID is already in use"] },
-      });
+      // Allow claiming an auto-discovered device (registered_via='auto', not archived)
+      if (prior.archived_at) {
+        return res.status(409).json({
+          message: `Device ID "${prior.device_id}" is already registered and archived. Device IDs are permanently retired — choose a different ID for the new board.`,
+          errors: { device_id: ["This device ID is already in use (archived)"] },
+        });
+      }
+      if (prior.registered_via === "manual") {
+        return res.status(409).json({
+          message: `Device ID "${prior.device_id}" is already registered. Device IDs must be unique system-wide.`,
+          errors: { device_id: ["This device ID is already in use"] },
+        });
+      }
+      // prior.registered_via === 'auto' and not archived: allow claiming
+      const hasManualIp = typeof ip_address === "string" && ip_address.length > 0;
+      const result = await pool.query(
+        `UPDATE devices
+            SET name = COALESCE($1, name),
+                tank_name = COALESCE($1, tank_name),
+                tank_location = COALESCE($2, tank_location),
+                ip_address = COALESCE($3, ip_address),
+                ip_source = CASE WHEN $5 THEN 'manual' ELSE ip_source END,
+                registered_via = 'manual',
+                is_active = true
+          WHERE device_id = $4
+          RETURNING ${DEVICE_COLUMNS}`,
+        [
+          typeof device_name === "string" ? device_name.trim() : null,
+          typeof tank_location === "string" ? tank_location.trim() : null,
+          typeof ip_address === "string" ? ip_address.trim() : null,
+          prior.device_id,
+          hasManualIp,
+        ]
+      );
+
+      await pool.query(
+        "INSERT INTO activity_logs (user_name, action_type, description, module) VALUES ($1, 'DEVICE_CLAIMED', $2, 'devices')",
+        [req.adminUser.username, `Claimed auto-discovered device ${prior.device_id} as ${device_name}${hasManualIp ? ` at ${ip_address}` : ""}`]
+      ).catch(() => {});
+
+      const row = result.rows[0];
+      console.log(`[${new Date().toISOString()}] Device claimed by ${req.adminUser.username}: ${prior.device_id} (${device_name})${hasManualIp ? ` @ ${ip_address}` : ""}`);
+      // A board that had to be claimed is usually one that is already reporting,
+      // so compute online from last_seen rather than hardcoding false - the row
+      // this response replaces in the UI would otherwise flash "Offline" until
+      // the next reload.
+      const staleSeconds = Math.max(5, Math.floor(DISCONNECT_STALE_MS / 1000));
+      const onlineResult = await pool.query(
+        `SELECT (last_seen > NOW() - ($2 || ' seconds')::interval) AS online
+           FROM devices WHERE device_id = $1`,
+        [row.device_id, staleSeconds]
+      );
+      return res.status(200).json({ ...row, online: !!onlineResult.rows[0]?.online });
     }
+
 
     // An Owner-typed address is authoritative: flag it 'manual' so the ingest
     // upsert stops overwriting it with whatever peer address it observes (which
@@ -1834,32 +1941,43 @@ app.get("/devices", requireAuth, async (req, res) => {
 // role accounts). device_config / device_hide are likewise owner decisions.
 app.put("/devices/:deviceId", requireAdmin, async (req, res) => {
   try {
-    const { tank_name, tank_location, is_active } = req.body;
+    const { tank_name, tank_location, ip_address, is_active } = req.body;
     if (tank_name !== undefined && tank_name !== null && typeof tank_name !== "string") {
       return res.status(400).json({ message: "tank_name must be a string" });
     }
     if (tank_location !== undefined && tank_location !== null && typeof tank_location !== "string") {
       return res.status(400).json({ message: "tank_location must be a string" });
     }
+    if (ip_address !== undefined && ip_address !== null && typeof ip_address !== "string") {
+      return res.status(400).json({ message: "ip_address must be a string" });
+    }
     if (is_active !== undefined && is_active !== null && typeof is_active !== "boolean") {
       return res.status(400).json({ message: "is_active must be a boolean" });
     }
-    if (tank_name === undefined && tank_location === undefined && is_active === undefined) {
+    if (tank_name === undefined && tank_location === undefined && ip_address === undefined && is_active === undefined) {
       return res.status(400).json({ message: "Nothing to update" });
     }
+
+    // When an admin explicitly sets an IP address, mark it as manual so the
+    // ingest upsert stops overwriting it with the observed peer address.
+    const hasManualIp = typeof ip_address === "string" && ip_address.trim().length > 0;
 
     const result = await pool.query(
       `UPDATE devices
           SET tank_name = COALESCE($1, tank_name),
               tank_location = COALESCE($2, tank_location),
-              is_active = COALESCE($3, is_active)
-        WHERE device_id = $4
+              ip_address = COALESCE($3, ip_address),
+              ip_source = CASE WHEN $6 THEN 'manual' ELSE ip_source END,
+              is_active = COALESCE($4, is_active)
+        WHERE device_id = $5
         RETURNING ${DEVICE_COLUMNS}`,
       [
         typeof tank_name === "string" ? tank_name.trim() : null,
         typeof tank_location === "string" ? tank_location.trim() : null,
+        typeof ip_address === "string" ? ip_address.trim() : null,
         is_active !== undefined ? is_active : null,
         req.params.deviceId,
+        hasManualIp,
       ]
     );
     if (result.rows.length === 0) return res.status(404).json({ message: "Device not found" });
@@ -1887,6 +2005,176 @@ app.put("/devices/:deviceId", requireAdmin, async (req, res) => {
   } catch (err) {
     console.error(`[${new Date().toISOString()}] Error updating device:`, err.message);
     res.status(500).json({ message: "Error updating device", error: err.message });
+  }
+});
+
+// -----------------------------------------------------------------------------
+// POST /devices/:id/rotate-secret (Admin) - issue a new per-device secret.
+//
+// A board can only receive a new secret through its WiFiManager config portal,
+// so rotating is inherently a physical task: somebody has to reach the tank.
+// Rotating with no overlap at all would guarantee an outage, and for a board
+// that is ALREADY unreachable - the usual reason to rotate after a suspected
+// compromise - it would leave the device permanently unable to report until
+// someone carries a laptop to the tank.
+//
+// So the outgoing secret is kept valid for a bounded grace window (default 24h,
+// hard-capped at 7 days) and the caller can pass grace_hours: 0 to revoke the
+// old secret immediately, which is what a compromise response actually wants.
+//
+// The new secret is returned ONCE in this response and is never echoed by any
+// read endpoint (DEVICE_COLUMNS deliberately excludes every secret column). It
+// is never written to the logs or the activity trail - only the fact of the
+// rotation is recorded.
+// -----------------------------------------------------------------------------
+const SECRET_GRACE_DEFAULT_MS = 24 * 60 * 60 * 1000; // 24h
+const SECRET_GRACE_MAX_MS = 7 * 24 * 60 * 60 * 1000; // 7d
+
+function generateDeviceSecret() {
+  // 32 bytes -> 64 hex chars. crypto.randomBytes is a CSPRNG, so this is not
+  // guessable the way a timestamp/uuid-derived value would be.
+  return crypto.randomBytes(32).toString("hex");
+}
+
+app.post("/devices/:deviceId/rotate-secret", requireAdmin, async (req, res) => {
+  try {
+    const { deviceId } = req.params;
+
+    // Validate BEFORE generating anything, so a bad request cannot burn a secret.
+    let graceMs = SECRET_GRACE_DEFAULT_MS;
+    if (req.body && req.body.grace_hours !== undefined) {
+      const raw = Number(req.body.grace_hours);
+      if (!Number.isFinite(raw) || raw < 0) {
+        return res.status(400).json({ message: "grace_hours must be a number >= 0" });
+      }
+      graceMs = Math.min(raw * 60 * 60 * 1000, SECRET_GRACE_MAX_MS);
+    }
+    if (Number(process.env.DEVICE_SECRET_GRACE_MS) > 0) {
+      const envGrace = Number(process.env.DEVICE_SECRET_GRACE_MS);
+      if (Number.isFinite(envGrace) && envGrace >= 0 && envGrace <= SECRET_GRACE_MAX_MS) {
+        graceMs = envGrace;
+      }
+    }
+
+    const existing = await pool.query(
+      `SELECT device_id, device_secret, archived_at
+         FROM devices WHERE device_id = $1`,
+      [deviceId]
+    );
+    if (existing.rows.length === 0) {
+      return res.status(404).json({ message: "Device not found" });
+    }
+    if (existing.rows[0].archived_at) {
+      // An archived ID is permanently retired, so there is nothing to rotate.
+      return res.status(409).json({
+        message: `Device "${deviceId}" is archived. Its ID is permanently retired, so there is no secret to rotate.`,
+      });
+    }
+
+    // A device still authenticating with the shared DEVICE_SECRET cannot be
+    // "rotated" - the secret it holds is fleet-wide, so replacing it per device
+    // would be a lie. The caller has to say explicitly that it means "migrate
+    // this board onto its own per-device secret", which is a different and
+    // strictly better operation, not a rotation.
+    const isFirstSecret = !existing.rows[0].device_secret;
+    const migrateFromShared =
+      req.body?.migrate_from_shared === true || req.body?.migrate_from_shared === "true";
+
+    if (isFirstSecret && !migrateFromShared) {
+      return res.status(409).json({
+        message:
+          `Device "${deviceId}" has no per-device secret yet - it authenticates with the shared DEVICE_SECRET. ` +
+          `Re-send with migrate_from_shared: true to issue its first per-device secret.`,
+        can_migrate_from_shared: true,
+      });
+    }
+
+    const newSecret = generateDeviceSecret();
+
+    // One statement so the swap is atomic: a reader can never observe a window
+    // where BOTH columns are NULL (device locked out) or both set to the same
+    // value. device_secret_prev_expires_at is NULL when graceMs is 0, which the
+    // chk_devices_secret_prev_pair CHECK requires alongside a NULL prev secret.
+    //
+    // On a first-secret migration there is no previous PER-DEVICE secret to
+    // park, so both prev columns stay NULL - the grace window is meaningless
+    // here. The shared secret is untouched either way; retiring that is a
+    // separate, fleet-wide decision (see devices still on the shared secret).
+    const result = await pool.query(
+      `UPDATE devices
+          SET device_secret = $2,
+              device_secret_prev = CASE WHEN $3::bigint > 0 AND $4::boolean IS FALSE THEN device_secret ELSE NULL END,
+              device_secret_prev_expires_at = CASE WHEN $3::bigint > 0 AND $4::boolean IS FALSE THEN NOW() + ($3 || ' milliseconds')::interval ELSE NULL END,
+              device_secret_rotated_at = NOW()
+        WHERE device_id = $1
+        RETURNING device_id, device_secret_rotated_at,
+                  device_secret_prev_expires_at`,
+      [deviceId, newSecret, graceMs, isFirstSecret]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ message: "Device not found" });
+    }
+
+    const rotated = result.rows[0];
+    const graceHours = Math.round(graceMs / (60 * 60 * 1000) * 10) / 10;
+
+    // How much of the fleet is still on the shared secret. Reported on a
+    // migration so the operator can see this is one board of N, and knows the
+    // shared secret is still a live risk until they are all moved off it.
+    let stillOnShared = null;
+    if (isFirstSecret) {
+      const shared = await pool.query(
+        `SELECT count(*)::int AS n
+           FROM devices
+          WHERE archived_at IS NULL AND is_active = true AND device_secret IS NULL`
+      );
+      stillOnShared = shared.rows[0].n;
+    }
+
+    // Record the rotation, never the value.
+    await pool.query(
+      "INSERT INTO activity_logs (user_name, action_type, description, module) VALUES ($1, 'DEVICE_SECRET_ROTATED', $2, 'devices')",
+      [
+        req.adminUser.username,
+        isFirstSecret
+          ? `Issued a first per-device secret for ${deviceId} (migrated off the shared secret; ${stillOnShared} active devices still use the shared secret)`
+          : `Rotated the secret for ${deviceId} (previous secret ${graceMs > 0 ? `valid for another ${graceHours}h` : "revoked immediately"})`,
+      ]
+    ).catch(() => {});
+
+    console.log(
+      `[${new Date().toISOString()}] Secret ${isFirstSecret ? "issued" : "rotated"} by ${req.adminUser.username} for ${deviceId} ` +
+        (isFirstSecret
+          ? `(first per-device secret; ${stillOnShared} active devices still on the shared secret)`
+          : `(previous ${graceMs > 0 ? `valid ${graceHours}h` : "revoked now"})`)
+    );
+
+    res.json({
+      device_id: deviceId,
+      // Shown once. The UI must make the operator copy it before navigating away.
+      device_secret: newSecret,
+      rotated_at: rotated.device_secret_rotated_at,
+      previous_secret_expires_at: rotated.device_secret_prev_expires_at,
+      previous_secret_grace_hours: graceHours,
+      previous_secret_revoked: graceMs === 0,
+      // True when this was the board's first per-device secret rather than a
+      // rotation. The grace window is meaningless in that case.
+      first_secret: isFirstSecret,
+      devices_still_on_shared_secret: stillOnShared,
+      message: isFirstSecret
+        ? "Copy this secret now - it is not shown again. " +
+          "This board previously authenticated with the shared DEVICE_SECRET, which is still accepted " +
+          (stillOnShared === 1
+            ? "for the 1 other active device on it, so keep that secret treated as compromised until it is migrated too."
+            : `for ${stillOnShared} other active devices, so keep that secret treated as compromised until they are migrated too.`)
+        : "Copy this secret now - it is not shown again. " +
+          (graceMs > 0
+            ? `The previous secret keeps working for ${graceHours}h so the board can be reconfigured without an outage.`
+            : "The previous secret was revoked immediately; the board stops reporting until it is reconfigured."),
+    });
+  } catch (err) {
+    console.error(`[${new Date().toISOString()}] Error rotating device secret:`, err.message);
+    res.status(500).json({ message: "Error rotating device secret", error: err.message });
   }
 });
 

@@ -160,6 +160,44 @@ export const PROFILES = {
     ],
     interval: 5000,
   },
+
+  /**
+   * Ten tanks at once, one runner per device, staggered 1.5s apart so the whole
+   * fleet is live after ~13.5s and they never post in lockstep. The mix is
+   * deliberately uneven, because a fleet of ten identical healthy boards proves
+   * far less than a fleet with one of each failure mode in it:
+   *
+   *   ESP32_01..06  healthy        - baseline, the tank selector and history
+   *   ESP32_07      warming        - WARNING then CRITICAL on temperature
+   *   ESP32_08      ammonia_spike  - critical toxin, fastest-acting alarm
+   *   ESP32_09      failed_ammonia - "No signal" pill, must NOT read as a warning
+   *   ESP32_10      disconnect     - goes silent after 10 posts -> offline banner
+   *
+   * This is what exercises the multi-tank surfaces: the "N tanks affected"
+   * banner, the per-tank alarm badge, the Live Tank Bar, and the health
+   * poller reaching its MAX_CONCURRENCY=10 ceiling (services/devicePoller.cjs:23)
+   * in a single batch rather than two.
+   *
+   * Register all ten IDs on the Devices page FIRST if you want "Registered"
+   * badges and real tank names; otherwise the first POST /sensor from each board
+   * auto-creates the row and they show as "Auto-discovered" until claimed.
+   */
+  fleet10: {
+    description: "Ten tanks: 6 healthy + warming + ammonia spike + dead probe + disconnect.",
+    devices: [
+      { device_id: "ESP32_01", profile: "healthy", staggerMs: 0 },
+      { device_id: "ESP32_02", profile: "healthy", staggerMs: 1500 },
+      { device_id: "ESP32_03", profile: "healthy", staggerMs: 3000 },
+      { device_id: "ESP32_04", profile: "healthy", staggerMs: 4500 },
+      { device_id: "ESP32_05", profile: "healthy", staggerMs: 6000 },
+      { device_id: "ESP32_06", profile: "healthy", staggerMs: 7500 },
+      { device_id: "ESP32_07", profile: "warming", staggerMs: 9000 },
+      { device_id: "ESP32_08", profile: "ammonia_spike", staggerMs: 10500 },
+      { device_id: "ESP32_09", profile: "failed_ammonia", staggerMs: 12000 },
+      { device_id: "ESP32_10", profile: "disconnect", staggerMs: 13500 },
+    ],
+    interval: 5000,
+  },
 };
 
 export default PROFILES;

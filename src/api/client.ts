@@ -1,5 +1,5 @@
 import axios, { isAxiosError, type AxiosError } from "axios";
-import type { SensorEntry, ChartPoint, LogEntry, SensorSettings, ActivityLog, ActivityLogEntry, AuthResponse, WeeklyReport, AnalyticsOverview, AnalyticsDailyResponse, AnalyticsInsightsResponse, DeviceEntry, DeviceLiveReading, DeviceStatus, EffectiveThresholdsResponse, DeviceThresholdDetail, DeviceThresholdOverrides, CreateDevicePayload, DeviceArchiveResult } from "../types";
+import type { SensorEntry, ChartPoint, LogEntry, SensorSettings, ActivityLog, ActivityLogEntry, AuthResponse, WeeklyReport, AnalyticsOverview, AnalyticsDailyResponse, AnalyticsInsightsResponse, DeviceEntry, DeviceLiveReading, DeviceStatus, EffectiveThresholdsResponse, DeviceThresholdDetail, DeviceThresholdOverrides, CreateDevicePayload, DeviceArchiveResult, DeviceSecretRotation } from "../types";
 import { API_BASE } from "../types";
 import { formatFarmTime } from "../utils/time";
 
@@ -231,16 +231,48 @@ export async function fetchDevicesLatest(signal?: AbortSignal): Promise<DeviceLi
   return response.data || [];
 }
 
-// PUT /devices/:id - rename a tank (tank_name), set its location, and/or hide
-// or show it (is_active). The hardware device_id never changes.
+// PUT /devices/:id - rename a tank (tank_name), set its location and/or IP,
+// and/or hide or show it (is_active). The hardware device_id never changes.
 export async function updateDevice(
   deviceId: string,
-  payload: { tank_name?: string | null; tank_location?: string | null; is_active?: boolean },
+  payload: { tank_name?: string | null; tank_location?: string | null; ip_address?: string | null; is_active?: boolean },
   signal?: AbortSignal
 ): Promise<DeviceEntry> {
   const response = await client.put<DeviceEntry>(
     `/devices/${encodeURIComponent(deviceId)}`,
     payload,
+    { signal }
+  );
+  return response.data;
+}
+
+// POST /devices/:id/rotate-secret - issue a new per-device secret.
+//
+// The new secret comes back ONCE in this response and is never retrievable
+// again, so callers must surface it for the operator to copy immediately. The
+// outgoing secret keeps working for a bounded grace window (default 24h) because
+// a board can only learn a new secret through its config portal; pass
+// grace_hours: 0 to revoke it immediately, which is what a compromise response
+// wants.
+//
+// A device that still authenticates with the shared DEVICE_SECRET cannot be
+// rotated (that secret is fleet-wide, not its own). Pass migrateFromShared to
+// issue its FIRST per-device secret instead - a strict upgrade, reported
+// separately via first_secret / devices_still_on_shared_secret.
+// Requires an existing per-device secret otherwise.
+export async function rotateDeviceSecret(
+  deviceId: string,
+  graceHours?: number,
+  signal?: AbortSignal,
+  migrateFromShared = false
+): Promise<DeviceSecretRotation> {
+  const body: { grace_hours?: number; migrate_from_shared?: boolean } = {};
+  if (graceHours !== undefined) body.grace_hours = graceHours;
+  if (migrateFromShared) body.migrate_from_shared = true;
+
+  const response = await client.post<DeviceSecretRotation>(
+    `/devices/${encodeURIComponent(deviceId)}/rotate-secret`,
+    body,
     { signal }
   );
   return response.data;

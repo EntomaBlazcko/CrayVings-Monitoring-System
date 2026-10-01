@@ -1,6 +1,12 @@
 // Fails if any tracked text file has been through a lossy character-set round
 // trip. Catches the class of bug where UTF-8 is decoded as Windows-1252 and
-// re-encoded, which silently turns "°C" into "Â°C" and friends.
+// re-encoded, which silently turns the degree sign in "°C" into a
+// two-character "A-circumflex + degree" sequence and friends.
+//
+// NB: the example above is written with an escape rather than as literal
+// characters on purpose. Spelling out the mojibake verbatim made this file
+// match its own first pattern, so `npm run check:encoding` reported a problem
+// in the checker itself and every clean tree "failed" the gate.
 const { execSync } = require("child_process");
 const fs = require("fs");
 const path = require("path");

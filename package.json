@@ -15,7 +15,9 @@
     "test:regression": "node tests/regression.cjs",
     "test:devices": "node tests/devices.cjs",
     "test:poller": "node tests/devicePoller.cjs",
-    "test:all": "npm test && npm run test:poller && npm run test:devices && npm run test:regression",
+    "test:migration": "node tests/migration014.cjs",
+    "test:secrets": "node tests/deviceSecretRotation.cjs",
+    "test:all": "npm test && npm run test:poller && npm run test:devices && npm run test:migration && npm run test:secrets && npm run test:regression",
     "seed:admin": "node seed-admin.cjs",
     "mock": "node scripts/mock-device.js",
     "mock:profiles": "node scripts/mock-device.js --list-profiles"

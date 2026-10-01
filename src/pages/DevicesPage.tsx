@@ -12,7 +12,7 @@
 // Archiving keeps every reading the device ever produced, so a retired board can
 // still be restored, and its ID is never released to another board.
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useState } from "react";
 import {
   Cpu,
   Plus,
@@ -25,15 +25,19 @@ import {
   Wifi,
   WifiOff,
   ShieldCheck,
+  Pencil,
+  X,
+  KeyRound,
+  Copy,
 } from "lucide-react";
 import { isAxiosError } from "axios";
 import { z } from "zod";
-import { archiveDevice, createDevice, fetchDevices, restoreDevice } from "../api/client";
+import { archiveDevice, createDevice, fetchDevices, restoreDevice, rotateDeviceSecret, updateDevice } from "../api/client";
 import { useSensorData, useActivityLogger } from "../hooks/useSensors";
 import { DeviceLiveCheck } from "../components/deviceActions";
 import { Spinner, ErrorCard } from "../components/Loading";
 import { formatTimeAgo } from "../utils/time";
-import type { DeviceEntry } from "../types";
+import type { DeviceEntry, DeviceSecretRotation } from "../types";
 
 // Mirrors the server-side createDeviceSchema so the Owner gets instant feedback,
 // while the server remains the authority (it re-validates every field).
@@ -63,6 +67,29 @@ const deviceFormSchema = z.object({
 type DeviceForm = z.infer<typeof deviceFormSchema>;
 type FormErrors = Partial<Record<keyof DeviceForm, string>>;
 
+// Editing an existing row sends the same optional fields, minus device_id: the
+// hardware ID is the archive key and is deliberately immutable, so the server's
+// PUT has no field for it.
+const deviceEditSchema = z.object({
+  tank_name: z
+    .string()
+    .trim()
+    .min(1, "Device name is required")
+    .max(100, "Device name must be 100 characters or fewer"),
+  ip_address: z
+    .string()
+    .trim()
+    .refine((v) => {
+      if (!v) return true; // optional
+      const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(v);
+      return !!m && m.slice(1).every((o) => Number(o) >= 0 && Number(o) <= 255);
+    }, "Enter a valid IPv4 address (e.g. 192.168.100.27)"),
+  tank_location: z.string().trim().max(100, "Location must be 100 characters or fewer"),
+});
+
+type EditForm = z.infer<typeof deviceEditSchema>;
+type EditFormErrors = Partial<Record<keyof EditForm, string>>;
+
 const EMPTY_FORM: DeviceForm = {
   device_id: "",
   device_name: "",
@@ -78,6 +105,16 @@ function fieldMessage(errors: unknown, key: string): string | undefined {
   if (typeof value === "string") return value;
   return undefined;
 }
+
+// Grace windows offered when rotating a device secret. The 7-day cap is the
+// server's own limit, and 0 (revoke now) is the compromise-response option.
+const GRACE_OPTIONS = [
+  { value: 0, label: "Revoke immediately (old secret dies now)" },
+  { value: 1, label: "1 hour (board is at the tank right now)" },
+  { value: 24, label: "24 hours (default - a normal rotation)" },
+  { value: 72, label: "3 days (board is remote)" },
+  { value: 168, label: "7 days (maximum the server allows)" },
+];
 
 // The client rejects with the raw AxiosError (see the response interceptor in
 // api/client.ts, which rewrites error.message from the server's { message }), so
@@ -133,6 +170,34 @@ export default function DevicesPage() {
   const [busyDevice, setBusyDevice] = useState<string | null>(null);
   const [rowError, setRowError] = useState<string | null>(null);
   const [confirmArchive, setConfirmArchive] = useState<string | null>(null);
+
+  // Row currently open in the inline editor, plus its own form state. Kept
+  // separate from the Add form so the two never overwrite each other's drafts.
+  const [editing, setEditing] = useState<DeviceEntry | null>(null);
+  const [editForm, setEditForm] = useState<EditForm>({ tank_name: "", ip_address: "", tank_location: "" });
+  const [editErrors, setEditErrors] = useState<EditFormErrors>({});
+  const [editError, setEditError] = useState<string | null>(null);
+  const [editSaving, setEditSaving] = useState(false);
+
+  // --- Secret rotation (audit B4) ------------------------------------------
+  // Two stages, because the new secret is returned by the server exactly once:
+  //   1. open the panel and pick a grace window (how long the OUTGOING secret
+  //      keeps working, because a board can only be reconfigured by hand at
+  //      its config portal);
+  //   2. once issued, show the secret in a copy box that is deliberately NOT
+  //      closable into a lost state - dismissing it is an explicit "I'm done,
+  //      I've written it down" and the secret can never be shown again.
+  const [rotateOpen, setRotateOpen] = useState<string | null>(null);
+  const [rotateGrace, setRotateGrace] = useState<number>(24);
+  const [rotateBusy, setRotateBusy] = useState(false);
+  const [rotateError, setRotateError] = useState<string | null>(null);
+  // Set when the server reports the device has no per-device secret yet, i.e. it
+  // still authenticates with the shared DEVICE_SECRET. Rotation is meaningless
+  // for such a board, so the panel switches to offering the first-secret
+  // migration instead of pretending a secret can be replaced.
+  const [needsSharedMigration, setNeedsSharedMigration] = useState(false);
+  const [issued, setIssued] = useState<DeviceSecretRotation | null>(null);
+  const [copied, setCopied] = useState(false);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -274,12 +339,246 @@ export default function DevicesPage() {
     [load, logActivity, refetch]
   );
 
+  const openEdit = useCallback((device: DeviceEntry) => {
+    setEditing(device);
+    setEditForm({
+      // An auto-discovered board has never had a name here, so seed the field
+      // with its ID - otherwise the editor opens on a required-but-empty box.
+      tank_name: device.tank_name || device.name || device.device_id,
+      ip_address: device.ip_address || "",
+      tank_location: device.tank_location || "",
+    });
+    setEditErrors({});
+    setEditError(null);
+  }, []);
+
+  const closeEdit = useCallback(() => {
+    setEditing(null);
+    setEditErrors({});
+    setEditError(null);
+  }, []);
+
+  const setEditField = useCallback((key: keyof EditForm, value: string) => {
+    setEditForm((prev) => ({ ...prev, [key]: value }));
+    setEditErrors((prev) => ({ ...prev, [key]: undefined }));
+    setEditError(null);
+  }, []);
+
+  const handleEditSave = useCallback(
+    async (e: React.FormEvent) => {
+      e.preventDefault();
+      if (!editing) return;
+      setEditError(null);
+
+      let parsed: EditForm;
+      try {
+        parsed = deviceEditSchema.parse(editForm);
+      } catch (err) {
+        if (err instanceof z.ZodError) {
+          const errors: EditFormErrors = {};
+          err.issues.forEach((issue) => {
+            const key = issue.path[0] as keyof EditForm | undefined;
+            if (key && !errors[key]) errors[key] = issue.message;
+          });
+          setEditErrors(errors);
+          return;
+        }
+        setEditError("Invalid form data");
+        return;
+      }
+      setEditErrors({});
+      setEditSaving(true);
+
+      try {
+        // ip_address is only sent when non-blank. The server stores whatever
+        // string it is given, so an empty string would persist as an empty
+        // address while leaving ip_source='manual' - and the ingest upsert
+        // refuses to overwrite a manual IP, so the board could never learn its
+        // real address again and the poller would skip it forever. Omitting the
+        // field leaves the stored IP untouched instead.
+        await updateDevice(editing.device_id, {
+          tank_name: parsed.tank_name,
+          tank_location: parsed.tank_location,
+          ...(parsed.ip_address ? { ip_address: parsed.ip_address } : {}),
+        });
+        logActivity(
+          "settings_change",
+          `Updated device ${editing.device_id} (name: ${parsed.tank_name})`,
+          "devices"
+        );
+        setEditing(null);
+        await load();
+        refetch();
+      } catch (err) {
+        setEditError(getApiError(err));
+      } finally {
+        setEditSaving(false);
+      }
+    },
+    [editing, editForm, load, logActivity, refetch]
+  );
+
+  const openRotate = useCallback((device: DeviceEntry) => {
+    setRotateOpen(device.device_id);
+    setRotateError(null);
+    setCopied(false);
+    setNeedsSharedMigration(false);
+    // Default back to the forgiving 24h window: the common case is a routine
+    // rotation where someone still has to walk over to the tank.
+    setRotateGrace(24);
+  }, []);
+
+  const closeRotate = useCallback(() => {
+    setRotateOpen(null);
+    setRotateError(null);
+    setNeedsSharedMigration(false);
+  }, []);
+
+  const handleRotate = useCallback(async () => {
+    if (!rotateOpen) return;
+    setRotateBusy(true);
+    setRotateError(null);
+    try {
+      const result = await rotateDeviceSecret(
+        rotateOpen,
+        needsSharedMigration ? undefined : rotateGrace,
+        undefined,
+        needsSharedMigration
+      );
+      setIssued(result);
+      setCopied(false);
+      setNeedsSharedMigration(false);
+      logActivity(
+        "settings_change",
+        result.first_secret
+          ? `Issued a first per-device secret for ${result.device_id} (migrated off the shared secret)`
+          : `Rotated the device secret for ${result.device_id}${
+              result.previous_secret_revoked
+                ? " (previous secret revoked immediately)"
+                : ` (previous secret valid for ${result.previous_secret_grace_hours}h)`
+            }`,
+        "devices"
+      );
+      await load();
+    } catch (err) {
+      // A 409 carrying can_migrate_from_shared means the board has no secret of
+      // its own yet. Don't show it as a dead end - reframe it as an offer.
+      const canMigrate =
+        isAxiosError(err) &&
+        getStatus(err) === 409 &&
+        (err.response?.data as { can_migrate_from_shared?: unknown } | undefined)
+          ?.can_migrate_from_shared === true;
+      if (canMigrate) {
+        setNeedsSharedMigration(true);
+        setRotateError(null);
+      } else {
+        setRotateError(getApiError(err));
+      }
+    } finally {
+      setRotateBusy(false);
+    }
+  }, [rotateOpen, rotateGrace, needsSharedMigration, load, logActivity]);
+
+  const copySecret = useCallback(async () => {
+    if (!issued) return;
+    try {
+      await navigator.clipboard.writeText(issued.device_secret);
+      setCopied(true);
+    } catch {
+      // Clipboard access can be blocked (insecure context, permissions). The
+      // secret stays selectable in the box, so tell the user to copy manually
+      // rather than silently pretending it worked.
+      setCopied(false);
+      setRotateError("Could not reach the clipboard - select the secret above and copy it manually.");
+    }
+  }, [issued]);
+
+  // Dismissing the show-once box discards the secret for good.
+  const dismissIssued = useCallback(() => {
+    setIssued(null);
+    setCopied(false);
+    setRotateOpen(null);
+  }, []);
+
   if (loadError && !devices) {
     return <ErrorCard title="Devices" message={loadError} onRetry={load} />;
   }
 
   return (
     <div className="space-y-4">
+      {/* ---------------------------------------------------------------- */}
+      {/* Show-once secret (audit B4)                                      */}
+      {/* ---------------------------------------------------------------- */}
+      {issued && (
+        <section
+          role="alert"
+          className="rounded-xl border-2 border-amber-400 bg-amber-50 p-4"
+        >
+          <h2 className="flex items-center gap-2 text-base font-bold text-amber-900">
+            <KeyRound size={18} /> New secret for {issued.device_id} - copy it now
+          </h2>
+          <p className="mt-1 text-xs text-amber-900">
+            This is the only time this secret is ever shown. It is not stored in
+            readable form and there is no way to look it up again, so copy it
+            into your password manager before closing this box.
+          </p>
+
+          <div className="mt-3 flex flex-wrap items-center gap-2">
+            <code className="min-w-0 flex-1 select-all break-all rounded-lg border border-amber-300 bg-white px-3 py-2 font-mono text-xs text-gray-800">
+              {issued.device_secret}
+            </code>
+            <button
+              type="button"
+              onClick={copySecret}
+              className="inline-flex shrink-0 items-center gap-1 rounded-lg bg-amber-700 px-3 py-2 text-xs font-semibold text-white transition hover:bg-amber-800"
+            >
+              {copied ? <Check size={12} /> : <Copy size={12} />}
+              {copied ? "Copied" : "Copy secret"}
+            </button>
+          </div>
+
+          <p className="mt-3 text-xs text-amber-900">
+            {issued.first_secret ? (
+              <>
+                This is a <strong>first</strong> secret for this board, so there was no old one to
+                expire. The board still works on the shared <span className="font-mono">DEVICE_SECRET</span>
+                {issued.devices_still_on_shared_secret
+                  ? `, and ${issued.devices_still_on_shared_secret} other active ${
+                      issued.devices_still_on_shared_secret === 1 ? "device is" : "devices are"
+                    } still using it.`
+                  : "."}
+              </>
+            ) : issued.previous_secret_revoked ? (
+              <>
+                The previous secret was <strong>revoked immediately</strong>. This board will stop
+                reporting until you set the new secret in its WiFi config portal.
+              </>
+            ) : (
+              <>
+                The previous secret keeps working until{" "}
+                <strong>{formatTimeAgo(new Date(issued.previous_secret_expires_at as string))}</strong>{" "}
+                ({issued.previous_secret_grace_hours}h grace window), which gives you time to
+                reconfigure the board. After that it stops working on its own.
+              </>
+            )}
+          </p>
+          <p className="mt-2 text-xs text-amber-900">
+            Next step: open the board&apos;s config portal, paste the new secret
+            into the device secret field, and save. Nothing needs to be reflashed.
+          </p>
+
+          <div className="mt-3 flex justify-end">
+            <button
+              type="button"
+              onClick={dismissIssued}
+              className="rounded-lg border border-amber-300 bg-white px-3 py-2 text-xs font-semibold text-amber-900 transition hover:bg-amber-100"
+            >
+              I&apos;ve saved it - close
+            </button>
+          </div>
+        </section>
+      )}
+
       {/* ---------------------------------------------------------------- */}
       {/* Add Device                                                        */}
       {/* ---------------------------------------------------------------- */}
@@ -358,8 +657,9 @@ export default function DevicesPage() {
                 <p className="mt-1 text-xs text-red-600">{formErrors.ip_address}</p>
               ) : (
                 <p className="mt-1 text-xs text-gray-400">
-                  Set this to the board&apos;s static LAN address so health checks can reach it. Left
-                  blank, the server learns it from incoming data.
+                  This is the <strong>board&apos;s own LAN IP</strong> (e.g. 192.168.1.150), NOT your server IP.
+                  The health poller dials http://[this-ip]/status. Find it in the board&apos;s Serial Monitor
+                  after it connects to WiFi. Left blank, the server learns it from incoming data (may be NAT IP).
                 </p>
               )}
             </div>
@@ -483,8 +783,10 @@ export default function DevicesPage() {
                 {activeDevices.map((device) => {
                   const isBusy = busyDevice === device.device_id;
                   const isHidden = !device.is_active;
+                  const isEditing = editing?.device_id === device.device_id;
                   return (
-                    <tr key={device.device_id} className="border-b border-gray-100 last:border-0">
+                    <Fragment key={device.device_id}>
+                    <tr className="border-b border-gray-100 last:border-0">
                       <td className="py-2.5 pr-3">
                         <div className="font-semibold text-gray-800">
                           {device.tank_name || device.name || device.device_id}
@@ -533,13 +835,45 @@ export default function DevicesPage() {
                       <td className="py-2.5 text-right">
                         <div className="flex items-center justify-end gap-1.5">
                           <DeviceLiveCheck deviceId={device.device_id} ipAddress={device.ip_address} compact />
+                          {isEditing ? (
+                            <button
+                              type="button"
+                              onClick={closeEdit}
+                              title="Close the editor"
+                              className="inline-flex items-center gap-1 rounded-md border border-gray-200 bg-white px-2 py-1 text-xs font-semibold text-gray-600 transition hover:border-gray-300"
+                            >
+                              <X size={12} /> Close
+                            </button>
+                          ) : (
+                            <button
+                              type="button"
+                              onClick={() => openEdit(device)}
+                              title="Edit name, location and IP address"
+                              className="inline-flex items-center gap-1 rounded-md border border-gray-200 bg-white px-2 py-1 text-xs font-semibold text-gray-600 transition hover:border-brand-300 hover:text-brand-700"
+                            >
+                              <Pencil size={12} /> Edit
+                            </button>
+                          )}
+                          <button
+                            type="button"
+                            disabled={isBusy}
+                            onClick={() => (rotateOpen === device.device_id ? closeRotate() : openRotate(device))}
+                            title="Issue a new per-device secret (the old one keeps working for a grace window)"
+                            className={`inline-flex items-center gap-1 rounded-md border px-2 py-1 text-xs font-semibold transition disabled:opacity-50 ${
+                              rotateOpen === device.device_id
+                                ? "border-amber-300 bg-amber-50 text-amber-800"
+                                : "border-gray-200 bg-white text-gray-600 hover:border-amber-300 hover:text-amber-800"
+                            }`}
+                          >
+                            <KeyRound size={12} /> Secret
+                          </button>
                           {confirmArchive === device.device_id ? (
                             <span className="inline-flex items-center gap-1">
                               <button
                                 type="button"
                                 disabled={isBusy}
                                 onClick={() => handleArchive(device.device_id)}
-                                title="Archive: keeps all data, retires the device"
+                                title="Archive: keeps every reading, and the device ID is permanently retired. It can never be registered again - not by this board, not by its replacement."
                                 className="inline-flex items-center gap-1 rounded-md bg-red-600 px-2 py-1 text-xs font-semibold text-white transition hover:bg-red-700 disabled:opacity-50"
                               >
                                 {isBusy ? <Loader2 size={11} className="animate-spin" /> : <Archive size={11} />}
@@ -553,14 +887,22 @@ export default function DevicesPage() {
                               >
                                 Cancel
                               </button>
+                              {/* The confirmation itself has to carry the
+                                  consequence, not just a hover title: archiving
+                                  looks reversible from the button alone, and the
+                                  ID it burns is the single most permanent thing
+                                  on this page. */}
+                              <span className="text-[11px] font-medium text-red-700">
+                                ID permanently retired
+                              </span>
                             </span>
                           ) : (
                             <button
                               type="button"
                               disabled={isBusy}
                               onClick={() => setConfirmArchive(device.device_id)}
-                              title="Archive this device (data and readings are kept)"
-                              className="inline-flex items-center gap-1 rounded-md border border-red-200 bg-white px-2 py-1 text-xs font-semibold text-red-600 transition hover:bg-red-50 disabled:opacity-50"
+                              title="Archive this device: every reading is kept and the tank leaves the active views. The device ID is permanently retired and can never be registered again."
+                              className="inline-flex items-center gap-1 rounded-md border border-red-200 bg-white px-2 py-1 text-xs font-semibold text-red-600 transition hover:border-red-50 disabled:opacity-50"
                             >
                               <Archive size={12} /> Archive
                             </button>
@@ -568,6 +910,248 @@ export default function DevicesPage() {
                         </div>
                       </td>
                     </tr>
+
+                    {isEditing && (
+                      <tr>
+                        <td colSpan={6} className="border-b border-gray-100 bg-surface-sunken px-4 py-4">
+                          <form onSubmit={handleEditSave} className="space-y-3" noValidate>
+                            <p className="text-xs text-gray-500">
+                              Editing details for{" "}
+                              <span className="font-mono text-gray-700">{device.device_id}</span>. The
+                              device ID is permanent - it is the archive key and is never reused.
+                            </p>
+
+                            <div className="grid gap-3 md:grid-cols-3">
+                              <div>
+                                <label
+                                  htmlFor={`edit-name-${device.device_id}`}
+                                  className="block text-sm font-medium text-gray-700 mb-1"
+                                >
+                                  Device Name <span className="text-red-500">*</span>
+                                </label>
+                                <input
+                                  id={`edit-name-${device.device_id}`}
+                                  type="text"
+                                  value={editForm.tank_name}
+                                  onChange={(e) => setEditField("tank_name", e.target.value)}
+                                  maxLength={100}
+                                  aria-invalid={!!editErrors.tank_name}
+                                  className={`w-full px-3 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-brand-500/20 transition-colors ${
+                                    editErrors.tank_name
+                                      ? "border-red-500 bg-red-50"
+                                      : "border-gray-300 focus:border-brand-500"
+                                  }`}
+                                />
+                                {editErrors.tank_name && (
+                                  <p className="mt-1 text-xs text-red-600">{editErrors.tank_name}</p>
+                                )}
+                              </div>
+
+                              <div>
+                                <label
+                                  htmlFor={`edit-ip-${device.device_id}`}
+                                  className="block text-sm font-medium text-gray-700 mb-1"
+                                >
+                                  IP Address{" "}
+                                  <span className="text-gray-400 font-normal">
+                                    (optional - leave blank to keep current)
+                                  </span>
+                                </label>
+                                <input
+                                  id={`edit-ip-${device.device_id}`}
+                                  type="text"
+                                  inputMode="numeric"
+                                  value={editForm.ip_address}
+                                  onChange={(e) => setEditField("ip_address", e.target.value)}
+                                  aria-invalid={!!editErrors.ip_address}
+                                  className={`w-full px-3 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-brand-500/20 transition-colors ${
+                                    editErrors.ip_address
+                                      ? "border-red-500 bg-red-50"
+                                      : "border-gray-300 focus:border-brand-500"
+                                  }`}
+                                />
+                                {editErrors.ip_address ? (
+                                  <p className="mt-1 text-xs text-red-600">{editErrors.ip_address}</p>
+                                ) : (
+                                  <p className="mt-1 text-xs text-gray-400">
+                                    The board&apos;s own LAN IP, not your server IP. Saving this
+                                    locks the address (<span className="font-semibold">manual</span>)
+                                    so incoming data can no longer overwrite it.
+                                  </p>
+                                )}
+                              </div>
+
+                              <div>
+                                <label
+                                  htmlFor={`edit-location-${device.device_id}`}
+                                  className="block text-sm font-medium text-gray-700 mb-1"
+                                >
+                                  Location{" "}
+                                  <span className="text-gray-400 font-normal">(optional)</span>
+                                </label>
+                                <input
+                                  id={`edit-location-${device.device_id}`}
+                                  type="text"
+                                  value={editForm.tank_location}
+                                  onChange={(e) => setEditField("tank_location", e.target.value)}
+                                  maxLength={100}
+                                  aria-invalid={!!editErrors.tank_location}
+                                  className={`w-full px-3 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-brand-500/20 transition-colors ${
+                                    editErrors.tank_location
+                                      ? "border-red-500 bg-red-50"
+                                      : "border-gray-300 focus:border-brand-500"
+                                  }`}
+                                />
+                                {editErrors.tank_location && (
+                                  <p className="mt-1 text-xs text-red-600">{editErrors.tank_location}</p>
+                                )}
+                              </div>
+                            </div>
+
+                            {editError && (
+                              <div className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
+                                {editError}
+                              </div>
+                            )}
+
+                            <div className="flex items-center gap-2">
+                              <button
+                                type="submit"
+                                disabled={editSaving}
+                                className="inline-flex items-center gap-2 rounded-lg bg-gradient-to-r from-brand-500 to-brand-400 px-4 py-2 text-sm font-semibold text-white transition hover:from-brand-600 hover:to-brand-500 focus:outline-none focus:ring-2 focus:ring-brand-500/20 disabled:opacity-50 disabled:cursor-not-allowed"
+                              >
+                                {editSaving ? (
+                                  <Loader2 size={15} className="animate-spin" />
+                                ) : (
+                                  <Check size={15} />
+                                )}
+                                {editSaving ? "Saving..." : "Save changes"}
+                              </button>
+                              <button
+                                type="button"
+                                onClick={closeEdit}
+                                disabled={editSaving}
+                                className="rounded-lg border border-gray-200 bg-white px-4 py-2 text-sm font-semibold text-gray-600 transition hover:border-gray-300 disabled:opacity-50"
+                              >
+                                Cancel
+                              </button>
+                            </div>
+                          </form>
+                        </td>
+                      </tr>
+                    )}
+
+                    {rotateOpen === device.device_id && (
+                      <tr>
+                        <td colSpan={6} className="border-b border-gray-100 bg-surface-sunken px-4 py-4">
+                          <div className="space-y-3">
+                            <p className="text-xs text-gray-500">
+                              {needsSharedMigration ? (
+                                <>
+                                  <span className="font-mono text-gray-700">{device.device_id}</span>{" "}
+                                  has no secret of its own - it authenticates with the shared{" "}
+                                  <span className="font-mono">DEVICE_SECRET</span>. That secret is
+                                  fleet-wide, so it cannot be rotated per device. What we can do is
+                                  issue this board its own per-device secret and then move it off
+                                  the shared one.
+                                </>
+                              ) : (
+                                <>
+                                  Rotating the secret for{" "}
+                                  <span className="font-mono text-gray-700">{device.device_id}</span>.
+                                  A board can only learn a new secret at its WiFi config portal, so
+                                  the outgoing secret keeps working for the grace window you pick -
+                                  long enough to walk over to the tank.
+                                </>
+                              )}
+                            </p>
+
+                            {!needsSharedMigration && (
+                              <div>
+                                <label
+                                  htmlFor={`rotate-grace-${device.device_id}`}
+                                  className="block text-sm font-medium text-gray-700 mb-1"
+                                >
+                                  Grace window for the old secret
+                                </label>
+                                <select
+                                  id={`rotate-grace-${device.device_id}`}
+                                  value={rotateGrace}
+                                  disabled={rotateBusy}
+                                  onChange={(e) => setRotateGrace(Number(e.target.value))}
+                                  className="w-full max-w-sm px-3 py-2 border rounded-lg border-gray-300 bg-white focus:outline-none focus:ring-2 focus:ring-brand-500/20 disabled:opacity-50"
+                                >
+                                  {GRACE_OPTIONS.map((opt) => (
+                                    <option key={opt.value} value={opt.value}>
+                                      {opt.label}
+                                    </option>
+                                  ))}
+                                </select>
+                                <p className="mt-1 text-xs text-gray-400">
+                                  {rotateGrace === 0
+                                    ? "Revoked the moment the new secret is issued. Use this when a secret is suspected compromised - but the board stops reporting until it is reconfigured."
+                                    : "The old secret keeps working for this long, then stops on its own. Nothing is scheduled or cleaned up later; the deadline is simply checked at sign-in."}
+                                </p>
+                              </div>
+                            )}
+
+                            {rotateGrace > 0 && !needsSharedMigration && (
+                              <p className="flex items-start gap-1.5 text-xs text-amber-700">
+                                <AlertTriangle size={13} className="mt-0.5 shrink-0" />
+                                Reconfigure the board before the window closes, or it will stop
+                                reporting. Grace is a hand-off period, not a repair.
+                              </p>
+                            )}
+
+                            {needsSharedMigration && (
+                              <p className="flex items-start gap-1.5 text-xs text-amber-700">
+                                <AlertTriangle size={13} className="mt-0.5 shrink-0" />
+                                This board will keep working on the shared secret too, so this does
+                                not reduce your exposure until every device has been moved off it and
+                                the shared secret is retired.
+                              </p>
+                            )}
+
+                            {rotateError && (
+                              <p className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">
+                                {rotateError}
+                              </p>
+                            )}
+
+                            <div className="flex items-center gap-2">
+                              <button
+                                type="button"
+                                disabled={rotateBusy}
+                                onClick={handleRotate}
+                                className="inline-flex items-center gap-2 rounded-lg bg-gradient-to-r from-brand-500 to-brand-400 px-4 py-2 text-sm font-semibold text-white transition hover:from-brand-600 hover:to-brand-500 focus:outline-none focus:ring-2 focus:ring-brand-500/20 disabled:opacity-50 disabled:cursor-not-allowed"
+                              >
+                                {rotateBusy ? (
+                                  <Loader2 size={15} className="animate-spin" />
+                                ) : (
+                                  <KeyRound size={15} />
+                                )}
+                                {rotateBusy
+                                  ? "Working..."
+                                  : needsSharedMigration
+                                    ? "Issue its first per-device secret"
+                                    : rotateGrace === 0
+                                      ? "Rotate and revoke old secret"
+                                      : "Rotate secret"}
+                              </button>
+                              <button
+                                type="button"
+                                onClick={closeRotate}
+                                disabled={rotateBusy}
+                                className="rounded-lg border border-gray-200 bg-white px-4 py-2 text-sm font-semibold text-gray-600 transition hover:border-gray-300 disabled:opacity-50"
+                              >
+                                {needsSharedMigration ? "Not now" : "Cancel"}
+                              </button>
+                            </div>
+                          </div>
+                        </td>
+                      </tr>
+                    )}
+                    </Fragment>
                   );
                 })}
 

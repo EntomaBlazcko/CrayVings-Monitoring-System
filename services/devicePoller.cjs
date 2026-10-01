@@ -21,7 +21,12 @@ const axios = require("axios");
 // (REQ_TIMEOUT_MS) would stall a third of the fleet's health checks each cycle.
 // Capped so a large farm still cannot flood the LAN with simultaneous requests.
 const MAX_CONCURRENCY = 10;
-const REQ_TIMEOUT_MS = 2000; // fail fast on a hung device
+// Per-request timeout. Kept well under POLL_INTERVAL_MS on purpose: a cycle
+// polls the fleet in ceil(n/MAX_CONCURRENCY) batches, so the timeout bounds how
+// long a cycle can run. Env-tunable because a board that genuinely needs longer
+// should not require a code change - but see createTick() for why a slow cycle
+// can no longer stack on top of the next one.
+const REQ_TIMEOUT_MS = parseInt(process.env.POLL_TIMEOUT_MS) || 2000;
 const POLL_INTERVAL_MS = 5000; // cadence
 const FAILURE_THRESHOLD = 3; // consecutive failures before a warning is logged
 const FAILURE_WARN_BACKOFF_MS = 30000; // don't re-warn more often than this
@@ -58,7 +63,7 @@ async function checkDevice(pool, dev) {
     }
 
     await pool.query(
-      `UPDATE devices SET last_health_seen = NOW() WHERE device_id = $1`,
+      `UPDATE devices SET last_seen = NOW(), last_health_seen = NOW() WHERE device_id = $1`,
       [dev.device_id]
     );
 
@@ -98,17 +103,68 @@ async function pollOnce(pool) {
   }
 }
 
+// Re-entrancy guard for the interval tick.
+//
+// A cycle polls the fleet in ceil(n / MAX_CONCURRENCY) batches, so its worst-case
+// duration is that many timeouts. At the defaults that is ~2 s per batch, which
+// means a fleet of 21+ slow boards already outruns the 5 s interval - and
+// setInterval fires regardless of whether the previous cycle finished. Cycles
+// would then stack: 2 cycles in flight, 4 a moment later, doubling the load on
+// a LAN that is already struggling, and making a transient slowdown look like a
+// hard failure. A tick that arrives mid-cycle is dropped so cycles serialise.
+function createTick(pool, { onSkip } = {}) {
+  let running = false;
+  let skippedStreak = 0;
+
+  return {
+    get running() {
+      return running;
+    },
+    get skippedStreak() {
+      return skippedStreak;
+    },
+    async run() {
+      if (running) {
+        skippedStreak++;
+        // Warn on the first skip of a streak, then roughly every 20th, so a
+        // persistently overrunning poller cannot turn into log spam.
+        if (onSkip && (skippedStreak === 1 || skippedStreak % 20 === 0)) onSkip(skippedStreak);
+        return false;
+      }
+      running = true;
+      try {
+        await pollOnce(pool);
+        return true;
+      } catch (err) {
+        console.error("[POLL] Poll cycle failed:", err.message);
+        return false;
+      } finally {
+        running = false;
+        skippedStreak = 0;
+      }
+    },
+  };
+}
+
 // Starts the background poller. Safe to call once at boot; never throws.
 function startDevicePoller(pool) {
-  pollOnce(pool).catch((err) => {
-    console.error(`[POLL] Initial poll failed:`, err.message);
+  const tick = createTick(pool, {
+    onSkip: (n) =>
+      console.warn(
+        `[POLL] Previous cycle still running; skipped ${n} tick(s) in a row. ` +
+          `Cycles are taking longer than ${POLL_INTERVAL_MS}ms - raise POLL_TIMEOUT_MS ` +
+          `or lower MAX_CONCURRENCY.`
+      ),
   });
+
+  tick.run();
   setInterval(() => {
-    pollOnce(pool).catch(() => {}); // swallow: interval must never crash
+    tick.run(); // never rejects: createTick.run() swallows its own errors
   }, POLL_INTERVAL_MS);
   console.log(`[POLL] ESP32 status poller started (every ${POLL_INTERVAL_MS / 1000}s, up to ${MAX_CONCURRENCY} concurrent, timeout ${REQ_TIMEOUT_MS}ms)`);
 }
 
 // pollOnce is exported so the batching/concurrency behaviour can be unit tested
 // without a database or a running interval. It is not part of the boot path.
-module.exports = { startDevicePoller, pollOnce, MAX_CONCURRENCY };
+// createTick is exported so the overlap guard is testable the same way.
+module.exports = { startDevicePoller, pollOnce, createTick, MAX_CONCURRENCY, REQ_TIMEOUT_MS };
