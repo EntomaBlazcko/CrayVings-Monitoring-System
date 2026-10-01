@@ -225,20 +225,33 @@ unsigned long lastPageChange = 0;
 
 #define DEVICE_ID_DEFAULT "ESP32_02"
 
+// Device ID contract - MUST stay in step with the dashboard's registration
+// schema (server.cjs createDeviceSchema / DevicesPage deviceFormSchema):
+//   /^[A-Za-z0-9._-]+$/ and at most 50 characters.
+//
+// Why this is enforced on the BOARD and not just in the web form: POST /sensor
+// accepts any string up to 50 characters and auto-registers it. A board
+// configured with an ID the dashboard cannot accept ("Tank 1!", a slash, a
+// space) would report forever under an identity the Owner can never register,
+// rename into place, or ever reuse - a junk row holding the tank's readings
+// that can only be archived. Rejecting it here keeps the two sides in one
+// contract, and the board says why instead of failing silently.
+#define DEVICE_ID_MAX_LEN 50
+
 // Backend IP when no portal override has been saved. If serverIP is still this
 // placeholder after the device connects to WiFi, autoDeriveServerIp() rewrites
 // it to the WiFi subnet + SERVER_IP_HOST_OCTET (e.g. on 192.168.1.x it becomes
 // 192.168.1.10). Change SERVER_IP_HOST_OCTET to your server's host octet, or
 // enter the real IP in the config portal.
 #define SERVER_IP_DEFAULT "192.168.4.10"
-#define SERVER_IP_HOST_OCTET 20
+#define SERVER_IP_HOST_OCTET 10
 
 #define SERVER_PORT_DEFAULT "3000"
 #define SEND_INTERVAL 1000
 
 char serverIP[50] = SERVER_IP_DEFAULT;
 char serverPort[10] = SERVER_PORT_DEFAULT;
-char deviceId[50] = DEVICE_ID_DEFAULT;
+char deviceId[DEVICE_ID_MAX_LEN + 1] = DEVICE_ID_DEFAULT;
 char deviceSecret[100] = "";
 
 // Optional static IP config (192.168.4.x star topology). When configured the
@@ -348,6 +361,72 @@ void applyStaticIpConfig()
     }
 }
 
+// The dashboard accepts only [A-Za-z0-9._-] in a device_id (see
+// DEVICE_ID_MAX_LEN above). Deliberately hand-rolled rather than isalnum()/
+// isxdigit(), whose behaviour depends on the C locale, and deliberately
+// ASCII-only so a non-ASCII byte can never slip through on one toolchain and
+// not another.
+bool deviceIdCharAllowed(char c)
+{
+    unsigned char u = (unsigned char)c;
+    return (u >= 'A' && u <= 'Z') ||
+           (u >= 'a' && u <= 'z') ||
+           (u >= '0' && u <= '9') ||
+           c == '.' || c == '_' || c == '-';
+}
+
+// Returns true when `candidate` was accepted. A rejected candidate leaves
+// `deviceId` untouched and prints the reason, so the operator sees on the serial
+// monitor exactly why their entry did not stick.
+//
+// The previous version strncpy'd first and validated the empty case afterwards.
+// That silently truncated anything past the buffer - a 50-character ID, which
+// the dashboard accepts, became a different 49-character identity here - and it
+// accepted spaces, punctuation and any other character the dashboard would then
+// refuse at registration time.
+bool applyDeviceIdCandidate(String candidate, const char* fallback)
+{
+    candidate.trim();
+
+    if (candidate.length() == 0)
+    {
+        // Clearing the field must never post an empty device_id: that would
+        // auto-register a junk device on the server. Fall back to whatever the
+        // caller says this board was using, defaulting to the compiled-in one.
+        const char *keep = (fallback && fallback[0] != '\0') ? fallback : DEVICE_ID_DEFAULT;
+        strncpy(deviceId, keep, sizeof(deviceId) - 1);
+        deviceId[sizeof(deviceId) - 1] = '\0';
+        Serial.printf("[CONFIG] Device ID was blank; keeping '%s'\n", deviceId);
+        return false;
+    }
+
+    if (candidate.length() > DEVICE_ID_MAX_LEN)
+    {
+        Serial.printf("[CONFIG] REJECTED device ID '%s': %u characters, the dashboard allows at most %d.\n",
+                      candidate.c_str(), (unsigned)candidate.length(), DEVICE_ID_MAX_LEN);
+        Serial.println("[CONFIG] Keeping the previous device ID. Shorten it, or change it on the dashboard's Devices page.");
+        return false;
+    }
+
+    for (unsigned i = 0; i < candidate.length(); i++)
+    {
+        if (!deviceIdCharAllowed(candidate[i]))
+        {
+            Serial.printf("[CONFIG] REJECTED device ID '%s': '%c' is not allowed at position %u.\n",
+                          candidate.c_str(), candidate[i], i + 1);
+            Serial.println("[CONFIG] Use only letters, numbers, dots, dashes and underscores (e.g. ESP32_01).");
+            Serial.printf("[CONFIG] Keeping the previous device ID ('%s').\n", deviceId);
+            return false;
+        }
+    }
+
+    strncpy(deviceId, candidate.c_str(), sizeof(deviceId) - 1);
+    deviceId[sizeof(deviceId) - 1] = '\0';
+
+    Serial.printf("[CONFIG] Device ID set to '%s'\n", deviceId);
+    return true;
+}
+
 void loadSystemConfig()
 {
     Preferences prefs;
@@ -361,9 +440,10 @@ void loadSystemConfig()
     strncpy(serverPort, val.c_str(), sizeof(serverPort) - 1);
     serverPort[sizeof(serverPort) - 1] = '\0';
 
-    // Device ID is pinned to the compiled-in DEVICE_ID_DEFAULT (ESP32_02);
-    // never editable via the config portal, so a board can't register under a
-    // random name. Friendly tank names are set on the dashboard instead.
+    // Device ID can now be set via config portal; fall back to compiled-in default.
+    val = prefs.getString("device_id", DEVICE_ID_DEFAULT);
+    applyDeviceIdCandidate(val, DEVICE_ID_DEFAULT);
+
     val = prefs.getString("device_secret", "");
     strncpy(deviceSecret, val.c_str(), sizeof(deviceSecret) - 1);
     deviceSecret[sizeof(deviceSecret) - 1] = '\0';
@@ -1828,7 +1908,7 @@ void startWifiConfigPortal()
     // autoDeriveServerIp() had just worked out from the real subnet.
     WiFiManagerParameter serverIPParam(
         "server_ip",
-        "Backend Server IP (e.g. 192.168.1.100)",
+        "Dashboard Server IP (where THIS board sends data, e.g. 192.168.1.100) — NOT this board's IP",
         serverIP,
         50
     );
@@ -1838,6 +1918,13 @@ void startWifiConfigPortal()
         "Backend Server Port",
         serverPort,
         6
+    );
+
+    WiFiManagerParameter deviceIdParam(
+        "device_id",
+        "Device ID (letters, numbers, . _ - only; max 50)",
+        deviceId,
+        DEVICE_ID_MAX_LEN
     );
 
     char tankHeightText[10];
@@ -1890,6 +1977,7 @@ void startWifiConfigPortal()
 
     wm.addParameter(&serverIPParam);
     wm.addParameter(&serverPortParam);
+    wm.addParameter(&deviceIdParam);
     wm.addParameter(&deviceSecretParam);
     wm.addParameter(&tankHeightParam);
     wm.addParameter(&staticIpParam);
@@ -1934,6 +2022,11 @@ void startWifiConfigPortal()
 
         strncpy(deviceSecret, deviceSecretParam.getValue(), sizeof(deviceSecret) - 1);
         deviceSecret[sizeof(deviceSecret) - 1] = '\0';
+
+        // A blank field must not wipe the ID this board already reports under,
+        // so fall back to the value loaded from NVS rather than the compiled default.
+        String previousDeviceId = deviceId;
+        applyDeviceIdCandidate(deviceIdParam.getValue(), previousDeviceId.c_str());
 
         tankHeightCm = atof(tankHeightParam.getValue());
         if (tankHeightCm < 5.0 || tankHeightCm > 200.0)
@@ -2121,6 +2214,30 @@ int postReading(const String &url, float tempToSend, float levelToSend, float am
             Serial.println("[HTTP] 401 = device secret problem. Open the config portal (triple-tap the");
             Serial.println("[HTTP] top-left corner, or send 'W' over serial) and set 'Device Secret' to");
             Serial.println("[HTTP] the same value as DEVICE_SECRET in the server's .env, then save.");
+        }
+    }
+    else if (code > 0)
+    {
+        // Accepted. The server tells us when it had to CREATE our registry row
+        // (auto_registered) rather than match one that already existed - i.e.
+        // this board's ID is not registered on the dashboard. That is the exact
+        // firmware/registration mismatch this warning exists to surface, and the
+        // board's serial monitor is where the Owner will actually see it.
+        String body = http.getString();
+        if (body.indexOf("\"auto_registered\":true") >= 0)
+        {
+            static bool warned = false;
+            if (!warned)
+            {
+                warned = true;
+                Serial.println("[HTTP] WARNING: the dashboard did not know this device - it");
+                Serial.println("[HTTP] auto-registered us as an 'Auto-discovered' tank. Data IS");
+                Serial.println("[HTTP] being saved, but the readings cannot be tied to a tank you");
+                Serial.println("[HTTP] named. Open the dashboard's Devices page and click 'Add");
+                Serial.println("[HTTP] Device' with this exact ID to claim it, or change 'Device ID'");
+                Serial.println("[HTTP] in the config portal to the ID you registered.");
+                Serial.printf("[HTTP] Our current device ID: '%s'\n", deviceId);
+            }
         }
     }
     http.end();
