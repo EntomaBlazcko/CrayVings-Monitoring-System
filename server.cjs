@@ -2955,6 +2955,11 @@ app.post("/auth/login", loginLimiter, async (req, res) => {
       await pool.query("UPDATE users SET token = $1, token_expires_at = $2 WHERE id = $3", [hashToken(token), tokenExpiresAt, user.id]);
     }
 
+    // The cookie MUST be attached before the response is sent. res.json()
+    // writes the head and flushes it, so anything appended afterwards lands in
+    // the error path with ERR_HTTP_HEADERS_SENT - the login "succeeds" from the
+    // client's point of view and silently comes back without a session.
+    setSessionCookie(res, token, tokenExpiresAt);
     res.json({
       message: "Login successful",
       user: { id: user.id, username: user.username, email: user.email, role: user.role, name: user.name, owner: isOwnerUser(user), protected: isOwnerUser(user) },
@@ -2963,7 +2968,6 @@ app.post("/auth/login", loginLimiter, async (req, res) => {
       // is the whole thing the cookie exists to prevent.
       tokenExpiresAt: tokenExpiresAt.toISOString(),
     });
-    setSessionCookie(res, token, tokenExpiresAt);
   } catch (err) {
     console.error(`[${new Date().toISOString()}] Login error:`, err.message);
     res.status(500).json({ message: "Login failed" });
