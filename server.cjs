@@ -655,6 +655,18 @@ function zodFieldErrors(err) {
   return flat.fieldErrors || {};
 }
 
+// Coerces a report/analytics aggregate to a number, or to null when there is
+// nothing to report. A failed sensor is stored as NULL, so a window with no
+// valid readings aggregates to NULL - and Number(null) is 0, which would render
+// a tank with a dead probe as a confidently healthy "0.0". The `|| 0` idiom
+// that used to stand here did exactly that, in SQL and again in JS, so the fake
+// zero had to be removed from both layers.
+function numOrNull(v) {
+  if (v === null || v === undefined || v === "") return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
 // Normalises the peer address of an inbound request into a bare address that
 // can be handed to the device poller and put straight into a URL.
 //
@@ -762,8 +774,7 @@ const SMS_DELIVERY_POLL_MS = parseInt(process.env.SMS_DELIVERY_POLL_MS, 10) || 4
 // Only reconcile messages sent within this window — older sends are settled.
 const SMS_POLL_WINDOW_MS = 6 * 60 * 60 * 1000;
 // Purge sms_logs rows older than this many days (0 disables purging)
-const rawRetention = parseInt(process.env.SMS_RETENTION_DAYS, 10);
-const SMS_RETENTION_DAYS = Number.isFinite(rawRetention) && rawRetention >= 0 ? rawRetention : 30;
+const SMS_RETENTION_DAYS = envDays("SMS_RETENTION_DAYS", 30);
 
 // SMS mute state. Two layers, both persisted in the system_state table so a
 // restart no longer silently unmutes:
@@ -1261,45 +1272,65 @@ const ALERT_COOLDOWN_MS = 120000;
   }
 })();
 
-// Keep only last 30 days of logs and sensor readings (startup and daily).
-// activity_logs is a user-audit trail, not sensor data - it is kept longer
-// (default 90 days, ACTIVITY_LOGS_RETENTION_DAYS; 0 disables the purge).
-const LOGS_RETENTION_DAYS = 30;
-const rawActivityRetention = parseInt(process.env.ACTIVITY_LOGS_RETENTION_DAYS, 10);
-const ACTIVITY_LOGS_RETENTION_DAYS =
-  Number.isFinite(rawActivityRetention) && rawActivityRetention >= 0 ? rawActivityRetention : 90;
+// Reads a retention window from the environment: a non-negative whole number of
+// days, or `fallback` when unset or unparseable. 0 disables that purge.
+//
+// Declared as a hoisted function so the SMS block above can use it too - this
+// parse-and-validate dance was previously copy-pasted three times.
+function envDays(name, fallback) {
+  const raw = parseInt(process.env[name], 10);
+  return Number.isFinite(raw) && raw >= 0 ? raw : fallback;
+}
+
+// Retention windows, all configurable and all disableable with 0.
+//
+// This deletes sensor readings irreversibly, and the sensors table is the only
+// record of what the tanks actually did. It used to run against a hardcoded
+// 30 days with no off-switch, so an operator who wanted the full history had no
+// way to keep it short of editing server.cjs and redeploying. activity_logs is a
+// user-audit trail rather than sensor data, so it defaults to a longer window.
+//
+// sensors grows fastest by far: the ESP32s post about once a second per tank,
+// which is what actually makes a retention window necessary.
+const SYSTEM_LOGS_RETENTION_DAYS = envDays("SYSTEM_LOGS_RETENTION_DAYS", 30);
+const SENSOR_RETENTION_DAYS = envDays("SENSOR_RETENTION_DAYS", 30);
+const ACTIVITY_LOGS_RETENTION_DAYS = envDays("ACTIVITY_LOGS_RETENTION_DAYS", 90);
+
 async function cleanupOldData() {
-  try {
+  // All three intervals are bound as parameters rather than interpolated, so a
+  // bad value can never reach the parser as SQL. The table name is the one
+  // interpolated identifier here, and it is always a literal from the three call
+  // sites below - never anything derived from a request or the environment.
+  const purge = async (table, days, label) => {
+    if (days <= 0) return;
     const result = await pool.query(
-      `DELETE FROM system_logs WHERE timestamp < NOW() - INTERVAL '${LOGS_RETENTION_DAYS} days' RETURNING id`
+      `DELETE FROM ${table} WHERE timestamp < NOW() - ($1 || ' days')::interval RETURNING id`,
+      [days]
     );
     if (result.rowCount > 0) {
-      console.log(`[${new Date().toISOString()}] Cleaned up ${result.rowCount} old system_logs entries`);
-    }
-
-    if (ACTIVITY_LOGS_RETENTION_DAYS > 0) {
-      const activityResult = await pool.query(
-        `DELETE FROM activity_logs WHERE timestamp < NOW() - ($1 || ' days')::interval RETURNING id`,
-        [ACTIVITY_LOGS_RETENTION_DAYS]
+      console.log(
+        `[${new Date().toISOString()}] Cleaned up ${result.rowCount} ${label} rows older than ${days} days`
       );
-      if (activityResult.rowCount > 0) {
-        console.log(`[${new Date().toISOString()}] Cleaned up ${activityResult.rowCount} activity_logs entries older than ${ACTIVITY_LOGS_RETENTION_DAYS} days`);
-      }
     }
+  };
 
-    // ESP32 posts ~1 reading/sec, so the sensors table grows fast — prune old readings
-    const sensorResult = await pool.query(
-      `DELETE FROM sensors WHERE timestamp < NOW() - INTERVAL '${LOGS_RETENTION_DAYS} days' RETURNING id`
-    );
-    if (sensorResult.rowCount > 0) {
-      console.log(`[${new Date().toISOString()}] Cleaned up ${sensorResult.rowCount} old sensor readings`);
-    }
+  try {
+    await purge("system_logs", SYSTEM_LOGS_RETENTION_DAYS, "system_logs");
+    await purge("activity_logs", ACTIVITY_LOGS_RETENTION_DAYS, "activity_logs");
+    await purge("sensors", SENSOR_RETENTION_DAYS, "sensor reading");
   } catch (err) {
     console.error(`[${new Date().toISOString()}] Error cleaning up logs:`, err.message);
   }
 }
 
-// Run cleanup on startup, then daily
+// Run cleanup on startup, then daily. The first run happens before anyone is
+// looking at the console, and it deletes sensor readings for good, so the
+// effective windows are announced up front rather than discovered by noticing
+// that history has gone missing.
+console.log(
+  `[${new Date().toISOString()}] Retention: sensors ${SENSOR_RETENTION_DAYS || "off"}, ` +
+  `system_logs ${SYSTEM_LOGS_RETENTION_DAYS || "off"}, activity_logs ${ACTIVITY_LOGS_RETENTION_DAYS || "off"} (days)`
+);
 cleanupOldData();
 setInterval(cleanupOldData, 24 * 60 * 60 * 1000);
 
@@ -1454,7 +1485,14 @@ function evictDeviceFromMemory(deviceId) {
   // These three are plain objects, not Maps.
   delete lastSensorReading[deviceId];
   delete lastAmmoniaReading[deviceId];
-  delete lastAlertedState[deviceId];
+  // lastAlertedState is keyed `${deviceId}:${sensor}` - one entry per sensor per
+  // tank - so `delete lastAlertedState[deviceId]` removed a key that never
+  // existed and the alert dedup state survived. Re-registering a previously
+  // deleted tank then inherited it, and a tank last seen in "critical" stayed
+  // suppressed: the sensor had to recover to "good" before it could alert again.
+  for (const key of Object.keys(lastAlertedState)) {
+    if (key.startsWith(`${deviceId}:`)) delete lastAlertedState[key];
+  }
 }
 
 function broadcastSensorUpdate(deviceId, readings, ts) {
@@ -2389,15 +2427,15 @@ app.get("/report/weekly", requireAuth, async (req, res) => {
     try {
       summaryResult = await pool.query(`
         SELECT
-          COALESCE(AVG(temperature) FILTER (WHERE temperature > 0), 0)::float AS temp_avg,
-          COALESCE(MIN(temperature) FILTER (WHERE temperature > 0), 0)::float AS temp_min,
-          COALESCE(MAX(temperature) FILTER (WHERE temperature > 0), 0)::float AS temp_max,
-          COALESCE(AVG(water_level) FILTER (WHERE water_level >= 0), 0)::float AS water_avg,
-          COALESCE(MIN(water_level) FILTER (WHERE water_level >= 0), 0)::float AS water_min,
-          COALESCE(MAX(water_level) FILTER (WHERE water_level >= 0), 0)::float AS water_max,
-          COALESCE(AVG(ammonia) FILTER (WHERE ammonia >= 0), 0)::float AS ammonia_avg,
-          COALESCE(MIN(ammonia) FILTER (WHERE ammonia >= 0), 0)::float AS ammonia_min,
-          COALESCE(MAX(ammonia) FILTER (WHERE ammonia >= 0), 0)::float AS ammonia_max,
+          (AVG(temperature) FILTER (WHERE temperature > 0))::float AS temp_avg,
+          (MIN(temperature) FILTER (WHERE temperature > 0))::float AS temp_min,
+          (MAX(temperature) FILTER (WHERE temperature > 0))::float AS temp_max,
+          (AVG(water_level) FILTER (WHERE water_level >= 0))::float AS water_avg,
+          (MIN(water_level) FILTER (WHERE water_level >= 0))::float AS water_min,
+          (MAX(water_level) FILTER (WHERE water_level >= 0))::float AS water_max,
+          (AVG(ammonia) FILTER (WHERE ammonia >= 0))::float AS ammonia_avg,
+          (MIN(ammonia) FILTER (WHERE ammonia >= 0))::float AS ammonia_min,
+          (MAX(ammonia) FILTER (WHERE ammonia >= 0))::float AS ammonia_max,
           COUNT(*) AS total_readings
         FROM sensors
         WHERE timestamp >= NOW() - INTERVAL '7 days'
@@ -2405,7 +2443,10 @@ app.get("/report/weekly", requireAuth, async (req, res) => {
       `, [deviceId]);
     } catch (err) {
       console.error(`[${new Date().toISOString()}] Weekly summary query failed:`, err.message);
-      summaryResult = { rows: [{ temp_avg: 0, temp_min: 0, temp_max: 0, water_avg: 0, water_min: 0, water_max: 0, ammonia_avg: 0, ammonia_min: 0, ammonia_max: 0, total_readings: 0 }] };
+      // The query failed, so there is no aggregate to report. Handing back zeros
+    // prints a whole week of "0.0 °C" in the PDF as if it had been measured;
+    // nulls render as "--", and total_readings 0 makes the emptiness obvious.
+    summaryResult = { rows: [{ temp_avg: null, temp_min: null, temp_max: null, water_avg: null, water_min: null, water_max: null, ammonia_avg: null, ammonia_min: null, ammonia_max: null, total_readings: 0 }] };
     }
 
     let dailyResult;
@@ -2413,15 +2454,15 @@ app.get("/report/weekly", requireAuth, async (req, res) => {
       dailyResult = await pool.query(`
         SELECT
           DATE(timestamp) AS date,
-          COALESCE(AVG(temperature) FILTER (WHERE temperature > 0), 0)::float AS temp_avg,
-          COALESCE(MIN(temperature) FILTER (WHERE temperature > 0), 0)::float AS temp_min,
-          COALESCE(MAX(temperature) FILTER (WHERE temperature > 0), 0)::float AS temp_max,
-          COALESCE(AVG(water_level) FILTER (WHERE water_level >= 0), 0)::float AS water_avg,
-          COALESCE(MIN(water_level) FILTER (WHERE water_level >= 0), 0)::float AS water_min,
-          COALESCE(MAX(water_level) FILTER (WHERE water_level >= 0), 0)::float AS water_max,
-          COALESCE(AVG(ammonia) FILTER (WHERE ammonia >= 0), 0)::float AS ammonia_avg,
-          COALESCE(MIN(ammonia) FILTER (WHERE ammonia >= 0), 0)::float AS ammonia_min,
-          COALESCE(MAX(ammonia) FILTER (WHERE ammonia >= 0), 0)::float AS ammonia_max,
+          (AVG(temperature) FILTER (WHERE temperature > 0))::float AS temp_avg,
+          (MIN(temperature) FILTER (WHERE temperature > 0))::float AS temp_min,
+          (MAX(temperature) FILTER (WHERE temperature > 0))::float AS temp_max,
+          (AVG(water_level) FILTER (WHERE water_level >= 0))::float AS water_avg,
+          (MIN(water_level) FILTER (WHERE water_level >= 0))::float AS water_min,
+          (MAX(water_level) FILTER (WHERE water_level >= 0))::float AS water_max,
+          (AVG(ammonia) FILTER (WHERE ammonia >= 0))::float AS ammonia_avg,
+          (MIN(ammonia) FILTER (WHERE ammonia >= 0))::float AS ammonia_min,
+          (MAX(ammonia) FILTER (WHERE ammonia >= 0))::float AS ammonia_max,
           COUNT(*) AS readings
         FROM sensors
         WHERE timestamp >= NOW() - INTERVAL '7 days'
@@ -2492,15 +2533,15 @@ app.get("/report/weekly", requireAuth, async (req, res) => {
       const dateStr = typeof day.date === 'string' ? day.date.split('T')[0] : String(day.date);
       return {
         date: dateStr,
-        temp_avg: Number(day.temp_avg) || 0,
-        temp_min: Number(day.temp_min) || 0,
-        temp_max: Number(day.temp_max) || 0,
-        water_avg: Number(day.water_avg) || 0,
-        water_min: Number(day.water_min) || 0,
-        water_max: Number(day.water_max) || 0,
-        ammonia_avg: Number(day.ammonia_avg) || 0,
-        ammonia_min: Number(day.ammonia_min) || 0,
-        ammonia_max: Number(day.ammonia_max) || 0,
+        temp_avg: numOrNull(day.temp_avg),
+        temp_min: numOrNull(day.temp_min),
+        temp_max: numOrNull(day.temp_max),
+        water_avg: numOrNull(day.water_avg),
+        water_min: numOrNull(day.water_min),
+        water_max: numOrNull(day.water_max),
+        ammonia_avg: numOrNull(day.ammonia_avg),
+        ammonia_min: numOrNull(day.ammonia_min),
+        ammonia_max: numOrNull(day.ammonia_max),
         readings: parseInt(day.readings) || 0,
         alerts: dailyAlertsMap[dateStr] || 0,
       };
@@ -2514,15 +2555,15 @@ app.get("/report/weekly", requireAuth, async (req, res) => {
         end: now.toISOString(),
       },
       summary: {
-        temp_avg: Number(summary.temp_avg) || 0,
-        temp_min: Number(summary.temp_min) || 0,
-        temp_max: Number(summary.temp_max) || 0,
-        water_avg: Number(summary.water_avg) || 0,
-        water_min: Number(summary.water_min) || 0,
-        water_max: Number(summary.water_max) || 0,
-        ammonia_avg: Number(summary.ammonia_avg) || 0,
-        ammonia_min: Number(summary.ammonia_min) || 0,
-        ammonia_max: Number(summary.ammonia_max) || 0,
+        temp_avg: numOrNull(summary.temp_avg),
+        temp_min: numOrNull(summary.temp_min),
+        temp_max: numOrNull(summary.temp_max),
+        water_avg: numOrNull(summary.water_avg),
+        water_min: numOrNull(summary.water_min),
+        water_max: numOrNull(summary.water_max),
+        ammonia_avg: numOrNull(summary.ammonia_avg),
+        ammonia_min: numOrNull(summary.ammonia_min),
+        ammonia_max: numOrNull(summary.ammonia_max),
         total_readings: parseInt(summary.total_readings) || 0,
       },
       daily,
@@ -2569,22 +2610,25 @@ app.get("/report/range", requireAdmin, async (req, res) => {
     try {
       summaryResult = await pool.query(`
         SELECT
-          COALESCE(AVG(temperature) FILTER (WHERE temperature > 0), 0)::float AS temp_avg,
-          COALESCE(MIN(temperature) FILTER (WHERE temperature > 0), 0)::float AS temp_min,
-          COALESCE(MAX(temperature) FILTER (WHERE temperature > 0), 0)::float AS temp_max,
-          COALESCE(AVG(water_level) FILTER (WHERE water_level >= 0), 0)::float AS water_avg,
-          COALESCE(MIN(water_level) FILTER (WHERE water_level >= 0), 0)::float AS water_min,
-          COALESCE(MAX(water_level) FILTER (WHERE water_level >= 0), 0)::float AS water_max,
-          COALESCE(AVG(ammonia) FILTER (WHERE ammonia >= 0), 0)::float AS ammonia_avg,
-          COALESCE(MIN(ammonia) FILTER (WHERE ammonia >= 0), 0)::float AS ammonia_min,
-          COALESCE(MAX(ammonia) FILTER (WHERE ammonia >= 0), 0)::float AS ammonia_max,
+          (AVG(temperature) FILTER (WHERE temperature > 0))::float AS temp_avg,
+          (MIN(temperature) FILTER (WHERE temperature > 0))::float AS temp_min,
+          (MAX(temperature) FILTER (WHERE temperature > 0))::float AS temp_max,
+          (AVG(water_level) FILTER (WHERE water_level >= 0))::float AS water_avg,
+          (MIN(water_level) FILTER (WHERE water_level >= 0))::float AS water_min,
+          (MAX(water_level) FILTER (WHERE water_level >= 0))::float AS water_max,
+          (AVG(ammonia) FILTER (WHERE ammonia >= 0))::float AS ammonia_avg,
+          (MIN(ammonia) FILTER (WHERE ammonia >= 0))::float AS ammonia_min,
+          (MAX(ammonia) FILTER (WHERE ammonia >= 0))::float AS ammonia_max,
           COUNT(*) AS total_readings
         FROM sensors
         WHERE ${deviceFilter} AND ${timeFilter}
       `, [deviceId]);
     } catch (err) {
       console.error(`[${new Date().toISOString()}] Range summary query failed:`, err.message);
-      summaryResult = { rows: [{ temp_avg: 0, temp_min: 0, temp_max: 0, water_avg: 0, water_min: 0, water_max: 0, ammonia_avg: 0, ammonia_min: 0, ammonia_max: 0, total_readings: 0 }] };
+      // The query failed, so there is no aggregate to report. Handing back zeros
+    // prints a whole week of "0.0 °C" in the PDF as if it had been measured;
+    // nulls render as "--", and total_readings 0 makes the emptiness obvious.
+    summaryResult = { rows: [{ temp_avg: null, temp_min: null, temp_max: null, water_avg: null, water_min: null, water_max: null, ammonia_avg: null, ammonia_min: null, ammonia_max: null, total_readings: 0 }] };
     }
 
     let bucketsResult;
@@ -2592,15 +2636,15 @@ app.get("/report/range", requireAdmin, async (req, res) => {
       bucketsResult = await pool.query(`
         SELECT
           ${bucketExpr} AS label,
-          COALESCE(AVG(temperature) FILTER (WHERE temperature > 0), 0)::float AS temp_avg,
-          COALESCE(MIN(temperature) FILTER (WHERE temperature > 0), 0)::float AS temp_min,
-          COALESCE(MAX(temperature) FILTER (WHERE temperature > 0), 0)::float AS temp_max,
-          COALESCE(AVG(water_level) FILTER (WHERE water_level >= 0), 0)::float AS water_avg,
-          COALESCE(MIN(water_level) FILTER (WHERE water_level >= 0), 0)::float AS water_min,
-          COALESCE(MAX(water_level) FILTER (WHERE water_level >= 0), 0)::float AS water_max,
-          COALESCE(AVG(ammonia) FILTER (WHERE ammonia >= 0), 0)::float AS ammonia_avg,
-          COALESCE(MIN(ammonia) FILTER (WHERE ammonia >= 0), 0)::float AS ammonia_min,
-          COALESCE(MAX(ammonia) FILTER (WHERE ammonia >= 0), 0)::float AS ammonia_max,
+          (AVG(temperature) FILTER (WHERE temperature > 0))::float AS temp_avg,
+          (MIN(temperature) FILTER (WHERE temperature > 0))::float AS temp_min,
+          (MAX(temperature) FILTER (WHERE temperature > 0))::float AS temp_max,
+          (AVG(water_level) FILTER (WHERE water_level >= 0))::float AS water_avg,
+          (MIN(water_level) FILTER (WHERE water_level >= 0))::float AS water_min,
+          (MAX(water_level) FILTER (WHERE water_level >= 0))::float AS water_max,
+          (AVG(ammonia) FILTER (WHERE ammonia >= 0))::float AS ammonia_avg,
+          (MIN(ammonia) FILTER (WHERE ammonia >= 0))::float AS ammonia_min,
+          (MAX(ammonia) FILTER (WHERE ammonia >= 0))::float AS ammonia_max,
           COUNT(*) AS readings
         FROM sensors
         WHERE ${deviceFilter} AND ${timeFilter}
@@ -2676,15 +2720,15 @@ app.get("/report/range", requireAdmin, async (req, res) => {
       .reverse()
       .map((row) => ({
         date: row.label,
-        temp_avg: Number(row.temp_avg) || 0,
-        temp_min: Number(row.temp_min) || 0,
-        temp_max: Number(row.temp_max) || 0,
-        water_avg: Number(row.water_avg) || 0,
-        water_min: Number(row.water_min) || 0,
-        water_max: Number(row.water_max) || 0,
-        ammonia_avg: Number(row.ammonia_avg) || 0,
-        ammonia_min: Number(row.ammonia_min) || 0,
-        ammonia_max: Number(row.ammonia_max) || 0,
+        temp_avg: numOrNull(row.temp_avg),
+        temp_min: numOrNull(row.temp_min),
+        temp_max: numOrNull(row.temp_max),
+        water_avg: numOrNull(row.water_avg),
+        water_min: numOrNull(row.water_min),
+        water_max: numOrNull(row.water_max),
+        ammonia_avg: numOrNull(row.ammonia_avg),
+        ammonia_min: numOrNull(row.ammonia_min),
+        ammonia_max: numOrNull(row.ammonia_max),
         readings: parseInt(row.readings) || 0,
         alerts: bucketAlertsMap[row.label] || 0,
       }));
@@ -2696,15 +2740,15 @@ app.get("/report/range", requireAdmin, async (req, res) => {
       period: { start: startIso, end: now.toISOString() },
       bucket,
       summary: {
-        temp_avg: Number(summary.temp_avg) || 0,
-        temp_min: Number(summary.temp_min) || 0,
-        temp_max: Number(summary.temp_max) || 0,
-        water_avg: Number(summary.water_avg) || 0,
-        water_min: Number(summary.water_min) || 0,
-        water_max: Number(summary.water_max) || 0,
-        ammonia_avg: Number(summary.ammonia_avg) || 0,
-        ammonia_min: Number(summary.ammonia_min) || 0,
-        ammonia_max: Number(summary.ammonia_max) || 0,
+        temp_avg: numOrNull(summary.temp_avg),
+        temp_min: numOrNull(summary.temp_min),
+        temp_max: numOrNull(summary.temp_max),
+        water_avg: numOrNull(summary.water_avg),
+        water_min: numOrNull(summary.water_min),
+        water_max: numOrNull(summary.water_max),
+        ammonia_avg: numOrNull(summary.ammonia_avg),
+        ammonia_min: numOrNull(summary.ammonia_min),
+        ammonia_max: numOrNull(summary.ammonia_max),
         total_readings: parseInt(summary.total_readings) || 0,
       },
       daily,
@@ -4012,15 +4056,15 @@ function analyticsDays(req) {
 async function queryPeriodStats(startTs, deviceId = null) {
   const result = await pool.query(
     `SELECT
-       COALESCE(AVG(temperature) FILTER (WHERE temperature > 0), 0)::float AS temp_avg,
-       COALESCE(MIN(temperature) FILTER (WHERE temperature > 0), 0)::float AS temp_min,
-       COALESCE(MAX(temperature) FILTER (WHERE temperature > 0), 0)::float AS temp_max,
-       COALESCE(AVG(water_level) FILTER (WHERE water_level >= 0), 0)::float AS water_avg,
-       COALESCE(MIN(water_level) FILTER (WHERE water_level >= 0), 0)::float AS water_min,
-       COALESCE(MAX(water_level) FILTER (WHERE water_level >= 0), 0)::float AS water_max,
-       COALESCE(AVG(ammonia) FILTER (WHERE ammonia >= 0), 0)::float AS ammonia_avg,
-       COALESCE(MIN(ammonia) FILTER (WHERE ammonia >= 0), 0)::float AS ammonia_min,
-       COALESCE(MAX(ammonia) FILTER (WHERE ammonia >= 0), 0)::float AS ammonia_max,
+       (AVG(temperature) FILTER (WHERE temperature > 0))::float AS temp_avg,
+       (MIN(temperature) FILTER (WHERE temperature > 0))::float AS temp_min,
+       (MAX(temperature) FILTER (WHERE temperature > 0))::float AS temp_max,
+       (AVG(water_level) FILTER (WHERE water_level >= 0))::float AS water_avg,
+       (MIN(water_level) FILTER (WHERE water_level >= 0))::float AS water_min,
+       (MAX(water_level) FILTER (WHERE water_level >= 0))::float AS water_max,
+       (AVG(ammonia) FILTER (WHERE ammonia >= 0))::float AS ammonia_avg,
+       (MIN(ammonia) FILTER (WHERE ammonia >= 0))::float AS ammonia_min,
+       (MAX(ammonia) FILTER (WHERE ammonia >= 0))::float AS ammonia_max,
        COUNT(*) AS total_readings
      FROM sensors
      WHERE timestamp >= $1
@@ -4029,9 +4073,9 @@ async function queryPeriodStats(startTs, deviceId = null) {
   );
   const r = result.rows[0] || {};
   return {
-    temperature: { avg: Number(r.temp_avg) || 0, min: Number(r.temp_min) || 0, max: Number(r.temp_max) || 0 },
-    water_level: { avg: Number(r.water_avg) || 0, min: Number(r.water_min) || 0, max: Number(r.water_max) || 0 },
-    ammonia: { avg: Number(r.ammonia_avg) || 0, min: Number(r.ammonia_min) || 0, max: Number(r.ammonia_max) || 0 },
+    temperature: { avg: numOrNull(r.temp_avg), min: numOrNull(r.temp_min), max: numOrNull(r.temp_max) },
+    water_level: { avg: numOrNull(r.water_avg), min: numOrNull(r.water_min), max: numOrNull(r.water_max) },
+    ammonia: { avg: numOrNull(r.ammonia_avg), min: numOrNull(r.ammonia_min), max: numOrNull(r.ammonia_max) },
     total_readings: parseInt(r.total_readings, 10) || 0,
   };
 }
@@ -4081,7 +4125,14 @@ async function queryGapEvents(startTs, deviceId = null) {
 
 // Trend helper: compares two window averages and derives direction + % change.
 function buildTrend(current, previous) {
-  const changePct = previous > 0 ? ((current - previous) / previous) * 100 : 0;
+  // A window with no valid readings has no average at all, so there is nothing
+  // to compare against. Report "stable" instead of a percentage derived from a
+  // fake zero - dividing by a null previous average would be NaN, and the old
+  // `previous > 0 ? ... : 0` guard quietly turned a dead sensor into "no change".
+  if (current === null || previous === null || !(previous > 0)) {
+    return { current_avg: current, previous_avg: previous, change_pct: 0, direction: "stable" };
+  }
+  const changePct = ((current - previous) / previous) * 100;
   let direction = "stable";
   if (changePct >= 1) direction = "up";
   else if (changePct <= -1) direction = "down";
@@ -4145,9 +4196,9 @@ app.get("/analytics/daily", requireAuth, async (req, res) => {
       pool.query(
         `SELECT
            DATE(timestamp) AS date,
-           COALESCE(AVG(temperature) FILTER (WHERE temperature > 0), 0)::float AS temp_avg,
-           COALESCE(AVG(water_level) FILTER (WHERE water_level >= 0), 0)::float AS water_avg,
-           COALESCE(AVG(ammonia) FILTER (WHERE ammonia >= 0), 0)::float AS ammonia_avg,
+           (AVG(temperature) FILTER (WHERE temperature > 0))::float AS temp_avg,
+           (AVG(water_level) FILTER (WHERE water_level >= 0))::float AS water_avg,
+           (AVG(ammonia) FILTER (WHERE ammonia >= 0))::float AS ammonia_avg,
            COUNT(*)::int AS readings
          FROM sensors
          WHERE timestamp >= $1 AND ($2::text IS NULL OR device_id = $2)
@@ -4171,9 +4222,9 @@ app.get("/analytics/daily", requireAuth, async (req, res) => {
 
     const daily = sensorResult.rows.map((row) => ({
       date: dateToDayString(row.date),
-      temp_avg: Number(row.temp_avg) || 0,
-      water_avg: Number(row.water_avg) || 0,
-      ammonia_avg: Number(row.ammonia_avg) || 0,
+      temp_avg: numOrNull(row.temp_avg),
+      water_avg: numOrNull(row.water_avg),
+      ammonia_avg: numOrNull(row.ammonia_avg),
       readings: parseInt(row.readings, 10) || 0,
       alerts: alertMap[dateToDayString(row.date)] || 0,
     }));
@@ -4220,8 +4271,13 @@ function generateInsights(overview, thresholds) {
   }
 
   // ---- Temperature ----
+  // The `!== null` is explicit on purpose. A window with no valid readings has
+  // avg === null, and `null > 0` happens to be false, so the toFixed() calls
+  // below are unreachable today - but only by that coincidence. Spelling it out
+  // keeps a later edit to the outer condition from turning a dead sensor into a
+  // TypeError on /analytics/insights.
   const temp = summary.temperature;
-  if (temp.avg > 0) {
+  if (temp.avg !== null && temp.avg > 0) {
     if (temp.avg > t.temp_max) {
       push("critical", "temperature", "Temperature too high",
         `Average ${temp.avg.toFixed(1)}°C exceeds the ${t.temp_max}°C maximum.`,
@@ -4248,7 +4304,7 @@ function generateInsights(overview, thresholds) {
       "Likely evaporation — top up the tank."
     );
   }
-  if (water.avg > 0 && water.avg < t.water_level_min) {
+  if (water.avg !== null && water.avg > 0 && water.avg < t.water_level_min) {
     push("critical", "water_level", "Water level too low",
       `Average ${water.avg.toFixed(0)}% is below the ${t.water_level_min}% minimum.`,
       "Refill to restore the safe operating range."
@@ -4257,7 +4313,7 @@ function generateInsights(overview, thresholds) {
 
   // ---- Ammonia ----
   const ammonia = summary.ammonia;
-  if (ammonia.avg > 0) {
+  if (ammonia.avg !== null && ammonia.avg > 0) {
     if (ammonia.avg >= t.ammonia_max) {
       push("critical", "ammonia", "Ammonia at or above maximum",
         `Average ${ammonia.avg.toFixed(2)} ppm hits the ${t.ammonia_max} ppm limit.`,
