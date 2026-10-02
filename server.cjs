@@ -16,6 +16,8 @@ const crypto = require("crypto");
 const rateLimit = require("express-rate-limit");
 const nodemailer = require("nodemailer");
 const axios = require("axios");
+const fs = require("fs");
+const path = require("path");
 require("dotenv").config();
 
 // SMS gateway circuit breaker (services/smsService.cjs) - stops hammering the
@@ -158,6 +160,69 @@ const sensorIngestLimiter = rateLimit({
 app.use(globalLimiter);
 
 // =============================================================================
+// /api PREFIX
+// =============================================================================
+// The frontend is built with API_BASE="/api" so that one compiled bundle works
+// unchanged in both places: Vite proxies /api to this server in dev, and in
+// production this server serves dist/ itself, so /api is already same-origin.
+// Stripping the prefix here (rather than in the Vite proxy) keeps one
+// authoritative copy of the routing table.
+//
+// Bare paths stay live on purpose - the ESP32 firmware posts to /sensor and
+// every suite in tests/ calls the unprefixed routes.
+app.use((req, res, next) => {
+  if (req.url === "/api" || req.url.startsWith("/api/") || req.url.startsWith("/api?")) {
+    req.url = req.url.slice(4) || "/";
+    // Remember where it came from. Once the prefix is gone the SPA fallback
+    // below can no longer tell a mistyped API call (/api/devcies) from a React
+    // Router deep link, and answering the former with index.html would hand the
+    // client an HTML bundle where it expects JSON.
+    req.wasApiPrefixed = true;
+  }
+  next();
+});
+
+// =============================================================================
+// CSRF GUARD
+// =============================================================================
+// SameSite=Lax is the primary defence: a cross-site POST cannot make the browser
+// attach the session cookie at all, so the request arrives anonymous. This is
+// the second, independent layer, and it exists because Lax has one documented
+// blind spot - a sibling subdomain or a different port on the same registrable
+// domain is "same-site" but cross-origin, and Lax will happily attach the
+// cookie there.
+//
+// Origin is checked only on state-changing verbs, and only when the request
+// actually carries one. No Origin header means the caller is not a browser:
+// the ESP32s, curl and the test harness all look like that, and blocking them
+// would break device ingestion to defend against an attack they cannot mount.
+// A browser, by contrast, always attaches Origin to a cross-origin POST - that
+// is precisely what makes it detectable.
+const CSRF_SAFE_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
+
+app.use((req, res, next) => {
+  if (CSRF_SAFE_METHODS.has(req.method)) return next();
+
+  const origin = req.headers.origin;
+  if (!origin) return next();
+
+  // Same-origin is the normal case and needs no allowlist entry: the browser
+  // sends the Host the request actually reached.
+  const host = req.headers.host;
+  let sameOrigin = false;
+  if (host) {
+    try {
+      sameOrigin = new URL(origin).host === host;
+    } catch {
+      sameOrigin = false;
+    }
+  }
+  if (sameOrigin || allowedOrigins.includes(origin)) return next();
+
+  return res.status(403).json({ message: `Cross-origin ${req.method} blocked` });
+});
+
+// =============================================================================
 // PASSWORD HASHING UTILITIES
 // =============================================================================
 // New hashes: "iterations:salt:hash". Legacy "salt:hash" hashes are verified at
@@ -214,6 +279,76 @@ function hashToken(token) {
 }
 
 // =============================================================================
+// SESSION COOKIE
+// =============================================================================
+// The raw token used to be handed to the browser in a JSON body and parked in
+// localStorage, where any XSS on any page could read it out and replay it from
+// anywhere. It now travels in an HttpOnly cookie, which JavaScript cannot touch
+// at all - `document.cookie` does not expose it and there is no read primitive.
+//
+// SameSite=Lax (not None) is the load-bearing part. The dashboard and the API
+// are same-origin now - Vite proxies /api in dev and Express serves dist/ in
+// production - so Lax lets the browser attach the cookie to our own fetches
+// while refusing to attach it to a cross-site POST. That refusal is the CSRF
+// defence, enforced by the browser rather than by anything we have to remember
+// to check. Lax still permits top-level GET navigation, which is why the
+// deep-link GET routes keep working after a hard refresh.
+//
+// The one caveat Lax cannot cover is same-site-but-cross-origin (a sibling
+// subdomain, or a different port on the same registrable domain), so the Origin
+// check below is kept as a second, independent layer on state-changing verbs.
+const SESSION_COOKIE = "crayvings_session";
+
+// No TTL constant of its own on purpose: setSessionCookie takes the same
+// tokenExpiresAt that is written to the users row, so the cookie and the token
+// expire at one instant and cannot drift apart into a cookie that outlives the
+// session behind it.
+//
+// Only meaningful when the dashboard is served over HTTPS. Left off by default
+// because the dev server and a LAN demo run on http://localhost, where the
+// Secure attribute would make the browser discard the cookie outright.
+const COOKIE_SECURE = /^(1|true|yes)$/i.test(String(process.env.COOKIE_SECURE || ""));
+
+// Minimal Cookie header parser. Deliberately not cookie-parser: the session
+// cookie is the only one we read, and adding a dependency for one split() is
+// not worth the supply-chain surface.
+function readCookies(req) {
+  const header = req.headers.cookie;
+  if (!header) return {};
+  const out = {};
+  for (const part of header.split(";")) {
+    const eq = part.indexOf("=");
+    if (eq < 1) continue;
+    const key = part.slice(0, eq).trim();
+    if (!key) continue;
+    try {
+      out[key] = decodeURIComponent(part.slice(eq + 1).trim());
+    } catch {
+      // A malformed percent-escape is not worth a 500; treat it as absent.
+    }
+  }
+  return out;
+}
+
+function setSessionCookie(res, token, expiresAt) {
+  const attrs = [
+    `${SESSION_COOKIE}=${encodeURIComponent(token)}`,
+    "Path=/",
+    "HttpOnly",
+    "SameSite=Lax",
+    `Expires=${new Date(expiresAt).toUTCString()}`,
+  ];
+  if (COOKIE_SECURE) attrs.push("Secure");
+  res.append("Set-Cookie", attrs.join("; "));
+}
+
+function clearSessionCookie(res) {
+  // Max-Age=0 is the reliable delete: it does not depend on the browser
+  // comparing Expires against a clock the two sides might disagree about.
+  res.append("Set-Cookie", `${SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`);
+}
+
+// =============================================================================
 // ERROR RESPONSES
 // =============================================================================
 // Every 5xx used to answer with `{ message, error: err.message }`, which handed
@@ -235,12 +370,40 @@ function fail(res, status, message, err, req) {
 // =============================================================================
 // AUTHENTICATION MIDDLEWARE
 // =============================================================================
-// requireAdmin validates the Bearer token AND checks the admin role;
-// requireAuth validates the token only. Both attach the user to req.
+// requireAdmin validates the session AND checks the admin role;
+// requireAuth validates the session only. Both attach the user to req.
+//
+// A session can arrive two ways, in priority order:
+//   1. the HttpOnly cookie  - the dashboard, and the only path a browser uses
+//   2. Authorization: Bearer - ESP32s, curl, and every test suite
+//
+// The `?token=` query parameter that /sensor/stream used to accept is gone:
+// EventSource is same-origin now, so the stream receives the cookie like every
+// other request, and no token rides in a URL that access logs would record.
+//
+// Bearer is kept deliberately rather than deleted: it is what lets the firmware
+// and the harness authenticate without pretending to be a browser. It needs no
+// CSRF consideration of its own - a browser cannot attach an Authorization
+// header cross-origin without CORS approval, and an attacker who already holds
+// a stolen token gains nothing from forging a request that carries it.
+//
+// Returns viaCookie so the caller can clear a cookie that no longer matches
+// anything; a Bearer caller has no cookie to clear.
+function readSession(req) {
+  const cookies = readCookies(req);
+  if (cookies[SESSION_COOKIE]) {
+    return { token: cookies[SESSION_COOKIE], viaCookie: true };
+  }
+  const header = req.headers.authorization;
+  if (header && header.startsWith("Bearer ")) {
+    return { token: header.slice(7), viaCookie: false };
+  }
+  return { token: null, viaCookie: false };
+}
 
-// Validates token and admin role; attaches user to req.adminUser
+// Validates session and admin role; attaches user to req.adminUser
 function requireAdmin(req, res, next) {
-  const token = req.headers.authorization?.replace("Bearer ", "");
+  const { token, viaCookie } = readSession(req);
   if (!token) return res.status(401).json({ message: "Authentication required" });
 
   pool.query("SELECT * FROM users WHERE token = $1 AND status = 'active'", [hashToken(token)])
@@ -250,6 +413,9 @@ function requireAdmin(req, res, next) {
       if (user.role !== "admin") return res.status(403).json({ message: "Admin access required" });
       if (user.token_expires_at && new Date(user.token_expires_at) <= new Date()) {
         await pool.query("UPDATE users SET token = NULL, token_expires_at = NULL WHERE id = $1", [user.id]);
+        // Only meaningful for a browser session; a Bearer caller holds no cookie
+        // to expire, so there is nothing to tell it.
+        if (viaCookie) clearSessionCookie(res);
         return res.status(401).json({ message: "Session expired, please log in again" });
       }
       req.adminUser = user;
@@ -276,27 +442,22 @@ app._deleteUserHard = async (userId, actorUsername) => {
   return reqResult.rows[0];
 };
 function requireAuth(req, res, next) {
-  // Token normally arrives as "Authorization: Bearer <token>". EventSource (SSE)
-  // cannot set custom headers, so `?token=` is accepted on the stream route and
-  // nowhere else.
-  //
-  // Why the restriction matters: a token in a URL is recorded by every access
-  // log, proxy and CDN hop along the path, and rides along in the Referer header
-  // of anything the response links to. Scoping it to the one route that has no
-  // alternative keeps that exposure to a single endpoint instead of all 50+.
-  // Phase 6 removes it entirely by moving SSE onto the session cookie.
-  const headerToken = req.headers.authorization?.replace("Bearer ", "");
-  const isStreamRoute = req.path === "/sensor/stream";
-  const queryToken = isStreamRoute && typeof req.query?.token === "string" ? req.query.token : null;
-  const token = headerToken || queryToken;
+  const { token, viaCookie } = readSession(req);
   if (!token) return res.status(401).json({ message: "Authentication required" });
 
   pool.query("SELECT * FROM users WHERE token = $1 AND status = 'active'", [hashToken(token)])
     .then(async result => {
-      if (result.rows.length === 0) return res.status(403).json({ message: "Invalid token" });
+      if (result.rows.length === 0) {
+        // A cookie that no longer matches any session must be actively cleared,
+        // or the browser keeps replaying it on every request and every retry
+        // ends in the same 403. Bearer callers have no cookie to clear.
+        if (viaCookie) clearSessionCookie(res);
+        return res.status(403).json({ message: "Invalid token" });
+      }
       const user = result.rows[0];
       if (user.token_expires_at && new Date(user.token_expires_at) <= new Date()) {
         await pool.query("UPDATE users SET token = NULL, token_expires_at = NULL WHERE id = $1", [user.id]);
+        clearSessionCookie(res);
         return res.status(401).json({ message: "Session expired, please log in again" });
       }
       req.user = user;
@@ -2777,9 +2938,12 @@ app.post("/auth/login", loginLimiter, async (req, res) => {
     res.json({
       message: "Login successful",
       user: { id: user.id, username: user.username, email: user.email, role: user.role, name: user.name, owner: isOwnerUser(user), protected: isOwnerUser(user) },
-      token,
+      // The token is deliberately NOT in the body any more. Returning it here
+      // would put a replayable credential back into JavaScript's reach, which
+      // is the whole thing the cookie exists to prevent.
       tokenExpiresAt: tokenExpiresAt.toISOString(),
     });
+    setSessionCookie(res, token, tokenExpiresAt);
   } catch (err) {
     console.error(`[${new Date().toISOString()}] Login error:`, err.message);
     res.status(500).json({ message: "Login failed" });
@@ -2790,6 +2954,7 @@ app.post("/auth/login", loginLimiter, async (req, res) => {
 app.post("/auth/logout", requireAuth, async (req, res) => {
   try {
     await pool.query("UPDATE users SET token = NULL, token_expires_at = NULL WHERE id = $1", [req.user.id]);
+    clearSessionCookie(res);
     res.json({ message: "Logged out" });
   } catch (err) {
     return fail(res, 500, "Error logging out", err, req);
@@ -4394,6 +4559,49 @@ app.get("/analytics/insights", requireAuth, async (req, res) => {
 // JSON 404 for unknown paths (Express's default is an HTML error page), and a
 // final error middleware that logs the failure and never leaks stack traces or
 // internal messages to production clients (audit 2.4.1).
+
+// =============================================================================
+// STATIC DASHBOARD (production)
+// =============================================================================
+// Serving dist/ from this process is what makes the session cookie possible: it
+// puts the dashboard and the API on one origin, so SameSite=Lax is enough to
+// stop CSRF and no HTTPS requirement comes with it. Previously nothing served
+// dist/ at all, so `npm run build` produced a folder only a human could open.
+//
+// Guarded on existence rather than assumed: in development the dashboard is
+// served by Vite and dist/ may be absent or stale, and a missing index.html
+// must not take the API down with it.
+const DIST_DIR = path.join(__dirname, "dist");
+const INDEX_HTML = path.join(DIST_DIR, "index.html");
+
+if (fs.existsSync(INDEX_HTML)) {
+  app.use(express.static(DIST_DIR, { index: false }));
+
+  // SPA fallback. /devices, /analytics and friends are real navigation paths
+  // that exist only in the React Router, so a hard refresh or a shared link has
+  // to be answered with index.html and let the client route it.
+  //
+  // app.use rather than app.get("*"): Express 5 runs path-to-regexp v8, which
+  // rejects a bare "*" as a route pattern, and a pathless middleware sidesteps
+  // the pattern syntax entirely.
+  app.use((req, res, next) => {
+    if (req.method !== "GET" && req.method !== "HEAD") return next();
+    // API calls and asset requests must still 404 as JSON rather than being
+    // handed an HTML document. A path with a file extension is an asset.
+    if (req.wasApiPrefixed) return next();
+    if (path.extname(req.path)) return next();
+    return res.sendFile(INDEX_HTML, (err) => {
+      if (err) next(err);
+    });
+  });
+
+  console.log(`[${new Date().toISOString()}] Serving built dashboard from ${DIST_DIR}`);
+} else {
+  console.log(
+    `[${new Date().toISOString()}] No dist/index.html found - serving the API only. ` +
+    `Run "npm run build" to serve the dashboard from this process, or use "npm run dev".`
+  );
+}
 
 app.use((req, res) => {
   res.status(404).json({ message: "Route not found" });
