@@ -105,7 +105,7 @@ Run from the project root. Record the counts - they are the baseline.
 | `npm run test:poller` | `34 checks` | health poller: batching, re-entrancy guard, timeout forwarding, failure counting |
 | `npm run test:devices` | `104 checks` | registration, uniqueness, claiming, archiving, IP provenance, the `auto_registered` contract |
 | `npm run test:migration` | `15 checks` | the case-insensitive unique index, 23505 rejection, blocked path, re-run path |
-| `npm run test:secrets` | `60 checks` | per-device secret rotation, grace window, revocation, no secret leaks |
+| `npm run test:secrets` | `65 checks` | per-device secret rotation, grace window, revocation, no secret leaks, wrong-length secret rejection |
 | `npm run test:sessions` | `29 checks` | cookie session: issued, HttpOnly/SameSite, no token in body, cookie-only auth, logout revocation, re-login invalidation, CSRF |
 | `npm run test:all` | all of the above except `test:sessions`, then `test:regression` | see B.7 for the expected final failure |
 
@@ -128,6 +128,10 @@ npm run test:sessions
       older copy of the suite - the six `auto_registered` checks are missing.
 - [ ] `test:secrets` leaves no test users behind: it should print
       `PASS  no test users left  -> 0 rows`.
+- [ ] `test:secrets` reports **65** checks. Section G covers the constant-time
+      secret comparison: a 1-char, empty, or same-length wrong secret must give
+      a 401, never a 500 (`timingSafeEqual` throws on a length mismatch, and a
+      misconfigured board hitting a 500 drops its readings silently).
 - [ ] `test:sessions` reports **29** checks and leaves no test user behind.
 
 > `test:sessions` is the only suite that calls `POST /auth/login`, which the

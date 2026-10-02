@@ -222,9 +222,11 @@ tank. `POST /devices` must be `requireAdmin`, consistent with `POST /auth/users`
 (`:2280`) and `POST /settings/recipients` (`:2825`). Recommend also tightening PUT
 to `requireAdmin` while in there.
 
-Separately: the shared device secret is compared with plain `===`
+Separately: the shared device secret was compared with plain `===`
 (`server.cjs:1358`), not `timingSafeEqual` as the password path does. Worth
-hardening.
+hardening. **Done** (`e70c1af`) — `safeEqual()` is now used for the shared and
+per-device secrets on `POST /sensor`. The line number above has drifted; the
+comparison lives in the `/sensor` handler.
 
 ### 2.6 Where the code lives (implementation notes)
 
