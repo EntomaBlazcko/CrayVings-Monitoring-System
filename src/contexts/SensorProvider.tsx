@@ -11,6 +11,7 @@ import {
   type ReactNode,
 } from "react";
 import { isAxiosError } from "axios";
+import { API_BASE } from "../types";
 import {
   SensorDataContext,
   SensorSettingsContext,
@@ -281,16 +282,19 @@ function useSensorDataPolling(
 
       setState((prev) => ({ ...prev, loading: true, connectionStatus: "connecting" }));
 
-      const baseUrl = import.meta.env.VITE_API_BASE || "http://localhost:3000";
-      // EventSource cannot set Authorization headers, so the session token
-      // travels as a query parameter (the server accepts it for SSE).
+      // API_BASE, not a re-derived base URL: the SSE stream has to go to the
+      // same place as every axios call, and it used to hardcode its own
+      // "http://localhost:3000" fallback, which silently went cross-origin the
+      // moment the default base became a same-origin "/api".
       const params = new URLSearchParams();
-      const token = localStorage.getItem("crayvings_token");
-      if (token) params.set("token", token);
       if (selectedDeviceId) params.set("device_id", selectedDeviceId);
-      const url = `${baseUrl}/sensor/stream${params.toString() ? `?${params.toString()}` : ""}`;
+      const url = `${API_BASE}/sensor/stream${params.toString() ? `?${params.toString()}` : ""}`;
 
       try {
+        // No token in the URL. The session cookie rides along automatically
+        // because this is same-origin, which retires the old ?token= parameter
+        // entirely - that one landed in every access log between here and the
+        // server.
         const es = new EventSource(url, { withCredentials: true });
         eventSource = es;
 

@@ -23,17 +23,15 @@ const client = axios.create({
   headers: {
     "Content-Type": "application/json",
   },
+  // The session cookie is attached by the browser because the dashboard and the
+  // API are same-origin. Sending credentials explicitly keeps that true if
+  // VITE_API_BASE is ever pointed at a separate host.
+  withCredentials: true,
 });
 
-// Attaches the auth token from localStorage to every request.
-
-client.interceptors.request.use((config) => {
-  const token = localStorage.getItem("crayvings_token");
-  if (token) {
-    config.headers.Authorization = `Bearer ${token}`;
-  }
-  return config;
-});
+// No Authorization interceptor any more. The session is an HttpOnly cookie set
+// by the server; there is no token in JavaScript to attach, and nothing for an
+// injected script to steal out of localStorage.
 
 // Timeouts/cancels are left to the call site. A 401 clears the stored
 // session so the app returns to login on next load.
@@ -74,7 +72,10 @@ client.interceptors.response.use(
     // Both should end the local session instead of leaving a broken page behind.
     // Other 401/403s (wrong password/OTP, admin-only route) must NOT log the
     // user out — that would kick the admin to the login screen mid-flow.
-    if (localStorage.getItem("crayvings_token")) {
+    // The gate is the cached user object, not a token: the cookie is HttpOnly so
+    // this code cannot see it, and "were we logged in?" is exactly the question
+    // the user cache answers.
+    if (localStorage.getItem("crayvings_user")) {
       const status = error.response?.status;
       const sessionLost =
         (status === 401 &&
@@ -83,7 +84,8 @@ client.interceptors.response.use(
             serverMsg.includes("Session expired"))) ||
         (status === 403 && serverMsg === "Invalid token");
       if (sessionLost) {
-        localStorage.removeItem("crayvings_token");
+        // The server already expired or cleared the cookie on its side; drop the
+        // cached identity so the app returns to the login screen.
         localStorage.removeItem("crayvings_user");
         // Notify AuthProvider so the app returns to the login screen.
         if (typeof window !== "undefined") {

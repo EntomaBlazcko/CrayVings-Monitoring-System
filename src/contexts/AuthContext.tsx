@@ -2,7 +2,6 @@ import { createContext, useState, useCallback, useEffect, type ReactNode } from 
 import type { AuthUser } from "../types";
 import { loginUser, logoutUser } from "../api/client";
 
-const TOKEN_KEY = "crayvings_token";
 const USER_KEY = "crayvings_user";
 
 export interface AuthContextType {
@@ -21,17 +20,11 @@ interface AuthProviderProps {
   children: ReactNode;
 }
 
-function getStoredToken(): string | null {
-  return localStorage.getItem(TOKEN_KEY);
-}
-
-function setStoredToken(token: string | null) {
-  if (token) {
-    localStorage.setItem(TOKEN_KEY, token);
-  } else {
-    localStorage.removeItem(TOKEN_KEY);
-  }
-}
+// Only the user's public profile is cached, never a credential. The session
+// itself is an HttpOnly cookie that this code cannot read, which is the point:
+// there is no token in localStorage for an injected script to exfiltrate. The
+// cookie's own expiry is enforced server-side, and a stale cache is corrected
+// by the first request that comes back 401/403.
 
 // Corrupted localStorage user JSON is discarded rather than crashing boot.
 function getStoredUser(): AuthUser | null {
@@ -53,15 +46,10 @@ function setStoredUser(user: AuthUser | null) {
   }
 }
 
-// The session token lives in localStorage (XSS-exposed, but acceptable here:
-// the server validates it on every protected request and regenerates it per
-// login).
+// The session cookie is HttpOnly and managed entirely by the browser; this
+// provider only mirrors the user's profile so the UI knows who is signed in.
 export function AuthProvider({ children }: AuthProviderProps) {
-  const [user, setUser] = useState<AuthUser | null>(() => {
-    const savedUser = getStoredUser();
-    const savedToken = getStoredToken();
-    return savedUser && savedToken ? savedUser : null;
-  });
+  const [user, setUser] = useState<AuthUser | null>(() => getStoredUser());
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -72,7 +60,6 @@ export function AuthProvider({ children }: AuthProviderProps) {
       const response = await loginUser(username, password);
       setUser(response.user);
       setStoredUser(response.user);
-      setStoredToken(response.token);
     } catch (err: unknown) {
       if (err instanceof Error) {
         setError(err.message || "Login failed");
@@ -90,7 +77,6 @@ export function AuthProvider({ children }: AuthProviderProps) {
     void logoutUser();
     setUser(null);
     setStoredUser(null);
-    setStoredToken(null);
   }, []);
 
   const clearError = useCallback(() => {
@@ -104,7 +90,6 @@ export function AuthProvider({ children }: AuthProviderProps) {
     const onUnauthorized = () => {
       setUser(null);
       setStoredUser(null);
-      setStoredToken(null);
     };
     window.addEventListener("crayvings_unauthorized", onUnauthorized);
     return () => window.removeEventListener("crayvings_unauthorized", onUnauthorized);
