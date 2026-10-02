@@ -325,8 +325,16 @@ export function parseAlertSeverity(log: LogEntry, settings?: SensorSettings | nu
 }
 
 // API configuration
-
-const DEFAULT_API_BASE = "http://localhost:3000";
+//
+// "/api" rather than an absolute host so the dashboard and the API are always
+// the same origin: Vite proxies /api in development, and server.cjs serves
+// dist/ from the API process in production. That sameness is what lets the
+// session ride in a SameSite=Lax cookie, which is the CSRF defence.
+//
+// VITE_API_BASE still wins if it is set, which is the escape hatch for pointing
+// a build at a genuinely separate API host - at the cost of needing
+// SameSite=None + HTTPS there.
+const DEFAULT_API_BASE = "/api";
 
 function getApiBase(): string {
   if (typeof import.meta !== "undefined" && import.meta.env) {
@@ -398,10 +406,11 @@ export interface AuthUser {
 }
 
 // Response from POST /auth/login.
+// No `token` field: the session is set as an HttpOnly cookie on the response,
+// so there is deliberately nothing here for JavaScript to read or store.
 export interface AuthResponse {
   message: string;
   user: AuthUser;
-  token: string;
 }
 
 // Weekly report types
