@@ -32,9 +32,24 @@ async function testLogin() {
     console.log("✅ Login successful!\n");
     console.log("Response:");
     console.log(`  Message: ${response.data.message}`);
-    // Not even a prefix: a partial token in a terminal, a CI log or a pasted
-    // screenshot is still a credential fragment.
-    console.log(`  Token: received (${response.data.token.length} chars, not printed)`);
+
+    // The session is an HttpOnly cookie, so this asserts on how it was set
+    // rather than printing any part of it - a cookie fragment in a terminal, a
+    // CI log or a pasted screenshot is still a live credential.
+    const cookies = response.headers["set-cookie"] || [];
+    const session = cookies.find((c) => c.startsWith("crayvings_session="));
+    if (session) {
+      const value = session.slice("crayvings_session=".length).split(";")[0];
+      const flags = session.split(";").slice(1).map((s) => s.trim());
+      console.log(`  Session cookie: set (${value.length} chars, not printed)`);
+      console.log(`  Cookie flags: ${flags.join("; ")}`);
+    } else {
+      console.log("  Session cookie: MISSING - the browser would not be logged in");
+    }
+    // The point of the cookie: nothing in the body for JavaScript to read or
+    // store. If a token reappears here, the XSS-exposure fix has regressed.
+    console.log(`  Body carries a token: ${"token" in response.data ? "YES (regression!)" : "no"}`);
+
     console.log(`  User: ${response.data.user.name} (${response.data.user.role})`);
     console.log(`  Username: ${response.data.user.username}`);
     console.log(`  Email: ${response.data.user.email}`);
