@@ -1210,11 +1210,16 @@ curl http://localhost:3000/alert/mute-status
 
 ### Production recommendations
 
-1. Use HTTPS behind a reverse proxy
+1. Use HTTPS behind a reverse proxy — and set `COOKIE_SECURE=true` when you do.
+   The session cookie is issued without `Secure` by default so it works over
+   plain HTTP in development; behind TLS you want it on.
 2. Enable database encryption
-3. **Still open (audit, deferred):** public read-only GET endpoints are not yet
-   authenticated (token still held in localStorage) — scheduled as a separate
-   refactor
+3. **Done:** the deferred audit refactor is complete. Read endpoints are
+   authenticated, and the session credential is no longer held in
+   `localStorage` — it is an `HttpOnly` cookie, so it is unreachable from
+   JavaScript. `localStorage` holds only the user's public profile under
+   `crayvings_user`. Bearer authentication remains for the ESP32s, which cannot
+   hold a cookie.
 
 ---
 
