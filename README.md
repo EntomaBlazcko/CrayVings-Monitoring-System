@@ -308,9 +308,10 @@ While muted, disconnect alerts still show as popups and are logged, but SMS is n
 
 ```
 src/
-├── api/client.ts              # API client functions
+├── api/client.ts              # All API calls (axios instance + interceptors)
 ├── components/
 │   ├── AnalyticsSection.tsx   # Analytics summary cards + insights
+│   ├── CriticalAlarmBanner.tsx # Persistent fleet-wide critical alarm (no auto-dismiss)
 │   ├── TankSelector.tsx       # Tank chip bar (online dots, X/Y online)
 │   ├── FarmOverview.tsx       # Dashboard fleet grid + on-demand "Live check"
 │   ├── deviceActions.tsx      # Per-tank rename / hide / live-check controls
@@ -321,49 +322,55 @@ src/
 │   ├── Loading.tsx            # Loading/error cards
 │   ├── StatCard.tsx           # Shared KPI stat card (single implementation)
 │   └── TrendCard.tsx          # Mini trend chart card
-├── config/
-│   ├── routes.ts              # Centralized route/menu definitions (role-aware)
-│   └── sensorDisplay.ts       # Centralized sensor display config (icon/color/status classes)
 ├── contexts/
 │   ├── AuthContext.tsx        # Auth provider + session state
 │   ├── SensorContext.tsx
 │   ├── SensorProvider.tsx     # SSE live data + history/devices polling with backoff
 │   └── useAuth.ts             # useAuth hook
 ├── hooks/
-│   ├── useDevicesLatest.ts    # Shared 5s poll of /devices/latest + thresholds
-│   ├── useSSE.ts              # Reusable SSE connection hook (token auth, reconnect)
-│   ├── useFloatingAlerts.ts
-│   ├── useSensors.ts
-│   └── useThresholdAlert.ts
+│   ├── useFleetAlarms.ts      # Fleet-wide critical alarm state behind the banner
+│   ├── useFloatingAlerts.ts   # Alert notification context + queue
+│   ├── useHiddenDevices.ts    # Shared hidden-tanks fetch/show/restore logic
+│   ├── useSensors.ts          # Threshold evaluation per parameter
+│   └── useThresholdAlert.ts   # Threshold breach detection
 ├── pages/
 │   ├── ActivityLogsPage.tsx
 │   ├── AlertsPage.tsx
 │   ├── AnalyticsPage.tsx
 │   ├── AuthPage.tsx           # Login
 │   ├── DashboardPage.tsx
+│   ├── DevicesPage.tsx        # Device registry: register, fleet list, archive
 │   ├── HistoricalDataPage.tsx
 │   ├── LogsPage.tsx           # Sensor/system logs
 │   ├── SensorsPage.tsx
 │   └── SettingsPage.tsx       # Thresholds + recipients + SMS mute + users
 ├── types/index.ts
-├── utils/alertGuidance.ts
-├── utils/playAlertSound.ts
-├── utils/time.ts
+├── utils/
+│   ├── alertGuidance.ts       # Per-sensor remediation text
+│   ├── paramIcons.tsx         # Per-parameter icons (moved here from the deleted src/config/)
+│   ├── pdfBrand.ts            # Shared brand furniture for PDF exports
+│   ├── playAlertSound.ts      # Web Audio alert sounds
+│   ├── text.ts                # Text formatting helpers (incl. fmtStat for absent readings)
+│   ├── time.ts
+│   └── tokens.ts              # Design tokens that cannot live in CSS alone
 ├── App.tsx                    # Routing, sidebar, role-based menus
 ├── main.tsx
 └── index.css                  # Tailwind v4 @theme design tokens (brand colors, elevation)
 server.cjs                     # Express backend (auth, sensors, SSE, logs, SMS, analytics)
 services/                      # smsService.cjs (circuit breaker), devicePoller.cjs (health checks)
 seed-admin.cjs                 # Bootstrap the initial owner/admin account
+db/migrations/                 # Structural SQL migrations 001-016 (run manually, tracked in schema_migrations)
+tests/                         # Custom-harness suites: regression, devices, devicePoller, migration014, deviceSecretRotation
 water_monitoring_system/ESP32_main_code/ESP32_main_code.ino  # ESP32 tank-1 firmware (WiFiManager), device ID ESP32_01
 water_monitoring_system/NODE_main_code/NODE_main_code.ino    # NodeMCU spare firmware (WiFiManager), device ID ESP32_02
-db/migrations/                 # Structural SQL migrations (run manually, tracked in schema_migrations)
 ```
 
 Migrations of note: `007_multi_device.cjs` (star topology), `008_device_secrets.cjs`
 (opt-in per-device secrets), `009_sensor_constraints.cjs` (NULLs stored
-sentinels, adds CHECK constraints + a partial index), and
-`010_schema_migrations.cjs` (version-tracking table seeded with 001-010).
+sentinels, adds CHECK constraints + a partial index), `010_schema_migrations.cjs`
+(version-tracking table), `014_device_registration.cjs` and
+`015_device_secret_rotation.cjs`. The full set is 001-016; `010` seeds the
+version table and later migrations record themselves as they run.
 
 ---
 

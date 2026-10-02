@@ -77,7 +77,7 @@ npm run server              # backend  -> http://localhost:3000
 npm run dev                 # frontend -> http://localhost:5173
 
 npm run build               # tsc -b && vite build  -> dist/
-npm run lint                # eslint .
+npm run lint                # eslint . (TS/TSX + CommonJS .cjs + node scripts)
 npm test                    # threshold logic (no server needed)
 npm run check:encoding      # UTF-8/encoding guard on text files
 ```
@@ -85,8 +85,12 @@ npm run check:encoding      # UTF-8/encoding guard on text files
 Full test suite:
 
 ```bash
-npm run test:all            # everything, in order
+npm run test:all            # lint -> encoding -> build -> unit -> DB suites
 ```
+
+`test:all` starts with the static checks on purpose: lint and the encoding
+guard are cheap, so a type error or an undeclared variable fails in seconds
+instead of after a Postgres-backed suite has already touched the database.
 
 Individually:
 
