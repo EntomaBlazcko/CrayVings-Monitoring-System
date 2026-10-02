@@ -63,6 +63,10 @@ const pool = new Pool({
 
 let checks = 0;
 let failures = 0;
+// Set when the run stops early on a 429. A truncated run must never report
+// success: skipping the cookie checks because the login budget was spent is the
+// one outcome this suite must not dress up as a pass.
+let truncated = false;
 
 function check(name, cond, extra = "") {
   checks++;
@@ -113,6 +117,7 @@ async function login(username, password) {
 // and sends you hunting in the wrong file. Bail out loudly instead.
 async function refuseIfRateLimited(result) {
   if (result.status !== 429) return false;
+  truncated = true;
   const mins = result.retryAfterSec === null ? 15 : Math.ceil(result.retryAfterSec / 60);
   console.error(
     `\n/auth/login returned 429: the server's brute-force guard allows a few\n` +
@@ -298,15 +303,57 @@ async function main() {
   await pool.query("DELETE FROM activity_logs WHERE description = $1", [PROBE]).catch(() => {});
   await pool.query("DELETE FROM users WHERE username = $1", [actorName]).catch(() => {});
 
+  // --- J. A dead session is cleared, on admin routes too ----------------------
+  // requireAuth and requireAdmin are sibling guards and must behave alike: a
+  // cookie that matches no session gets actively cleared. HttpOnly means the
+  // browser cannot do this itself, so if the server does not, a revoked session
+  // is replayed on every admin request forever.
+  console.log("\n--- J. A dead cookie is cleared from admin routes too ---");
+  // GET /auth/users, not GET /devices: reads are requireAuth so users can see
+  // tanks, and only mutations are admin-gated. Using /devices here would have
+  // exercised requireAuth twice and quietly proved nothing about requireAdmin.
+  const deadAdmin = await fetch(`${API}/auth/users`, { headers: { Cookie: `${COOKIE}=deadbeefdeadbeef` } });
+  check("admin route with an unknown cookie -> 403", deadAdmin.status === 403, `status=${deadAdmin.status}`);
+  const adminClear = deadAdmin.headers.getSetCookie().find((c) => c.startsWith(`${COOKIE}=`) && c.includes("Max-Age=0"));
+  check("the admin route clears the dead cookie", Boolean(adminClear), adminClear || "no clearing Set-Cookie");
+
+  // A forged cookie on a non-admin route already did this; assert both guards
+  // agree so they cannot drift apart again.
+  const deadUser = await fetch(`${API}/settings/effective`, { headers: { Cookie: `${COOKIE}=deadbeefdeadbeef` } });
+  const userClear = deadUser.headers.getSetCookie().find((c) => c.startsWith(`${COOKIE}=`) && c.includes("Max-Age=0"));
+  check("both guards clear a dead cookie", Boolean(userClear) && Boolean(adminClear));
+
+  // A VALID session belonging to a non-admin must survive: they are simply not
+  // an admin, and clearing the cookie would log a legitimate user out.
+  const plainUserName = `${PREFIX}plain`;
+  const plainToken = crypto.randomBytes(32).toString("hex");
+  await pool.query("DELETE FROM users WHERE username = $1", [plainUserName]);
+  await pool.query(
+    "INSERT INTO users (name, username, email, password_hash, role, token, token_expires_at) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+    ["Plain User", plainUserName, `${PREFIX}plain@example.invalid`, hashPassword(password), "user", sha256(plainToken), new Date(Date.now() + 3600000)]
+  );
+  const asPlain = await fetch(`${API}/auth/users`, { headers: { Cookie: `${COOKIE}=${plainToken}` } });
+  check("a valid non-admin hitting an admin route -> 403", asPlain.status === 403, `status=${asPlain.status}`);
+  const notCleared = asPlain.headers.getSetCookie().some((c) => c.startsWith(`${COOKIE}=`) && c.includes("Max-Age=0"));
+  check("that non-admin keeps their session", !notCleared, notCleared ? "cookie was wrongly cleared" : "cookie left intact");
+  await pool.query("DELETE FROM users WHERE username = $1", [plainUserName]).catch(() => {});
+
   await cleanup(username);
 }
 
 async function cleanup(username) {
-  console.log("\n--- J. Cleanup ---");
-  await pool.query("DELETE FROM users WHERE username IN ($1, $2)", [username, `${PREFIX}actor`]).catch(() => {});
+  console.log("\n--- K. Cleanup ---");
+  await pool.query("DELETE FROM users WHERE username LIKE $1", [`${PREFIX}%`]).catch(() => {});
   await pool.query("DELETE FROM activity_logs WHERE description LIKE $1", [`${PREFIX}%`]).catch(() => {});
-  const leftover = await pool.query("SELECT count(*)::int AS n FROM users WHERE username IN ($1, $2)", [username, `${PREFIX}actor`]);
+  const leftover = await pool.query("SELECT count(*)::int AS n FROM users WHERE username LIKE $1", [`${PREFIX}%`]);
   check("no test users left", leftover.rows[0].n === 0, `${leftover.rows[0].n} rows`);
+  if (truncated) {
+    console.log(
+      `\n=== SESSION COOKIE TESTS INCOMPLETE === (${checks} checks ran; stopped early on the login rate limit)`
+    );
+    await pool.end();
+    process.exit(1);
+  }
   console.log(
     `\n${failures === 0 ? "=== ALL SESSION COOKIE TESTS PASSED ===" : `=== ${failures} FAILED ===`} (${checks} checks)`
   );

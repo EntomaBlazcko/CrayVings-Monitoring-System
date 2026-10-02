@@ -83,9 +83,12 @@ and the API share an origin. That is why:
 
 Two consequences to respect:
 
-- **Do not set `VITE_API_BASE` to an absolute URL** unless you are deliberately
-  splitting hosts. Doing so makes the browser cross-origin, a `Lax` cookie is
-  then not sent, and login fails with no obvious cause.
+- **Never set `VITE_API_BASE` to an absolute URL.** Doing so makes the browser
+  cross-origin, and login then fails with no obvious cause. There is no value
+  that fixes it: `SameSite=Lax` is hard-coded (so a different *site* never sends
+  the cookie, TLS or not) and CORS is configured without credentials. To put the
+  API on another host, serve both from one reverse proxy on a single origin —
+  which is what `server.cjs` already does in production.
 - Bare paths (`/sensor`, `/auth/login`) must keep working. The ESP32 firmware and
   every suite in `tests/` call them unprefixed and authenticate with
   `Authorization: Bearer`, which is deliberately still supported — a browser

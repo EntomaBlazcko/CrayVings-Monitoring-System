@@ -421,9 +421,18 @@ function requireAdmin(req, res, next) {
 
   pool.query("SELECT * FROM users WHERE token = $1 AND status = 'active'", [hashToken(token)])
     .then(async result => {
-      if (result.rows.length === 0) return res.status(403).json({ message: "Invalid token" });
+      if (result.rows.length === 0) {
+        // Same reasoning as requireAuth: the session is gone, so clear the
+        // cookie rather than leaving the browser to replay a credential that can
+        // never work again. HttpOnly means the client cannot do this itself.
+        if (viaCookie) clearSessionCookie(res);
+        return res.status(403).json({ message: "Invalid token" });
+      }
       const user = result.rows[0];
-      if (user.role !== "admin") return res.status(403).json({ message: "Admin access required" });
+      // Expiry is checked before the role, so an expired session is cleaned up
+      // whatever role it holds. Checking role first meant an expired non-admin
+      // was told "Admin access required" and kept its dead token and cookie,
+      // which is the one case that left a stale credential behind.
       if (user.token_expires_at && new Date(user.token_expires_at) <= new Date()) {
         await pool.query("UPDATE users SET token = NULL, token_expires_at = NULL WHERE id = $1", [user.id]);
         // Only meaningful for a browser session; a Bearer caller holds no cookie
@@ -431,6 +440,9 @@ function requireAdmin(req, res, next) {
         if (viaCookie) clearSessionCookie(res);
         return res.status(401).json({ message: "Session expired, please log in again" });
       }
+      // A valid session that simply is not an admin must NOT be cleared - the
+      // caller is who they are, and they need to keep working as a user.
+      if (user.role !== "admin") return res.status(403).json({ message: "Admin access required" });
       req.adminUser = user;
       next();
     })
