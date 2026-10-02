@@ -260,13 +260,52 @@ async function main() {
   const survived = await pool.query("SELECT token FROM users WHERE username = $1", [username]);
   check("the refused request did not revoke the session", survived.rows[0]?.token !== null, "session still live");
 
+  // --- I. Cookie sessions are attributed to the right person -------------------
+  // POST /activity-logs used to re-read the Authorization header to work out who
+  // was acting, falling back to the "admin" account. A browser session carries no
+  // such header, so every logged action from the dashboard was filed under
+  // admin - the audit trail attributed the whole farm to one account.
+  //
+  // The token is minted into the DB directly rather than via /auth/login, so
+  // this costs none of the rate-limited login budget.
+  console.log("\n--- I. Cookie sessions are attributed to the right person ---");
+  const actorName = `${PREFIX}actor`;
+  const PROBE = `${PREFIX}attribution probe`;
+  const actorToken = crypto.randomBytes(32).toString("hex");
+  await pool.query("DELETE FROM users WHERE username = $1", [actorName]);
+  await pool.query(
+    "INSERT INTO users (name, username, email, password_hash, role, token, token_expires_at) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+    ["Cookie Actor", actorName, `${PREFIX}actor@example.invalid`, hashPassword(password), "user", sha256(actorToken), new Date(Date.now() + 3600000)]
+  );
+
+  const logged = await fetch(`${API}/activity-logs`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Cookie: `${COOKIE}=${actorToken}` },
+    body: JSON.stringify({ action_type: "navigation", description: PROBE, module: "test" }),
+  });
+  check("cookie-authenticated POST /activity-logs -> 201", logged.status === 201, `status=${logged.status}`);
+
+  const who = await pool.query(
+    "SELECT user_name FROM activity_logs WHERE description = $1 ORDER BY id DESC LIMIT 1",
+    [PROBE]
+  );
+  const userName = who.rows[0]?.user_name;
+  check(
+    "the activity log names the cookie's owner, not admin",
+    userName === actorName,
+    `recorded as "${userName}", expected "${actorName}"`
+  );
+  await pool.query("DELETE FROM activity_logs WHERE description = $1", [PROBE]).catch(() => {});
+  await pool.query("DELETE FROM users WHERE username = $1", [actorName]).catch(() => {});
+
   await cleanup(username);
 }
 
 async function cleanup(username) {
-  console.log("\n--- I. Cleanup ---");
-  await pool.query("DELETE FROM users WHERE username = $1", [username]).catch(() => {});
-  const leftover = await pool.query("SELECT count(*)::int AS n FROM users WHERE username = $1", [username]);
+  console.log("\n--- J. Cleanup ---");
+  await pool.query("DELETE FROM users WHERE username IN ($1, $2)", [username, `${PREFIX}actor`]).catch(() => {});
+  await pool.query("DELETE FROM activity_logs WHERE description LIKE $1", [`${PREFIX}%`]).catch(() => {});
+  const leftover = await pool.query("SELECT count(*)::int AS n FROM users WHERE username IN ($1, $2)", [username, `${PREFIX}actor`]);
   check("no test users left", leftover.rows[0].n === 0, `${leftover.rows[0].n} rows`);
   console.log(
     `\n${failures === 0 ? "=== ALL SESSION COOKIE TESTS PASSED ===" : `=== ${failures} FAILED ===`} (${checks} checks)`

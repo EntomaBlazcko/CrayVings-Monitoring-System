@@ -4156,16 +4156,16 @@ app.post("/activity-logs", requireAuth, async (req, res) => {
     const { action_type, description, module } = req.body;
     if (!action_type) return res.status(400).json({ message: "action_type required" });
 
-    // Derive acting user from session token; fall back to the "admin" account
-    // when no valid token is present (must match a real username for the FK)
-    const token = req.headers.authorization?.replace("Bearer ", "");
-    let userName = "admin";
-    if (token) {
-      const tokenResult = await pool.query("SELECT username FROM users WHERE token = $1", [hashToken(token)]);
-      if (tokenResult.rows.length > 0) {
-        userName = tokenResult.rows[0].username;
-      }
-    }
+    // Attribute the entry to the session requireAuth already resolved, rather
+    // than re-reading the Authorization header. That header is absent for every
+    // browser session, which are cookie-authenticated, so resolving the actor
+    // from it filed the entire farm's activity under "admin" - an audit trail
+    // that named one account for actions by everyone. req.user is populated
+    // from whichever credential was presented, so it is correct for both.
+    //
+    // The fallback is only a guard against a null user reaching here, and it
+    // deliberately does not name a real account.
+    const userName = req.user?.username || "unknown";
 
     const result = await pool.query(
       "INSERT INTO activity_logs (user_name, action_type, description, module) VALUES ($1, $2, $3, $4) RETURNING *",
