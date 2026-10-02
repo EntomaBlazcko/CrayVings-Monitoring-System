@@ -31,6 +31,13 @@ const { startDevicePoller } = require("./services/devicePoller.cjs");
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// Where the built dashboard lives. Declared up here rather than next to the
+// static handler because GET / (registered with the API, far above it) has to
+// know whether a build exists in order to decide between the app and the API
+// identification message.
+const DIST_DIR = path.join(__dirname, "dist");
+const INDEX_HTML = path.join(DIST_DIR, "index.html");
+
 // ========================
 // POSTGRESQL CONNECTION POOL
 // ========================
@@ -85,11 +92,17 @@ const allowedOrigins = (process.env.ALLOWED_ORIGINS || "http://localhost:5173")
 app.use(
   cors({
     origin(origin, callback) {
-      if (!origin || allowedOrigins.includes(origin)) {
-        callback(null, true);
-      } else {
-        callback(new Error(`Origin ${origin} not allowed by CORS`));
-      }
+      // No Origin header (ESP32, curl, the test harness) or an allowlisted
+      // origin: let the request through and let CORS decide whether the
+      // *browser* may read the response.
+      //
+      // A disallowed origin resolves to false rather than to an Error. Throwing
+      // here used to land in the global error handler and answer 500, which
+      // reads as a server fault and makes a rejected cross-origin request
+      // indistinguishable from a crash. With false there are simply no CORS
+      // headers, so the browser blocks the read, and the CSRF guard below owns
+      // the actual refusal (403) for anything that tries to change state.
+      callback(null, !origin || allowedOrigins.includes(origin));
     },
   })
 );
@@ -1486,8 +1499,15 @@ app.get("/health", (req, res) => {
   res.json({ status: "ok", serverTime: new Date().toISOString() });
 });
 
-// GET / - API identification message
+// GET / - the dashboard itself when a build exists, API identification when not.
+// This route is registered with the API, long before the static handler, so it
+// shadows dist/ for "/". That makes it the one route that has to be build-aware
+// in two places: leave it always-JSON and the production dashboard is
+// unreachable at its own root URL.
 app.get("/", (req, res) => {
+  if (fs.existsSync(INDEX_HTML)) {
+    return res.sendFile(INDEX_HTML);
+  }
   res.json({ message: "CRAYvings Monitoring System API", status: "running" });
 });
 
@@ -4571,9 +4591,6 @@ app.get("/analytics/insights", requireAuth, async (req, res) => {
 // Guarded on existence rather than assumed: in development the dashboard is
 // served by Vite and dist/ may be absent or stale, and a missing index.html
 // must not take the API down with it.
-const DIST_DIR = path.join(__dirname, "dist");
-const INDEX_HTML = path.join(DIST_DIR, "index.html");
-
 if (fs.existsSync(INDEX_HTML)) {
   app.use(express.static(DIST_DIR, { index: false }));
 
