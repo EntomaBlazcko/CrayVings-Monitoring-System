@@ -302,8 +302,38 @@ async function main() {
   check("the second call is a rotation, not a first secret", r.body?.first_secret === false);
   check("the rotation parks a previous secret", Boolean(r.body?.previous_secret_expires_at));
 
-  // --- G. The secret is never readable --------------------------------------
-  console.log("\n--- G. Secrets never leak through read endpoints ---");
+  // --- H. Malformed secrets are rejected, not crashed on --------------------
+  // The shared-secret decision is a crypto.timingSafeEqual comparison, and that
+  // function THROWS when the two buffers differ in length. The previous `===`
+  // could never throw. So a board sending a short, empty, or truncated secret -
+  // a misconfigured portal, a half-flashed board - used to get a clean 401 and
+  // would get a 500 if the length guard were ever lost. These checks exist to
+  // fail loudly if that regresses, because the symptom on a real farm is every
+  // misconfigured board silently dropping its readings.
+  console.log("\n--- G. Wrong-length secrets are rejected cleanly ---");
+  const shortSecret = await ingest(`${PREFIX}SHORT`, "x");
+  check("a 1-character secret -> 401, not 500", shortSecret.status === 401, `status=${shortSecret.status} body=${shortSecret.body.slice(0, 80)}`);
+
+  const emptySecret = await ingest(`${PREFIX}EMPTY`, "");
+  check("an empty secret -> 401, not 500", emptySecret.status === 401, `status=${emptySecret.status} body=${emptySecret.body.slice(0, 80)}`);
+
+  // Same length as the real secret, wrong content: the case a length guard
+  // cannot catch and the one constant-time comparison actually protects.
+  const sameLengthWrong = `${DEVICE_SECRET.slice(0, -1)}${DEVICE_SECRET.slice(-1) === "0" ? "1" : "0"}`;
+  check("the same-length wrong secret really is different", sameLengthWrong !== DEVICE_SECRET);
+  const lengthMatch = await ingest(`${PREFIX}SAMELEN`, sameLengthWrong);
+  check("a same-length but wrong secret -> 401", lengthMatch.status === 401, `status=${lengthMatch.status}`);
+
+  // And the happy path must be unaffected by the comparison change.
+  const stillAuthenticates = await ingest(`${PREFIX}GOODSECRET`, DEVICE_SECRET);
+  check("the correct shared secret still authenticates after the change", stillAuthenticates.status < 400, `status=${stillAuthenticates.status}`);
+  for (const id of [`${PREFIX}SHORT`, `${PREFIX}EMPTY`, `${PREFIX}SAMELEN`, `${PREFIX}GOODSECRET`]) {
+    await pool.query("DELETE FROM sensors WHERE device_id = $1", [id]).catch(() => {});
+    await pool.query("DELETE FROM devices WHERE device_id = $1", [id]).catch(() => {});
+  }
+
+  // --- I. The secret is never readable --------------------------------------
+  console.log("\n--- H. Secrets never leak through read endpoints ---");
 
 
   const list = await api("get", "/devices");
@@ -329,7 +359,7 @@ async function main() {
   check("PUT /devices/:id does not leak the secret VALUE", !JSON.stringify(upd.body).includes(secondNew));
 
   // --- H. Rotation is admin-only --------------------------------------------
-  console.log("\n--- H. Permissions ---");
+  console.log("\n--- I. Permissions ---");
   r = await api("post", `/devices/${rotId}/rotate-secret`, { token: userToken, body: { grace_hours: 1 } });
   check("non-admin rotate -> 403", r.status === 403, `status=${r.status}`);
   r = await api("post", `/devices/${rotId}/rotate-secret`, { token: null, body: {} });
@@ -343,7 +373,7 @@ async function main() {
   check("a denied rotate did not change the stored secret", afterDenied.rows[0]?.device_secret === secondNew);
 
   // --- Cleanup ---------------------------------------------------------------
-  console.log("\n--- I. Cleanup ---");
+  console.log("\n--- J. Cleanup ---");
   for (const id of [rotId, noSecretId, archId]) {
     await pool.query("DELETE FROM sensors WHERE device_id = $1", [id]).catch(() => {});
     await pool.query("DELETE FROM devices WHERE device_id = $1", [id]).catch(() => {});

@@ -1685,7 +1685,16 @@ app.post("/sensor", sensorIngestLimiter, async (req, res) => {
         console.warn(`[${new Date().toISOString()}] POST /sensor 401 from ${req.ip}: missing X-Device-Secret header (device_id: ${req.body?.device_id ?? "?"})`);
         return res.status(401).json({ message: "Device secret required" });
       }
-      let authorized = presented === DEVICE_SECRET;
+      // Constant-time. This is the shared-secret decision itself, made inline on
+      // the request's critical path against attacker-controlled input, so a plain
+      // === is a timing oracle: it returns early on the first mismatched byte,
+      // which lets an attacker recover the secret one byte at a time by timing
+      // 401s. This endpoint is hit once a second by every board, which gives
+      // them an unlimited, unthrottled oracle for free.
+      //
+      // The per-device comparison below is done by Postgres in SQL, so it is not
+      // on this path; only this shared-secret check needed fixing.
+      let authorized = safeEqual(presented, DEVICE_SECRET);
       if (!authorized) {
         // Per-device secret (migration 008). If the column/migration is
         // missing, fail gracefully to the shared-secret decision instead of
@@ -1715,9 +1724,13 @@ app.post("/sensor", sensorIngestLimiter, async (req, res) => {
           );
           if (perDevice.rows.length > 0) {
             const row = perDevice.rows[0];
-            if (row.device_secret && presented === row.device_secret) {
+            // The row only comes back because one of the two matched in SQL, so
+            // these comparisons only decide which log line to emit. Compared in
+            // constant time anyway, so the check reads as one uniform rule if
+            // the SQL is ever loosened to a candidate fetch.
+            if (row.device_secret && safeEqual(presented, row.device_secret)) {
               authorized = true;
-            } else if (row.device_secret_prev && presented === row.device_secret_prev) {
+            } else if (row.device_secret_prev && safeEqual(presented, row.device_secret_prev)) {
               authorized = true;
               console.warn(
                 `[${new Date().toISOString()}] POST /sensor: device ${req.body?.device_id} authenticated with its PREVIOUS secret ` +
