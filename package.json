@@ -18,7 +18,7 @@
     "test:migration": "node tests/migration014.cjs",
     "test:secrets": "node tests/deviceSecretRotation.cjs",
     "test:sessions": "node tests/authSessionCookie.cjs",
-    "test:all": "npm run lint && npm run check:encoding && npm run build && npm test && npm run test:poller && npm run test:devices && npm run test:migration && npm run test:secrets && npm run test:sessions && npm run test:regression",
+    "test:all": "npm run lint && npm run check:encoding && npm run build && npm test && npm run test:poller && npm run test:devices && npm run test:migration && npm run test:secrets && npm run test:regression",
     "seed:admin": "node seed-admin.cjs",
     "mock": "node scripts/mock-device.js",
     "mock:profiles": "node scripts/mock-device.js --list-profiles"

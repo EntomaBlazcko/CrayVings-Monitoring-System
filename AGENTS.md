@@ -130,9 +130,16 @@ Individually:
 | `npm run test:regression` | **yes** | yes |
 | `npm run test:devices` | **yes** | yes |
 | `npm run test:secrets` | **yes** | yes |
+| `npm run test:sessions` | **yes** | yes |
 
 The three that need a server fail with `status=-1` / `ECONNREFUSED` if it isn't up.
 That is an environment problem, **not** a regression — don't chase it as a code bug.
+
+`test:sessions` is **deliberately not in `test:all`.** It is the only suite that
+calls `POST /auth/login`, and the server rate-limits that endpoint to 5 attempts
+per 15 minutes per IP as a brute-force guard; the suite spends 4 of them. Since
+`test:all` has to stay re-runnable at will, this one runs on request. A `429` from
+it means the window is exhausted, not that the session code regressed.
 
 Other utilities:
 

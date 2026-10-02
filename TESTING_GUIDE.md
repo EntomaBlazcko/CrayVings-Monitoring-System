@@ -106,7 +106,8 @@ Run from the project root. Record the counts - they are the baseline.
 | `npm run test:devices` | `104 checks` | registration, uniqueness, claiming, archiving, IP provenance, the `auto_registered` contract |
 | `npm run test:migration` | `15 checks` | the case-insensitive unique index, 23505 rejection, blocked path, re-run path |
 | `npm run test:secrets` | `60 checks` | per-device secret rotation, grace window, revocation, no secret leaks |
-| `npm run test:all` | all of the above, then `test:regression` | see B.7 for the expected final failure |
+| `npm run test:sessions` | `29 checks` | cookie session: issued, HttpOnly/SameSite, no token in body, cookie-only auth, logout revocation, re-login invalidation, CSRF |
+| `npm run test:all` | all of the above except `test:sessions`, then `test:regression` | see B.7 for the expected final failure |
 
 ```bash
 npm test
@@ -116,11 +117,23 @@ npm run test:migration
 npm run test:secrets
 ```
 
+`test:sessions` runs separately and is not in `test:all`:
+
+```bash
+npm run test:sessions
+```
+
 - [ ] Each suite prints its `=== ALL ... PASSED ===` line and a zero `FAIL` count.
 - [ ] `test:devices` reports **104** checks. If it reports 98, you are running an
       older copy of the suite - the six `auto_registered` checks are missing.
 - [ ] `test:secrets` leaves no test users behind: it should print
       `PASS  no test users left  -> 0 rows`.
+- [ ] `test:sessions` reports **29** checks and leaves no test user behind.
+
+> `test:sessions` is the only suite that calls `POST /auth/login`, which the
+> server rate-limits to 5 attempts per 15 minutes per IP; the suite uses 4. Run
+> it once per window. A `429` means the budget is spent, not that sessions
+> broke - it prints an explanatory message instead of failing the cookie checks.
 
 ### B.1 The `auto_registered` contract (new - test it deliberately)
 

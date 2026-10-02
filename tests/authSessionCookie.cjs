@@ -3,6 +3,13 @@
 // =============================================================================
 // Run:  npm run test:sessions
 //
+// Deliberately NOT part of test:all. The server rate-limits /auth/login to 5
+// attempts per 15 minutes per IP, and this suite spends 4 of them, so it can
+// only run once per window. test:all has to stay re-runnable at will; a stage
+// that goes red on the second run teaches you to ignore red. The limiter is a
+// security control and is not relaxed to make a test convenient - run this one
+// deliberately, and wait out the window if you trip it.
+//
 // The cookie migration moved browsers from a JS-readable token to an HttpOnly
 // cookie. That change touched the single most important request in the system -
 // POST /auth/login - and nothing automated covered it, which is how
@@ -87,7 +94,33 @@ async function login(username, password) {
   } catch {
     body = { _raw: text.slice(0, 200) };
   }
-  return { status: res.status, body, setCookie: sessionCookie(res) };
+  // draft-7 headers are enabled on the server, so the budget is visible. Used
+  // only to explain a 429 - never to work around one.
+  const remaining = res.headers.get("ratelimit-remaining");
+  const reset = res.headers.get("ratelimit-reset");
+  return {
+    status: res.status,
+    body,
+    setCookie: sessionCookie(res),
+    remaining: remaining === null ? null : Number(remaining),
+    retryAfterSec: reset === null ? null : Math.max(0, Number(reset)),
+  };
+}
+
+// /auth/login is brute-force limited (5 per 15 min per IP). Hitting that is
+// correct server behaviour, not a broken cookie, and the difference matters:
+// reported as a cookie failure it looks like a regression in the session code
+// and sends you hunting in the wrong file. Bail out loudly instead.
+async function refuseIfRateLimited(result) {
+  if (result.status !== 429) return false;
+  const mins = result.retryAfterSec === null ? 15 : Math.ceil(result.retryAfterSec / 60);
+  console.error(
+    `\n/auth/login returned 429: the server's brute-force guard allows a few\n` +
+    `attempts per 15 minutes per IP, and this suite needs 4 of them. That is a\n` +
+    `rate limit, not a cookie failure. Wait ~${mins} min (or restart the server)\n` +
+    `and re-run. Not failing the session checks against an exhausted budget.`
+  );
+  return true;
 }
 
 async function main() {
@@ -103,8 +136,15 @@ async function main() {
   );
 
   const good = await login(username, password);
+  if (await refuseIfRateLimited(good)) {
+    await cleanup(username);
+    return;
+  }
   check("login with valid credentials -> 200", good.status === 200, `status=${good.status} body=${JSON.stringify(good.body).slice(0, 120)}`);
   check("login sets the session cookie", Boolean(good.setCookie), good.setCookie ? "present" : "NO Set-Cookie");
+  if (good.remaining !== null) {
+    console.log(`      (login budget: ${good.remaining} attempt(s) left in the current window)`);
+  }
 
   if (!good.setCookie) {
     console.log("\nNo cookie was issued, so the rest of the round-trip cannot be checked.");
@@ -151,12 +191,16 @@ async function main() {
   // --- E. Failed login issues nothing ----------------------------------------
   console.log("\n--- E. Failed login ---");
   const bad = await login(username, wrongPassword);
+  if (await refuseIfRateLimited(bad)) {
+    await cleanup(username);
+    return;
+  }
   check("login with a wrong password -> 401", bad.status === 401, `status=${bad.status}`);
   check("failed login sets no cookie", !bad.setCookie, bad.setCookie ? "cookie issued on failure" : "none");
 
-  const missing = await login(`${PREFIX}nobody`, password);
-  check("login as an unknown user -> 401", missing.status === 401, `status=${missing.status}`);
-  check("unknown user sets no cookie", !missing.setCookie, missing.setCookie ? "cookie issued" : "none");
+  // An unknown username is the same 401 branch as a wrong password (both fail
+  // before any session is created), so it is not worth a second rate-limited
+  // attempt to prove again.
 
   // --- F. Logout revokes server-side ------------------------------------------
   console.log("\n--- F. Logout ---");
@@ -183,7 +227,15 @@ async function main() {
   // --- G. Sessions are single-use ---------------------------------------------
   console.log("\n--- G. Re-login invalidates the previous cookie ---");
   const first = await login(username, password);
+  if (await refuseIfRateLimited(first)) {
+    await cleanup(username);
+    return;
+  }
   const second = await login(username, password);
+  if (await refuseIfRateLimited(second)) {
+    await cleanup(username);
+    return;
+  }
   check("second login -> 200", second.status === 200, `status=${second.status}`);
   const rotated = cookieValue(first.setCookie) !== cookieValue(second.setCookie);
   check("each login issues a different token", rotated);
