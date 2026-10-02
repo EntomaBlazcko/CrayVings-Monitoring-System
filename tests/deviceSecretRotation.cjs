@@ -22,7 +22,6 @@
 // =============================================================================
 
 require("dotenv").config();
-const assert = require("assert");
 const crypto = require("crypto");
 const { Pool } = require("pg");
 
@@ -53,8 +52,6 @@ function check(name, cond, extra = "") {
     console.log(`FAIL  ${name}${extra ? "  -> " + extra : ""}`);
   }
 }
-
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function api(method, path, { token = adminToken, body, headers = {} } = {}) {
   const res = await fetch(`${API}${path}`, {
@@ -88,11 +85,6 @@ async function ingest(deviceId, secret) {
     body: JSON.stringify({ device_id: deviceId, temperature: 27.5, ph: 7.2, water_level: 30 }),
   });
   return { status: res.status, body: await res.text() };
-}
-
-async function login(username, password) {
-  const r = await api("post", "/auth/login", { token: null, body: { username, password } });
-  return r;
 }
 
 async function setSecret(deviceId, secret) {

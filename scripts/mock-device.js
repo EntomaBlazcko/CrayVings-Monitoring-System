@@ -36,7 +36,6 @@ dotenv.config({ path: path.join(ROOT, ".env") });
 
 const API_BASE = process.env.VITE_API_BASE || "http://localhost:3000";
 const DEVICE_SECRET = process.env.DEVICE_SECRET || "";
-const SENSOR_URL = `${API_BASE}/sensor`;
 const DEFAULT_DEVICE = "ESP32_03 Mock Device";
 
 const PARAM_KEYS = ["temperature", "water_level", "ammonia"];

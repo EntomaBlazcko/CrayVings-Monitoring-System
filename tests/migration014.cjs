@@ -23,7 +23,6 @@
 // =============================================================================
 
 require("dotenv").config();
-const assert = require("assert");
 const { Pool } = require("pg");
 
 const pool = new Pool({

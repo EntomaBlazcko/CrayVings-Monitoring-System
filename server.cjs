@@ -504,28 +504,6 @@ function getChangedFields(current, updates) {
 }
 
 // =============================================================================
-// HELPER: UPDATE ONLY IF FIELDS ACTUALLY CHANGED
-// =============================================================================
-// Only executes the UPDATE when at least one field changed, keeping audit logs clean.
-
-// UPDATE wrapper with change detection; optionally touches updated_at
-async function updateOnlyIfChanged(client, { table, keyColumn, keyValue, currentRow, updates, touchUpdatedAt }) {
-  const changes = getChangedFields(currentRow, updates);
-  if (Object.keys(changes).length === 0) {
-    return { changed: false, row: currentRow };
-  }
-  if (touchUpdatedAt) changes.updated_at = new Date();
-  const keys = Object.keys(changes);
-  const values = Object.values(changes);
-  const setClauses = keys.map((k, i) => `${k} = $${i + 1}`).join(", ");
-  const result = await client.query(
-    `UPDATE ${table} SET ${setClauses} WHERE ${keyColumn} = $${keys.length + 1} RETURNING *`,
-    [...values, keyValue]
-  );
-  return { changed: true, row: result.rows[0] };
-}
-
-// =============================================================================
 // INPUT VALIDATION SCHEMAS (Zod)
 // =============================================================================
 // ESP32 marks failed sensors with -1 (and 0 for temperature), so lower bounds
@@ -3431,7 +3409,11 @@ app.put("/settings/device/:deviceId", requireAdmin, async (req, res) => {
       ammonia_min: "Ammonia",
       ammonia_max: "Ammonia",
     };
-    for (const [field, newValue] of Object.entries(parsed)) {
+    // Iterating `parsed` means only the fields the caller actually sent are
+    // logged. The values recorded are the effective before/after, not the raw
+    // input, so a threshold that resolved through the global default is logged
+    // as the number that is really in force.
+    for (const field of Object.keys(parsed)) {
       const paramLabel = changeParamLabels[field] || field;
       await pool.query(
         `INSERT INTO system_logs (action, parameter, old_value, new_value, device_id) VALUES ($1, $2, $3, $4, $5)`,

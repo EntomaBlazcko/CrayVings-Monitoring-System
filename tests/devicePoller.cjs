@@ -15,7 +15,6 @@
 //      being health-polled forever.
 // =============================================================================
 
-const assert = require("assert");
 
 // axios is required by the poller; stub .get before the poller is loaded so the
 // poller captures the stub through the shared module instance.
