@@ -20,6 +20,7 @@ import { ErrorCard } from "../components/Loading";
 import TankSelector from "../components/TankSelector";
 import { useSensors } from "../hooks/useSensors";
 import { useAuth } from "../contexts/useAuth";
+import { fmtStat } from "../utils/text";
 import { fetchSensorHistory, fetchWeeklyReport, fetchRangeReport } from "../api/client";
 import { isAxiosError } from "axios";
 import { getSettingsThresholds, getThresholdStatus, type ThresholdStatus } from "../types";
@@ -551,20 +552,20 @@ export default function HistoricalDataPage() {
         {
           label: "Temperature",
           color: PARAM.temperature,
-          avg: `${(summary.temp_avg ?? 0).toFixed(1)}°C`,
-          minmax: `Min ${(summary.temp_min ?? 0).toFixed(1)} · Max ${(summary.temp_max ?? 0).toFixed(1)}`,
+          avg: `${fmtStat(summary.temp_avg, 1)}°C`,
+          minmax: `Min ${fmtStat(summary.temp_min, 1)} · Max ${fmtStat(summary.temp_max, 1)}`,
         },
         {
           label: "Water Level",
           color: PARAM.water_level,
-          avg: `${(summary.water_avg ?? 0).toFixed(0)}%`,
-          minmax: `Min ${(summary.water_min ?? 0).toFixed(0)} · Max ${(summary.water_max ?? 0).toFixed(0)}`,
+          avg: `${fmtStat(summary.water_avg, 0)}%`,
+          minmax: `Min ${fmtStat(summary.water_min, 0)} · Max ${fmtStat(summary.water_max, 0)}`,
         },
         {
           label: "Ammonia",
           color: PARAM.ammonia,
-          avg: `${(summary.ammonia_avg ?? 0).toFixed(2)} ppm`,
-          minmax: `Min ${(summary.ammonia_min ?? 0).toFixed(2)} · Max ${(summary.ammonia_max ?? 0).toFixed(2)}`,
+          avg: `${fmtStat(summary.ammonia_avg, 2)} ppm`,
+          minmax: `Min ${fmtStat(summary.ammonia_min, 2)} · Max ${fmtStat(summary.ammonia_max, 2)}`,
         },
       ];
       cards.forEach((c, i) => {
@@ -633,12 +634,12 @@ export default function HistoricalDataPage() {
         head: [[unitLabel, "Temp Avg", "Temp Range", "Water Avg", "Water Range", "Ammonia Avg", "Ammonia Range", "Readings", "Alerts"]],
         body: cappedBuckets.map(d => [
           fmtBucket(d.date),
-          `${(d.temp_avg ?? 0).toFixed(1)}°C`,
-          `${(d.temp_min ?? 0).toFixed(1)} - ${(d.temp_max ?? 0).toFixed(1)}°C`,
-          `${(d.water_avg ?? 0).toFixed(0)}%`,
-          `${(d.water_min ?? 0).toFixed(0)} - ${(d.water_max ?? 0).toFixed(0)}%`,
-          `${(d.ammonia_avg ?? 0).toFixed(2)} ppm`,
-          `${(d.ammonia_min ?? 0).toFixed(2)} - ${(d.ammonia_max ?? 0).toFixed(2)} ppm`,
+          `${fmtStat(d.temp_avg, 1)}°C`,
+          `${fmtStat(d.temp_min, 1)} - ${fmtStat(d.temp_max, 1)}°C`,
+          `${fmtStat(d.water_avg, 0)}%`,
+          `${fmtStat(d.water_min, 0)} - ${fmtStat(d.water_max, 0)}%`,
+          `${fmtStat(d.ammonia_avg, 2)} ppm`,
+          `${fmtStat(d.ammonia_min, 2)} - ${fmtStat(d.ammonia_max, 2)} ppm`,
           (d.readings ?? 0).toLocaleString(),
           String(d.alerts ?? 0),
         ]),
@@ -1019,13 +1020,13 @@ export default function HistoricalDataPage() {
             {timeRange === "1w" && weeklyReport ? (
               <div className="flex gap-3 text-xs">
                 <span className="text-orange-600" title="Min">
-                  <TrendingDown size={12} className="inline" /> {(weeklyReport.summary.temp_min ?? 0).toFixed(1)}°
+                  <TrendingDown size={12} className="inline" /> {fmtStat(weeklyReport.summary.temp_min, 1)}°
                 </span>
                 <span className="text-green-600" title="Average">
-                  <Activity size={12} className="inline" /> {(weeklyReport.summary.temp_avg ?? 0).toFixed(1)}°
+                  <Activity size={12} className="inline" /> {fmtStat(weeklyReport.summary.temp_avg, 1)}°
                 </span>
                 <span className="text-red-600" title="Max">
-                  <TrendingUp size={12} className="inline" /> {(weeklyReport.summary.temp_max ?? 0).toFixed(1)}°
+                  <TrendingUp size={12} className="inline" /> {fmtStat(weeklyReport.summary.temp_max, 1)}°
                 </span>
               </div>
             ) : stats?.temperature && (
@@ -1085,13 +1086,13 @@ export default function HistoricalDataPage() {
             {timeRange === "1w" && weeklyReport ? (
               <div className="flex gap-3 text-xs">
                 <span className="text-orange-600" title="Min">
-                  <TrendingDown size={12} className="inline" /> {(weeklyReport.summary.water_min ?? 0).toFixed(0)}%
+                  <TrendingDown size={12} className="inline" /> {fmtStat(weeklyReport.summary.water_min, 0)}%
                 </span>
                 <span className="text-green-600" title="Average">
-                  <Activity size={12} className="inline" /> {(weeklyReport.summary.water_avg ?? 0).toFixed(0)}%
+                  <Activity size={12} className="inline" /> {fmtStat(weeklyReport.summary.water_avg, 0)}%
                 </span>
                 <span className="text-red-600" title="Max">
-                  <TrendingUp size={12} className="inline" /> {(weeklyReport.summary.water_max ?? 0).toFixed(0)}%
+                  <TrendingUp size={12} className="inline" /> {fmtStat(weeklyReport.summary.water_max, 0)}%
                 </span>
               </div>
             ) : stats?.water_level && (
@@ -1151,13 +1152,13 @@ export default function HistoricalDataPage() {
             {timeRange === "1w" && weeklyReport ? (
               <div className="flex gap-3 text-xs">
                 <span className="text-orange-600" title="Min">
-                  <TrendingDown size={12} className="inline" /> {(weeklyReport.summary.ammonia_min ?? 0).toFixed(2)}
+                  <TrendingDown size={12} className="inline" /> {fmtStat(weeklyReport.summary.ammonia_min, 2)}
                 </span>
                 <span className="text-green-600" title="Average">
-                  <Activity size={12} className="inline" /> {(weeklyReport.summary.ammonia_avg ?? 0).toFixed(2)}
+                  <Activity size={12} className="inline" /> {fmtStat(weeklyReport.summary.ammonia_avg, 2)}
                 </span>
                 <span className="text-red-600" title="Max">
-                  <TrendingUp size={12} className="inline" /> {(weeklyReport.summary.ammonia_max ?? 0).toFixed(2)}
+                  <TrendingUp size={12} className="inline" /> {fmtStat(weeklyReport.summary.ammonia_max, 2)}
                 </span>
               </div>
             ) : stats?.ammonia && (
@@ -1421,17 +1422,17 @@ export default function HistoricalDataPage() {
                       <td className="px-3 py-2.5 font-medium text-gray-800 whitespace-nowrap">
                         {formatFarmDate(day.date)}
                       </td>
-                      <td className="px-3 py-2.5 text-center text-gray-600">{(day.temp_avg ?? 0).toFixed(1)}°C</td>
+                      <td className="px-3 py-2.5 text-center text-gray-600">{fmtStat(day.temp_avg, 1)}°C</td>
                       <td className="px-3 py-2.5 text-center text-gray-500 text-xs">
-                        {(day.temp_min ?? 0).toFixed(1)} - {(day.temp_max ?? 0).toFixed(1)}°C
+                        {fmtStat(day.temp_min, 1)} - {fmtStat(day.temp_max, 1)}°C
                       </td>
-                      <td className="px-3 py-2.5 text-center text-gray-600">{(day.water_avg ?? 0).toFixed(0)}%</td>
+                      <td className="px-3 py-2.5 text-center text-gray-600">{fmtStat(day.water_avg, 0)}%</td>
                       <td className="px-3 py-2.5 text-center text-gray-500 text-xs">
-                        {(day.water_min ?? 0).toFixed(0)} - {(day.water_max ?? 0).toFixed(0)}%
+                        {fmtStat(day.water_min, 0)} - {fmtStat(day.water_max, 0)}%
                       </td>
-                      <td className="px-3 py-2.5 text-center text-gray-600">{(day.ammonia_avg ?? 0).toFixed(2)}</td>
+                      <td className="px-3 py-2.5 text-center text-gray-600">{fmtStat(day.ammonia_avg, 2)}</td>
                       <td className="px-3 py-2.5 text-center text-gray-500 text-xs">
-                        {(day.ammonia_min ?? 0).toFixed(2)} - {(day.ammonia_max ?? 0).toFixed(2)}
+                        {fmtStat(day.ammonia_min, 2)} - {fmtStat(day.ammonia_max, 2)}
                       </td>
                       <td className="px-3 py-2.5 text-center text-gray-600">{(day.readings ?? 0).toLocaleString()}</td>
                       <td className="px-3 py-2.5 text-center">

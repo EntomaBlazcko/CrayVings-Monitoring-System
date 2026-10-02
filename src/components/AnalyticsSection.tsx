@@ -35,6 +35,7 @@ import { isAxiosError } from "axios";
 import type { AnalyticsOverview, AnalyticsDailyEntry, Insight } from "../types";
 import { getThresholdStatus, SENSOR_KEY_TO_DISPLAY } from "../types";
 import { formatFarmDateTime, formatFarmDate } from "../utils/time";
+import { fmtStat } from "../utils/text";
 import { SENSOR_COLORS, CHART_COLORS, BAND_COLORS, BAR_COLORS } from "../utils/tokens";
 
 type RangeKey = 7 | 30 | 90;
@@ -107,15 +108,26 @@ function InsightIcon({ level }: { level: Insight["level"] }) {
   return <Info size={18} className={INSIGHT_STYLES.info.icon} />;
 }
 
+// pg returns DECIMAL aggregates as strings and a missing aggregate as null, so
+// both need normalising before they reach a chart. null has to survive: Recharts
+// breaks the line on a null point, which is the honest rendering, whereas the
+// `|| 0` this replaces drew a plunge to the floor for a day the sensor was
+// simply dead.
+function toNum(v: unknown): number | null {
+  if (v === null || v === undefined || v === "") return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
 // Builds recharts points from daily aggregates (defensive Number coercion for
 // DECIMAL columns that pg returns as strings).
 function toChartPoints(daily: AnalyticsDailyEntry[]) {
   return daily.map((d) => ({
     name: d.date,
     date: d.date,
-    temp: Number(d.temp_avg) || 0,
-    water: Number(d.water_avg) || 0,
-    ammonia: Number(d.ammonia_avg) || 0,
+    temp: toNum(d.temp_avg),
+    water: toNum(d.water_avg),
+    ammonia: toNum(d.ammonia_avg),
     readings: Number(d.readings) || 0,
     alerts: Number(d.alerts) || 0,
   }));
@@ -166,9 +178,11 @@ function ParamCard({
 }: {
   name: string;
   unit: string;
-  avg: number;
-  min: number;
-  max: number;
+  // Nullable: a window with no valid readings has no average, and these are
+  // rendered with fmtStat so the card shows "--" instead of a fake 0.0.
+  avg: number | null;
+  min: number | null;
+  max: number | null;
   changePct: number;
   direction: "up" | "down" | "stable";
   icon: React.ReactNode;
@@ -202,11 +216,11 @@ function ParamCard({
         </span>
       </div>
       <div className={`text-2xl font-bold ${STATUS_TEXT[status]}`}>
-        {avg.toFixed(decimals)}
+        {fmtStat(avg, decimals)}
         <span className="text-base font-normal text-gray-500">{unit}</span>
       </div>
       <div className="text-xs text-gray-400 mt-1">
-        Period range {min.toFixed(decimals)} – {max.toFixed(decimals)} {unit}
+        Period range {fmtStat(min, decimals)} – {fmtStat(max, decimals)} {unit}
       </div>
       {breached ? (
         <div className="mt-2 border-t border-gray-100 pt-2">
@@ -321,16 +335,35 @@ export default function AnalyticsSection() {
   const dayHighlights = useMemo(() => {
     const valid = daily.filter((d) => Number(d.readings) > 0);
     if (valid.length === 0) return null;
-    const num = (v: number) => Number(v) || 0;
 
-    let hottest = valid[0], coldest = valid[0], highestAmmonia = valid[0], mostAlerts = valid[0], busiest = valid[0];
-    for (const d of valid) {
-      if (num(d.temp_avg) > num(hottest.temp_avg)) hottest = d;
-      if (num(d.temp_avg) < num(coldest.temp_avg)) coldest = d;
-      if (num(d.ammonia_avg) > num(highestAmmonia.ammonia_avg)) highestAmmonia = d;
-      if (num(d.alerts) > num(mostAlerts.alerts)) mostAlerts = d;
-      if (num(d.readings) > num(busiest.readings)) busiest = d;
-    }
+    // Each highlight is the best day *for its own metric*, so a day only becomes
+    // a candidate when it actually has a value for it. The `Number(v) || 0` this
+    // replaces turned a missing average into 0, which made any day with a dead
+    // temperature probe the "coldest" day in the window, at 0.0 °C.
+    const best = (
+      pick: (d: AnalyticsDailyEntry) => number | null,
+      cmp: (a: number, b: number) => boolean
+    ) => {
+      let winner: AnalyticsDailyEntry | null = null;
+      let winnerVal: number | null = null;
+      for (const d of valid) {
+        const v = toNum(pick(d));
+        if (v === null) continue;
+        if (winnerVal === null || cmp(v, winnerVal)) {
+          winner = d;
+          winnerVal = v;
+        }
+      }
+      return winner;
+    };
+
+    const hottest = best((d) => d.temp_avg, (a, b) => a > b);
+    const coldest = best((d) => d.temp_avg, (a, b) => a < b);
+    const highestAmmonia = best((d) => d.ammonia_avg, (a, b) => a > b);
+    const mostAlerts = best((d) => d.alerts, (a, b) => a > b);
+    const busiest = best((d) => d.readings, (a, b) => a > b);
+
+    if (!hottest || !coldest || !highestAmmonia || !mostAlerts || !busiest) return null;
     return { hottest, coldest, highestAmmonia, mostAlerts, busiest };
   }, [daily]);
 
@@ -341,16 +374,20 @@ export default function AnalyticsSection() {
       water_level: { below: 0, above: 0 },
       ammonia: { below: 0, above: 0 },
     };
-    const keyToAvg: Record<ParamKey, (d: AnalyticsDailyEntry) => number> = {
-      temperature: (d) => Number(d.temp_avg),
-      water_level: (d) => Number(d.water_avg),
-      ammonia: (d) => Number(d.ammonia_avg),
+    const keyToAvg: Record<ParamKey, (d: AnalyticsDailyEntry) => number | null> = {
+      temperature: (d) => toNum(d.temp_avg),
+      water_level: (d) => toNum(d.water_avg),
+      ammonia: (d) => toNum(d.ammonia_avg),
     };
     for (const d of daily) {
       for (const key of Object.keys(out) as ParamKey[]) {
         const avg = keyToAvg[key](d);
         const t = thresholds[key];
-        if (!Number.isFinite(avg) || !t) continue;
+        // A day with no valid reading is not a breach. The old
+        // `Number.isFinite(Number(null))` guard passed 0 through as finite, so
+        // every day a temperature probe was dead counted as "below safe range"
+        // and the card claimed a warming trend the data did not show.
+        if (avg === null || !t) continue;
         if (avg < t.range.min) out[key].below += 1;
         else if (avg > t.range.max) out[key].above += 1;
       }
@@ -847,21 +884,21 @@ const tooltipSeriesFilter = (payload: readonly TooltipEntry[]): TooltipEntry[] =
                 <p className="flex items-center gap-1 text-micro text-orange-600 font-bold uppercase">
                   <Flame size={12} /> Hottest Day
                 </p>
-                <p className="text-sm font-bold text-gray-800">{Number(dayHighlights.hottest.temp_avg).toFixed(1)}°C</p>
+                <p className="text-sm font-bold text-gray-800">{fmtStat(dayHighlights.hottest.temp_avg, 1)}°C</p>
                 <p className="text-micro text-gray-400">{formatFarmDate(dayHighlights.hottest.date)}</p>
               </div>
               <div className="rounded-lg bg-amber-50 border border-amber-100 p-2.5">
                 <p className="flex items-center gap-1 text-micro text-amber-600 font-bold uppercase">
                   <Snowflake size={12} /> Coolest Day
                 </p>
-                <p className="text-sm font-bold text-gray-800">{Number(dayHighlights.coldest.temp_avg).toFixed(1)}°C</p>
+                <p className="text-sm font-bold text-gray-800">{fmtStat(dayHighlights.coldest.temp_avg, 1)}°C</p>
                 <p className="text-micro text-gray-400">{formatFarmDate(dayHighlights.coldest.date)}</p>
               </div>
               <div className="rounded-lg bg-emerald-50 border border-emerald-100 p-2.5">
                 <p className="flex items-center gap-1 text-micro text-emerald-600 font-bold uppercase">
                   <FlaskConical size={12} /> Peak Ammonia
                 </p>
-                <p className="text-sm font-bold text-gray-800">{Number(dayHighlights.highestAmmonia.ammonia_avg).toFixed(2)} ppm</p>
+                <p className="text-sm font-bold text-gray-800">{fmtStat(dayHighlights.highestAmmonia.ammonia_avg, 2)} ppm</p>
                 <p className="text-micro text-gray-400">{formatFarmDate(dayHighlights.highestAmmonia.date)}</p>
               </div>
               <div className="rounded-lg bg-red-50 border border-red-100 p-2.5">

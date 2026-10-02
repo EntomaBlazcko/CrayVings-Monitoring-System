@@ -406,17 +406,21 @@ export interface AuthResponse {
 
 // Weekly report types
 
+// Report and analytics aggregates are nullable on purpose. A failed sensor is
+// stored as NULL, so a window or day with no valid readings has no average at
+// all, and the server sends null rather than 0. Anything typed `number` here
+// would push the "0.0 °C of a dead tank" reading back into the UI.
 export type WeeklyReportDaily = {
   date: string;
-  temp_avg: number;
-  temp_min: number;
-  temp_max: number;
-  water_avg: number;
-  water_min: number;
-  water_max: number;
-  ammonia_avg: number;
-  ammonia_min: number;
-  ammonia_max: number;
+  temp_avg: number | null;
+  temp_min: number | null;
+  temp_max: number | null;
+  water_avg: number | null;
+  water_min: number | null;
+  water_max: number | null;
+  ammonia_avg: number | null;
+  ammonia_min: number | null;
+  ammonia_max: number | null;
   readings: number;
   alerts: number;
 };
@@ -426,15 +430,15 @@ export type WeeklyReport = {
   bucket?: "hour" | "day";
   period: { start: string; end: string };
   summary: {
-    temp_avg: number;
-    temp_min: number;
-    temp_max: number;
-    water_avg: number;
-    water_min: number;
-    water_max: number;
-    ammonia_avg: number;
-    ammonia_min: number;
-    ammonia_max: number;
+    temp_avg: number | null;
+    temp_min: number | null;
+    temp_max: number | null;
+    water_avg: number | null;
+    water_min: number | null;
+    water_max: number | null;
+    ammonia_avg: number | null;
+    ammonia_min: number | null;
+    ammonia_max: number | null;
     total_readings: number;
   };
   daily: WeeklyReportDaily[];
@@ -447,8 +451,11 @@ export type WeeklyReport = {
 
 // Analytics types
 
-export type AnalyticsParamStats = { avg: number; min: number; max: number };
-export type AnalyticsTrend = { current_avg: number; previous_avg: number; change_pct: number; direction: "up" | "down" | "stable" };
+export type AnalyticsParamStats = { avg: number | null; min: number | null; max: number | null };
+// current_avg / previous_avg are null when that window had no valid readings,
+// in which case change_pct is 0 and direction is "stable" - there is nothing to
+// compare, rather than "no change".
+export type AnalyticsTrend = { current_avg: number | null; previous_avg: number | null; change_pct: number; direction: "up" | "down" | "stable" };
 
 export type AnalyticsOverview = {
   period: { start: string; end: string };
@@ -480,9 +487,11 @@ export type AnalyticsOverview = {
 
 export type AnalyticsDailyEntry = {
   date: string;
-  temp_avg: number;
-  water_avg: number;
-  ammonia_avg: number;
+  // Null when the day had rows but no valid reading for that sensor, which is
+  // how a failed probe shows up in the daily series.
+  temp_avg: number | null;
+  water_avg: number | null;
+  ammonia_avg: number | null;
   readings: number;
   alerts: number;
 };
