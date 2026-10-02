@@ -62,9 +62,37 @@ Note the deliberate split: **frontend is ESM TypeScript, backend is CommonJS `.c
 extension. Do not "modernise" the backend to ESM as drive-by work.
 
 `jsonwebtoken`, `pino`, and `bcrypt` are installed but **never imported anywhere** —
-sessions are custom `crypto`-based tokens, logging is `console.*`, and OTP hashing
-uses `crypto.createHash("sha256")` with a per-row salt. Don't assume they are in play
+sessions are custom `crypto`-generated tokens stored SHA-256-hashed in
+`users.token`, logging is `console.*`, and OTP hashing uses
+`crypto.createHash("sha256")` with a per-row salt. Don't assume they are in play
 just because they appear in `package.json`.
+
+### Sessions are an HttpOnly cookie, and that constrains the deployment
+
+`POST /auth/login` sets `crayvings_session` (`HttpOnly`, `SameSite=Lax`) and no
+longer returns a token in the body. Nothing in `src/` reads or writes a session
+credential — only the user's public profile is cached in `localStorage`
+(`crayvings_user`).
+
+The `Lax` attribute is the CSRF defence, and it only works because the dashboard
+and the API share an origin. That is why:
+
+- `API_BASE` (`src/types/index.ts`) defaults to the **relative** `/api`
+- `vite.config.ts` proxies `/api` to `localhost:3000` in dev
+- `server.cjs` serves `dist/` itself in production and strips the `/api` prefix
+
+Two consequences to respect:
+
+- **Do not set `VITE_API_BASE` to an absolute URL** unless you are deliberately
+  splitting hosts. Doing so makes the browser cross-origin, a `Lax` cookie is
+  then not sent, and login fails with no obvious cause.
+- Bare paths (`/sensor`, `/auth/login`) must keep working. The ESP32 firmware and
+  every suite in `tests/` call them unprefixed and authenticate with
+  `Authorization: Bearer`, which is deliberately still supported — a browser
+  cannot forge a Bearer request, so CSRF-checking it would only break devices.
+
+Express 5 runs path-to-regexp v8: a bare `"*"` route pattern **throws at
+startup**. The SPA fallback uses a pathless `app.use` for this reason.
 
 ## 3. Commands
 
@@ -74,7 +102,7 @@ cp .env.example .env        # Windows: Copy-Item .env.example .env
 npm run seed:admin          # first-time owner account, from .env vars
 
 npm run server              # backend  -> http://localhost:3000
-npm run dev                 # frontend -> http://localhost:5173
+npm run dev                 # frontend -> http://localhost:5173 (proxies /api to :3000)
 
 npm run build               # tsc -b && vite build  -> dist/
 npm run lint                # eslint . (TS/TSX + CommonJS .cjs + node scripts)

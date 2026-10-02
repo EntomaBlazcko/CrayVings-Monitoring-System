@@ -31,7 +31,7 @@ This can help reduce risks caused by poor water conditions and improve overall m
 ## Features
 
 ### Core Features
-- **Authentication & roles** - Login-based access control (owner/admin/user) with session tokens and 24-hour expiry; login is rate-limited (5 attempts / 15 min / IP)
+- **Authentication & roles** - Login-based access control (owner/admin/user). The session is an **HttpOnly cookie** (`SameSite=Lax`, 24-hour expiry) so no credential is ever readable by JavaScript or `localStorage`; login is rate-limited (5 attempts / 15 min / IP)
 - **Multi-tank star topology** - One ESP32 per tank (up to 6) pushing to a central server; the server health-polls each device's `GET /status`, and the dashboard scopes live/history/analytics to a selected tank with a tank-selector chip bar and farm overview grid
 - **Real-time sensor monitoring** - Temperature, water level, and ammonia (3 parameters via ESP32)
 - **Server-Sent Events (SSE) push** - Live readings stream to every open dashboard over `GET /sensor/stream` (no 1s polling); history refreshes every 30s and the fleet registry every 5s, both with exponential backoff on failure
@@ -240,8 +240,8 @@ While muted, disconnect alerts still show as popups and are logged, but SMS is n
 ### Auth & Users (admin-gated unless noted)
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/auth/login` | POST | Log in, returns user + session token |
-| `/auth/logout` | POST | Log out and invalidate token |
+| `/auth/login` | POST | Log in, sets the session cookie (HttpOnly, SameSite=Lax) and returns the user |
+| `/auth/logout` | POST | Log out, revokes the session and clears the cookie |
 | `/auth/users` | GET | List active users |
 | `/auth/users` | POST | Create a user |
 | `/auth/users/archived` | GET | List soft-deleted users |
@@ -258,7 +258,7 @@ While muted, disconnect alerts still show as popups and are logged, but SMS is n
 | `/sensor` | POST | Submit sensor data (shared `DEVICE_SECRET` or per-device `devices.device_secret`; 3/sec/device rate limit; failure sentinels stored as NULL) |
 | `/sensor/latest` | GET | Latest reading as `{ data, deviceExists }` — HTTP 200 even when no readings exist yet; `recv_at` = live device heartbeat; optional `device_id` filter |
 | `/sensor` | GET | Get history (`limit`: 1-1000; optional `device_id` filter, per-tank; `?before=<ISO timestamp>` keyset cursor for paging older data) |
-| `/sensor/stream` | GET | **SSE** live-reading stream (auth via `?token=` because EventSource cannot send headers; keep-alive pings every 25s) |
+| `/sensor/stream` | GET | **SSE** live-reading stream (auth via the session cookie - EventSource is same-origin so it cannot leak a token in the URL; keep-alive pings every 25s) |
 | `/devices` | GET | Fleet registry + online flags (name, tank_name, tank_location, ip_address, last_health_seen) |
 | `/devices/latest` | GET | Freshest in-memory reading per active tank in one call (drives the Live Tank Bar; no DB hit) |
 | `/devices/:deviceId/status` | GET | Live on-demand poll of one ESP32's `GET /status` (3s timeout) |
@@ -477,7 +477,7 @@ a capstone demo can fail a component and show automatic recovery.
 | No data showing | Verify ESP32 is connected to same WiFi network |
 | CORS error | Add frontend port to ALLOWED_ORIGINS (required in production) |
 | "Device offline" | Check ESP32 WiFi connection (use WiFiManager portal) |
-| Live values stop updating | SSE connection dropped — the client auto-reconnects with backoff; check the server is reachable and the session token is still valid |
+| Live values stop updating | SSE connection dropped — the client auto-reconnects with backoff; check the server is reachable and the session cookie is still valid |
 | "Too many login attempts" | Login rate limit (5/15 min/IP) — wait or restart the server in dev |
 | Sensor POST returns 401 | `DEVICE_SECRET` mismatch — send it in the `X-Device-Secret` header, or set `devices.device_secret` for the device |
 | Sensor POST returns 400 | Reading rejected by validation (bad range or ammonia spike guard) — sentinels are fine, out-of-bounds values are not |
@@ -489,21 +489,32 @@ a capstone demo can fail a component and show automatic recovery.
 ```bash
 curl http://localhost:3000/health
 
-# Authenticated endpoints need the session token from POST /auth/login:
+# The dashboard authenticates with a cookie, but curl has no cookie jar, so
+# non-browser callers (and the firmware and the test suites) still use Bearer:
 TOKEN="paste-token-here"
 curl -H "Authorization: Bearer $TOKEN" http://localhost:3000/sensor/latest
 # → { "data": { ...readings... }, "deviceExists": true }   (200 even with no data yet)
+
+# A browser-equivalent call, keeping the cookie the way the dashboard does:
+curl -c cookies.txt -X POST http://localhost:3000/auth/login \
+  -H "Content-Type: application/json" -d '{"username":"...","password":"..."}'
+curl -b cookies.txt http://localhost:3000/sensor/latest
 
 # Ingest a test reading (add -H "X-Device-Secret: $DEVICE_SECRET" when set):
 curl -X POST http://localhost:3000/sensor -H "Content-Type: application/json" \
   -d '{"device_id":"TEST","temperature":25,"water_level":75,"ammonia":0.4}'
 
-# Watch the live SSE stream:
-curl -N "http://localhost:3000/sensor/stream?token=$TOKEN"
+# Watch the live SSE stream (Bearer; a browser uses the cookie instead):
+curl -N -H "Authorization: Bearer $TOKEN" "http://localhost:3000/sensor/stream"
 
 curl -X POST http://localhost:3000/alert/mute -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" -d '{"hours": 4}'
 ```
+
+All API routes also answer under an `/api` prefix (`/api/sensor/latest`), which
+is what the dashboard actually calls: `API_BASE` defaults to the relative `/api`
+so the built bundle and the API share an origin in both dev and production.
+Bare paths remain live for the firmware.
 
 ---
 
@@ -513,7 +524,18 @@ curl -X POST http://localhost:3000/alert/mute -H "Authorization: Bearer $TOKEN" 
 npm run build
 ```
 
-Output in `dist/` folder.
+Output in `dist/` folder. `server.cjs` serves that folder itself, so after a
+build the whole dashboard is one process:
+
+```bash
+npm run build && npm run server   # dashboard + API on http://localhost:3000
+```
+
+Keeping the dashboard and the API on one origin is not just convenience here:
+it is what lets the session be a `SameSite=Lax` cookie, which is the CSRF
+defence. If you split them across hosts, the cookie stops being sent and you
+need HTTPS plus `SameSite=None`, so prefer one process. Without a `dist/` the
+server logs that it is API-only and `npm run dev` still works normally.
 
 ---
 
