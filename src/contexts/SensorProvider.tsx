@@ -97,8 +97,14 @@ function pickDefaultTank(devices: DeviceEntry[]): DeviceEntry {
   })[0];
 }
 
-// 401s are re-thrown so the axios response interceptor can clear the session
-// and route back to the login screen.
+// True when the failure was a 401. This is NOT a re-throw helper any more: the
+// axios response interceptor in api/client.ts already detects a lost session,
+// clears the token and dispatches "crayvings_unauthorized" for AuthProvider to
+// act on, and it does so before it rejects. Re-throwing here only produced an
+// unhandled promise rejection, because the callers are fire-and-forget - a
+// useEffect body, a setInterval tick, an onClick - and none of them await.
+// The remaining job of this check is to return early so a page being torn down
+// by the redirect does not first paint "Failed to load settings".
 function isSessionExpired(error: unknown): boolean {
   return isAxiosError(error) && error.response?.status === 401;
 }
@@ -534,7 +540,7 @@ function useSettingsManager(): SensorSettingsState & {
         settingsError: null,
       }));
     } catch (error) {
-      if (isSessionExpired(error)) return Promise.reject(error);
+      if (isSessionExpired(error)) return;
       setState((prev) => ({
         ...prev,
         settingsLoading: false,
@@ -573,7 +579,7 @@ function useSettingsManager(): SensorSettingsState & {
       }));
       flashSaved();
     } catch (error) {
-      if (isSessionExpired(error)) return Promise.reject(error);
+      if (isSessionExpired(error)) return;
       setState((prev) => ({
         ...prev,
         settingsSaving: false,
@@ -595,7 +601,7 @@ function useSettingsManager(): SensorSettingsState & {
       }));
       flashSaved();
     } catch (error) {
-      if (isSessionExpired(error)) return Promise.reject(error);
+      if (isSessionExpired(error)) return;
       setState((prev) => ({
         ...prev,
         settingsSaving: false,
@@ -615,7 +621,7 @@ function useSettingsManager(): SensorSettingsState & {
       });
       flashSaved();
     } catch (error) {
-      if (isSessionExpired(error)) return Promise.reject(error);
+      if (isSessionExpired(error)) return;
       setState((prev) => ({
         ...prev,
         settingsSaving: false,
@@ -731,7 +737,7 @@ function useLogsManager(selectedDeviceId: string | null): LogsState & {
       }));
     } catch (error) {
       if (isAxiosError(error) && error.code === "ERR_CANCELED") return;
-      if (isSessionExpired(error)) return Promise.reject(error);
+      if (isSessionExpired(error)) return;
       setState((prev) => ({
         ...prev,
         logsLoading: false,
@@ -875,7 +881,7 @@ function useActivityLogsManager() {
       }
     } catch (error) {
       if (isAxiosError(error) && error.code === "ERR_CANCELED") return;
-      if (isSessionExpired(error)) return Promise.reject(error);
+      if (isSessionExpired(error)) return;
       if (isMountedRef.current) {
         setState((prev) => ({
           ...prev,
