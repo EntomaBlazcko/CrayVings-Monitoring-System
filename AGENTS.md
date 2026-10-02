@@ -139,10 +139,12 @@ The three that need a server fail with `status=-1` / `ECONNREFUSED` if it isn't 
 That is an environment problem, **not** a regression — don't chase it as a code bug.
 
 `test:sessions` is **deliberately not in `test:all`.** It is the only suite that
-calls `POST /auth/login`, and the server rate-limits that endpoint to 5 attempts
-per 15 minutes per IP as a brute-force guard; the suite spends 4 of them. Since
-`test:all` has to stay re-runnable at will, this one runs on request. A `429` from
-it means the window is exhausted, not that the session code regressed.
+calls `POST /auth/login`. Correct logins are not counted against the server's
+brute-force budget, so the suite no longer trips the limiter and can be run back
+to back — but a burst of genuinely failed logins in the browser will still make
+the server refuse it, and `test:all` has to stay green regardless of what you
+were doing in the UI a minute ago. A `429` from it means failed attempts have
+exhausted the window, not that the session code regressed.
 
 Other utilities:
 

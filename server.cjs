@@ -146,11 +146,17 @@ const globalLimiter = rateLimit({
 
 const loginLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,   // 15 minutes
-  limit: 5,                   // 5 login attempts / 15 min / IP (brute-force guard)
+  limit: 5,                   // 5 FAILED login attempts / 15 min / IP (brute-force guard)
   standardHeaders: "draft-7",
   legacyHeaders: false,
   message: { message: "Too many login attempts. Please try again later." },
   validate: { xForwardedForHeader: false },
+  // Only failed attempts count. A brute-force attack is made of wrong guesses,
+  // so a correct password adds nothing an attacker could use - but counting it
+  // throttled ordinary use: logging out and back in, two staff on shift, or an
+  // account switch all burned budget, and the user was locked out of a dashboard
+  // they had the right credentials for. Guessing is still capped at 5 per window.
+  skipSuccessfulRequests: true,
 });
 
 // Per-device limiter for sensor ingestion (audit 2.2.5/2.5.2). The normal send

@@ -3,12 +3,12 @@
 // =============================================================================
 // Run:  npm run test:sessions
 //
-// Deliberately NOT part of test:all. The server rate-limits /auth/login to 5
-// attempts per 15 minutes per IP, and this suite spends 4 of them, so it can
-// only run once per window. test:all has to stay re-runnable at will; a stage
-// that goes red on the second run teaches you to ignore red. The limiter is a
-// security control and is not relaxed to make a test convenient - run this one
-// deliberately, and wait out the window if you trip it.
+// Deliberately NOT part of test:all. It is the only suite that calls
+// /auth/login, so a burst of genuinely failed logins in the browser can make the
+// server refuse it, and test:all has to stay re-runnable at will regardless of
+// what you were doing in the UI a minute ago. Correct logins are NOT counted
+// against the brute-force budget, so the suite itself no longer trips the limit
+// and can be run back to back.
 //
 // The cookie migration moved browsers from a JS-readable token to an HttpOnly
 // cookie. That change touched the single most important request in the system -
@@ -338,11 +338,33 @@ async function main() {
   check("that non-admin keeps their session", !notCleared, notCleared ? "cookie was wrongly cleared" : "cookie left intact");
   await pool.query("DELETE FROM users WHERE username = $1", [plainUserName]).catch(() => {});
 
+  // --- K. Correct logins are not throttled ------------------------------------
+  // The brute-force guard used to count successful attempts too, so six correct
+  // logins in a row locked you out of a dashboard you had the right credentials
+  // for. A brute-force attack is made of wrong guesses, so successes add
+  // nothing an attacker could use and should cost nothing.
+  //
+  // Before the fix the sixth of these returned 429. It does not burn the failure
+  // budget either, which is why this suite is now safe to run repeatedly.
+  console.log("\n--- K. Correct logins are not throttled ---");
+  let allSucceeded = true;
+  let sawThrottle = null;
+  for (let i = 1; i <= 6; i++) {
+    const attempt = await login(username, password);
+    if (attempt.status === 429) { allSucceeded = false; sawThrottle = i; break; }
+    if (attempt.status !== 200) { allSucceeded = false; sawThrottle = `status ${attempt.status} on attempt ${i}`; break; }
+  }
+  check(
+    "6 consecutive correct logins are all accepted",
+    allSucceeded,
+    sawThrottle ? `blocked at attempt ${sawThrottle}` : "all 6 returned 200"
+  );
+
   await cleanup(username);
 }
 
 async function cleanup(username) {
-  console.log("\n--- K. Cleanup ---");
+  console.log("\n--- L. Cleanup ---");
   await pool.query("DELETE FROM users WHERE username LIKE $1", [`${PREFIX}%`]).catch(() => {});
   await pool.query("DELETE FROM activity_logs WHERE description LIKE $1", [`${PREFIX}%`]).catch(() => {});
   const leftover = await pool.query("SELECT count(*)::int AS n FROM users WHERE username LIKE $1", [`${PREFIX}%`]);

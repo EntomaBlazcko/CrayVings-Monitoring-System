@@ -106,7 +106,7 @@ Run from the project root. Record the counts - they are the baseline.
 | `npm run test:devices` | `104 checks` | registration, uniqueness, claiming, archiving, IP provenance, the `auto_registered` contract |
 | `npm run test:migration` | `15 checks` | the case-insensitive unique index, 23505 rejection, blocked path, re-run path |
 | `npm run test:secrets` | `65 checks` | per-device secret rotation, grace window, revocation, no secret leaks, wrong-length secret rejection |
-| `npm run test:sessions` | `36 checks` | cookie session: issued, HttpOnly/SameSite, no token in body, cookie-only auth, logout revocation, re-login invalidation, CSRF, activity-log attribution, dead-cookie clearing on both guards |
+| `npm run test:sessions` | `37 checks` | cookie session: issued, HttpOnly/SameSite, no token in body, cookie-only auth, logout revocation, re-login invalidation, CSRF, activity-log attribution, dead-cookie clearing on both guards, correct logins not throttled |
 | `npm run test:all` | all of the above except `test:sessions`, then `test:regression` | see B.7 for the expected final failure |
 
 ```bash
@@ -132,12 +132,14 @@ npm run test:sessions
       secret comparison: a 1-char, empty, or same-length wrong secret must give
       a 401, never a 500 (`timingSafeEqual` throws on a length mismatch, and a
       misconfigured board hitting a 500 drops its readings silently).
-- [ ] `test:sessions` reports **36** checks and leaves no test user behind.
+- [ ] `test:sessions` reports **37** checks and leaves no test user behind.
+      It can be run back to back: correct logins are not counted against the
+      server's brute-force budget, only failed ones are.
 
-> `test:sessions` is the only suite that calls `POST /auth/login`, which the
-> server rate-limits to 5 attempts per 15 minutes per IP; the suite uses 4. Run
-> it once per window. A `429` means the budget is spent, not that sessions
-> broke - it prints an explanatory message instead of failing the cookie checks.
+> `test:sessions` is the only suite that calls `POST /auth/login`. A `429` means
+> five *failed* attempts landed in the current 15-minute window, not that
+> sessions broke — it prints an explanation and exits INCOMPLETE rather than
+> failing the cookie checks against a spent budget.
 
 ### B.1 The `auto_registered` contract (new - test it deliberately)
 
