@@ -682,13 +682,38 @@ export async function deleteUser(
   await client.delete(`/auth/users/${userId}`, { signal });
 }
 
-// PUT /auth/users/:id/password (Admin only) - reset a user's password
+// PUT /auth/users/:id/password (Admin only) - reset another user's password.
+// The server signs the target out; use changeOwnPassword to rotate your own.
+//
+// currentPassword is only needed when an admin resets their OWN account through
+// this route - the server treats that as the self-service case and demands proof
+// of the current password. Omit it for any other target.
 export async function resetUserPassword(
   userId: number,
   newPassword: string,
+  currentPassword?: string,
   signal?: AbortSignal
 ): Promise<void> {
-  await client.put(`/auth/users/${userId}/password`, { newPassword }, { signal });
+  await client.put(`/auth/users/${userId}/password`, { newPassword, currentPassword }, { signal });
+}
+
+// PUT /auth/me/password - change your own password (any role).
+//
+// currentPassword is mandatory server-side: a session alone must not be enough
+// to set a new credential, or a stolen session becomes a permanent takeover. The
+// server also rotates the session, so the caller stays signed in here while
+// every other session for the account dies. No logout call is needed.
+export async function changeOwnPassword(
+  currentPassword: string,
+  newPassword: string,
+  signal?: AbortSignal
+): Promise<{ message: string; tokenExpiresAt: string }> {
+  const response = await client.put<{ message: string; tokenExpiresAt: string }>(
+    "/auth/me/password",
+    { currentPassword, newPassword },
+    { signal }
+  );
+  return response.data;
 }
 
 export interface SmsRecipient {

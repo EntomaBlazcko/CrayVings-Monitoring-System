@@ -9,7 +9,7 @@ const pool = new Pool({
 });
 
 // Read-only. Full index + check-constraint dump so the DBML block in
-// DATABASE_SCHEMA.md lists only what actually exists.
+// DATABASE.md lists only what actually exists.
 (async () => {
   const idx = await pool.query(
     `SELECT c.relname AS table_name, i.relname AS index_name,

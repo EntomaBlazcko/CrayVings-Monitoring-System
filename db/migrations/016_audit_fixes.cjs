@@ -66,8 +66,8 @@ const pool = new Pool({
   console.log("[migration] idx_sensors_device_id_ci built (concurrently)");
 
   // ---- 2. sms_logs recipient integrity -------------------------------------
-  // docs/DATABASE_SCHEMA.md:516 documents `fk_sms_logs_recipient ... ON DELETE
-  // CASCADE`, but no such FK exists on the live database, and grepping every
+  // docs/DATABASE.md documents `fk_sms_logs_recipient ... ON DELETE CASCADE`,
+  // but no such FK exists on the live database, and grepping every
   // migration shows none ever created one - 003_sms_integration.cjs created both
   // tables without it. So the documented constraint has never existed; this is a
   // documentation bug, not a dropped constraint.

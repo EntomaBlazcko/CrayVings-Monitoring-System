@@ -106,7 +106,7 @@ Run from the project root. Record the counts - they are the baseline.
 | `npm run test:devices` | `104 checks` | registration, uniqueness, claiming, archiving, IP provenance, the `auto_registered` contract |
 | `npm run test:migration` | `15 checks` | the case-insensitive unique index, 23505 rejection, blocked path, re-run path |
 | `npm run test:secrets` | `65 checks` | per-device secret rotation, grace window, revocation, no secret leaks, wrong-length secret rejection |
-| `npm run test:sessions` | `37 checks` | cookie session: issued, HttpOnly/SameSite, no token in body, cookie-only auth, logout revocation, re-login invalidation, CSRF, activity-log attribution, dead-cookie clearing on both guards, correct logins not throttled |
+| `npm run test:sessions` | `59 checks` | cookie session: issued, HttpOnly/SameSite, no token in body, cookie-only auth, logout revocation, re-login invalidation, CSRF, activity-log attribution, dead-cookie clearing on both guards, correct logins not throttled, self-service + admin password change (policy, current-password proof, 404 on unknown id, session revocation, audit) |
 | `npm run test:all` | all of the above except `test:sessions`, then `test:regression` | see B.7 for the expected final failure |
 
 ```bash
@@ -132,9 +132,9 @@ npm run test:sessions
       secret comparison: a 1-char, empty, or same-length wrong secret must give
       a 401, never a 500 (`timingSafeEqual` throws on a length mismatch, and a
       misconfigured board hitting a 500 drops its readings silently).
-- [ ] `test:sessions` reports **37** checks and leaves no test user behind.
-      It can be run back to back: correct logins are not counted against the
-      server's brute-force budget, only failed ones are.
+- [ ] `test:sessions` reports **59** checks and leaves no test user or test
+      activity row behind. It can be run back to back: correct logins are not
+      counted against the server's brute-force budget, only failed ones are.
 
 > `test:sessions` is the only suite that calls `POST /auth/login`. A `429` means
 > five *failed* attempts landed in the current 15-minute window, not that
@@ -583,7 +583,7 @@ Everything below must be ticked before the system is called verified.
 
 | Symptom | Look at |
 |---------|---------|
-| Board not appearing on the dashboard | `docs/DEVICES_MODULE_HOWTO.md`, then the Devices page "Auto-discovered" badge |
+| Board not appearing on the dashboard | `docs/DEVICES.md`, then the Devices page "Auto-discovered" badge |
 | Whole test suite red with `status=-1` | The server is not running. Check A.4 before reading any code. |
 | 401 from a board | Device secret mismatch - the firmware's `X-Device-Secret` vs the server's |
 | Device shows Offline but is posting | The health poller and the Online badge use different clocks; see the sign-off note |
@@ -593,12 +593,14 @@ Everything below must be ticked before the system is called verified.
 
 ## Related documents
 
-- `docs/HOW_IT_WORKS.md` - system design and data flow
-- `docs/DEVICES_MODULE_HOWTO.md` - device registration, archiving, rotation
-- `docs/DATABASE_SCHEMA.md` - tables, columns, indexes
-- `docs/MOCK_DEVICE.md` - simulating a board without hardware
-- `docs/TESTING_MULTI_TANK.md` - the original star-topology test run
-- `docs/HTTPSMS_SETUP.md` - SMS gateway
+- `docs/README.md` - documentation index
+- `docs/ARCHITECTURE.md` - system design and data flow
+- `docs/DEVICES.md` - device registration, archiving, secret rotation
+- `docs/DATABASE.md` - tables, columns, indexes
+- `docs/TESTING.md` - the consolidated testing guide: static checks, the mock
+  simulator, a ten-device fleet rehearsal, the star-topology hardware run, and
+  what each `npm test` script covers
+- `docs/INTEGRATIONS.md` - SMS gateway
 
 ---
 

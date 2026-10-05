@@ -579,8 +579,8 @@ Migration 016 enforces the intent with the trigger `trg_sms_logs_recipient`
 recipient_phone` and raises a `foreign_key_violation` when no matching
 `authorized_recipients` row exists.
 
-The 5 pre-existing orphan rows (ids 970, 974, 979, 984, 989 — all
-`+639925876027`, all 2026-09-16, 4 `queued` + 1 `failed`) were **left in place by
+The 5 pre-existing orphan rows (ids 970, 974, 979, 984, 989 — all one recipient
+number, all 2026-09-16, 4 `queued` + 1 `failed`) were **left in place by
 design**: whether an alert was actually delivered is an operator decision, and
 deleting or reassigning them would fabricate a delivery record.
 
@@ -769,7 +769,7 @@ Things to know before you paste it:
   documentation, not for rendering.
 
 ```dbml
-// Full schema and enforcement notes: see DATABASE_SCHEMA.md
+// Full schema and enforcement notes: see DATABASE.md
 
 Table users {
   id int [pk, increment]

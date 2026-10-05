@@ -294,7 +294,9 @@ Match that. Don't strip existing comments, and don't add comments restating the 
 
 - `README.md` — features, full API endpoint tables, architecture, troubleshooting
 - `TESTING_GUIDE.md` — the ordered verification procedure (phases A–H)
-- `docs/DATABASE_SCHEMA.md` — every table, column, index, FK
-- `docs/HOW_IT_WORKS.md` — detailed architecture and alert/SMS logic
-- `docs/DEVICES_MODULE_HOWTO.md` — device registration/archiving
-- `docs/MOCK_DEVICE.md` — simulating an ESP32
+- `docs/README.md` — documentation index
+- `docs/ARCHITECTURE.md` — detailed architecture, API map, alert/SMS logic
+- `docs/DATABASE.md` — every table, column, index, FK
+- `docs/DEVICES.md` — device registration/archiving, secret rotation
+- `docs/TESTING.md` — static checks, mock simulator, fleet rehearsal, `npm test` scripts
+- `docs/INTEGRATIONS.md` — SMS gateway (HTTPSMS) setup and debugging

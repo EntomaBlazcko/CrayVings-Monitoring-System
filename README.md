@@ -170,7 +170,7 @@ PG_USER=postgres
 PG_PASSWORD=your_password
 ALLOWED_ORIGINS=http://localhost:5173
 
-# SMS via HTTPSMS (optional Android gateway; see docs/HTTPSMS_SETUP.md)
+# SMS via HTTPSMS (optional Android gateway; see docs/INTEGRATIONS.md)
 HTTPSMS_API_KEY=your_httpsms_api_key
 HTTPSMS_FROM=+639XXXXXXXXXX
 
@@ -250,18 +250,20 @@ While muted, disconnect alerts still show as popups and are logged, but SMS is n
 | `/auth/users/deletion-requests` | GET | List pending deletion requests |
 | `/auth/users/:id/restore` | POST | Restore a soft-deleted user |
 | `/auth/users/archived/:id` | DELETE | Permanently purge archived user |
-| `/auth/users/:id/password` | PUT | Reset a user's password |
+| `/auth/me/password` | PUT | Change your own password (needs the current one; signs other sessions out and keeps you signed in) |
+| `/auth/users/:id/password` | PUT | Reset another user's password (admin; signs that account out; requires the current password when the target is yourself) |
 
 ### Sensors & Reports
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/sensor` | POST | Submit sensor data (shared `DEVICE_SECRET` or per-device `devices.device_secret`; 3/sec/device rate limit; failure sentinels stored as NULL) |
+| `/sensor` | POST | Submit sensor data (shared `DEVICE_SECRET` or per-device `devices.device_secret`; 12 posts/sec/device rate limit; failure sentinels stored as NULL) |
 | `/sensor/latest` | GET | Latest reading as `{ data, deviceExists }` — HTTP 200 even when no readings exist yet; `recv_at` = live device heartbeat; optional `device_id` filter |
 | `/sensor` | GET | Get history (`limit`: 1-1000; optional `device_id` filter, per-tank; `?before=<ISO timestamp>` keyset cursor for paging older data) |
 | `/sensor/stream` | GET | **SSE** live-reading stream (auth via the session cookie - EventSource is same-origin so it cannot leak a token in the URL; keep-alive pings every 25s) |
 | `/devices` | GET | Fleet registry + online flags (name, tank_name, tank_location, ip_address, last_health_seen) |
 | `/devices/latest` | GET | Freshest in-memory reading per active tank in one call (drives the Live Tank Bar; no DB hit) |
 | `/devices/:deviceId/status` | GET | Live on-demand poll of one ESP32's `GET /status` (3s timeout) |
+| `/devices/:deviceId/rotate-secret` | POST | Issue a new per-device `device_secret` (admin). The old one keeps working for a grace window (`grace_hours`, default 24h, capped at 7d). The new secret is returned **once**, in this response, and never leaves the DB again |
 | `/report/weekly` | GET | Weekly report (summary, daily breakdown, alert counts) |
 | `/report/range` | GET | Aggregated report for `?hours=N` (hourly buckets when ≤24h, daily otherwise; admin) |
 
@@ -277,6 +279,20 @@ While muted, disconnect alerts still show as popups and are logged, but SMS is n
 | `/settings/recipients/:id/restore` | POST | Restore archived recipient |
 | `/settings/recipients/archived/:id` | DELETE | Permanently purge archived recipient |
 | `/settings/recipients/test/:id` | POST | Send test SMS |
+
+### Per-tank threshold overrides
+
+Thresholds are layered: a global row in `sensor_settings`, optionally overridden
+per tank in `device_threshold_overrides`. `GET /settings/effective` resolves the
+whole farm in one call (what the dashboard uses); the `/settings/device/:deviceId`
+routes manage one tank.
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/settings/effective` | GET | Effective thresholds for every tank: `{ global, devices: { device_id: thresholds } }` |
+| `/settings/device/:deviceId` | GET | One tank's `global`, `effective`, which fields are `overridden`, and the raw `override` row (admin) |
+| `/settings/device/:deviceId` | PUT | Upsert a **partial** override — only the fields you send change. Validated so `min < max` still holds for that tank; each changed field logs a system-log entry attributed to the tank (admin) |
+| `/settings/device/:deviceId` | DELETE | Drop the tank's overrides; it falls back to global thresholds. `404` if nothing was overridden (admin) |
 
 ### Alerts & SMS
 | Endpoint | Method | Description |
@@ -481,7 +497,7 @@ a capstone demo can fail a component and show automatic recovery.
 | "Too many login attempts" | Login rate limit (5/15 min/IP) — wait or restart the server in dev |
 | Sensor POST returns 401 | `DEVICE_SECRET` mismatch — send it in the `X-Device-Secret` header, or set `devices.device_secret` for the device |
 | Sensor POST returns 400 | Reading rejected by validation (bad range or ammonia spike guard) — sentinels are fine, out-of-bounds values are not |
-| SMS not sending | Verify HTTPSMS_API_KEY / HTTPSMS_FROM in .env; see docs/HTTPSMS_SETUP.md |
+| SMS not sending | Verify HTTPSMS_API_KEY / HTTPSMS_FROM in .env; see docs/INTEGRATIONS.md |
 | Can't log in | First-time setup requires `npm run seed:admin` (ADMIN_INITIAL_PASSWORD) |
 | AudioContext warning | Click anywhere on the page to unlock audio |
 
@@ -549,12 +565,16 @@ ISC
 
 ### Documentation (all in [docs/](docs/))
 
+Start at [docs/README.md](docs/README.md) for the full index.
+
 | Doc | What it covers |
 |---|---|
-| [HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md) | Detailed documentation: architecture, data flow, alert/SMS logic, hardware integration, performance, security |
-| [DATABASE_SCHEMA.md](docs/DATABASE_SCHEMA.md) | Every table, column, index, FK, plus a copy-paste DBML diagram for dbdiagram.io |
-| [HTTPSMS_SETUP.md](docs/HTTPSMS_SETUP.md) | SMS configuration: gateway phone, `.env` keys, recipients, delivery tracking, troubleshooting |
-| [MOCK_DEVICE.md](docs/MOCK_DEVICE.md) | Simulate an ESP32 with `npm run mock` — 8 scenario profiles, CLI options, recipes |
-| [TESTING_MULTI_TANK.md](docs/TESTING_MULTI_TANK.md) | Step-by-step verification of the multi-tank star topology (phases A–F) |
-| [LAST_NIGHT_SESSION.md](docs/LAST_NIGHT_SESSION.md) | Session log: what changed, what was verified, what is still deferred |
-| [full-audit-27092026.md](docs/full-audit-27092026.md) | Full system audit — 4 critical, 9 moderate, 9 minor findings + suggested order of work |
+| [ARCHITECTURE.md](docs/ARCHITECTURE.md) | Architecture, data flow, SSE, alert/SMS logic, hardware integration, API map, performance, security, and the inline system diagram |
+| [DATABASE.md](docs/DATABASE.md) | Every table, column, index, FK, plus a copy-paste DBML diagram for dbdiagram.io |
+| [DEVICES.md](docs/DEVICES.md) | Device registration, rename/hide/archive/restore, secret rotation, the star topology and the health poller |
+| [TESTING.md](docs/TESTING.md) | Static checks, the mock simulator, a ten-device fleet rehearsal, the hardware star-topology run, and the automated suites |
+| [INTEGRATIONS.md](docs/INTEGRATIONS.md) | SMS configuration: gateway phone, `.env` keys, recipients, circuit breaker, delivery tracking, troubleshooting |
+
+Repository-level guides live outside `docs/`: [AGENTS.md](AGENTS.md) (conventions
+and constraints) and [TESTING_GUIDE.md](TESTING_GUIDE.md) (the ordered A–H manual
+verification procedure).

@@ -49,6 +49,7 @@ import {
   requestUserDeletion,
   verifyUserDeletion,
   resetUserPassword,
+  changeOwnPassword,
   resetSettings as apiResetSettings,
   fetchDeviceThresholds,
   fetchSmsRecipients,
@@ -155,17 +156,23 @@ const SETTINGS_FIELDS: Array<keyof SensorSettings> = [
   "ammonia_max",
 ];
 
+// One definition of the password rules, used by every form that sets one: create
+// account, admin reset, and change-my-own. The server enforces the same policy
+// (server.cjs passwordPolicySchema) - this copy is for instant feedback, not for
+// safety, which is why the two must not be allowed to drift apart quietly.
+const passwordSchema = z
+  .string()
+  .min(8, "Password must be at least 8 characters")
+  .max(100)
+  .regex(/[A-Z]/, "Password must contain at least one uppercase letter")
+  .regex(/[a-z]/, "Password must contain at least one lowercase letter")
+  .regex(/[0-9]/, "Password must contain at least one number");
+
 const userSchema = z.object({
   name: z.string().min(2, "Name must be at least 2 characters").max(100),
   username: z.string().min(3, "Username must be at least 3 characters").max(50).regex(/^[a-zA-Z0-9_]+$/, "Username can only contain letters, numbers, and underscores"),
   email: z.string().email("Please enter a valid email address"),
-  password: z
-    .string()
-    .min(8, "Password must be at least 8 characters")
-    .max(100)
-    .regex(/[A-Z]/, "Password must contain at least one uppercase letter")
-    .regex(/[a-z]/, "Password must contain at least one lowercase letter")
-    .regex(/[0-9]/, "Password must contain at least one number"),
+  password: passwordSchema,
   role: z.enum(["user", "admin"]),
 });
 
@@ -562,7 +569,7 @@ export default function SettingsPage() {
   const [showPassword, setShowPassword] = useState(false);
   const [formErrors, setFormErrors] = useState<FormErrors>({});
   const [actionLoading, setActionLoading] = useState<string | null>(null);
-  const [resetModal, setResetModal] = useState<{ id: number; name: string; password: string; errors: FormErrors } | null>(null);
+  const [resetModal, setResetModal] = useState<{ id: number; name: string; password: string; current: string; errors: FormErrors } | null>(null);
   const [deleteConfirm, setDeleteConfirm] = useState<{ id: number; username: string } | null>(null);
   const [toasts, setToasts] = useState<{ id: number; message: string; type: "success" | "error" }[]>([]);
 
@@ -789,17 +796,24 @@ export default function SettingsPage() {
   const handleResetPassword = useCallback(async (id: number) => {
     if (!resetModal) return;
 
+    // Resetting your OWN account through the admin route still has to prove the
+    // current password, exactly like the self-service endpoint does.
+    const isSelf = resetModal.id === user?.id;
+
     try {
       const { password } = resetModal;
-      const pwSchema = z.string().min(8, "Password must be at least 8 characters").max(100)
-        .regex(/[A-Z]/, "Must contain an uppercase letter")
-        .regex(/[a-z]/, "Must contain a lowercase letter")
-        .regex(/[0-9]/, "Must contain a number");
-      pwSchema.parse(password);
+      if (isSelf && !resetModal.current) {
+        setResetModal((prev) => prev ? { ...prev, errors: { current: "Enter your current password" } } : null);
+        return;
+      }
+      passwordSchema.parse(password);
 
       setActionLoading(`reset-${id}`);
-      await resetUserPassword(id, password);
-      showToast("Password reset successfully", "success");
+      await resetUserPassword(id, password, isSelf ? resetModal.current : undefined);
+      showToast(
+        isSelf ? "Password updated — other sessions were signed out" : "Password reset successfully — that account has been signed out",
+        "success"
+      );
       setResetModal(null);
     } catch (err: unknown) {
       if (err instanceof z.ZodError) {
@@ -816,7 +830,42 @@ export default function SettingsPage() {
     } finally {
       setActionLoading(null);
     }
-  }, [resetModal, showToast]);
+  }, [resetModal, showToast, user?.id]);
+
+  // Change-my-own-password form. The current password is required by the server:
+  // a session on its own must never be enough to set a new credential, or a
+  // stolen session becomes a permanent takeover of the account.
+  const [pwForm, setPwForm] = useState({ current: "", next: "", confirm: "" });
+  const [pwErrors, setPwErrors] = useState<FormErrors>({});
+  const [showPwFields, setShowPwFields] = useState(false);
+  const [pwSaving, setPwSaving] = useState(false);
+
+  const handleChangeOwnPassword = useCallback(async () => {
+    const { current, next, confirm } = pwForm;
+    const errors: FormErrors = {};
+
+    if (!current) errors.current = "Enter your current password";
+    const parsed = passwordSchema.safeParse(next);
+    if (!parsed.success) errors.next = parsed.error.issues[0]?.message ?? "Invalid password";
+    if (confirm && next && confirm !== next) errors.confirm = "Passwords do not match";
+
+    setPwErrors(errors);
+    if (Object.keys(errors).length > 0) return;
+
+    setPwSaving(true);
+    try {
+      await changeOwnPassword(current, next);
+      setPwForm({ current: "", next: "", confirm: "" });
+      showToast("Password changed — any other signed-in session was signed out", "success");
+    } catch (err: unknown) {
+      // The server owns the rules, so its message is the authority here; a
+      // rejected current password lands on `current`, everything else on `next`.
+      const message = getApiError(err);
+      setPwErrors(isAxiosError(err) && err.response?.status === 403 ? { current: message } : { next: message });
+    } finally {
+      setPwSaving(false);
+    }
+  }, [pwForm, showToast]);
 
   const [recipients, setRecipients] = useState<SmsRecipient[]>([]);
   const [isLoadingRecipients, setIsLoadingRecipients] = useState(true);
@@ -1416,6 +1465,134 @@ export default function SettingsPage() {
         />
       )}
 
+      {/* Change my own password. Visible to every role on purpose: the absence of
+          a self-service password change is what made an owner lockout
+          unrecoverable from inside the app. */}
+      <section className="bg-white rounded-xl border border-gray-100 shadow-sm p-5">
+        <div className="flex items-start gap-3 mb-4">
+          <span className="w-9 h-9 rounded-lg bg-orange-100 text-orange-600 flex items-center justify-center shrink-0">
+            <KeyRound size={18} />
+          </span>
+          <div className="flex-1">
+            <h2 className="text-base font-bold text-gray-800">Change My Password</h2>
+            <p className="text-sm text-gray-500">
+              Signed in as <span className="font-mono text-gray-700">{user?.username}</span>. Changing your
+              password signs out every other session on this account.
+            </p>
+          </div>
+        </div>
+
+        <form
+          className="space-y-4"
+          noValidate
+          onSubmit={(e) => {
+            e.preventDefault();
+            void handleChangeOwnPassword();
+          }}
+        >
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+            <div>
+              <label htmlFor="own-current-password" className="block text-sm font-medium text-gray-700 mb-1">
+                Current Password
+              </label>
+              <input
+                id="own-current-password"
+                type={showPwFields ? "text" : "password"}
+                value={pwForm.current}
+                onChange={(e) => {
+                  setPwForm((prev) => ({ ...prev, current: e.target.value }));
+                  if (pwErrors.current) setPwErrors((prev) => ({ ...prev, current: "" }));
+                }}
+                className={`w-full px-3 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-brand-500/20 focus:border-brand-500 ${
+                  pwErrors.current ? "border-red-500 bg-red-50" : "border-gray-300"
+                }`}
+                placeholder="Your password today"
+                autoComplete="current-password"
+              />
+              {pwErrors.current && <p className="mt-1 text-xs text-red-600">{pwErrors.current}</p>}
+            </div>
+
+            <div>
+              <label htmlFor="own-new-password" className="block text-sm font-medium text-gray-700 mb-1">
+                New Password
+              </label>
+              <input
+                id="own-new-password"
+                type={showPwFields ? "text" : "password"}
+                value={pwForm.next}
+                onChange={(e) => {
+                  setPwForm((prev) => ({ ...prev, next: e.target.value }));
+                  if (pwErrors.next) setPwErrors((prev) => ({ ...prev, next: "" }));
+                }}
+                className={`w-full px-3 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-brand-500/20 focus:border-brand-500 ${
+                  pwErrors.next ? "border-red-500 bg-red-50" : "border-gray-300"
+                }`}
+                placeholder="Choose a new password"
+                autoComplete="new-password"
+              />
+              {pwErrors.next ? (
+                <p className="mt-1 text-xs text-red-600">{pwErrors.next}</p>
+              ) : (
+                <div className="mt-1 flex flex-wrap gap-x-3 gap-y-0.5">
+                  <span className={`text-xs ${/[A-Z]/.test(pwForm.next) ? "text-green-600" : "text-gray-400"}`}>
+                    {/[A-Z]/.test(pwForm.next) ? "✓" : "○"} Uppercase
+                  </span>
+                  <span className={`text-xs ${/[a-z]/.test(pwForm.next) ? "text-green-600" : "text-gray-400"}`}>
+                    {/[a-z]/.test(pwForm.next) ? "✓" : "○"} Lowercase
+                  </span>
+                  <span className={`text-xs ${/[0-9]/.test(pwForm.next) ? "text-green-600" : "text-gray-400"}`}>
+                    {/[0-9]/.test(pwForm.next) ? "✓" : "○"} Number
+                  </span>
+                  <span className={`text-xs ${pwForm.next.length >= 8 ? "text-green-600" : "text-gray-400"}`}>
+                    {pwForm.next.length >= 8 ? "✓" : "○"} 8+ chars
+                  </span>
+                </div>
+              )}
+            </div>
+
+            <div>
+              <label htmlFor="own-confirm-password" className="block text-sm font-medium text-gray-700 mb-1">
+                Confirm New Password
+              </label>
+              <input
+                id="own-confirm-password"
+                type={showPwFields ? "text" : "password"}
+                value={pwForm.confirm}
+                onChange={(e) => {
+                  setPwForm((prev) => ({ ...prev, confirm: e.target.value }));
+                  if (pwErrors.confirm) setPwErrors((prev) => ({ ...prev, confirm: "" }));
+                }}
+                className={`w-full px-3 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-brand-500/20 focus:border-brand-500 ${
+                  pwErrors.confirm ? "border-red-500 bg-red-50" : "border-gray-300"
+                }`}
+                placeholder="Type it again"
+                autoComplete="new-password"
+              />
+              {pwErrors.confirm && <p className="mt-1 text-xs text-red-600">{pwErrors.confirm}</p>}
+            </div>
+          </div>
+
+          <div className="flex items-center justify-end gap-3">
+            <button
+              type="button"
+              onClick={() => setShowPwFields((prev) => !prev)}
+              className="flex items-center gap-1.5 px-3 py-2 text-sm font-semibold text-gray-600 hover:text-gray-800 transition"
+            >
+              {showPwFields ? <EyeOff size={16} /> : <Eye size={16} />}
+              {showPwFields ? "Hide" : "Show"}
+            </button>
+            <button
+              type="submit"
+              disabled={pwSaving}
+              className="flex items-center gap-2 bg-gradient-to-r from-brand-500 to-brand-400 text-white px-5 py-2 rounded-lg font-semibold text-sm hover:from-brand-600 hover:to-brand-500 transition-all disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              {pwSaving ? <Loader2 size={16} className="animate-spin" /> : <KeyRound size={16} />}
+              Update Password
+            </button>
+          </div>
+        </form>
+      </section>
+
       {isAdmin && (
         <div className="space-y-6 pt-6 border-t border-gray-200">
           <div className="flex items-center justify-between">
@@ -1669,7 +1846,7 @@ export default function SettingsPage() {
                         <td className="px-4 py-3">
                           <div className="flex items-center justify-end gap-1">
                             <button
-                              onClick={() => setResetModal({ id: u.id, name: u.username, password: "", errors: {} })}
+                              onClick={() => setResetModal({ id: u.id, name: u.username, password: "", current: "", errors: {} })}
                               className="p-1.5 text-gray-400 hover:text-amber-600 hover:bg-amber-50 rounded-md transition-colors"
                               title="Reset Password"
                             >
@@ -2364,11 +2541,31 @@ export default function SettingsPage() {
                 <h3 className="text-lg font-bold text-gray-800">Reset Password</h3>
                 <p className="text-sm text-gray-500">
                   Enter new password for <span className="font-semibold">{resetModal.name}</span>
+                  {resetModal.id === user?.id
+                    ? " — this is your own account, so you will stay signed in here."
+                    : " — they will be signed out and must log in again."}
                 </p>
               </div>
             </div>
 
             <div className="mb-4">
+              {resetModal.id === user?.id && (
+                <>
+                  <input
+                    type="password"
+                    value={resetModal.current}
+                    onChange={(e) => setResetModal((prev) => prev ? { ...prev, current: e.target.value, errors: {} } : null)}
+                    className={`w-full px-3 py-2 mb-3 border rounded-lg focus:outline-none focus:ring-2 focus:ring-brand-500/20 focus:border-brand-500 ${
+                      resetModal.errors.current ? "border-red-500 bg-red-50" : "border-gray-300"
+                    }`}
+                    placeholder="Your current password"
+                    autoComplete="current-password"
+                  />
+                  {resetModal.errors.current && (
+                    <p className="mt-1 mb-2 text-xs text-red-600">{resetModal.errors.current}</p>
+                  )}
+                </>
+              )}
               <input
                 type="password"
                 value={resetModal.password}

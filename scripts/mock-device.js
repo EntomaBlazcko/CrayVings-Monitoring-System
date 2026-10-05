@@ -16,7 +16,7 @@
  *   node scripts/mock-device.js --list-devices           # query the live API
  *
  * Run `node scripts/mock-device.js --help` for the full flag list, or read
- * docs/MOCK_DEVICE.md.
+ * Part 2 of docs/TESTING.md.
  */
 
 import fs from "node:fs";

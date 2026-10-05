@@ -27,6 +27,8 @@
 //   6. Logout clears the cookie AND revokes the token server-side, so a copy
 //      of the cookie taken before logout stops working.
 //   7. Sessions are single-use: logging in again invalidates the old cookie.
+//   8. Password changes are enforced server-side: policy, current-password
+//      proof, 404 on an unknown target, session revocation, and an audit row.
 //
 // Requires a running server (API_BASE, default http://localhost:3000) and
 // PostgreSQL for the throwaway user. The user is removed at the end.
@@ -84,6 +86,18 @@ const hasAttr = (setCookie, attr) =>
 
 const sessionCookie = (res) => (res.headers.getSetCookie() || []).find((c) => c.startsWith(`${COOKIE}=`));
 const cookieValue = (setCookie) => (setCookie || "").slice(COOKIE.length + 1).split(";")[0];
+
+// Same PBKDF2 shape as hashPassword, used only to confirm a stored hash really
+// matches a plaintext the test chose.
+function verifyAgainst(stored, candidate) {
+  if (typeof stored !== "string" || typeof candidate !== "string") return false;
+  const parts = stored.split(":");
+  const iterations = parts.length === 3 ? parseInt(parts[0], 10) : 10000;
+  const salt = parts.length === 3 ? parts[1] : parts[0];
+  const expected = parts.length === 3 ? parts[2] : parts[1];
+  const actual = crypto.pbkdf2Sync(candidate, salt, iterations, PBKDF2_KEYLEN, PBKDF2_DIGEST).toString("hex");
+  return expected === actual;
+}
 
 async function login(username, password) {
   const res = await fetch(`${API}/auth/login`, {
@@ -360,15 +374,177 @@ async function main() {
     sawThrottle ? `blocked at attempt ${sawThrottle}` : "all 6 returned 200"
   );
 
+  // --- L. Password changes ----------------------------------------------------
+  // An owner lockout left one gap and five
+  // defects in the password write path, and none of it was covered:
+  //   1. No self-service change at all - nobody could rotate their own password.
+  //   2. The strength rules existed only in the browser, so `{"newPassword":"a"}`
+  //      was accepted and stored.
+  //   3. An unknown id reported "Password updated" and changed nothing.
+  //   4. A password change left the session alive, so a stolen cookie outlived
+  //      the rotation meant to lock the thief out.
+  //   5. Nothing was written to activity_logs.
+  // A live session is minted straight into the DB for these, so they cost none
+  // of the rate-limited login budget.
+  console.log("\n--- L. Password changes ---");
+
+  const newPassword = `${PREFIX}rotated-Passw0rd`;
+  const sessionToken = crypto.randomBytes(32).toString("hex");
+  await pool.query(
+    "UPDATE users SET token = $1, token_expires_at = $2 WHERE username = $3",
+    [sha256(sessionToken), new Date(Date.now() + 3600000), username]
+  );
+  const ownCookie = { Cookie: `${COOKIE}=${sessionToken}` };
+
+  const changeOwn = (body, headers = ownCookie) =>
+    fetch(`${API}/auth/me/password`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json", ...headers },
+      body: JSON.stringify(body),
+    });
+
+  const unauth = await changeOwn({ currentPassword: password, newPassword }, {});
+  check("PUT /auth/me/password with no session -> 401", unauth.status === 401, `status=${unauth.status}`);
+
+  const weak = await changeOwn({ currentPassword: password, newPassword: "a" });
+  check(
+    "a weak new password is rejected by the SERVER -> 400",
+    weak.status === 400,
+    `status=${weak.status} ${JSON.stringify(weak.body || {}).slice(0, 120)}`
+  );
+  const stillOld = await pool.query("SELECT password_hash FROM users WHERE username = $1", [username]);
+  check(
+    "the rejected attempt did not change the stored hash",
+    verifyAgainst(stillOld.rows[0]?.password_hash, password),
+    "the original password still verifies"
+  );
+
+  const wrongCurrent = await changeOwn({ currentPassword: `${PREFIX}wrong-current`, newPassword });
+  check("wrong current password -> 403", wrongCurrent.status === 403, `status=${wrongCurrent.status}`);
+
+  const noCurrent = await changeOwn({ newPassword });
+  check("missing current password -> 400", noCurrent.status === 400, `status=${noCurrent.status}`);
+
+  const sameAsCurrent = await changeOwn({ currentPassword: password, newPassword: password });
+  check("reusing the current password -> 400", sameAsCurrent.status === 400, `status=${sameAsCurrent.status}`);
+
+  const changed = await changeOwn({ currentPassword: password, newPassword });
+  check("valid change -> 200", changed.status === 200, `status=${changed.status} ${JSON.stringify(changed.body || {}).slice(0, 120)}`);
+
+  // The replacement cookie: the caller stays signed in, and because the token
+  // column holds a single value, writing it kills every session that came before.
+  const rotatedCookie = sessionCookie(changed);
+  check("a replacement session cookie is issued", Boolean(rotatedCookie), rotatedCookie || "no Set-Cookie");
+  const stillWorks = await fetch(`${API}/settings/effective`, { headers: { Cookie: `${COOKIE}=${cookieValue(rotatedCookie)}` } });
+  check("the new cookie authenticates", stillWorks.status === 200, `status=${stillWorks.status}`);
+  const oldDead = await fetch(`${API}/settings/effective`, { headers: ownCookie });
+  check("the pre-change cookie no longer authenticates", oldDead.status !== 200, `status=${oldDead.status}`);
+
+  const audit = await pool.query(
+    "SELECT user_name, action_type FROM activity_logs WHERE user_name = $1 AND action_type = 'PASSWORD_CHANGED' ORDER BY id DESC LIMIT 1",
+    [username]
+  );
+  check(
+    "the change is written to activity_logs",
+    audit.rows[0]?.action_type === "PASSWORD_CHANGED" && audit.rows[0]?.user_name === username,
+    `${audit.rows[0]?.action_type} by ${audit.rows[0]?.user_name}`
+  );
+
+  const oldPassword = await login(username, password);
+  // The newest live cookie for this account. Logging in again rotates the token,
+  // so this must be re-read after every login or the admin calls below are made
+  // with a cookie the server has already retired (they answer 403).
+  let liveCookie = cookieValue(rotatedCookie);
+  if (!await refuseIfRateLimited(oldPassword)) {
+    check("the OLD password no longer logs in -> 401", oldPassword.status === 401, `status=${oldPassword.status}`);
+    const newCreds = await login(username, newPassword);
+    if (!await refuseIfRateLimited(newCreds)) {
+      check("the NEW password logs in -> 200", newCreds.status === 200, `status=${newCreds.status}`);
+      if (newCreds.setCookie) liveCookie = cookieValue(newCreds.setCookie);
+    }
+  }
+
+  // --- M. Admin reset of ANOTHER account ---------------------------------------
+  console.log("\n--- M. Admin password reset ---");
+  const targetName = `${PREFIX}target`;
+  const targetPassword = `${PREFIX}target-original-1`;
+  const targetToken = crypto.randomBytes(32).toString("hex");
+  await pool.query("DELETE FROM users WHERE username = $1", [targetName]);
+  await pool.query(
+    "INSERT INTO users (name, username, email, password_hash, role, token, token_expires_at) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+    ["Reset Target", targetName, `${PREFIX}target@example.invalid`, hashPassword(targetPassword), "user", sha256(targetToken), new Date(Date.now() + 3600000)]
+  );
+  const targetRow = await pool.query("SELECT id FROM users WHERE username = $1", [targetName]);
+  const targetId = targetRow.rows[0].id;
+
+  const adminCookie = { Cookie: `${COOKIE}=${liveCookie}` };
+  const resetAs = (id, body) =>
+    fetch(`${API}/auth/users/${id}/password`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json", ...adminCookie },
+      body: JSON.stringify(body),
+    });
+
+  check(
+    "resetting an unknown id -> 404 instead of a silent success",
+    (await resetAs(987654, { newPassword })).status === 404
+  );
+
+  const resetWeak = await resetAs(targetId, { newPassword: "a" });
+  check("admin reset honours the same strength policy -> 400", resetWeak.status === 400, `status=${resetWeak.status}`);
+
+  const selfNoProof = await resetAs(
+    (await pool.query("SELECT id FROM users WHERE username = $1", [username])).rows[0].id,
+    { newPassword: `${PREFIX}another-Passw0rd` }
+  );
+  check(
+    "an admin resetting their OWN password must prove the current one -> 400",
+    selfNoProof.status === 400,
+    `status=${selfNoProof.status}`
+  );
+
+  const targetResetPassword = `${PREFIX}target-rotated-2`;
+  const reset = await resetAs(targetId, { newPassword: targetResetPassword });
+  check("admin reset of another account -> 200", reset.status === 200, `status=${reset.status}`);
+
+  const afterReset = await pool.query("SELECT token, password_hash FROM users WHERE username = $1", [targetName]);
+  check("the reset target's session is revoked", afterReset.rows[0]?.token === null, afterReset.rows[0]?.token === null ? "null" : "still set");
+  const targetCookieDead = await fetch(`${API}/settings/effective`, { headers: { Cookie: `${COOKIE}=${targetToken}` } });
+  check("the target's captured cookie no longer authenticates", targetCookieDead.status !== 200, `status=${targetCookieDead.status}`);
+  check("the new password verifies against the stored hash", verifyAgainst(afterReset.rows[0]?.password_hash, targetResetPassword));
+
+  const resetAudit = await pool.query(
+    "SELECT user_name, action_type FROM activity_logs WHERE description LIKE $1 ORDER BY id DESC LIMIT 1",
+    [`Reset password for user account "${targetName}"%`]
+  );
+  check(
+    "the admin reset is audited against the acting admin",
+    resetAudit.rows[0]?.action_type === "PASSWORD_RESET" && resetAudit.rows[0]?.user_name === username,
+    `${resetAudit.rows[0]?.action_type} by ${resetAudit.rows[0]?.user_name}`
+  );
+
   await cleanup(username);
 }
 
 async function cleanup(username) {
-  console.log("\n--- L. Cleanup ---");
+  console.log("\n--- N. Cleanup ---");
   await pool.query("DELETE FROM users WHERE username LIKE $1", [`${PREFIX}%`]).catch(() => {});
   await pool.query("DELETE FROM activity_logs WHERE description LIKE $1", [`${PREFIX}%`]).catch(() => {});
+  // The password-change audit rows do not start with the prefix (they read like
+  // real entries), so they are matched on the throwaway username instead -
+  // scoped tightly enough that a genuine PASSWORD_CHANGED row on a real account
+  // is never touched.
+  await pool.query(
+    "DELETE FROM activity_logs WHERE action_type IN ('PASSWORD_CHANGED', 'PASSWORD_RESET') AND (user_name LIKE $1 OR description LIKE $2)",
+    [`${PREFIX}%`, `%${PREFIX}%`]
+  ).catch(() => {});
   const leftover = await pool.query("SELECT count(*)::int AS n FROM users WHERE username LIKE $1", [`${PREFIX}%`]);
   check("no test users left", leftover.rows[0].n === 0, `${leftover.rows[0].n} rows`);
+  const leftoverLogs = await pool.query(
+    "SELECT count(*)::int AS n FROM activity_logs WHERE user_name LIKE $1",
+    [`${PREFIX}%`]
+  );
+  check("no test activity rows left", leftoverLogs.rows[0].n === 0, `${leftoverLogs.rows[0].n} rows`);
   if (truncated) {
     console.log(
       `\n=== SESSION COOKIE TESTS INCOMPLETE === (${checks} checks ran; stopped early on the login rate limit)`

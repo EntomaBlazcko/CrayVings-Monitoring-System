@@ -284,6 +284,83 @@ function needsRehash(stored) {
   return parseInt(parts[0], 10) !== PBKDF2_ITERATIONS;
 }
 
+// =============================================================================
+// PASSWORD POLICY
+// =============================================================================
+// The strength rules used to exist only in SettingsPage.tsx, which meant a direct
+// `PUT /auth/users/:id/password {"newPassword":"a"}` was accepted by the server
+// and stored. A credential write cannot take its rules from the client - the
+// client is not the thing being protected - so the policy is defined once here
+// and every write path goes through it.
+//
+// 8 characters minimum: long enough to survive an offline crack of a leaked
+// hash at 600k PBKDF2 iterations, short enough that nobody types a passphrase.
+// Upper + lower + digit is deliberately modest; length is what buys security,
+// and a harsher rule set mostly produces `Password1!` written on a sticky note.
+// 100 is a ceiling so an oversized body cannot be turned into a slow hash.
+const PASSWORD_MIN_LENGTH = 8;
+const PASSWORD_MAX_LENGTH = 100;
+
+const passwordPolicySchema = z
+  .string()
+  .min(PASSWORD_MIN_LENGTH, `Password must be at least ${PASSWORD_MIN_LENGTH} characters`)
+  .max(PASSWORD_MAX_LENGTH, `Password must be at most ${PASSWORD_MAX_LENGTH} characters`)
+  .regex(/[A-Z]/, "Password must contain at least one uppercase letter")
+  .regex(/[a-z]/, "Password must contain at least one lowercase letter")
+  .regex(/[0-9]/, "Password must contain at least one number");
+
+// Validates a candidate password and returns its PBKDF2 hash, or null when the
+// value is absent. Throws ZodError on a policy violation - callers translate
+// that into a 400 with per-field messages, the same shape the settings and
+// device endpoints already return.
+function hashNewPassword(candidate) {
+  if (typeof candidate !== "string" || candidate.length === 0) return null;
+  return hashPassword(passwordPolicySchema.parse(candidate));
+}
+
+// One session per account: `users.token` is a single column, so writing a new
+// token invalidates whatever token existed before it. That is what makes
+// "rotate the session" and "sign out everyone else" the same statement.
+const SESSION_TTL_MS = 24 * 60 * 60 * 1000;
+
+// The single write path for every password change in the system - self-service
+// and admin reset both land here, so a rule cannot be enforced on one route and
+// forgotten on the other.
+//
+// `keepCallerSession` mints a replacement session for the account that is doing
+// the changing, so a user rotating their own password is not signed out of the
+// dashboard they are standing in. Because the token column holds one value,
+// that replacement also kills any other session: there is no second row to
+// preserve and no way for a copied cookie to outlive the change.
+async function changePassword({ targetId, passwordHash, keepCallerSession, executor = pool }) {
+  if (keepCallerSession) {
+    const token = generateToken();
+    const tokenExpiresAt = new Date(Date.now() + SESSION_TTL_MS);
+    await executor.query(
+      "UPDATE users SET password_hash = $1, token = $2, token_expires_at = $3 WHERE id = $4",
+      [passwordHash, hashToken(token), tokenExpiresAt, targetId]
+    );
+    return { token, tokenExpiresAt };
+  }
+  // Clearing the token is the revocation: an admin rotating a password they do
+  // not know must also eject whoever was holding that account's session.
+  await executor.query(
+    "UPDATE users SET password_hash = $1, token = NULL, token_expires_at = NULL WHERE id = $2",
+    [passwordHash, targetId]
+  );
+  return null;
+}
+
+// Writes one activity_logs row. A credential change that leaves no trace is
+// indistinguishable from one that never happened, and "who reset whose
+// password" is the first question asked after a suspected compromise.
+async function writeActivityLog(userName, actionType, description, module = "settings", executor = pool) {
+  await executor.query(
+    "INSERT INTO activity_logs (user_name, action_type, description, module) VALUES ($1, $2, $3, $4)",
+    [userName, actionType, description, module]
+  );
+}
+
 // Generates a random 64-character hex token for session authentication
 function generateToken() {
   return crypto.randomBytes(32).toString("hex");
@@ -2007,8 +2084,9 @@ app.get("/sensor/latest", requireAuth, async (req, res) => {
 // REAL-TIME STREAM (SSE)
 // =============================================================================
 // GET /sensor/stream - Server-Sent Events feed of live readings. Auth uses the
-// session token as a ?token= query parameter because EventSource cannot set
-// Authorization headers. Broadcasts happen on every accepted POST /sensor.
+// Auth uses the session cookie like every other read route: the dashboard is
+// same-origin, so EventSource receives the cookie automatically. Broadcasts
+// happen on every accepted POST /sensor.
 app.get("/sensor/stream", requireAuth, (req, res) => {
   // Refuse before any SSE header is flushed: once the response has started we can
   // no longer change the status code, and the client would sit on a dead stream
@@ -2972,8 +3050,7 @@ app.post("/auth/login", loginLimiter, async (req, res) => {
 
     // New token per login (24h expiry); old tokens are invalidated
     const token = generateToken();
-    const TOKEN_TTL_MS = 24 * 60 * 60 * 1000;
-    const tokenExpiresAt = new Date(Date.now() + TOKEN_TTL_MS);
+    const tokenExpiresAt = new Date(Date.now() + SESSION_TTL_MS);
 
     // Upgrade legacy/weak hashes to the current PBKDF2 count on successful login only
     if (needsRehash(user.password_hash)) {
@@ -3375,15 +3452,144 @@ app.get("/auth/users/deletion-requests", requireAdmin, async (req, res) => {
 });
 
 // PUT /auth/users/:id/password (Admin only) - reset a user's password
+//
+// Hardened after an owner lockout, where nobody could rotate their own password
+// and this endpoint had no rules. The old body
+// was four lines and had five defects: no policy check, no proof of the current
+// password, a silent no-op on an unknown id, no session revocation, and no audit
+// entry. What it is for now is resetting SOMEONE ELSE's account - a user
+// changing their own password goes through PUT /auth/me/password, which is not
+// admin-gated.
 app.put("/auth/users/:id/password", requireAdmin, async (req, res) => {
   try {
-    const { newPassword } = req.body;
-    if (!newPassword) return res.status(400).json({ message: "New password required" });
-    const passwordHash = hashPassword(newPassword);
-    await pool.query("UPDATE users SET password_hash = $1 WHERE id = $2", [passwordHash, req.params.id]);
-    res.json({ message: "Password updated" });
+    const { newPassword, currentPassword } = req.body;
+
+    // Archived accounts cannot authenticate at all (every session query filters
+    // status = 'active'), so resetting one would report a change that can never
+    // be used. Say so instead of writing a hash nobody will ever verify.
+    const targetResult = await pool.query(
+      "SELECT id, username FROM users WHERE id = $1 AND status <> 'archived'",
+      [req.params.id]
+    );
+    if (targetResult.rows.length === 0) {
+      return res.status(404).json({ message: "No active user with this id" });
+    }
+    const target = targetResult.rows[0];
+
+    // An admin targeting themselves is a password change wearing an admin's
+    // clothes, so it gets the self-service rule: prove you know the current one.
+    // Without this, a hijacked admin session could rotate the owner's password
+    // and take the account over permanently - which is the exact trap the
+    // recovery flow exists to close.
+    const isSelf = String(target.id) === String(req.adminUser.id);
+    if (isSelf && typeof currentPassword !== "string") {
+      return res.status(400).json({ message: "Current password required" });
+    }
+    if (isSelf && !verifyPassword(currentPassword, req.adminUser.password_hash)) {
+      return res.status(403).json({ message: "Current password is incorrect" });
+    }
+
+    // Validate before touching the row: a rejected password must not rotate the
+    // target's session as a side effect of a request that was going to fail.
+    let passwordHash;
+    try {
+      passwordHash = hashNewPassword(newPassword);
+    } catch (err) {
+      if (err instanceof z.ZodError) {
+        return res.status(400).json({ message: "Password does not meet the security requirements", errors: zodFieldErrors(err) });
+      }
+      throw err;
+    }
+    if (!passwordHash) return res.status(400).json({ message: "New password required" });
+
+    const session = await changePassword({
+      targetId: target.id,
+      passwordHash,
+      keepCallerSession: isSelf,
+    });
+
+    await writeActivityLog(
+      req.adminUser.username,
+      isSelf ? "PASSWORD_CHANGED" : "PASSWORD_RESET",
+      isSelf
+        ? "Changed own password (active sessions revoked)"
+        : `Reset password for user account "${target.username}" (their sessions were revoked)`
+    );
+
+    // Self-targeted: hand the caller its replacement cookie before responding,
+    // for the same reason login does (res.json() flushes the head).
+    if (session) setSessionCookie(res, session.token, session.tokenExpiresAt);
+
+    res.json({
+      message: "Password updated",
+      // The target is signed out; the caller keeps working only if it was them.
+      target_signed_out: !isSelf,
+    });
   } catch (err) {
     fail(res, 500, "Error updating password", err, req);
+  }
+});
+
+// PUT /auth/me/password - change your own password (any role)
+//
+// This is the endpoint whose absence made the owner lockout unrecoverable from
+// inside the app: the only password write used to be admin-only and aimed at
+// other people, so nobody could rotate their own credential without a second
+// admin on the farm. It requires the CURRENT password on purpose. A stolen
+// session alone must not be able to set a new password, or the theft is
+// permanent - the attacker locks the real owner out of the only account that
+// can undo it.
+//
+// Deliberately NOT rate-limited. loginLimiter is keyed per IP, so applying it
+// here would share one bucket with /auth/login and a run of rejected new
+// passwords could lock the owner out of the very recovery path this endpoint
+// exists to provide. The current-password check is the real control, matching
+// how the admin OTP deletion flow already treats the same requirement.
+app.put("/auth/me/password", requireAuth, async (req, res) => {
+  try {
+    const { currentPassword, newPassword } = req.body;
+    // typeof, not truthiness: a JSON body can carry a number or an object here,
+    // and pbkdf2Sync would throw on it - a 500 for what is really a bad request.
+    if (typeof currentPassword !== "string" || currentPassword.length === 0) {
+      return res.status(400).json({ message: "Current password required" });
+    }
+
+    // Policy before hashing: a rejected password costs nothing.
+    let passwordHash;
+    try {
+      passwordHash = hashNewPassword(newPassword);
+    } catch (err) {
+      if (err instanceof z.ZodError) {
+        return res.status(400).json({ message: "Password does not meet the security requirements", errors: zodFieldErrors(err) });
+      }
+      throw err;
+    }
+    if (!passwordHash) return res.status(400).json({ message: "New password required" });
+
+    if (!verifyPassword(currentPassword, req.user.password_hash)) {
+      // Same wording as the deletion flow's "Incorrect password": say the proof
+      // failed, never whether the username or the password was the wrong part.
+      return res.status(403).json({ message: "Current password is incorrect" });
+    }
+
+    // Changing to the password you already have is a no-op that reads like a
+    // successful rotation in the audit trail. Reject it and let the user pick a
+    // genuinely new one.
+    if (verifyPassword(newPassword, req.user.password_hash)) {
+      return res.status(400).json({ message: "New password must be different from the current one" });
+    }
+
+    const session = await changePassword({ targetId: req.user.id, passwordHash, keepCallerSession: true });
+
+    await writeActivityLog(req.user.username, "PASSWORD_CHANGED", "Changed own password (active sessions revoked)");
+
+    setSessionCookie(res, session.token, session.tokenExpiresAt);
+    res.json({
+      message: "Password changed. Any other signed-in session has been signed out.",
+      tokenExpiresAt: session.tokenExpiresAt.toISOString(),
+    });
+  } catch (err) {
+    fail(res, 500, "Error changing password", err, req);
   }
 });
 
