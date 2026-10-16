@@ -8,7 +8,7 @@
 import { useEffect, useRef } from "react";
 import { useSensorData, useActivityLogger } from "../hooks/useSensors";
 import { useFloatingAlerts } from "../hooks/useFloatingAlerts";
-import { playCriticalSound } from "../utils/playAlertSound";
+import { playCriticalSound, playSuccessSound } from "../utils/playAlertSound";
 
 export function DeviceConnectionMonitor() {
   const { devices } = useSensorData();
@@ -79,6 +79,8 @@ export function DeviceConnectionMonitor() {
           deviceId: id,
           tank: label,
         });
+
+        playSuccessSound();
       }
     }
 

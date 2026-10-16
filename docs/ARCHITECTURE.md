@@ -237,14 +237,16 @@ Two flows run in opposite directions:
 
 ### 4 · Data layer — PostgreSQL 15
 
-14 tables, accessed through a single `pg.Pool` (max 20 connections, 30 s idle
-timeout, 5 s connect timeout). Grouped by function:
+16 tables (`sensor_calibration` arrived with 018;
+`user_deletion_request_status_history` with 021). Accessed through a single
+`pg.Pool` (max 20 connections, 30 s idle timeout, 5 s connect timeout). Grouped
+by function:
 
 | Group | Tables |
 |---|---|
 | Time-series | `sensors` — the hot table; NULL records a failed sensor; keyset pagination up to 1000 rows |
-| Configuration & registry | `devices`, `sensor_settings`, `device_threshold_overrides` |
-| Identity & audit | `users`, `email_otps`, `user_deletion_requests`, `activity_logs` |
+| Configuration & registry | `devices`, `sensor_settings`, `device_threshold_overrides`, `sensor_calibration` |
+| Identity & audit | `users`, `email_otps`, `user_deletion_requests`, `user_deletion_request_status_history`, `activity_logs` |
 | Alerting state | `system_logs`, `last_alerts` |
 | Messaging state | `authorized_recipients`, `sms_logs`, `system_state` |
 | Schema versioning | `schema_migrations` |
@@ -269,7 +271,7 @@ Full column-level detail is in [DATABASE.md](DATABASE.md).
 | Android SMS Gateway | A phone running the HttpSms app relays API requests onto the mobile network |
 | SMS Recipients | Operators and farm staff, managed from Settings, stored in `authorized_recipients` |
 | SMTP / Nodemailer | Account-deletion OTP codes only — not general alerting. Falls back to console output in development |
-| Schema migrations | `db/migrations/` — 16 standalone scripts (001–016), run manually and tracked in `schema_migrations` |
+| Schema migrations | `db/migrations/` — 21 standalone scripts (001–021), run manually and tracked in `schema_migrations` |
 | Test harness | `tests/` — 6 standalone suites, plus `tools/watch-connection.cjs` |
 
 ---
@@ -1300,13 +1302,13 @@ from the name.
 | `ALLOWED_ORIGINS` | — | Comma-separated CORS allowlist |
 | `ADMIN_USERNAME` / `ADMIN_EMAIL` / `ADMIN_NAME` / `ADMIN_INITIAL_PASSWORD` | — | Owner seeding on a fresh database. `ADMIN_INITIAL_PASSWORD` is a **live plaintext credential** while it sits in `.env`; replace or remove it once the account exists |
 | `DEVICE_SECRET` | — | Shared ingestion secret. When set, `POST /sensor` requires the `X-Device-Secret` header |
-| `DEVICE_SECRET_GRACE_MS` | — | Window during which a rotated per-device secret is still accepted |
+| `DEVICE_SECRET_GRACE_MS` | — | Window during which a rotated per-device secret is still accepted. A **security control**: `0` locks out any board not yet re-provisioned, non-zero keeps a stolen pre-rotation secret valid until the window closes. Unset falls back to the caller's default (24h, capped at 7 days by `grace_hours`) |
 | `COOKIE_SECURE` | off | Set `true` when serving over HTTPS |
 | `OTP_EMAIL` / `SMTP_HOST` / `SMTP_PORT` / `SMTP_USER` / `SMTP_PASS` / `SMTP_SECURE` / `SMTP_FROM` | — | Account-deletion OTP email only |
-| `DEV_OTP_CONSOLE_FALLBACK` | — | Print OTPs to the console instead of sending mail (development) |
+| `DEV_OTP_CONSOLE_FALLBACK` | — | Print OTPs to the console instead of sending mail. Only in non-production; with no `SMTP_HOST` the server always falls back and warns at startup |
 | `DELTA_LOGGING_ENABLED` | `true` | Change-only sensor logging |
 | `TEMP_DELTA_TOLERANCE` / `WATER_LEVEL_DELTA_TOLERANCE` / `AMMONIA_DELTA_TOLERANCE` | `0.1` / `1.0` / `0.05` | Per-sensor change thresholds |
-| `POLL_TIMEOUT_MS` | `2000` | Per-request timeout in the device poller |
+| `POLL_TIMEOUT_MS` | `2000` | Per-request timeout in the device poller. The poll *cycle* (`POLL_INTERVAL_MS = 5000`) is hard-coded in `services/devicePoller.cjs` and is not configurable |
 | `DEVICE_DISCONNECT_ENABLED` | `true` | Disconnect SMS alerts |
 | `DISCONNECT_STALE_MS` | `30000` | Silence before a disconnect alert |
 | `DISCONNECT_REARM_MS` | `300000` | Steady-online period before a new disconnect may fire |
@@ -1316,6 +1318,27 @@ from the name.
 | `SMS_DAILY_CAP` | `0` | Daily SMS ceiling; `0` = unlimited |
 | `SMS_DELIVERY_POLL_MS` | — | Delivery-status reconciliation cadence |
 | `HOURLY_SMS_ENABLED` / `HOURLY_SMS_INTERVAL_MS` | — | Hourly status SMS |
+
+### Not read by the server
+
+Declared in `.env.example` but consumed only by tooling. Setting them in `.env`
+affects nothing the server does — they are documented there so the values are
+discoverable, and `NO_COLOR` is honoured by convention rather than by this
+project.
+
+| Variable | Read by | Purpose |
+|---|---|---|
+| `API_BASE` | `test-login.cjs`, all suites in `tests/` | Base URL for bare, unprefixed routes. Default `http://localhost:3000` |
+| `TEST_USERNAME` / `TEST_PASSWORD` | `test-login.cjs` | Credentials for the login smoke check. No fallback by design — an unset value exits 1 |
+| `WATCH_INTERVAL_MS` / `WATCH_STALE_MS` / `WATCH_PROBE_TIMEOUT_MS` | `tools/watch-connection.cjs` | Connection-diagnostic cadence. Defaults 2000 / 15000 / 2000 |
+| `NO_COLOR` | `tools/watch-connection.cjs`, `scripts/mock-device.js` | Disable ANSI colour |
+| `TOKENS_HASHED` | `tests/regression.cjs` | Set `0` **only** to assert the pre-hash token format. Leave unset normally |
+
+Deliberately absent: `ARDUINO_ENABLED` / `ARDUINO_PORT` / `ARDUINO_BAUD` and
+`DEVICE_ID` were removed. There is no serial bridge in this codebase (zero
+`ARDUINO_` references anywhere in code or firmware), and the firmware reads its
+device id from `#define DEVICE_ID_DEFAULT` — it cannot read `.env`. Their
+presence implied a feature that does not exist.
 
 ---
 

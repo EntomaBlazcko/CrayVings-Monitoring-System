@@ -230,6 +230,16 @@ async function main() {
   });
   check("logout with the cookie -> 200", out.status === 200, `status=${out.status}`);
   check("logout clears the cookie", Boolean(sessionCookie(out)?.includes("Max-Age=0")), sessionCookie(out) || "no clearing Set-Cookie");
+  // The clearing cookie must mirror the issuing one on Secure. A browser refuses
+  // to let an insecure response overwrite a cookie it holds as Secure, so a
+  // missing flag here means logout silently does nothing over TLS and the
+  // cookie survives to its natural 24h expiry. Asserted against the same env
+  // var as the issue path above so the two cannot disagree.
+  check(
+    "cleared cookie sets Secure only when COOKIE_SECURE is on",
+    hasAttr(sessionCookie(out) || "", "Secure") === (String(process.env.COOKIE_SECURE).toLowerCase() === "true"),
+    `cleared=${sessionCookie(out) || "(none)"} COOKIE_SECURE=${process.env.COOKIE_SECURE ?? "unset"}`
+  );
 
   const stored = await pool.query("SELECT token FROM users WHERE username = $1", [username]);
   check("logout nulls the stored token", stored.rows[0]?.token === null, stored.rows[0]?.token === null ? "null" : "still set");

@@ -73,6 +73,26 @@ class SmsCircuitBreaker {
     }
   }
 
+  // Manual reset from the dashboard. Normally the breaker self-heals: after a
+  // cooldown the next send acts as the HALF_OPEN probe and flips it back to
+  // CLOSED (or OPEN again if the gateway is still down). That recovery path
+  // needs a send to exist, so a gateway that comes back while the farm is quiet
+  // can sit OPEN indefinitely with the board showing a stuck red banner and
+  // "0/N recipient(s)". An admin resetting explicitly is that missing send —
+  // it just marks the gateway as believed-okay again and lets the next alert or
+  // manual SMS prove it for real (a genuinely dead gateway re-trips within 5
+  // failures, so this cannot mask an outage for long).
+  reset() {
+    const was = this.state;
+    this.state = "CLOSED";
+    this.consecutiveFailures = 0;
+    this.cooldownUntil = 0;
+    this.lastError = null;
+    if (was !== "CLOSED") {
+      console.log(`[${new Date().toISOString()}] SMS circuit breaker ${was} -> CLOSED (manual reset)`);
+    }
+  }
+
   snapshot() {
     return {
       state: this.state,

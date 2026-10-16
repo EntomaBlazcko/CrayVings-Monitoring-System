@@ -2,6 +2,7 @@ import axios, { isAxiosError, type AxiosError } from "axios";
 import type { SensorEntry, ChartPoint, LogEntry, SensorSettings, ActivityLog, ActivityLogEntry, AuthResponse, WeeklyReport, AnalyticsOverview, AnalyticsDailyResponse, AnalyticsInsightsResponse, DeviceEntry, DeviceLiveReading, DeviceStatus, EffectiveThresholdsResponse, DeviceThresholdDetail, DeviceThresholdOverrides, CreateDevicePayload, DeviceArchiveResult, DeviceSecretRotation } from "../types";
 import { API_BASE } from "../types";
 import { formatFarmTime } from "../utils/time";
+import { toNum } from "../utils/text";
 
 export interface UserEntry {
   id: number;
@@ -150,10 +151,20 @@ export async function fetchSensorHistory(limit = 1000, deviceId?: string | null,
         timestamp: timestamp ? timestamp.toISOString() : "",
         // ESP32 failed-sensor sentinels: temperature 0, water_level/ammonia -1
         // (below server minValid, not real readings). Columns are DECIMAL so pg
-        // returns strings — coerce to numbers here.
-        temperature: item.temperature !== undefined && Number(item.temperature) >= 0.0001 ? Number(item.temperature) : null,
-        water_level: item.water_level !== undefined && Number(item.water_level) >= 0 ? Number(item.water_level) : null,
-        ammonia: item.ammonia !== undefined && Number(item.ammonia) >= 0 ? Number(item.ammonia) : null,
+        // returns strings, and a failed sensor arrives as JSON null — both need
+        // normalising to a number or null here.
+        //
+        // toNum() coerces BEFORE it validates, which is the whole point: the
+        // guard this replaces read `!== undefined`, and that does not reject
+        // null. Number(null) is 0, so every stored NULL passed the `>= 0`
+        // sentinel test and was handed to the charts as a real reading of 0.
+        //
+        // Note temperature is safe here only because 0.0001 happens to reject
+        // that 0. The epsilon exists for the separate "0 C is a sentinel" rule,
+        // not to catch null — do not relax it to `>= 0`.
+        temperature: toNum(item.temperature, 0.0001),
+        water_level: toNum(item.water_level),
+        ammonia: toNum(item.ammonia),
       };
     });
   
@@ -377,6 +388,53 @@ export async function fetchLogs(
   };
 }
 
+
+// GET /calibration/water-level - the HC-SR04 geometry actually in force for one
+// tank: EMPTY_CM (distance at 0% level) and FULL_CM (distance at 100%).
+//
+// This is NOT the same as the water_level_min/max alert thresholds from
+// /settings - it is the sensor calibration, and it is what the server uses to
+// convert a stored distance into a percentage. Surfacing it is the only way an
+// operator can tell "the tank is empty (0%)" apart from "this tank is
+// calibrated for the wrong geometry and its 0% is meaningless".
+export type WaterLevelCalibration = {
+  device_id: string;
+  empty_cm: number;
+  full_cm: number;
+  source: "sensor_calibration" | "default";
+  usable_depth_cm: number | null;
+};
+
+export async function fetchWaterLevelCalibration(
+  deviceId: string,
+  signal?: AbortSignal,
+): Promise<WaterLevelCalibration> {
+  const response = await client.get<Record<string, unknown>>("/calibration/water-level", {
+    params: { device_id: deviceId },
+    signal,
+  });
+  const data = response.data;
+  return {
+    device_id: String(data.device_id),
+    empty_cm: Number(data.empty_cm),
+    full_cm: Number(data.full_cm),
+    source: data.source === "sensor_calibration" ? "sensor_calibration" : "default",
+    usable_depth_cm: data.usable_depth_cm == null ? null : Number(data.usable_depth_cm),
+  };
+}
+
+// PUT /calibration/water-level - retune a tank's geometry without reflashing.
+export async function saveWaterLevelCalibration(
+  deviceId: string,
+  emptyCm: number,
+  fullCm: number,
+): Promise<void> {
+  await client.put("/calibration/water-level", {
+    device_id: deviceId,
+    empty_cm: emptyCm,
+    full_cm: fullCm,
+  });
+}
 
 // GET /settings - fetch thresholds, converting PostgreSQL NUMERIC strings to numbers
 export async function fetchSettings(signal?: AbortSignal): Promise<SensorSettings> {
@@ -879,6 +937,15 @@ export async function fetchSmsLogs(
 // GET /alert/sms-health - SMS delivery health snapshot
 export async function fetchSmsHealth(signal?: AbortSignal): Promise<SmsHealth> {
   const response = await client.get<SmsHealth>("/alert/sms-health", { signal });
+  return response.data;
+}
+
+// POST /alert/sms-breaker/reset (Admin) - re-arms the SMS circuit after the
+// gateway is verified healthy. Without this a recovered phone can leave the
+// circuit OPEN (and every send silently failing "0/N") until an alert happens
+// to fire a HALF_OPEN probe.
+export async function resetSmsBreaker(signal?: AbortSignal): Promise<{ success: boolean; message: string } & Partial<SmsHealth>> {
+  const response = await client.post("/alert/sms-breaker/reset", {}, { signal });
   return response.data;
 }
 

@@ -4,6 +4,7 @@ import { playLowAlertSound, playHighAlertSound } from "../utils/playAlertSound";
 import { buildScenarioGuidance } from "../utils/alertGuidance";
 import type { AlertGuidance } from "../utils/alertGuidance";
 import { FixLegendModal } from "./FixLegend";
+import { fmtSensor, type SensorKey } from "../utils/text";
 import { 
   FloatingAlertContext, 
   useFloatingAlerts,
@@ -158,7 +159,7 @@ function FloatingAlertItem({ notification, onClose }: FloatingAlertItemProps) {
           </p>
           {notification.parameter !== "device" && (
             <p className="text-xs text-gray-500 mt-0.5">
-              Current: {notification.value} - Threshold: {notification.threshold === "min" ? "below min" : "above max"}
+              Current: {fmtSensor(notification.parameter as SensorKey, notification.value)} - Threshold: {notification.threshold === "min" ? "below min" : "above max"}
             </p>
           )}
           {guidance && (

@@ -19,6 +19,7 @@ import {
 } from "../utils/alertGuidance";
 import { SENSOR_KEY_TO_DISPLAY } from "../types";
 import { PARAM_ICON } from "../utils/paramIcons";
+import { fmtSensor, type SensorKey } from "../utils/text";
 
 // What each status pill means — mirrors the server's 15% deviation margin.
 const SEVERITY_KEY = [
@@ -209,7 +210,7 @@ export function FixLegendModal({
             <div className="rounded-lg bg-gray-50 border border-gray-100 p-2.5">
               <p className="text-micro font-bold text-gray-400 uppercase">Reading</p>
               <p className="text-lg font-bold text-gray-800">
-                {guidance.currentValue != null ? `${guidance.currentValue} ${guidance.unit}` : "—"}
+                {guidance.currentValue != null ? `${fmtSensor(guidance.parameterKey as SensorKey, guidance.currentValue)} ${guidance.unit}` : "—"}
               </p>
             </div>
             <div className="rounded-lg bg-gray-50 border border-gray-100 p-2.5">

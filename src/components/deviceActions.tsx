@@ -6,6 +6,7 @@ import { useState } from "react";
 import { Activity, Pencil, Check, X, Loader2, EyeOff, RefreshCw } from "lucide-react";
 import { fetchDeviceStatus, updateDevice } from "../api/client";
 import type { DeviceEntry, DeviceStatus } from "../types";
+import { fmtSensor } from "../utils/text";
 
 export type LiveState =
   | { status: "idle" }
@@ -15,7 +16,7 @@ export type LiveState =
 
 function fmtLive(key: "temperature" | "water_level" | "ammonia", value: number): string {
   const isReal = key === "temperature" ? value > 0 : value >= 0;
-  return isReal ? String(value) : "--";
+  return isReal ? fmtSensor(key, value) : "--";
 }
 
 // On-demand poll of one ESP32's GET /status (uptime, RSSI, heap + live values).

@@ -11,6 +11,7 @@ import { useEffect, useRef } from "react";
 import { useSensorData, useSensorSettings } from "./useSensors";
 import { useFloatingAlerts } from "./useFloatingAlerts";
 import { getThresholdStatus, type SensorThreshold, type ThresholdStatus } from "../types";
+import { fmtSensor } from "../utils/text";
 
 const ALERT_COOLDOWN_MS = 60000;
 const SENSOR_KEYS = ["temperature", "water_level", "ammonia"] as const;
@@ -86,7 +87,7 @@ export function useThresholdAlert() {
         if (now - (lastAlertTimeRef.current[alertKey] || 0) > ALERT_COOLDOWN_MS) {
           const label = labelFor(deviceId);
           const prefix = isBelowMin ? "Low" : "High";
-          const message = `${prefix} ${config.name}: ${value}${config.unit} is ${isBelowMin ? "below" : "above"} threshold (${config.range.min}${config.unit} - ${config.range.max}${config.unit})`;
+          const message = `${prefix} ${config.name}: ${fmtSensor(key, value)}${config.unit} is ${isBelowMin ? "below" : "above"} threshold (${config.range.min}${config.unit} - ${config.range.max}${config.unit})`;
 
           lastAlertTimeRef.current[alertKey] = now;
 

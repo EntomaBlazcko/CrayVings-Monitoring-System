@@ -260,7 +260,7 @@ npm run mock
 # Or with options:
 npm run mock -- --device ESP32_09 --profile healthy --interval 5000
 npm run mock -- --profile fleet      # two tanks in parallel
-npm run mock -- --profile fleet10    # ten tanks
+  npm run mock -- --profile fleet10    # tanks 4-10
 npm run mock -- --profile ammonia_spike
 npm run mock -- --list-profiles      # see all 8 profiles
 ```

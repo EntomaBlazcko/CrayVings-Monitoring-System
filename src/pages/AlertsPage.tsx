@@ -22,7 +22,7 @@ import { parseAlertSeverity, tankOptionLabel, type AlertSeverity } from "../type
 import { SENSOR_KEY_TO_DISPLAY, DISPLAY_TO_SENSOR_KEY } from "../types";
 import type { LogEntry, MenuKey } from "../types";
 import { formatFarmDateTime, formatFarmTime, formatTimeAgo } from "../utils/time";
-import { titleCase } from "../utils/text";
+import { titleCase, fmtSensor, type SensorKey } from "../utils/text";
 import { buildScenarioGuidance, getAlertGuidance } from "../utils/alertGuidance";
 import type { AlertGuidance } from "../utils/alertGuidance";
 import { FixLegendPanel, FixLegendModal } from "../components/FixLegend";
@@ -656,7 +656,7 @@ export default function AlertsPage({ onNavigate }: { onNavigate?: (menu: MenuKey
                   <div className="rounded-lg bg-gray-50 border border-gray-100 p-2.5">
                     <p className="text-micro font-bold text-gray-400 uppercase">Reading</p>
                     <p className="text-lg font-bold text-gray-800">
-                      {guidance.currentValue != null ? `${guidance.currentValue} ${guidance.unit}` : "—"}
+                      {guidance.currentValue != null ? `${fmtSensor(guidance.parameterKey as SensorKey, guidance.currentValue)} ${guidance.unit}` : "—"}
                     </p>
                   </div>
                   <div className="rounded-lg bg-gray-50 border border-gray-100 p-2.5">

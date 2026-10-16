@@ -14,6 +14,7 @@ import type { AlertGuidance } from "../utils/alertGuidance";
 import { FixLegendModal } from "./FixLegend";
 import { useSensorSettings } from "../hooks/useSensors";
 import { formatTimeAgo } from "../utils/time";
+import { fmtSensor } from "../utils/text";
 
 const PARAM_TINT: Record<FleetAlarm["parameter"], string> = {
   ammonia: "text-red-100",
@@ -49,7 +50,7 @@ export default function CriticalAlarmBanner({ onGoToAlerts }: { onGoToAlerts?: (
       <div
         role="alert"
         aria-live="assertive"
-        className="sticky top-0 z-40 -mx-3 md:-mx-5 px-3 md:px-5 pt-3 md:pt-4 pb-3 bg-gradient-to-r from-red-600 via-red-600 to-red-700 shadow-lg"
+        className="sticky top-16 z-30 -mx-3 md:-mx-5 px-3 md:px-5 pt-3 md:pt-4 pb-3 bg-gradient-to-r from-red-600 via-red-600 to-red-700 shadow-lg"
       >
         <div className="max-w-[1600px]">
           {/* Headline row */}
@@ -77,7 +78,7 @@ export default function CriticalAlarmBanner({ onGoToAlerts }: { onGoToAlerts?: (
               {!expanded && (
                 <p className="mt-1 text-xs text-red-50 truncate">
                   {criticalAlarms
-                    .map((a) => `${a.tankLabel}: ${a.parameterName} ${a.direction.toLowerCase()} ${a.value}${a.unit}`)
+                    .map((a) => `${a.tankLabel}: ${a.parameterName} ${a.direction.toLowerCase()} ${fmtSensor(a.parameter, a.value)}${a.unit}`)
                     .join("  ·  ")}
                 </p>
               )}
@@ -96,7 +97,7 @@ export default function CriticalAlarmBanner({ onGoToAlerts }: { onGoToAlerts?: (
                         <span className="block text-xs font-semibold text-white leading-snug">
                           {alarm.parameterName} {alarm.direction.toLowerCase()}{" "}
                           <span className={`${PARAM_TINT[alarm.parameter]} font-bold`}>
-                            {alarm.value}
+                            {fmtSensor(alarm.parameter, alarm.value)}
                             {alarm.unit}
                           </span>
                           <span className="text-red-100 font-normal">

@@ -555,8 +555,8 @@ bool headlessMode = false;   // true = no TFT / touch attached (skip display UI)
 // chosen to exceed the server's delta-logging tolerances (0.1C / 1% / 0.05ppm)
 // so the dashboard charts keep collecting live rows, while the values stay
 // inside safe thresholds so no false alerts fire.
-float simTemp = 27.0;
-float simLevel = 75.0;
+float simTemp = 25.0;
+float simLevel = 90.0;
 float simAmmonia = 0.5;
 
 void loadDeviceModes()
@@ -737,9 +737,10 @@ void readTemperature()
 {
     if (simulateDevice)
     {
-        // Virtual tank: random walk around ~27C within the 20-31C safe band.
+        // Virtual tank: random walk around ~25C within a narrow band, well
+        // inside the server's 20-31C safe range.
         simTemp += ((int)esp_random() % 211 - 105) / 100.0f; // ~ +/-1.05C
-        simTemp = constrain(simTemp, 20.0f, 31.0f);
+        simTemp = constrain(simTemp, 23.0f, 27.0f);
         temperature = simTemp;
         return;
     }
@@ -769,9 +770,10 @@ void readWaterLevel()
 {
     if (simulateDevice)
     {
-        // Virtual tank: random walk around ~75% within the 10-100% band.
+        // Virtual tank: random walk around ~90% within a narrow band, well
+        // inside the server's 10-100% safe range.
         simLevel += ((int)esp_random() % 31 - 15) / 10.0f; // ~ +/-1.5%
-        simLevel = constrain(simLevel, 10.0f, 100.0f);
+        simLevel = constrain(simLevel, 85.0f, 95.0f);
         waterLevel = simLevel;
         return;
     }
@@ -1086,13 +1088,16 @@ void readAmmonia()
 {
     if (simulateDevice)
     {
-        // Virtual tank: random walk around ~0.5 ppm (floor 0.2), safe range.
+        // Virtual tank: random walk around ~0.5 ppm, bounded 0.3-0.8. The floor
+        // must stay ABOVE the server's default ammonia_min threshold (0.25):
+        // the old 0.2 floor let the walk drift below min and fire false
+        // "low ammonia" warnings. The 0.8 cap keeps readings below ammonia_max.
         simAmmonia += ((int)esp_random() % 21 - 10) / 100.0f; // ~ +/-0.1 ppm
-        if (simAmmonia < 0.2f)
+        if (simAmmonia < 0.3f)
         {
-            simAmmonia = 0.2f;
+            simAmmonia = 0.3f;
         }
-        simAmmonia = constrain(simAmmonia, 0.0f, 25.0f);
+        simAmmonia = constrain(simAmmonia, 0.3f, 0.8f);
         ammoniaPpm = simAmmonia;
         ammoniaReady = true;
         lastShownPpm = simAmmonia;

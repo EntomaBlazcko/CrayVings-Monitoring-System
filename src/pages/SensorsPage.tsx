@@ -222,7 +222,7 @@ export default function SensorsPage() {
         <div className="bg-red-50 border border-red-200 rounded-xl p-3 flex items-center gap-2">
           <ShieldAlert size={16} className="text-red-500 shrink-0" />
           <span className="text-xs text-red-700">
-            {consecutiveFailures} consecutive failed updates — device may be unreachable.
+            {consecutiveFailures} consecutive failed updates to the live view — data stream may be reconnecting. The device heartbeat is checked separately on the Devices page.
           </span>
         </div>
       )}
@@ -401,25 +401,31 @@ export default function SensorsPage() {
                   </tr>
                 )}
                 {recentReadings.map((item: ChartPoint, i) => {
-                  const t = Number(item.temperature);
-                  const w = Number(item.water_level);
-                  const a = Number(item.ammonia);
-                  const tempOk = Number.isFinite(t) ? getThresholdStatus(t, thresholds.temperature.range, thresholds.temperature.isMinOnly) : "warning";
-                  const levelOk = Number.isFinite(w) ? getThresholdStatus(w, thresholds.water_level.range, thresholds.water_level.isMinOnly) : "warning";
-                  const ammOk = Number.isFinite(a) ? getThresholdStatus(a, thresholds.ammonia.range, thresholds.ammonia.isMinOnly) : "warning";
+                  // ChartPoint is already `number | null` with null meaning
+                  // "sensor failure" (see src/types), and fetchSensorHistory is
+                  // the only thing that builds it. So these are read straight
+                  // through with no Number() call: coercing here would undo the
+                  // coercion the client already did, and Number(null) is 0 —
+                  // which would render a dead probe as a safe "0.00 ppm".
+                  const t = item.temperature;
+                  const w = item.water_level;
+                  const a = item.ammonia;
+                  const tempOk = t !== null ? getThresholdStatus(t, thresholds.temperature.range, thresholds.temperature.isMinOnly) : "warning";
+                  const levelOk = w !== null ? getThresholdStatus(w, thresholds.water_level.range, thresholds.water_level.isMinOnly) : "warning";
+                  const ammOk = a !== null ? getThresholdStatus(a, thresholds.ammonia.range, thresholds.ammonia.isMinOnly) : "warning";
                   return (
                     <tr key={item.timestamp ?? i} className="border-b border-gray-100 last:border-0 hover:bg-gray-50">
                       <td className="px-3 py-2 text-gray-600 whitespace-nowrap text-xs">
                         {formatFarmDateTime(item.timestamp)}
                       </td>
                       <td className={`px-3 py-2 text-center ${STATUS_VALUE[tempOk]}`}>
-                        {Number.isFinite(t) ? `${t.toFixed(1)}°C` : "--"}
+                        {t !== null ? `${t.toFixed(1)}°C` : "--"}
                       </td>
                       <td className={`px-3 py-2 text-center ${STATUS_VALUE[levelOk]}`}>
-                        {Number.isFinite(w) ? `${w.toFixed(0)}%` : "--"}
+                        {w !== null ? `${w.toFixed(0)}%` : "--"}
                       </td>
                       <td className={`px-3 py-2 text-center ${STATUS_VALUE[ammOk]}`}>
-                        {Number.isFinite(a) ? `${a.toFixed(2)} ppm` : "--"}
+                        {a !== null ? `${a.toFixed(2)} ppm` : "--"}
                       </td>
                     </tr>
                   );

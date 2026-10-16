@@ -4,6 +4,9 @@ const TONE_CONFIG = {
   critical: { frequency: 880, duration: 0.15, type: "square" as OscillatorType, repeatDelay: 200 },
   low: { frequency: 300, duration: 0.4, type: "sine" as OscillatorType },
   high: { frequency: 600, duration: 0.4, type: "square" as OscillatorType },
+  // Reconnect confirmation: brighter and longer than a warning so it reads as
+  // "all good" rather than an alarm.
+  success: { frequency: 660, duration: 0.5, type: "sine" as OscillatorType },
 } as const;
 
 // AUDIO PARAMETERS
@@ -200,6 +203,9 @@ const SOUND_URLS = {
   critical: "/sounds/critical.mp3",
   low: "/sounds/low.mp3",
   high: "/sounds/high.mp3",
+  // Filename keeps the original "SUCESS" spelling; don't "fix" it without
+  // renaming the asset itself or preload silently falls through to the tone.
+  success: "/sounds/SUCESS.mp3",
 } as const;
 
 // Pre-loads all default sound files; failures fall back to synth tones
@@ -242,6 +248,7 @@ function getToneConfigForKey(key: string): { frequency: number; duration: number
     case "critical": return { frequency: TONE_CONFIG.critical.frequency, duration: TONE_CONFIG.critical.duration, type: TONE_CONFIG.critical.type };
     case "low": return TONE_CONFIG.low;
     case "high": return TONE_CONFIG.high;
+    case "success": return TONE_CONFIG.success;
     default: return { frequency: 440, duration: 0.3, type: "sine" };
   }
 }
@@ -250,30 +257,113 @@ function getToneConfigForKey(key: string): { frequency: number; duration: number
 
 export async function playWarningSound(): Promise<void> {
   if (!isSoundEnabled()) return;
+  try {
+    await ensureAudioContextReady();
+  } catch {
+    // Best effort: a locked context still gets one play() attempt below.
+  }
   const sound = await getActiveSound("warning");
+  try {
+    if (import.meta?.env?.DEV) {
+      console.debug(`[alert-sound] playing warning (type=${sound.type})`);
+    }
+  } catch {
+    // DEV logging must never break playback.
+  }
   await sound.play();
 }
 
 // Synth critical tone plays twice with a short delay for urgency
 export async function playCriticalSound(): Promise<void> {
   if (!isSoundEnabled()) return;
-  const sound = await getActiveSound("critical");
-  await sound.play();
-  if (sound.type === "synth") {
-    const { repeatDelay } = TONE_CONFIG.critical;
-    await new Promise(resolve => setTimeout(resolve, repeatDelay));
-    await sound.play();
+  // Ensure audio context is ready (in case user hasn't interacted yet)
+  try {
+    await ensureAudioContextReady();
+  } catch {
+    // Ignore; will try to play anyway
   }
+  const sound = await getActiveSound("critical");
+  try {
+    if (import.meta?.env?.DEV) {
+      console.debug(`[alert-sound] playing critical (type=${sound.type})`);
+    }
+  } catch {
+    // DEV logging must never break playback.
+  }
+  await sound.play();
+  // Always do a short follow-up beep for critical urgency (both MP3 and synth)
+  const { repeatDelay } = TONE_CONFIG.critical;
+  await new Promise(resolve => setTimeout(resolve, repeatDelay));
+  await sound.play();
 }
 
 export async function playLowAlertSound(): Promise<void> {
   if (!isSoundEnabled()) return;
+  try {
+    await ensureAudioContextReady();
+  } catch {
+    // Best effort: a locked context still gets one play() attempt below.
+  }
   const sound = await getActiveSound("low");
+  try {
+    if (import.meta?.env?.DEV) {
+      console.debug(`[alert-sound] playing low (type=${sound.type})`);
+    }
+  } catch {
+    // DEV logging must never break playback.
+  }
   await sound.play();
 }
 
 export async function playHighAlertSound(): Promise<void> {
   if (!isSoundEnabled()) return;
+  try {
+    await ensureAudioContextReady();
+  } catch {
+    // Best effort: a locked context still gets one play() attempt below.
+  }
   const sound = await getActiveSound("high");
   await sound.play();
+}
+
+// Device reconnect confirmation. Fired by DeviceConnectionMonitor when a tank
+// transitions offline -> online, so the operator gets positive feedback that
+// the hardware is back without watching the fleet list.
+export async function playSuccessSound(): Promise<void> {
+  if (!isSoundEnabled()) return;
+  try {
+    await ensureAudioContextReady();
+  } catch {
+    // Best effort: a locked context still gets one play() attempt below.
+  }
+  const sound = await getActiveSound("success");
+  try {
+    if (import.meta?.env?.DEV) {
+      console.debug(`[alert-sound] playing success (type=${sound.type})`);
+    }
+  } catch {
+    // DEV logging must never break playback.
+  }
+  await sound.play();
+}
+
+// DEV-only test helpers
+export async function testCriticalSound(): Promise<void> {
+  try {
+    await ensureAudioContextReady();
+  } catch {
+    // playCriticalSound makes its own attempt; a locked context is not fatal.
+  }
+  await playCriticalSound();
+}
+
+if (import.meta && import.meta.env && import.meta.env.DEV) {
+  try {
+    (window as unknown as { __testCriticalSound?: () => Promise<void> }).__testCriticalSound = testCriticalSound;
+    (window as unknown as { __playCriticalSound?: () => Promise<void> }).__playCriticalSound = playCriticalSound;
+    (window as unknown as { __playWarningSound?: () => Promise<void> }).__playWarningSound = playWarningSound;
+    (window as unknown as { __playSuccessSound?: () => Promise<void> }).__playSuccessSound = playSuccessSound;
+  } catch {
+    // Exposing dev helpers is optional; never break module load over it.
+  }
 }

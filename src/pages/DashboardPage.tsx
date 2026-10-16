@@ -1,10 +1,12 @@
-import { useState, useMemo } from "react";
-import { Thermometer, Waves, FlaskConical, AlertTriangle, AlertCircle, CheckCircle, RefreshCw, BellOff, Settings, Volume2, VolumeX } from "lucide-react";
+import { useState, useMemo, useEffect } from "react";
+import { Thermometer, Waves, FlaskConical, AlertTriangle, AlertCircle, CheckCircle, RefreshCw, BellOff, Settings, Volume2, VolumeX, Ruler } from "lucide-react";
 import type { ThresholdStatus, MenuKey } from "../types";
 import { useSensors } from "../hooks/useSensors";
 import { useAuth } from "../contexts/useAuth";
-import { getThresholdStatus } from "../types";
+import { getThresholdStatus, WATER_LEVEL_DEFAULT_CALIBRATION } from "../types";
+import { fetchWaterLevelCalibration, type WaterLevelCalibration } from "../api/client";
 import { formatFarmTime } from "../utils/time";
+import { fmtSensor, type SensorKey } from "../utils/text";
 import { buildLiveGuidance } from "../utils/alertGuidance";
 import type { AlertGuidance } from "../utils/alertGuidance";
 import { FixLegendPanel, FixLegendModal } from "../components/FixLegend";
@@ -27,6 +29,44 @@ export default function DashboardPage({ onNavigate }: Props) {
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [fixGuidance, setFixGuidance] = useState<AlertGuidance | null>(null);
   const [alertsSoundEnabled, setAlertsSoundEnabled] = useState<boolean>(() => getIsSoundEnabled());
+
+  // The HC-SR04 geometry actually in force for the selected tank.
+  //
+  // Without this the page can only ever show a bare percentage, and a 0% is
+  // ambiguous: it could be a genuinely empty tank, or a tank whose sensor was
+  // re-mounted and whose stored calibration no longer matches the hardware.
+  // Showing the measured distance next to the calibration makes that
+  // disambiguation possible from the dashboard.
+  const [calibration, setCalibration] = useState<WaterLevelCalibration | null>(null);
+  const [calibrationUnavailable, setCalibrationUnavailable] = useState(false);
+
+  useEffect(() => {
+    if (!selectedDeviceId) return;
+    const controller = new AbortController();
+    fetchWaterLevelCalibration(selectedDeviceId, controller.signal)
+      .then((cal) => {
+        setCalibration(cal);
+        setCalibrationUnavailable(false);
+      })
+      .catch(() => {
+        // Migration 018 not applied yet, or the tank has been deleted. Fall back
+        // to the display defaults and say so, rather than showing nothing.
+        setCalibration(null);
+        setCalibrationUnavailable(true);
+      });
+    return () => controller.abort();
+  }, [selectedDeviceId]);
+
+  // Falls back to the compiled-in defaults when the endpoint is unavailable, so
+  // the "0% is measured at X cm" line is never blank.
+  const waterCalibration = calibration ?? {
+    device_id: selectedDeviceId ?? "",
+    empty_cm: WATER_LEVEL_DEFAULT_CALIBRATION.emptyCm,
+    full_cm: WATER_LEVEL_DEFAULT_CALIBRATION.fullCm,
+    source: "default" as const,
+    usable_depth_cm:
+      WATER_LEVEL_DEFAULT_CALIBRATION.emptyCm - WATER_LEVEL_DEFAULT_CALIBRATION.fullCm,
+  };
 
   // The SELECTED tank's effective thresholds (global defaults + per-tank
   // override) — every status evaluation on this page follows the tank.
@@ -61,7 +101,7 @@ export default function DashboardPage({ onNavigate }: Props) {
 
       if (status === "warning" || status === "critical") {
         const direction = value < threshold.range.min ? "low" : "high";
-        alerts.push(`${threshold.name} ${direction} at ${value}${threshold.unit}`);
+        alerts.push(`${threshold.name} ${direction} at ${fmtSensor(key, value)}${threshold.unit}`);
       }
     }
 
@@ -150,8 +190,8 @@ export default function DashboardPage({ onNavigate }: Props) {
   };
 
   // Failed sensors arrive as null — render "--" instead of "null°C" etc.
-  const fmt = (value: number | null, unit: string) =>
-    loading ? "Loading..." : value !== null && value !== undefined ? `${value}${unit}` : `--${unit}`;
+  const fmt = (key: SensorKey, value: number | null | undefined, unit: string) =>
+    loading ? "Loading..." : value !== null && value !== undefined ? `${fmtSensor(key, value)}${unit}` : `--${unit}`;
 
   // Ammonia leads everywhere: it is the fastest-acting toxin for crayfish, so
   // it must be the first number read rather than the third. Same order in the
@@ -159,7 +199,7 @@ export default function DashboardPage({ onNavigate }: Props) {
   const stats = [
     {
       title: "Ammonia",
-      value: fmt(latestReading?.ammonia ?? null, " ppm"),
+      value: fmt("ammonia", latestReading?.ammonia, " ppm"),
       color: sensorColors.ammonia,
       icon: <FlaskConical size={24} />,
       loading,
@@ -168,7 +208,7 @@ export default function DashboardPage({ onNavigate }: Props) {
     },
     {
       title: "Water Temperature",
-      value: fmt(latestReading?.temperature ?? null, "°C"),
+      value: fmt("temperature", latestReading?.temperature, "°C"),
       color: sensorColors.temperature,
       icon: <Thermometer size={24} />,
       loading,
@@ -177,7 +217,7 @@ export default function DashboardPage({ onNavigate }: Props) {
     },
     {
       title: "Water Level",
-      value: fmt(latestReading?.water_level ?? null, "%"),
+      value: fmt("water_level", latestReading?.water_level, "%"),
       color: sensorColors.water_level,
       icon: <Waves size={24} />,
       loading,
@@ -187,9 +227,9 @@ export default function DashboardPage({ onNavigate }: Props) {
   ];
 
   const highlights = [
-    { label: "Ammonia", value: loading ? "..." : latestReading?.ammonia != null ? `${latestReading.ammonia} ppm` : "--", color: isOfflineWithData ? "bg-yellow-50 border-yellow-200 text-yellow-700" : latestReading ? "bg-emerald-50 border-emerald-200 text-emerald-700" : "bg-red-50 border-red-200 text-red-700" },
-    { label: "Temperature", value: loading ? "..." : latestReading?.temperature != null ? `${latestReading.temperature}°C` : "--", color: isOfflineWithData ? "bg-yellow-50 border-yellow-200 text-yellow-700" : latestReading ? "bg-orange-50 border-orange-200 text-orange-700" : "bg-red-50 border-red-200 text-red-700" },
-    { label: "Water Level", value: loading ? "..." : latestReading?.water_level != null ? `${latestReading.water_level}%` : "--", color: isOfflineWithData ? "bg-yellow-50 border-yellow-200 text-yellow-700" : latestReading ? "bg-blue-50 border-blue-200 text-blue-700" : "bg-red-50 border-red-200 text-red-700" },
+    { label: "Ammonia", value: loading ? "..." : latestReading?.ammonia != null ? `${fmtSensor("ammonia", latestReading.ammonia)} ppm` : "--", color: isOfflineWithData ? "bg-yellow-50 border-yellow-200 text-yellow-700" : latestReading ? "bg-emerald-50 border-emerald-200 text-emerald-700" : "bg-red-50 border-red-200 text-red-700" },
+    { label: "Temperature", value: loading ? "..." : latestReading?.temperature != null ? `${fmtSensor("temperature", latestReading.temperature)}°C` : "--", color: isOfflineWithData ? "bg-yellow-50 border-yellow-200 text-yellow-700" : latestReading ? "bg-orange-50 border-orange-200 text-orange-700" : "bg-red-50 border-red-200 text-red-700" },
+    { label: "Water Level", value: loading ? "..." : latestReading?.water_level != null ? `${fmtSensor("water_level", latestReading.water_level)}%` : "--", color: isOfflineWithData ? "bg-yellow-50 border-yellow-200 text-yellow-700" : latestReading ? "bg-blue-50 border-blue-200 text-blue-700" : "bg-red-50 border-red-200 text-red-700" },
   ];
 
   const recentAlerts = tankStatus.alerts.filter(alert => alert !== "Tank is Safe").slice(0, 4);
@@ -495,23 +535,36 @@ export default function DashboardPage({ onNavigate }: Props) {
             <div className={`grid grid-cols-1 gap-4 sm:grid-cols-3 ${isOfflineWithData ? "opacity-60" : ""}`}>
               <div className="rounded-xl bg-emerald-50 p-4">
                 <p className="text-xs text-gray-500">Ammonia</p>
-                <p className="mt-1 text-2xl font-bold text-emerald-600">{latestReading?.ammonia ?? "--"} ppm</p>
+                <p className="mt-1 text-2xl font-bold text-emerald-600">{latestReading?.ammonia != null ? fmtSensor("ammonia", latestReading.ammonia) : "--"} ppm</p>
                 <p className="mt-1 text-xs text-gray-400">
                   Safe: {thresholds.ammonia.range.min}-{thresholds.ammonia.range.max} ppm
                 </p>
               </div>
               <div className="rounded-xl bg-orange-50 p-4">
                 <p className="text-xs text-gray-500">Temperature</p>
-                <p className="mt-1 text-2xl font-bold text-orange-600">{latestReading?.temperature ?? "--"}°C</p>
+                <p className="mt-1 text-2xl font-bold text-orange-600">{latestReading?.temperature != null ? fmtSensor("temperature", latestReading.temperature) : "--"}°C</p>
                 <p className="mt-1 text-xs text-gray-400">
                   Safe: {thresholds.temperature.range.min}-{thresholds.temperature.range.max}°C
                 </p>
               </div>
               <div className="rounded-xl bg-blue-50 p-4">
                 <p className="text-xs text-gray-500">Water Level</p>
-                <p className="mt-1 text-2xl font-bold text-blue-600">{latestReading?.water_level ?? "--"}%</p>
+                <p className="mt-1 text-2xl font-bold text-blue-600">
+                  {/* Failed sensors are null, never 0 - a 0% is a real reading
+                      (an empty tank) and must render as "0%", not "--". */}
+                  {latestReading?.water_level != null ? `${fmtSensor("water_level", latestReading.water_level)}%` : "--"}
+                </p>
                 <p className="mt-1 text-xs text-gray-400">
                   Safe: {thresholds.water_level.range.min}-{thresholds.water_level.range.max}%
+                </p>
+                {/* The geometry behind that percentage: the measured air gap,
+                    and the two distances that 0% and 100% correspond to. Without
+                    this a 0% could be a dry tank or a miscalibrated sensor. */}
+                <p className="mt-1 text-micro text-gray-400 flex items-center gap-1">
+                  <Ruler size={11} className="inline shrink-0" />
+                  {latestReading?.water_distance_cm != null
+                    ? `${latestReading.water_distance_cm} cm gap · 0% at ${waterCalibration.empty_cm} cm · 100% at ${waterCalibration.full_cm} cm`
+                    : `0% at ${waterCalibration.empty_cm} cm · 100% at ${waterCalibration.full_cm} cm${calibrationUnavailable ? " (default)" : ""}`}
                 </p>
               </div>
             </div>

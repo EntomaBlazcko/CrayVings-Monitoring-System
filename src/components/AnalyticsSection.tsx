@@ -35,7 +35,7 @@ import { isAxiosError } from "axios";
 import type { AnalyticsOverview, AnalyticsDailyEntry, Insight } from "../types";
 import { getThresholdStatus, SENSOR_KEY_TO_DISPLAY } from "../types";
 import { formatFarmDateTime, formatFarmDate } from "../utils/time";
-import { fmtStat } from "../utils/text";
+import { fmtStat, toNum } from "../utils/text";
 import { SENSOR_COLORS, CHART_COLORS, BAND_COLORS, BAR_COLORS } from "../utils/tokens";
 
 type RangeKey = 7 | 30 | 90;
@@ -106,17 +106,6 @@ function InsightIcon({ level }: { level: Insight["level"] }) {
   if (level === "critical") return <AlertTriangle size={18} className={INSIGHT_STYLES.critical.icon} />;
   if (level === "warning") return <AlertTriangle size={18} className={INSIGHT_STYLES.warning.icon} />;
   return <Info size={18} className={INSIGHT_STYLES.info.icon} />;
-}
-
-// pg returns DECIMAL aggregates as strings and a missing aggregate as null, so
-// both need normalising before they reach a chart. null has to survive: Recharts
-// breaks the line on a null point, which is the honest rendering, whereas the
-// `|| 0` this replaces drew a plunge to the floor for a day the sensor was
-// simply dead.
-function toNum(v: unknown): number | null {
-  if (v === null || v === undefined || v === "") return null;
-  const n = Number(v);
-  return Number.isFinite(n) ? n : null;
 }
 
 // Builds recharts points from daily aggregates (defensive Number coercion for

@@ -354,10 +354,16 @@ async function changePassword({ targetId, passwordHash, keepCallerSession, execu
 // Writes one activity_logs row. A credential change that leaves no trace is
 // indistinguishable from one that never happened, and "who reset whose
 // password" is the first question asked after a suspected compromise.
-async function writeActivityLog(userName, actionType, description, module = "settings", executor = pool) {
+//
+// user_name is the display string the UI renders; userId is the migration 019
+// FK that survives a rename and lets the row be joined back to the account
+// (NULL when the actor is not resolvable, e.g. the "unknown" guard below).
+// module and executor stay trailing so callers log the actor without repeating
+// the plumbing defaults.
+async function writeActivityLog(userName, actionType, description, userId = null, module = "settings", executor = pool) {
   await executor.query(
-    "INSERT INTO activity_logs (user_name, action_type, description, module) VALUES ($1, $2, $3, $4)",
-    [userName, actionType, description, module]
+    "INSERT INTO activity_logs (user_name, user_id, action_type, description, module) VALUES ($1, $2, $3, $4, $5)",
+    [userName, userId, actionType, description, module]
   );
 }
 
@@ -441,7 +447,15 @@ function setSessionCookie(res, token, expiresAt) {
 function clearSessionCookie(res) {
   // Max-Age=0 is the reliable delete: it does not depend on the browser
   // comparing Expires against a clock the two sides might disagree about.
-  res.append("Set-Cookie", `${SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`);
+  //
+  // The Secure attribute has to mirror setSessionCookie. A browser will refuse to
+  // let an insecure response overwrite a cookie it holds as Secure, so on an
+  // HTTPS deployment the delete was silently dropped and logout left the cookie
+  // alive until its natural 24h expiry. Mirroring the flag is what makes logout
+  // actually log out over TLS.
+  const attrs = [`${SESSION_COOKIE}=`, "Path=/", "HttpOnly", "SameSite=Lax", "Max-Age=0"];
+  if (COOKIE_SECURE) attrs.push("Secure");
+  res.append("Set-Cookie", attrs.join("; "));
 }
 
 // =============================================================================
@@ -497,12 +511,32 @@ function readSession(req) {
   return { token: null, viaCookie: false };
 }
 
+// The session lookup projection, shared by requireAdmin and requireAuth so the
+// two guards cannot drift apart on which fields they load.
+//
+// `token` is deliberately absent: it is the SHA-256 of the cookie the caller
+// already presented, so returning it tells the caller nothing it does not have.
+// `password_hash` is deliberately present, because /auth/me/password and the
+// OTP deletion flow both verify the current password against the loaded user.
+//
+// Matching on (token, status) in one statement rather than token in SQL and
+// status in JS is what lets the composite idx_users_token_active index answer
+// the whole predicate; two steps would need two index probes.
+const SESSION_USER_COLUMNS =
+  "SELECT id, username, name, email, role, status, token_expires_at, password_hash " +
+  "FROM users WHERE token = $1 AND status = 'active'";
+
 // Validates session and admin role; attaches user to req.adminUser
 function requireAdmin(req, res, next) {
   const { token, viaCookie } = readSession(req);
   if (!token) return res.status(401).json({ message: "Authentication required" });
 
-  pool.query("SELECT * FROM users WHERE token = $1 AND status = 'active'", [hashToken(token)])
+  // Explicit columns, not SELECT *. Every authenticated request and every SSE
+  // connect lands here, so the asterisk made this the most-executed query in the
+  // app - and it carried the session token itself back out of the table on each
+  // one, a credential nobody downstream reads. password_hash has to stay: the
+  // password-change routes verify the current password against req.adminUser.
+  pool.query(SESSION_USER_COLUMNS, [hashToken(token)])
     .then(async result => {
       if (result.rows.length === 0) {
         // Same reasoning as requireAuth: the session is gone, so clear the
@@ -553,7 +587,7 @@ function requireAuth(req, res, next) {
   const { token, viaCookie } = readSession(req);
   if (!token) return res.status(401).json({ message: "Authentication required" });
 
-  pool.query("SELECT * FROM users WHERE token = $1 AND status = 'active'", [hashToken(token)])
+  pool.query(SESSION_USER_COLUMNS, [hashToken(token)])
     .then(async result => {
       if (result.rows.length === 0) {
         // A cookie that no longer matches any session must be actively cleared,
@@ -589,7 +623,8 @@ function requireAuth(req, res, next) {
 //                 marked used so replay is impossible.
 //   3. APPROVE/EXECUTE — a *different* admin (second person) approves, which
 //                 performs the hard delete. The timestamped auth+reason history
-//                 lives in `status_history` + the activity-log audit trail.
+//                 lives in `user_deletion_request_status_history` + the
+//                 activity-log audit trail.
 //
 // SMTP delivery is plug-and-play: set SMTP_HOST/SMTP_USER/SMTP_PASS/SMTP_FROM
 // in .env (see .env.example). When SMTP is not configured the server logs the
@@ -773,10 +808,127 @@ function getChangedFields(current, updates) {
 }
 
 // =============================================================================
+// WATER-LEVEL GEOMETRY (calibration)
+// =============================================================================
+//
+// The server's own copy of the HC-SR04 calibration, used when a stored
+// per-tank calibration exists. These are FALLBACKS: the authoritative values
+// live in `sensor_calibration` (migration 018) and are settable per tank over
+// HTTP, so the EMPTY/FULL distances can be corrected without reflashing a
+// board. Per-tank row wins; these constants only apply to a tank that has never
+// been calibrated.
+//
+//   level% = (EMPTY - distance) / (EMPTY - FULL) * 100, clamped 0-100
+//
+// Note what these are NOT: `sensor_settings.water_level_min/max` and
+// `device_threshold_overrides.water_level_min/max` are ALERT thresholds
+// ("warn me below 40%"), not geometry. Putting EMPTY_CM/FULL_CM there would
+// mean recalibrating the sensor also moved the alert lines, which is not what
+// either of those numbers means.
+const WATER_LEVEL_EMPTY_CM = 23.5;
+const WATER_LEVEL_FULL_CM = 8.0;
+
+// Beyond this the firmware's arithmetic is broken, not merely mis-calibrated.
+// Anything inside the band but outside 0-100 is clamped and flagged instead of
+// rejected - a 400 would make the ESP32 requeue the reading forever and stall
+// that tank's heartbeat, which is a far worse outcome than an imperfect number.
+const WATER_LEVEL_PCT_HARD_MAX = 200;
+
+// Logged (not silently accepted) when the board's own percentage disagrees with
+// what the server computes from the stored distance + this tank's calibration.
+// The usual cause is a board calibrated for a different tank geometry than the
+// calibration stored server-side - a real, actionable config drift.
+const WATER_LEVEL_MISMATCH_PCT = 5;
+
+// A reading the server had to clamp. Surfaced in the response body so the
+// firmware can print it on the serial monitor instead of the fault only being
+// visible as a subtly wrong chart.
+const WATER_LEVEL_CLAMP_NOTE = "water_level_clamped";
+
+// Converts a raw HC-SR04 distance (cm) to a percentage using a calibration pair.
+// Returns null for a calibration that cannot produce a percentage (full >=
+// empty), so a bad config surfaces as "cannot compute" rather than as NaN or a
+// sign-flipped value.
+function levelPercentFromDistance(distanceCm, emptyCm, fullCm) {
+  if (!(emptyCm > fullCm)) return null;
+  const span = emptyCm - fullCm;
+  const pct = ((emptyCm - distanceCm) / span) * 100;
+  return Math.min(100, Math.max(0, pct));
+}
+
+// Per-tank HC-SR04 calibration: EMPTY_CM (distance at minimum fill = 0%) and
+// FULL_CM (distance at maximum fill = 100%). Falls back to the constants above
+// when the tank has no row, so the handler works before migration 018 has been
+// applied or for a tank nobody has calibrated yet.
+//
+// Cached per device because this runs on every POST /sensor (1 Hz per tank):
+// without the cache it is one extra round-trip to PostgreSQL per reading, which
+// is pure overhead on the hottest path in the system. Calibration changes are
+// rare and the invalidation below makes an edit take effect immediately.
+const waterCalibrationCache = new Map(); // device_id -> { empty_cm, full_cm, source }
+
+async function getWaterCalibration(deviceId) {
+  const cached = waterCalibrationCache.get(deviceId);
+  if (cached) return cached;
+
+  let row = null;
+  try {
+    const result = await pool.query(
+      `SELECT empty_cm, full_cm FROM sensor_calibration WHERE device_id = $1`,
+      [deviceId],
+    );
+    row = result.rows[0] ?? null;
+  } catch (err) {
+    // Migration 018 not applied yet (or the table was dropped): fall through to
+    // the defaults rather than failing every POST /sensor on the farm.
+    if (!waterCalibrationCache.has(`${deviceId}:warned`)) {
+      console.warn(
+        `[${new Date().toISOString()}] sensor_calibration unavailable (${err.message}) - using default water calibration for ${deviceId}. Run node db/migrations/018_water_level_calibration.cjs`,
+      );
+      waterCalibrationCache.set(`${deviceId}:warned`, true);
+    }
+  }
+
+  const calibration = row
+    ? { empty_cm: Number(row.empty_cm), full_cm: Number(row.full_cm), source: "sensor_calibration" }
+    : { empty_cm: WATER_LEVEL_EMPTY_CM, full_cm: WATER_LEVEL_FULL_CM, source: "default" };
+
+  waterCalibrationCache.set(deviceId, calibration);
+  return calibration;
+}
+
+// Drops a tank's cached calibration so the next reading picks the new values up.
+function invalidateWaterCalibration(deviceId) {
+  waterCalibrationCache.delete(deviceId);
+}
+
+// =============================================================================
 // INPUT VALIDATION SCHEMAS (Zod)
 // =============================================================================
 // ESP32 marks failed sensors with -1 (and 0 for temperature), so lower bounds
 // must accept those sentinel values.
+
+// A JSON number field that cannot silently become 0.
+//
+// Why this exists: `z.coerce.number()` runs Number() on the input, and
+// Number(null) === 0, Number("") === 0 and Number([]) === 0. So a payload of
+// {"water_level": null} - the natural way for a client to say "this sensor did
+// not report" - passed the old `min(-1).max(100)` bound and was written to
+// PostgreSQL as a real 0. An empty tank and a dead sensor became
+// indistinguishable in the time series, which is exactly the "fake value
+// instead of an error state" failure this column must never have. Booleans are
+// rejected for the same reason (Number(true) === 1). Anything that is not a
+// real number or a numeric string becomes NaN, which Zod's number type
+// rejects, and the caller gets a 400 instead of a stored lie.
+function sensorNumber(min, max) {
+  return z.preprocess(
+    (v) =>
+      v === null || v === undefined || v === "" || typeof v === "boolean" || Array.isArray(v)
+        ? Number.NaN
+        : v,
+    z.coerce.number().min(min).max(max),
+  );
+}
 
 // POST /sensor (ESP32 ingestion). Both firmwares convert the DS18B20's -127
 // disconnect code to -1 before sending, so the WIRE sentinels are: temperature
@@ -787,12 +939,19 @@ const sensorSchema = z.object({
   device_id: z.string().min(1).max(50),
   // Accepts -127 (raw DS18B20 code, in case a firmware variant sends it) and
   // the -1/0 wire sentinels; physical range is -10..50.
-  temperature: z.coerce.number().min(-127).max(50),
-  // -1 is the HC-SR04 failed-sensor sentinel.
-  water_level: z.coerce.number().min(-1).max(100),
+  temperature: sensorNumber(-127, 50),
+  // The percentage, -1 for a failed HC-SR04. Accepted up to
+  // WATER_LEVEL_PCT_HARD_MAX and clamped to 0-100 in the handler rather than
+  // rejected: a hard 400 here makes the board requeue forever.
+  water_level: sensorNumber(-1, WATER_LEVEL_PCT_HARD_MAX),
+  // The raw measured air gap (cm), -1 for a failed HC-SR04. Optional so a
+  // pre-calibration firmware that only sends the percentage still works, but
+  // this is the field that makes recalibration possible after the fact, and
+  // the firmware sends it. 0-400 matches the HC-SR04's usable range.
+  water_distance_cm: sensorNumber(-1, 400).optional(),
   // ammonia is a real NH3 gas reading in ppm (MQ-137). Upper bound covers
   // the full datasheet range (5-500 ppm); -1 is the failed-sensor sentinel.
-  ammonia: z.coerce.number().min(-1).max(500).optional(),
+  ammonia: sensorNumber(-1, 500).optional(),
   // Optional device-side capture time (ISO 8601, SNTP-synced on the ESP32).
   // Sanitized below: not in the future, not older than the offline buffer.
   read_at: z.string().max(40).optional(),
@@ -802,6 +961,11 @@ const sensorSchema = z.object({
 // Temperature <= 0 is treated as a failure: the farm is tropical (water never
 // freezes) and both the client chart filter (>= 0.0001) and the alert engine
 // (minValid 0.0001) already treat it that way, so aggregates stay consistent.
+//
+// For water_level, 0 is explicitly NOT a sentinel: the calibrated formula makes
+// 0% a real value (an empty tank at exactly EMPTY_CM), and the board sends -1
+// for a failed sensor. Getting this backwards is what would make a dry tank
+// look like a working one.
 function readingOrNull(key, raw) {
   const value = Number(raw);
   if (!Number.isFinite(value)) return null;
@@ -1003,6 +1167,16 @@ const DELTA_TOLERANCES = {
   water_level: Number.isFinite(parseFloat(process.env.WATER_LEVEL_DELTA_TOLERANCE))
     ? parseFloat(process.env.WATER_LEVEL_DELTA_TOLERANCE)
     : 1,
+  // Raw HC-SR04 distance. Deliberately tighter than the 1% percentage tolerance
+  // on purpose: at a typical 15.5 cm calibration span, 0.1 cm is ~0.65% of the
+  // span, so it almost never triggers a write on its own (the percentage stays
+  // the dominant trigger and row rate is unchanged) but it does stop the
+  // stored distance drifting arbitrarily far from the percentage it was
+  // derived from. Loosening this to 1 cm would quietly quantise the distance and
+  // destroy the sub-cm fidelity that a later recalibration needs.
+  water_distance_cm: Number.isFinite(parseFloat(process.env.WATER_DISTANCE_DELTA_TOLERANCE))
+    ? parseFloat(process.env.WATER_DISTANCE_DELTA_TOLERANCE)
+    : 0.1,
   ammonia: Number.isFinite(parseFloat(process.env.AMMONIA_DELTA_TOLERANCE))
     ? parseFloat(process.env.AMMONIA_DELTA_TOLERANCE)
     : 0.05,
@@ -1115,6 +1289,18 @@ function buildSmsMessage(type, body) {
 // Routed through the circuit breaker so a dead/unreachable gateway fails fast
 // instead of being hammered. The config check stays OUTSIDE the breaker so a
 // missing key is reported immediately rather than tripping the breaker.
+// Maps an HTTPSMS HTTP failure into the reason the operator can act on. Axios
+// surfaces these as "Request failed with status code 402", which tells an admin
+// nothing about the phone/credit state they are the ones who can fix.
+const HTTPSMS_STATUS_HINTS = {
+  401: "HTTPSMS API key is invalid or expired — regenerate it at httpsms.com/settings",
+  402: "HTTPSMS account has no credits — top up at httpsms.com (this is the platform, not your unli-text SIM plan)",
+  403: "HTTPSMS API key lacks permission to send",
+  404: "HTTPSMS send endpoint returned 404 — check HTTPSMS_API_URL",
+  422: "HTTPSMS rejected the message (invalid phone / content)",
+  429: "HTTPSMS rate limit hit — retry after the cooldown",
+};
+
 async function sendHttpsms({ to, content }) {
   if (!HTTPSMS_API_KEY || !HTTPSMS_FROM) {
     const err = new Error("HTTPSMS_API_KEY / HTTPSMS_FROM not configured");
@@ -1122,12 +1308,26 @@ async function sendHttpsms({ to, content }) {
     throw err;
   }
   const response = await sendSmsWithBreaker(
-    () =>
-      axios.post(
-        HTTPSMS_API_URL,
-        { from: HTTPSMS_FROM, to, content },
-        { headers: { "x-api-key": HTTPSMS_API_KEY } }
-      ),
+    async () => {
+      try {
+        return await axios.post(
+          HTTPSMS_API_URL,
+          { from: HTTPSMS_FROM, to, content },
+          { headers: { "x-api-key": HTTPSMS_API_KEY } }
+        );
+      } catch (err) {
+        // Preserve the raw axios error for the server console/log row, but
+        // swap the message for one that points at the actual fix. The breaker
+        // records err.message too, so the dashboard banner gets the hint.
+        const hint = err?.response?.status
+          ? HTTPSMS_STATUS_HINTS[err.response.status]
+          : undefined;
+        if (hint) {
+          err.message = `${hint} (HTTP ${err.response.status})`;
+        }
+        throw err;
+      }
+    },
     "HTTPSMS"
   );
   return response.data?.data?.id || null;
@@ -1846,16 +2046,66 @@ app.post("/sensor", sensorIngestLimiter, async (req, res) => {
     if (!parsed.success) {
       return res.status(400).json({ message: "Invalid sensor data", errors: zodFieldErrors(parsed.error) });
     }
-    const { device_id, temperature, water_level, ammonia } = parsed.data;
+    const { device_id, temperature, water_distance_cm } = parsed.data;
     if (!device_id) return res.status(400).json({ message: "device_id is required" });
 
     // Sensor-failure sentinels become NULL so failed sensors never pollute the
     // time-series data (audit 2.2.2); the heartbeat itself still flows.
     const readings = {
       temperature: readingOrNull("temperature", temperature),
-      water_level: readingOrNull("water_level", water_level),
-      ammonia: readingOrNull("ammonia", ammonia),
+      water_level: readingOrNull("water_level", parsed.data.water_level),
+      ammonia: readingOrNull("ammonia", parsed.data.ammonia),
+      water_distance_cm: readingOrNull("water_distance_cm", water_distance_cm),
     };
+
+    // ---------------------------------------------------------------------
+    // Water level: clamp, then cross-check against the stored calibration.
+    // ---------------------------------------------------------------------
+    // A reading outside 0-100 is a firmware arithmetic fault or a
+    // mis-calibration, not something to reject outright: a 400 makes the ESP32
+    // requeue the reading and retry forever, so the tank's heartbeat (and
+    // therefore its ONLINE status and disconnect alerts) dies over a number the
+    // server could have simply corrected. Clamp, tell the board we clamped, and
+    // let the discrepancy stay visible.
+    const clampNotes = [];
+    if (readings.water_level !== null && (readings.water_level < 0 || readings.water_level > 100)) {
+      const clamped = Math.min(100, Math.max(0, readings.water_level));
+      console.warn(`[${new Date().toISOString()}] water_level ${readings.water_level}% from ${device_id} is outside 0-100 - clamped to ${clamped}%. Check that tank's EMPTY_CM / FULL_CM calibration.`);
+      readings.water_level = clamped;
+      clampNotes.push(WATER_LEVEL_CLAMP_NOTE);
+    }
+
+    // When we have both a distance and a calibration for this tank, the server's
+    // own conversion is authoritative: it is derived from the calibration an
+    // Owner can edit over HTTP, so a board flashed with the wrong EMPTY/FULL
+    // pair is corrected here rather than requiring a visit to the tank with a
+    // USB cable. Only when we CAN compute a percentage - a distance was sent
+    // and the calibration is sane - so a tank with no calibration row and no
+    // distance keeps reporting the firmware's own number.
+    const calibration = await getWaterCalibration(device_id);
+    let waterLevelMismatch = false;
+    if (
+      readings.water_distance_cm !== null &&
+      readings.water_level !== null &&
+      calibration
+    ) {
+      const serverPct = levelPercentFromDistance(
+        readings.water_distance_cm,
+        calibration.empty_cm,
+        calibration.full_cm,
+      );
+      if (serverPct !== null) {
+        if (Math.abs(serverPct - readings.water_level) > WATER_LEVEL_MISMATCH_PCT) {
+          waterLevelMismatch = true;
+          console.warn(
+            `[${new Date().toISOString()}] water_level mismatch on ${device_id}: board reported ${readings.water_level}% ` +
+              `at ${readings.water_distance_cm} cm, server calibration (empty ${calibration.empty_cm} cm / full ${calibration.full_cm} cm) says ${serverPct.toFixed(1)}%. ` +
+              `Storing the server's value - fix the tank's calibration on the dashboard or in the board's config portal.`,
+          );
+        }
+        readings.water_level = Math.round(serverPct * 10) / 10;
+      }
+    }
 
     // Ammonia spike tracking (accept-and-flag): compute the jump vs the last
     // STORED reading but NEVER reject. The old hard-400 made the ESP32 requeue
@@ -1959,25 +2209,36 @@ app.post("/sensor", sensorIngestLimiter, async (req, res) => {
       if (!isValid(newVal)) return false;
       return Math.abs(newVal - lastVal) > DELTA_TOLERANCES[key];
     };
-    const hasDelta = ["temperature", "water_level", "ammonia"].some(paramChanged);
+    // The distance participates in delta logging too. Without it, a calibration
+    // correction that only shows up in the distance would be invisible to the
+    // delta check and the corrected percentage could fail to get a row written.
+    const hasDelta = ["temperature", "water_level", "ammonia", "water_distance_cm"].some(paramChanged);
 
     // Publish the freshest reading to the in-memory map (drives /devices/latest
     // and the SSE push) regardless of whether a row gets written.
     latestDeviceReadings.set(device_id, { ...readings, recv_at: arrivalTs.toISOString() });
 
+    // Notes the firmware prints when it sees them, so a calibration fault shows
+    // up on the bench serial monitor and not only as a wrong chart.
+    const corrections = {
+      ...(clampNotes.length ? { [WATER_LEVEL_CLAMP_NOTE]: true } : {}),
+      ...(waterLevelMismatch ? { water_level_mismatch: true } : {}),
+    };
+
     // Delta mode: an unchanged reading is still a heartbeat (devices.last_seen
     // already updated above) but writes no new sensors row.
     if (DELTA_LOGGING_ENABLED && !hasDelta) {
       console.log(`[${new Date().toISOString()}] Sensor heartbeat from ${device_id} (unchanged - no row written)`);
-      res.status(200).json({ message: "No change, skipped", skipped: true, auto_registered: autoRegistered, data: { device_id, ...readings, timestamp: rowTs.toISOString() } });
+      res.status(200).json({ message: "No change, skipped", skipped: true, auto_registered: autoRegistered, ...corrections, data: { device_id, ...readings, timestamp: rowTs.toISOString() } });
       broadcastSensorUpdate(device_id, readings, arrivalTs);
-      scheduleAlertProcessing(device_id, rowTs, temperature, water_level, ammonia);
+      scheduleAlertProcessing(device_id, rowTs, temperature, readings.water_level, readings.ammonia);
       return;
     }
 
     const result = await pool.query(
-      `INSERT INTO sensors (device_id, temperature, water_level, ammonia, timestamp) VALUES ($1, $2, $3, $4, $5) RETURNING *`,
-      [device_id, readings.temperature, readings.water_level, readings.ammonia, rowTs]
+      `INSERT INTO sensors (device_id, temperature, water_level, water_distance_cm, ammonia, timestamp)
+       VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+      [device_id, readings.temperature, readings.water_level, readings.water_distance_cm, readings.ammonia, rowTs]
     );
     console.log(`[${new Date().toISOString()}] Sensor data saved from ${device_id}${readAt ? ` (read_at ${rowTs.toISOString()})` : ""}`);
 
@@ -1998,13 +2259,102 @@ app.post("/sensor", sensorIngestLimiter, async (req, res) => {
 
     // Respond immediately; timestamp returned as UTC ISO-8601 so the frontend
     // renders it in the farm timezone without silent timezone conversion.
-    res.status(201).json({ message: "Saved", auto_registered: autoRegistered, data: { ...result.rows[0], timestamp: rowTs.toISOString() } });
+    res.status(201).json({ message: "Saved", auto_registered: autoRegistered, ...corrections, data: { ...result.rows[0], timestamp: rowTs.toISOString() } });
 
     broadcastSensorUpdate(device_id, readings, arrivalTs);
-    scheduleAlertProcessing(device_id, rowTs, temperature, water_level, ammonia);
+    scheduleAlertProcessing(device_id, rowTs, temperature, readings.water_level, readings.ammonia);
   } catch (err) {
     console.error(`[${new Date().toISOString()}] Error saving sensor:`, err.message);
     res.status(500).json({ message: "Error saving data" });
+  }
+});
+
+// =============================================================================
+// WATER-LEVEL CALIBRATION (per tank)
+// =============================================================================
+//
+// WHERE THE EMPTY_CM / FULL_CM PAIR LIVES, and why it is not in sensor_settings:
+//
+//   sensor_settings.water_level_min/max            -> ALERT thresholds
+//   device_threshold_overrides.water_level_min/max -> per-tank ALERT thresholds
+//   sensor_calibration.empty_cm / full_cm           -> GEOMETRY (this route)
+//
+// The first two answer "when should we warn about the water level". This one
+// answers "what distance does 0% and 100% correspond to on THIS tank's sensor".
+// Conflating them is how you end up recalibrating a moved sensor and silently
+// moving every alert line with it.
+//
+// Because the geometry lives here and the raw distance is stored on every
+// sensors row, a wrong calibration is correctable from history at any time -
+// no reflashing, and no trip to the tank with a USB cable.
+
+// GET /calibration/water-level?device_id=... - effective calibration for one
+// tank, including whether it came from the per-tank row or the defaults, so the
+// UI never has to guess which numbers are in force.
+app.get("/calibration/water-level", requireAuth, async (req, res) => {
+  try {
+    const deviceId = String(req.query.device_id ?? "").trim();
+    if (!deviceId) {
+      return res.status(400).json({ message: "device_id is required" });
+    }
+    const calibration = await getWaterCalibration(deviceId);
+    res.json({
+      device_id: deviceId,
+      empty_cm: calibration.empty_cm,
+      full_cm: calibration.full_cm,
+      source: calibration.source,
+      // Derived, so the UI can show the usable depth and warn about a bad pair
+      // without duplicating the arithmetic.
+      usable_depth_cm: calibration.empty_cm > calibration.full_cm
+        ? calibration.empty_cm - calibration.full_cm
+        : null,
+    });
+  } catch (err) {
+    console.error(`[${new Date().toISOString()}] GET /calibration/water-level failed:`, err.message);
+    res.status(500).json({ message: "Error reading water-level calibration" });
+  }
+});
+
+// PUT /calibration/water-level - set the pair for one tank.
+const waterCalibrationSchema = z.object({
+  device_id: z.string().trim().min(1).max(50),
+  empty_cm: z.coerce.number().min(2).max(400),
+  full_cm: z.coerce.number().min(2).max(400),
+}).refine((v) => v.empty_cm > v.full_cm, {
+  message: "empty_cm must be greater than full_cm (it is the distance at minimum fill, which is the larger distance)",
+  path: ["full_cm"],
+});
+
+app.put("/calibration/water-level", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const parsed = waterCalibrationSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({ message: "Invalid water-level calibration", errors: zodFieldErrors(parsed.error) });
+    }
+    const { device_id, empty_cm, full_cm } = parsed.data;
+
+    const result = await pool.query(
+      `INSERT INTO sensor_calibration (device_id, empty_cm, full_cm, updated_by)
+         VALUES ($1, $2, $3, $4)
+       ON CONFLICT (device_id) DO UPDATE
+         SET empty_cm = EXCLUDED.empty_cm,
+             full_cm = EXCLUDED.full_cm,
+             updated_by = EXCLUDED.updated_by,
+             updated_at = NOW()
+       RETURNING *`,
+      [device_id, empty_cm, full_cm, req.user?.username ?? req.user?.user_id ?? null],
+    );
+
+    // Read the next POST immediately with the new geometry.
+    invalidateWaterCalibration(device_id);
+
+    console.log(
+      `[${new Date().toISOString()}] Water-level calibration for ${device_id} set to empty=${empty_cm} cm / full=${full_cm} cm by ${req.user?.username ?? "unknown"}`,
+    );
+    res.json({ message: "Calibration saved", data: result.rows[0] });
+  } catch (err) {
+    console.error(`[${new Date().toISOString()}] PUT /calibration/water-level failed:`, err.message);
+    res.status(500).json({ message: "Error saving water-level calibration" });
   }
 });
 
@@ -2214,8 +2564,8 @@ app.post("/devices", requireAdmin, async (req, res) => {
       );
 
       await pool.query(
-        "INSERT INTO activity_logs (user_name, action_type, description, module) VALUES ($1, 'DEVICE_CLAIMED', $2, 'devices')",
-        [req.adminUser.username, `Claimed auto-discovered device ${prior.device_id} as ${device_name}${hasManualIp ? ` at ${ip_address}` : ""}`]
+        "INSERT INTO activity_logs (user_name, user_id, action_type, description, module) VALUES ($1, $2, 'DEVICE_CLAIMED', $3, 'devices')",
+        [req.adminUser.username, req.adminUser.id, `Claimed auto-discovered device ${prior.device_id} as ${device_name}${hasManualIp ? ` at ${ip_address}` : ""}`]
       ).catch(() => {});
 
       const row = result.rows[0];
@@ -2249,8 +2599,8 @@ app.post("/devices", requireAdmin, async (req, res) => {
     );
 
     await pool.query(
-      "INSERT INTO activity_logs (user_name, action_type, description, module) VALUES ($1, 'DEVICE_REGISTERED', $2, 'devices')",
-      [req.adminUser.username, `Registered device ${device_id} (${device_name})${hasManualIp ? ` at ${ip_address}` : ""}`]
+      "INSERT INTO activity_logs (user_name, user_id, action_type, description, module) VALUES ($1, $2, 'DEVICE_REGISTERED', $3, 'devices')",
+      [req.adminUser.username, req.adminUser.id, `Registered device ${device_id} (${device_name})${hasManualIp ? ` at ${ip_address}` : ""}`]
     ).catch(() => {});
 
     const row = result.rows[0];
@@ -2366,8 +2716,8 @@ app.put("/devices/:deviceId", requireAdmin, async (req, res) => {
     const detail = `${action} ${row.device_id}` +
       (tank_name !== undefined ? ` (name: ${row.tank_name ?? "unchanged"})` : "");
     await pool.query(
-      "INSERT INTO activity_logs (user_name, action_type, description, module) VALUES ($1, 'TANK_UPDATED', $2, 'devices')",
-      [req.adminUser.username, detail]
+      "INSERT INTO activity_logs (user_name, user_id, action_type, description, module) VALUES ($1, $2, 'TANK_UPDATED', $3, 'devices')",
+      [req.adminUser.username, req.adminUser.id, detail]
     ).catch(() => {});
 
     res.json(updated);
@@ -2502,9 +2852,10 @@ app.post("/devices/:deviceId/rotate-secret", requireAdmin, async (req, res) => {
 
     // Record the rotation, never the value.
     await pool.query(
-      "INSERT INTO activity_logs (user_name, action_type, description, module) VALUES ($1, 'DEVICE_SECRET_ROTATED', $2, 'devices')",
+      "INSERT INTO activity_logs (user_name, user_id, action_type, description, module) VALUES ($1, $2, 'DEVICE_SECRET_ROTATED', $3, 'devices')",
       [
         req.adminUser.username,
+        req.adminUser.id,
         isFirstSecret
           ? `Issued a first per-device secret for ${deviceId} (migrated off the shared secret; ${stillOnShared} active devices still use the shared secret)`
           : `Rotated the secret for ${deviceId} (previous secret ${graceMs > 0 ? `valid for another ${graceHours}h` : "revoked immediately"})`,
@@ -2593,8 +2944,8 @@ app.post("/devices/:deviceId/archive", requireAdmin, async (req, res) => {
     );
 
     await pool.query(
-      "INSERT INTO activity_logs (user_name, action_type, description, module) VALUES ($1, 'DEVICE_ARCHIVED', $2, 'devices')",
-      [req.adminUser.username, `Archived device ${row.device_id} (${row.tank_name ?? "unnamed"}); ${readings.rows[0].n} historical readings retained`]
+      "INSERT INTO activity_logs (user_name, user_id, action_type, description, module) VALUES ($1, $2, 'DEVICE_ARCHIVED', $3, 'devices')",
+      [req.adminUser.username, req.adminUser.id, `Archived device ${row.device_id} (${row.tank_name ?? "unnamed"}); ${readings.rows[0].n} historical readings retained`]
     ).catch(() => {});
 
     console.log(`[${new Date().toISOString()}] Device archived by ${req.adminUser.username}: ${row.device_id} (${readings.rows[0].n} readings retained)`);
@@ -2628,8 +2979,8 @@ app.post("/devices/:deviceId/restore", requireAdmin, async (req, res) => {
     evictDeviceFromMemory(req.params.deviceId);
 
     await pool.query(
-      "INSERT INTO activity_logs (user_name, action_type, description, module) VALUES ($1, 'DEVICE_RESTORED', $2, 'devices')",
-      [req.adminUser.username, `Restored device ${row.device_id} (${row.tank_name ?? "unnamed"})`]
+      "INSERT INTO activity_logs (user_name, user_id, action_type, description, module) VALUES ($1, $2, 'DEVICE_RESTORED', $3, 'devices')",
+      [req.adminUser.username, req.adminUser.id, `Restored device ${row.device_id} (${row.tank_name ?? "unnamed"})`]
     ).catch(() => {});
 
     console.log(`[${new Date().toISOString()}] Device restored by ${req.adminUser.username}: ${row.device_id}`);
@@ -3181,9 +3532,9 @@ app.post("/auth/users/:id/restore", requireAdmin, async (req, res) => {
     );
 
     await client.query(
-      `INSERT INTO activity_logs (user_name, action_type, description, module)
-       VALUES ($1, 'USER_RESTORED', $2, 'settings')`,
-      [req.adminUser.username, `Restored user account "${archived.username}" from archive`]
+      `INSERT INTO activity_logs (user_name, user_id, action_type, description, module)
+       VALUES ($1, $3, 'USER_RESTORED', $2, 'settings')`,
+      [req.adminUser.username, `Restored user account "${archived.username}" from archive`, req.adminUser.id]
     );
 
     await client.query("COMMIT");
@@ -3198,7 +3549,10 @@ app.post("/auth/users/:id/restore", requireAdmin, async (req, res) => {
 });
 
 // DELETE /auth/users/archived/:id (Admin only) - permanently purge an archived
-// user. Cascade-deletes user_deletion_requests; activity_logs.user_name is SET NULL.
+// user. Survivors keep their audit chain: migration 020's FK sets
+// user_deletion_requests.user_id to NULL (identity kept in user_username) and
+// migration 019's sets activity_logs.user_id the same way; user_name, the
+// display string, is never touched.
 app.delete("/auth/users/archived/:id", requireAdmin, async (req, res) => {
   try {
     const result = await pool.query(
@@ -3207,9 +3561,9 @@ app.delete("/auth/users/archived/:id", requireAdmin, async (req, res) => {
     );
     if (result.rows.length === 0) return res.status(404).json({ message: "Archived user not found" });
     await pool.query(
-      `INSERT INTO activity_logs (user_name, action_type, description, module)
-       VALUES ($1, 'USER_PURGED', $2, 'settings')`,
-      [req.adminUser.username, `Permanently purged archived user "${result.rows[0].username}"`]
+      `INSERT INTO activity_logs (user_name, user_id, action_type, description, module)
+       VALUES ($1, $3, 'USER_PURGED', $2, 'settings')`,
+      [req.adminUser.username, `Permanently purged archived user "${result.rows[0].username}"`, req.adminUser.id]
     );
     res.json({ message: "User permanently deleted", username: result.rows[0].username });
   } catch (err) {
@@ -3285,24 +3639,44 @@ app.post("/auth/users/:id/deletion-request", requireAdmin, async (req, res) => {
     const code = generateOtpCode();
     const { digest, salt } = hashOtpCode(code);
 
-    const created = await pool.query(
-      `INSERT INTO user_deletion_requests
-        (user_id, user_username, requester_username, requester_email, status, reason,
-         otp_hash, otp_salt, otp_expires_at, status_history)
-       VALUES ($1, $2, $3::text, $4, 'PENDING_OTP', $5, $6, $7, $8,
-         jsonb_build_array(jsonb_build_object('from','PENDING_OTP','to','PENDING_OTP','by',$3::text,'at',now())))
-       RETURNING id`,
-      [
-        target.id,
-        target.username,
-        req.adminUser.username,
-        req.adminUser.email || req.adminUser.username,
-        reason || "Account deletion requested by admin",
-        digest,
-        salt,
-        new Date(Date.now() + OTP_TTL_MS),
-      ]
-    );
+    // Request row and its first history row commit together: a request that
+    // exists without an "it was created" entry would read as a gap in the
+    // audit chain that migration 021 formalised into
+    // user_deletion_request_status_history.
+    const reqClient = await pool.connect();
+    let requestId;
+    try {
+      await reqClient.query("BEGIN");
+      const created = await reqClient.query(
+        `INSERT INTO user_deletion_requests
+          (user_id, user_username, requester_username, requester_email, status, reason,
+           otp_hash, otp_salt, otp_expires_at)
+         VALUES ($1, $2, $3::text, $4, 'PENDING_OTP', $5, $6, $7, $8)
+         RETURNING id`,
+        [
+          target.id,
+          target.username,
+          req.adminUser.username,
+          req.adminUser.email || req.adminUser.username,
+          reason || "Account deletion requested by admin",
+          digest,
+          salt,
+          new Date(Date.now() + OTP_TTL_MS),
+        ]
+      );
+      await reqClient.query(
+        `INSERT INTO user_deletion_request_status_history (request_id, status, recorded_by)
+         VALUES ($1, 'PENDING_OTP', $2)`,
+        [created.rows[0].id, req.adminUser.username]
+      );
+      await reqClient.query("COMMIT");
+      requestId = created.rows[0].id;
+    } catch (createErr) {
+      await reqClient.query("ROLLBACK");
+      throw createErr;
+    } finally {
+      reqClient.release();
+    }
 
     let emailResult;
     try {
@@ -3316,8 +3690,10 @@ app.post("/auth/users/:id/deletion-request", requireAdmin, async (req, res) => {
       });
     } catch (emailErr) {
       // SMTP down / auth failure: the OTP never left the server, so remove the
-      // just-created request row — no phantom PENDING_OTP may linger.
-      await pool.query("DELETE FROM user_deletion_requests WHERE id = $1", [created.rows[0].id]);
+      // just-created request row — no phantom PENDING_OTP may linger. Its
+      // history row goes with it (ON DELETE CASCADE): a request treated as
+      // never having happened must leave no trace of having happened.
+      await pool.query("DELETE FROM user_deletion_requests WHERE id = $1", [requestId]);
       throw emailErr;
     }
 
@@ -3325,7 +3701,7 @@ app.post("/auth/users/:id/deletion-request", requireAdmin, async (req, res) => {
       message: emailResult.delivered
         ? `Confirmation code sent to ${otpRecipient}`
         : "Confirmation code generated (dev mode — SMTP not configured). Check server console.",
-      request_id: created.rows[0].id,
+      request_id: requestId,
       otp_sent: emailResult.delivered,
       email_to: otpRecipient,
       dev_fallback: emailResult.devFallback || false,
@@ -3379,6 +3755,14 @@ app.post("/auth/users/:id/deletion-verify", requireAdmin, async (req, res) => {
     const now = Date.now();
     if (row.otp_attempts >= OTP_MAX_ATTEMPTS || (row.otp_expires_at && new Date(row.otp_expires_at).getTime() < now)) {
       await client.query(`UPDATE user_deletion_requests SET status = 'EXPIRED' WHERE id = $1`, [row.id]);
+      // The pre-021 JSONB log never recorded EXPIRED — only creation and
+      // completion — so a request that timed out showed no reason in its own
+      // history. The child table records every transition it observes.
+      await client.query(
+        `INSERT INTO user_deletion_request_status_history (request_id, status, recorded_by)
+         VALUES ($1, 'EXPIRED', $2)`,
+        [row.id, req.adminUser.username]
+      );
       await client.query("COMMIT");
       return res.status(410).json({ message: "Confirmation code expired or exceeded max attempts" });
     }
@@ -3411,17 +3795,19 @@ app.post("/auth/users/:id/deletion-verify", requireAdmin, async (req, res) => {
     await client.query(
       `UPDATE user_deletion_requests
           SET status = 'COMPLETED', otp_verified_at = NOW(), otp_verified_by = $2::text,
-              executed_by = $2::text, executed_at = NOW(),
-              status_history = status_history || jsonb_build_array(
-                jsonb_build_object('from','PENDING_OTP','to','COMPLETED','by',$2::text,'at',now())
-              )
+              executed_by = $2::text, executed_at = NOW()
         WHERE id = $1`,
       [row.id, actor]
     );
     await client.query(
-      `INSERT INTO activity_logs (user_name, action_type, description, module)
-       VALUES ($1, 'USER_ARCHIVED', $2, 'settings')`,
-      [actor, `Archived user account "${userDel.rows[0].username}" via OTP verification (restorable)`]
+      `INSERT INTO user_deletion_request_status_history (request_id, status, recorded_by)
+       VALUES ($1, 'COMPLETED', $2)`,
+      [row.id, actor]
+    );
+    await client.query(
+      `INSERT INTO activity_logs (user_name, user_id, action_type, description, module)
+       VALUES ($1, $3, 'USER_ARCHIVED', $2, 'settings')`,
+      [actor, `Archived user account "${userDel.rows[0].username}" via OTP verification (restorable)`, req.adminUser.id]
     );
 
     await client.query("COMMIT");
@@ -3513,7 +3899,8 @@ app.put("/auth/users/:id/password", requireAdmin, async (req, res) => {
       isSelf ? "PASSWORD_CHANGED" : "PASSWORD_RESET",
       isSelf
         ? "Changed own password (active sessions revoked)"
-        : `Reset password for user account "${target.username}" (their sessions were revoked)`
+        : `Reset password for user account "${target.username}" (their sessions were revoked)`,
+      req.adminUser.id
     );
 
     // Self-targeted: hand the caller its replacement cookie before responding,
@@ -3581,7 +3968,7 @@ app.put("/auth/me/password", requireAuth, async (req, res) => {
 
     const session = await changePassword({ targetId: req.user.id, passwordHash, keepCallerSession: true });
 
-    await writeActivityLog(req.user.username, "PASSWORD_CHANGED", "Changed own password (active sessions revoked)");
+    await writeActivityLog(req.user.username, "PASSWORD_CHANGED", "Changed own password (active sessions revoked)", req.user.id);
 
     setSessionCookie(res, session.token, session.tokenExpiresAt);
     res.json({
@@ -3909,8 +4296,8 @@ app.post("/settings/recipients", requireAdmin, async (req, res) => {
       [name, normalizedPhone]
     );
     await pool.query(
-      "INSERT INTO activity_logs (user_name, action_type, description, module) VALUES ($1, 'SMS_RECIPIENT_ADDED', $2, 'settings')",
-      [req.adminUser.username, `Added SMS recipient ${normalizedPhone}`]
+      "INSERT INTO activity_logs (user_name, user_id, action_type, description, module) VALUES ($1, $2, 'SMS_RECIPIENT_ADDED', $3, 'settings')",
+      [req.adminUser.username, req.adminUser.id, `Added SMS recipient ${normalizedPhone}`]
     );
     res.status(201).json(result.rows[0]);
   } catch (err) {
@@ -3941,8 +4328,8 @@ app.put("/settings/recipients/:id", requireAdmin, async (req, res) => {
     );
     if (result.rows.length === 0) return res.status(404).json({ message: "Recipient not found" });
     await pool.query(
-      "INSERT INTO activity_logs (user_name, action_type, description, module) VALUES ($1, 'SMS_RECIPIENT_UPDATED', $2, 'settings')",
-      [req.adminUser.username, `Updated SMS recipient ${result.rows[0].phone_number}`]
+      "INSERT INTO activity_logs (user_name, user_id, action_type, description, module) VALUES ($1, $2, 'SMS_RECIPIENT_UPDATED', $3, 'settings')",
+      [req.adminUser.username, req.adminUser.id, `Updated SMS recipient ${result.rows[0].phone_number}`]
     );
     res.json(result.rows[0]);
   } catch (err) {
@@ -3963,8 +4350,8 @@ app.delete("/settings/recipients/:id", requireAdmin, async (req, res) => {
     );
     if (result.rows.length === 0) return res.status(404).json({ message: "Recipient not found" });
     await pool.query(
-      "INSERT INTO activity_logs (user_name, action_type, description, module) VALUES ($1, 'SMS_RECIPIENT_ARCHIVED', $2, 'settings')",
-      [req.adminUser.username, `Archived SMS recipient ${result.rows[0].phone_number} (restorable)`]
+      "INSERT INTO activity_logs (user_name, user_id, action_type, description, module) VALUES ($1, $2, 'SMS_RECIPIENT_ARCHIVED', $3, 'settings')",
+      [req.adminUser.username, req.adminUser.id, `Archived SMS recipient ${result.rows[0].phone_number} (restorable)`]
     );
     res.json({ message: "SMS recipient archived (restorable)", phone_number: result.rows[0].phone_number });
   } catch (err) {
@@ -4003,8 +4390,8 @@ app.post("/settings/recipients/:id/archive", requireAdmin, async (req, res) => {
     );
     if (result.rows.length === 0) return res.status(404).json({ message: "Recipient not found" });
     await pool.query(
-      "INSERT INTO activity_logs (user_name, action_type, description, module) VALUES ($1, 'SMS_RECIPIENT_ARCHIVED', $2, 'settings')",
-      [req.adminUser.username, `Archived SMS recipient ${result.rows[0].phone_number} (restorable)`]
+      "INSERT INTO activity_logs (user_name, user_id, action_type, description, module) VALUES ($1, $2, 'SMS_RECIPIENT_ARCHIVED', $3, 'settings')",
+      [req.adminUser.username, req.adminUser.id, `Archived SMS recipient ${result.rows[0].phone_number} (restorable)`]
     );
     res.json({ message: "SMS recipient archived (restorable)", phone_number: result.rows[0].phone_number });
   } catch (err) {
@@ -4040,8 +4427,8 @@ app.post("/settings/recipients/:id/restore", requireAdmin, async (req, res) => {
       [req.params.id]
     );
     await pool.query(
-      "INSERT INTO activity_logs (user_name, action_type, description, module) VALUES ($1, 'SMS_RECIPIENT_RESTORED', $2, 'settings')",
-      [req.adminUser.username, `Restored SMS recipient ${result.rows[0].phone_number} from archive`]
+      "INSERT INTO activity_logs (user_name, user_id, action_type, description, module) VALUES ($1, $2, 'SMS_RECIPIENT_RESTORED', $3, 'settings')",
+      [req.adminUser.username, req.adminUser.id, `Restored SMS recipient ${result.rows[0].phone_number} from archive`]
     );
     res.json({ message: "SMS recipient restored", data: result.rows[0] });
   } catch (err) {
@@ -4061,8 +4448,8 @@ app.delete("/settings/recipients/archived/:id", requireAdmin, async (req, res) =
     );
     if (result.rows.length === 0) return res.status(404).json({ message: "Archived recipient not found" });
     await pool.query(
-      "INSERT INTO activity_logs (user_name, action_type, description, module) VALUES ($1, 'SMS_RECIPIENT_PURGED', $2, 'settings')",
-      [req.adminUser.username, `Permanently purged SMS recipient ${result.rows[0].phone_number}`]
+      "INSERT INTO activity_logs (user_name, user_id, action_type, description, module) VALUES ($1, $2, 'SMS_RECIPIENT_PURGED', $3, 'settings')",
+      [req.adminUser.username, req.adminUser.id, `Permanently purged SMS recipient ${result.rows[0].phone_number}`]
     );
     res.json({ message: "SMS recipient permanently deleted", phone_number: result.rows[0].phone_number });
   } catch (err) {
@@ -4092,7 +4479,10 @@ app.post("/settings/recipients/test/:id", requireAdmin, async (req, res) => {
       return res.json({ success: true, message: "Test SMS sent", recipient: recipient.name || recipient.phone_number });
     } catch (err) {
       await logSms(recipient.phone_number, content, "failed", err.message);
-      return fail(res, 500, "Failed to send test SMS", err, req);
+      // Surface the real cause (e.g. "SMS circuit breaker OPEN ...", "401
+      // Unauthorized") so the dashboard toast tells the operator what to fix
+      // instead of the generic "Failed to send test SMS".
+      return fail(res, 500, `Failed to send test SMS: ${err.message}`, err, req);
     }
   } catch (err) {
     console.error(`[${new Date().toISOString()}] Error sending test SMS:`, err.message);
@@ -4164,8 +4554,8 @@ app.post("/alert/mute", requireAdmin, async (req, res) => {
       deviceSmsMuteUntil.set(deviceId, muteExpires);
       await persistMuteState(`sms_mute:${deviceId}`, muteExpires);
       await pool.query(
-        "INSERT INTO activity_logs (user_name, action_type, description, module) VALUES ($1, 'SMS_MUTED', $2, 'settings')",
-        [req.adminUser.username, `Tank ${label} (${deviceId}) SMS muted for ${hours}h until ${muteExpires}`]
+        "INSERT INTO activity_logs (user_name, user_id, action_type, description, module) VALUES ($1, $2, 'SMS_MUTED', $3, 'settings')",
+        [req.adminUser.username, req.adminUser.id, `Tank ${label} (${deviceId}) SMS muted for ${hours}h until ${muteExpires}`]
       ).catch(() => {});
       return res.json({ muted: true, muteExpires, device_id: deviceId, message: `SMS alerts muted for tank ${label} (${hours} hours)` });
     }
@@ -4178,8 +4568,8 @@ app.post("/alert/mute", requireAdmin, async (req, res) => {
     smsMuteUntil = new Date(Date.now() + hours * 60 * 60 * 1000).toISOString();
     await persistMuteState("sms_mute_global", smsMuteUntil);
     await pool.query(
-      "INSERT INTO activity_logs (user_name, action_type, description, module) VALUES ($1, 'SMS_MUTED', $2, 'settings')",
-      [req.adminUser.username, `SMS muted globally for ${hours}h until ${smsMuteUntil}`]
+      "INSERT INTO activity_logs (user_name, user_id, action_type, description, module) VALUES ($1, $2, 'SMS_MUTED', $3, 'settings')",
+      [req.adminUser.username, req.adminUser.id, `SMS muted globally for ${hours}h until ${smsMuteUntil}`]
     );
     res.json({ muted: true, muteExpires: smsMuteUntil, message: `SMS alerts muted for ${hours} hours` });
   } catch (err) {
@@ -4215,6 +4605,24 @@ app.get("/alert/mute-status", requireAuth, async (req, res) => {
   } catch (err) {
     console.error(`[${new Date().toISOString()}] Error fetching SMS mute status:`, err.message);
     res.status(500).json({ message: "Error fetching SMS mute status" });
+  }
+});
+
+// POST /alert/sms-breaker/reset (Admin) - override SAFE / SMS circuit breaker
+// manual reopen when the gateway is known to be healthy again. The breaker
+// would normally self-heal on its next HALF_OPEN probe, but it can only probe
+// when a send actually fires; a gateway that recovers during a quiet spell
+// would otherwise leave the circuit OPEN (and every SMS failing fast as
+// "0/N") until the next alert happens to trip a probe. Hand-poking it is the
+// operator saying "I've fixed the phone / network, go ahead".
+app.post("/alert/sms-breaker/reset", requireAdmin, async (req, res) => {
+  try {
+    smsCircuitBreaker.reset();
+    console.log(`[${new Date().toISOString()}] SMS circuit breaker manually reset by ${req.user?.username || "admin"}`);
+    return res.json({ success: true, message: "SMS circuit breaker reset to CLOSED", circuitBreaker: smsCircuitBreaker.snapshot() });
+  } catch (err) {
+    console.error(`[${new Date().toISOString()}] Error resetting SMS circuit breaker:`, err.message);
+    return res.status(500).json({ message: "Error resetting SMS circuit breaker" });
   }
 });
 
@@ -4388,12 +4796,13 @@ app.post("/activity-logs", requireAuth, async (req, res) => {
     // from whichever credential was presented, so it is correct for both.
     //
     // The fallback is only a guard against a null user reaching here, and it
-    // deliberately does not name a real account.
+    // deliberately does not name a real account. user_id mirrors the same
+    // verdict: NULL, never a fabricated link (migration 019's FK allows it).
     const userName = req.user?.username || "unknown";
 
     const result = await pool.query(
-      "INSERT INTO activity_logs (user_name, action_type, description, module) VALUES ($1, $2, $3, $4) RETURNING *",
-      [userName, action_type, description || "", module || ""]
+      "INSERT INTO activity_logs (user_name, user_id, action_type, description, module) VALUES ($1, $2, $3, $4, $5) RETURNING *",
+      [userName, req.user?.id ?? null, action_type, description || "", module || ""]
     );
     res.status(201).json({ message: "Logged", data: result.rows[0] });
   } catch (err) {

@@ -183,18 +183,15 @@ export const PROFILES = {
    * auto-creates the row and they show as "Auto-discovered" until claimed.
    */
   fleet10: {
-    description: "Ten tanks: 6 healthy + warming + ammonia spike + dead probe + disconnect.",
+    description: "Seven tanks: 3 healthy + warming + ammonia spike + dead probe + disconnect.",
     devices: [
-      { device_id: "ESP32_01", profile: "healthy", staggerMs: 0 },
-      { device_id: "ESP32_02", profile: "healthy", staggerMs: 1500 },
-      { device_id: "ESP32_03", profile: "healthy", staggerMs: 3000 },
-      { device_id: "ESP32_04", profile: "healthy", staggerMs: 4500 },
-      { device_id: "ESP32_05", profile: "healthy", staggerMs: 6000 },
-      { device_id: "ESP32_06", profile: "healthy", staggerMs: 7500 },
-      { device_id: "ESP32_07", profile: "warming", staggerMs: 9000 },
-      { device_id: "ESP32_08", profile: "ammonia_spike", staggerMs: 10500 },
-      { device_id: "ESP32_09", profile: "failed_ammonia", staggerMs: 12000 },
-      { device_id: "ESP32_10", profile: "disconnect", staggerMs: 13500 },
+      { device_id: "ESP32_04", profile: "healthy", staggerMs: 0 },
+      { device_id: "ESP32_05", profile: "healthy", staggerMs: 1500 },
+      { device_id: "ESP32_06", profile: "healthy", staggerMs: 3000 },
+      { device_id: "ESP32_07", profile: "warming", staggerMs: 4500 },
+      { device_id: "ESP32_08", profile: "ammonia_spike", staggerMs: 6000 },
+      { device_id: "ESP32_09", profile: "failed_ammonia", staggerMs: 7500 },
+      { device_id: "ESP32_10", profile: "disconnect", staggerMs: 9000 },
     ],
     interval: 5000,
   },

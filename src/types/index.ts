@@ -10,10 +10,26 @@ export type SensorEntry = {
   device_id: string;
   temperature: number | null;
   water_level: number | null;
+  // Raw HC-SR04 distance (sensor to water surface, cm). null when the firmware
+  // did not report it or the sensor failed. Stored alongside water_level so a
+  // corrected calibration can be re-applied to history - a percentage alone has
+  // already thrown the distance away.
+  water_distance_cm: number | null;
   ammonia: number | null;
   timestamp?: string;
   recv_at?: string;
 };
+
+// Water-level geometry. These are the DISPLAY-side defaults only: the values
+// actually in force for a tank come from GET /calibration/water-level (the
+// per-tank sensor_calibration row, falling back to the server's constants).
+// Kept here so a surface that has not fetched the calibration can still show the
+// operator what "0%" is measured against, instead of a bare percentage with no
+// way to tell an empty tank from a miscalibrated one.
+export const WATER_LEVEL_DEFAULT_CALIBRATION = {
+  emptyCm: 23.5,
+  fullCm: 8.0,
+} as const;
 
 // Optimized for Recharts; "name" is a formatted time label for the X-axis.
 export type ChartPoint = {

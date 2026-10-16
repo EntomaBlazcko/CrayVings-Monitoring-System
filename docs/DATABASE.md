@@ -2,24 +2,19 @@
 
 **Database:** `crayvings_monitoring_system_db` (PostgreSQL)
 
-> **Verified against the live database 2026-09-28**, after applying migrations
-> through 016. Every table, column, type, nullability, default, index, check
+> **Verified against the live database 2026-10-15**, after applying migrations
+> through 021. Every table, column, type, nullability, default, index, check
 > constraint, and foreign key below was read back from `information_schema` /
 > `pg_catalog` — not inferred from the migration scripts.
 >
-> **14 tables. 4 foreign keys, all `device_id` → `devices.device_id`.** The DBML
-> block near the bottom is ready to paste into <https://dbdiagram.io>.
+> **16 tables. 8 foreign keys.** The DBML block near the bottom is ready to
+> paste into <https://dbdiagram.io>.
 >
-> **Two relationships that look like they should be foreign keys but are not:**
+> **One relationship that looks like it should be a foreign key but is not:**
 >
 > - `sms_logs.recipient_phone` → `authorized_recipients.phone_number` — cannot
 >   be an FK, because migration 006 made `phone_number` unique only via a
 >   *partial* index. Enforced by trigger `trg_sms_logs_recipient` instead.
-> - `activity_logs.user_name` → `users.username` — **no FK exists at all.**
->   Migrations 001/002 create it; something later removed it. A genuine gap,
->   also blocked by a partial index. Not drawn as a `Ref` in the DBML, because
->   drawing an unenforced relationship as enforced is how a diagram starts
->   lying.
 
 ---
 
@@ -41,7 +36,7 @@ tokens.
 |---|---|---|---|
 | `id` | SERIAL | PRIMARY KEY | |
 | `name` | VARCHAR(100) | NOT NULL | Display name |
-| `username` | VARCHAR(50) | NOT NULL | Login name. **Intended** FK target for `activity_logs.user_name`, but no such foreign key currently exists — see *Foreign Key Relationships*. UNIQUE only while active (partial index `idx_users_username_active`) |
+| `username` | VARCHAR(50) | NOT NULL | Login name. Not an FK target: the audit link is `activity_logs.user_id` → `users.id` (migration 019), and `user_name` stays a display string. UNIQUE only while active (partial index `idx_users_username_active`) |
 | `email` | VARCHAR(255) | NOT NULL | UNIQUE only while active (partial index `idx_users_email_active`) |
 | `password_hash` | TEXT | NOT NULL | PBKDF2 (`iterations:salt:hash`) |
 | `role` | VARCHAR(20) | NOT NULL DEFAULT `'user'` | `admin` or `user` |
@@ -61,6 +56,7 @@ tokens.
 | `idx_users_status` | `(status)` |
 | `idx_users_username_active` | `UNIQUE (username) WHERE status IS DISTINCT FROM 'archived'` |
 | `idx_users_email_active` | `UNIQUE (email) WHERE status IS DISTINCT FROM 'archived'` |
+| `idx_users_token_active` | `(token, status) WHERE token IS NOT NULL` — migration 017; the session-lookup hot path |
 
 **Archiving (migration 006)**
 
@@ -235,7 +231,8 @@ unchanged heartbeats write no row).
 | `id` | SERIAL | PRIMARY KEY | |
 | `device_id` | VARCHAR(50) | NOT NULL, FK → `devices.device_id` | ESP32 device identifier |
 | `temperature` | DECIMAL(5,2) | DEFAULT 0, NULLABLE | Degrees Celsius. `NULL` when the DS18B20 failed (firmware reports −1 / 0) |
-| `water_level` | DECIMAL(5,2) | DEFAULT 0, NULLABLE | Percent (%). `NULL` when the HC-SR04 failed (firmware reports −1) |
+| `water_level` | DECIMAL(5,2) | DEFAULT 0, NULLABLE | Percent (%), **0-100** — `level% = (empty_cm − water_distance_cm) / (empty_cm − full_cm) × 100`, clamped; see `sensor_calibration`. `NULL` when the HC-SR04 failed (firmware reports −1). Note `0` is a *real* value (an empty tank), never a failure sentinel |
+| `water_distance_cm` | DECIMAL(6,2) | NULLABLE (migration 018) | Raw HC-SR04 distance, sensor to water surface. `NULL` = not reported by the firmware, or a failed sensor. Stored so a corrected calibration can be re-applied to history |
 | `ammonia` | DECIMAL(5,2) | DEFAULT 0, NULLABLE | ppm (MQ-137 sensor). `NULL` when the MQ-137 failed (firmware reports −1). **Precision is (5,2)**, verified against the live database — it was previously documented here as (5,3) |
 | `timestamp` | TIMESTAMPTZ | DEFAULT CURRENT_TIMESTAMP | Reading time (migration 007) |
 
@@ -258,6 +255,7 @@ permit NULL.
 | `chk_sensors_temperature_valid` | `temperature IS NULL OR (temperature > 0 AND temperature <= 100)` |
 | `chk_sensors_water_level_valid` | `water_level IS NULL OR (water_level >= 0 AND water_level <= 200)` |
 | `chk_sensors_ammonia_valid` | `ammonia IS NULL OR (ammonia >= 0 AND ammonia <= 1000)` |
+| `chk_sensors_water_distance_valid` | `water_distance_cm IS NULL OR (water_distance_cm > 0 AND water_distance_cm <= 400)` (migration 018) |
 
 **Indexes**
 
@@ -326,6 +324,39 @@ nullable and `NULL` means "inherit the global value"**, resolved at read time as
   thresholds and existing data is untouched.
 - Overrides are per-column, not per-row — setting only `temp_max` leaves
   `temp_min` on the global value.
+- These are **alert thresholds**, not geometry. Retuning a sensor must not move
+  the alert lines; that is what `sensor_calibration` is for.
+
+### `sensor_calibration` (migration 018)
+
+HC-SR04 **geometry** per tank — the pair the water-level percentage is computed
+from. Deliberately separate from the two tables above, which answer "when should
+we warn", not "what distance is 0%".
+
+| Column | Type | Constraints | Notes |
+|---|---|---|---|
+| `device_id` | VARCHAR(50) | PRIMARY KEY, FK → `devices.device_id` (`ON DELETE CASCADE`) | Tank the geometry applies to |
+| `empty_cm` | DECIMAL(6,2) | NOT NULL | Distance from sensor to water surface at **minimum** fill = **0%**. Default 23.5 |
+| `full_cm` | DECIMAL(6,2) | NOT NULL | Distance at **maximum** fill = **100%**. **Placeholder default 8.0 — measure the real tank** |
+| `updated_at` | TIMESTAMPTZ | NOT NULL DEFAULT NOW() | Last write to the row |
+| `updated_by` | VARCHAR(100) | NULLABLE | Username from the session that wrote it |
+
+**Check constraints**
+
+| Constraint | Definition |
+|---|---|
+| `chk_sensor_calibration_span` | `empty_cm > full_cm` — the whole table is read by a formula that divides by `empty_cm - full_cm` |
+| `chk_sensor_calibration_range` | `full_cm >= 2 AND empty_cm <= 400` — the 2 cm floor is the HC-SR04's near-field blind spot, not a policy |
+
+**Notes**
+
+- Migration 018 seeds one row per existing device with the defaults. Re-running
+  uses `ON CONFLICT DO NOTHING`, so a tuned calibration is never overwritten.
+- Read via `GET /calibration/water-level?device_id=…` (any authenticated user),
+  written via `PUT /calibration/water-level` (`requireAdmin`). A tank with no row
+  falls back to `server.cjs`'s `WATER_LEVEL_EMPTY_CM` / `WATER_LEVEL_FULL_CM`.
+- Because `sensors.water_distance_cm` keeps the raw measurement, a calibration
+  corrected today can be applied to history — no reflash, no trip to the tank.
 - If the table is missing (migration 012 not applied), `getThresholdsForDevice`
   catches the query and degrades quietly to the global thresholds, so alerting
   keeps working on a server started without migrations.
@@ -404,7 +435,8 @@ connect/disconnect, login/logout).
 | Column | Type | Constraints | Notes |
 |---|---|---|---|
 | `id` | SERIAL | PRIMARY KEY | |
-| `user_name` | VARCHAR(100) | NULLABLE. **No FK exists** — see below | Username of acting user, derived server-side from the session. Intended `ON DELETE SET NULL` (migrations 001/002) so an audit row survives account deletion |
+| `user_name` | VARCHAR(100) | NULLABLE | Display string — the acting user's username as written at the time. Not an FK (see below) |
+| `user_id` | INTEGER | NULLABLE. FK → `users.id` `ON DELETE SET NULL` (migration 019) | Acting account. NULL = actor not resolvable: account purged, row predates 019, or no account resolved (`"unknown"`). Never 0 |
 | `action_type` | VARCHAR(50) | NOT NULL | e.g. `navigation`, `settings_change`, `device_connect`, `device_disconnect`, `login`, `logout`, `DEVICE_CLAIMED`, `DEVICE_SECRET_ROTATED` |
 | `description` | TEXT | | Human-readable event description |
 | `module` | VARCHAR(100) | | App module where the event occurred |
@@ -416,20 +448,25 @@ connect/disconnect, login/logout).
 |---|---|
 | `idx_activity_logs_timestamp` | `(timestamp DESC)` |
 | `idx_activity_logs_action_type` | `(action_type)` |
+| `idx_activity_logs_user_id` | `(user_id) WHERE user_id IS NOT NULL` (migration 019) |
 
-**This is the only table in the database with no foreign key at all**, and it is
-the source of the largest documentation error in this file's history. Migrations
-001 and 002 both add `activity_logs_user_name_fkey` referencing
-`users.username` with `ON DELETE SET NULL` / `ON UPDATE CASCADE`, so the
-constraint existed and was later removed — nothing in the current migration set
-re-creates it. 2,700+ rows can name a `user_name` matching no account.
+**`user_name` and `user_id` are deliberately different things.** `user_name`
+records what the trail displayed; `user_id` is the enforced reference used to
+join a row back to its account. Migration 001 originally made `user_name` itself
+an FK to `users.username` (`activity_logs_user_name_fkey`, `ON DELETE SET NULL`);
+that constraint was later removed and cannot be re-created, because
+`users.username`'s `UNIQUE` is the *partial* index `idx_users_username_active`
+and a foreign key cannot reference a partial index. Migration 019 closes the gap
+the honest way — reference `users.id`, a plain primary key — and leaves
+`user_name` as the human-readable label. Migration 019 is applied: `user_id`
+carries `fk_activity_logs_user` (`ON DELETE SET NULL`), so the audit trail has a
+real reference.
 
-It cannot simply be re-added, for the same structural reason as
-`sms_logs.recipient_phone`: `users.username` is unique only via the *partial*
-index `idx_users_username_active (WHERE status IS DISTINCT FROM 'archived')`, and
-PostgreSQL will not reference a partial index from a foreign key. Restoring a
-full `UNIQUE` would undo migration 006's deliberate username-reuse-after-archive
-design.
+The 019 backfill is conservative by design: it links a historical row only when
+exactly one account ever carried that username *and* the row was written no
+earlier than that account was created. Usernames are reusable after archive
+(006) and after purge, so anything looser would risk attributing one person's
+action to another — worse in an audit trail than an honest NULL.
 
 ---
 
@@ -442,7 +479,7 @@ by migration 001.
 | Column | Type | Constraints | Notes |
 |---|---|---|---|
 | `id` | SERIAL | PRIMARY KEY | |
-| `user_id` | INTEGER | NOT NULL | Target user id |
+| `user_id` | INTEGER | NULLABLE. FK → `users.id` `ON DELETE SET NULL` (migration 020) | Target account. Migration 020 drops the original `NOT NULL` so the flow can hard-delete the account this row documents — then `user_id` goes NULL and `user_username` keeps the identity |
 | `user_username` | VARCHAR(100) | NOT NULL | Target username |
 | `requester_username` | VARCHAR(100) | NOT NULL | Admin who requested |
 | `requester_email` | VARCHAR(255) | NOT NULL | Admin's email (OTP destination) |
@@ -459,14 +496,44 @@ by migration 001.
 | `approved_at` | TIMESTAMPTZ | | |
 | `executed_by` | VARCHAR(100) | | |
 | `executed_at` | TIMESTAMPTZ | | |
-| `status_history` | JSONB | NOT NULL DEFAULT `'[]'::JSONB` | Full state log |
+
+The per-transition log that migration 001 kept here as the `status_history` JSONB
+column now lives in `user_deletion_request_status_history` below; migration 021
+relocated the entries and dropped the column.
 
 **Indexes**
 
 | Index | Definition |
 |---|---|
 | `idx_deletion_requests_status` | `(status)` |
-| `idx_deletion_requests_user` | `(user_id)` |
+| `idx_deletion_requests_user` | `(user_id)` — also backs migration 020's FK |
+
+---
+
+## Table: `user_deletion_request_status_history`
+
+One row per state transition of a `user_deletion_requests` row. Created by
+migration 021, which also relocated the entries from the parent's old
+`status_history` JSONB array and dropped it.
+
+| Column | Type | Constraints | Notes |
+|---|---|---|---|
+| `id` | SERIAL | PRIMARY KEY | |
+| `request_id` | INTEGER | NOT NULL. FK → `user_deletion_requests.id` `ON DELETE CASCADE` | |
+| `status` | VARCHAR(20) | NOT NULL | State entered: `PENDING_OTP`, `EXPIRED`, or `COMPLETED` |
+| `recorded_at` | TIMESTAMPTZ | NOT NULL DEFAULT NOW() | From the JSONB entry's `at`, else the request's `requested_at` |
+| `recorded_by` | VARCHAR(100) | | Admin behind the transition (soft reference by username) |
+
+**Indexes**
+
+| Index | Definition |
+|---|---|
+| `idx_deletion_status_history_request` | `(request_id)` |
+
+The JSONB entry's `from` field is deliberately not carried over: the previous
+row's `status` is the from-state, and storing it a second time only lets the two
+copies disagree. Unlike the old array, this table records the `EXPIRED`
+transition too, which the JSONB log never captured.
 
 ---
 
@@ -604,53 +671,51 @@ applied 2026-09-28.
 
 ## Foreign Key Relationships (enforced)
 
-Verified against `information_schema.referential_constraints` on 2026-09-28.
-There are **exactly four** foreign keys, all `device_id` → `devices.device_id`:
+Verified against `information_schema.referential_constraints` on 2026-10-15,
+after migrations 019–021 were applied. **Eight** foreign keys:
 
-| Constraint | Column(s) | References | Delete rule |
+| Constraint (live name) | Column(s) | References | Delete rule |
 |---|---|---|---|
 | `fk_sensors_device` | `sensors.device_id` | `devices.device_id` | `NO ACTION` |
 | `fk_lastalerts_device` | `last_alerts.device_id` | `devices.device_id` | `NO ACTION` |
-| `fk_system_logs_device` | `system_logs.device_id` | `devices.device_id` | `SET NULL` (migration 011) |
-| `fk_device_threshold_overrides_device` | `device_threshold_overrides.device_id` | `devices.device_id` | `CASCADE` (migration 012) |
+| `system_logs_device_id_fkey` | `system_logs.device_id` | `devices.device_id` | `SET NULL` (migration 011) |
+| `device_threshold_overrides_device_id_fkey` | `device_threshold_overrides.device_id` | `devices.device_id` | `CASCADE` (migration 012) |
+| `sensor_calibration_device_id_fkey` | `sensor_calibration.device_id` | `devices.device_id` | `CASCADE` (migration 018) |
+| `fk_activity_logs_user` | `activity_logs.user_id` | `users.id` | `SET NULL` (migration 019) |
+| `fk_user_deletion_requests_user` | `user_deletion_requests.user_id` | `users.id` | `SET NULL` (migration 020) |
+| `user_deletion_request_status_history_request_id_fkey` | `user_deletion_request_status_history.request_id` | `user_deletion_requests.id` | `CASCADE` (migration 021) |
 
-The first column lists logical labels. No migration names these constraints, so in
-the live database they carry the PostgreSQL defaults (`sensors_device_id_fkey`,
-`last_alerts_device_id_fkey`, `system_logs_device_id_fkey`,
-`device_threshold_overrides_device_id_fkey`).
+The names above are the ones actually in the database. `fk_sensors_device`,
+`fk_lastalerts_device`, `fk_activity_logs_user` and `fk_user_deletion_requests_user`
+are explicitly named by their migration; the rest were created inline and carry
+the PostgreSQL default `<table>_<column>_fkey`.
 
-### `activity_logs.user_name` is NOT a foreign key — a real gap
+The two `SET NULL` rules into `users` exist for the same reason: purging an account
+must not delete the audit trail that names it. The `CASCADE` on the child table
+means a request that is removed outright — the OTP-email-failure path in
+`server.cjs` deletes a just-created request — takes its history with it, the same
+verdict as "this never happened". `users`, previously referenced by nothing, is
+now the target of two foreign keys.
 
-This document previously listed `fk_activity_logs_user` (`ON DELETE SET NULL`,
-update `CASCADE`) in the table above. **That constraint does not exist in the
-live database.** Migrations 001 and 002 both add it under the name
-`activity_logs_user_name_fkey`, so it existed at some point and was removed
-later; nothing in the current migration set re-creates it. Verified by querying
-`information_schema.referential_constraints`: the four `device_id` constraints
-above are the complete set.
+### `activity_logs.user_name` is a display string, not a foreign key
 
-The practical consequence: 2,700+ `activity_logs` rows can name a `user_name`
-that no longer matches any `users.username`, and a new row can name a user that
-never existed. Nothing rejects it at the database level — the value is
-server-derived from the session, so it is correct in normal operation, but the
-database is not guarding it.
+`user_name` looks like it should reference `users.username`, and migrations
+001/002 did create `activity_logs_user_name_fkey` to do exactly that — but the
+constraint was later removed and cannot be re-created: `users.username`'s
+`UNIQUE` is the *partial* index `idx_users_username_active (WHERE status IS
+DISTINCT FROM 'archived')`, and a foreign key cannot reference a partial index.
+Restoring a full `UNIQUE` would undo migration 006's deliberate
+username-reuse-after-archive design.
 
-It also cannot simply be added, for the same structural reason as
-`sms_logs.recipient_phone`: `users.username`'s `UNIQUE` is the *partial* index
-`idx_users_username_active (WHERE status IS DISTINCT FROM 'archived')`, and a
-foreign key cannot reference a partial index. Restoring a full `UNIQUE` would
-undo migration 006's deliberate username-reuse-after-archive design.
+Migration 019 sidesteps the problem by referencing `users.id` — a plain primary
+key — through the new `user_id` column, leaving `user_name` as the
+human-readable string the UI renders. So it is the *name* column that stays
+unenforced, on purpose.
 
-Closing this needs a real decision, not a mechanical fix — leave it unenforced
-and rely on the server, or change the uniqueness model to allow the FK. It is
-**not** drawn as a `Ref` in the DBML below, because drawing an unenforced
-relationship as an enforced one is exactly the kind of drift that makes a
-diagram lie.
-
-A trigger, as used for `sms_logs` below, is an option worth considering here
-too — it would enforce the same intent for new rows without needing a unique
-index. It was not added because it is a change you have not asked for, and
-unlike the SMS case there is no live corruption to stop.
+The DBML below therefore does **not** draw a `Ref` from `user_name` to
+`username` — drawing an unenforced relationship as enforced is exactly the kind
+of drift that makes a diagram lie. The `user_id` reference (migration 019) *is*
+drawn, because it is real.
 
 ### `sms_logs.recipient_phone` has NO foreign key, by necessity
 
@@ -680,13 +745,15 @@ does not. Recipients are archived rather than deleted, so this path is rare.
 
 **Notes**
 
-- `activity_logs.user_name` is derived from the session token server-side, so it
-  is correct in normal operation. The FK described above (`ON DELETE SET NULL` so
-  an audit row survives account deletion, `ON UPDATE CASCADE` for renames) is
-  **not currently present** — see the section above.
-- `user_deletion_requests` and `email_otps` deliberately define **no** foreign
-  key constraints so the request/OTP pipeline still works after the target
-  account is hard-deleted.
+- `activity_logs.user_name` **and** `user_id` are both derived from the session
+  server-side. `user_id` is the enforced reference (migration 019, `SET NULL` so
+  the audit row survives account deletion); `user_name` is the display copy and
+  is intentionally left unenforced — see the section above.
+- `email_otps` deliberately defines **no** foreign key constraints, so a code can
+  still be verified for an account that has already been hard-deleted.
+  `user_deletion_requests` now has one (migration 020) rather than none; its
+  `SET NULL` rule preserves the same pipeline — the request survives the target's
+  hard delete, with the identity kept in `user_username`.
 - `last_alerts` is keyed by `(device_id, sensor_key)` so each device keeps its
   own alert state; derived from the latest `sensors` reading by the alert engine.
 - `users.token` + `users.token_expires_at` implement 24-hour session
@@ -735,6 +802,11 @@ does not. Recipients are archived rather than deleted, so this path is rare.
   | `014_device_registration.cjs` | Device registration & archive: `devices.archived_at`/`archived_by`/`registered_via`/`ip_source`; checks `chk_devices_registered_via`/`chk_devices_ip_source`/`chk_devices_archived_pair`; indexes `idx_devices_archived_at` + case-insensitive unique `idx_devices_device_id_ci` on `LOWER(device_id)`; backfills `registered_via='manual'` for pre-existing rows that had a `tank_name`. Records itself in `schema_migrations` **only** when the unique index is genuinely in place; on case-variant duplicates it commits the rest, falls back to a non-unique `idx_devices_device_id_folded`, and exits non-zero |
   | `015_device_secret_rotation.cjs` | Per-device secret rotation: `devices.device_secret_rotated_at`, `devices.device_secret_prev`, `devices.device_secret_prev_expires_at`; check `chk_devices_secret_prev_pair`; partial indexes `idx_devices_secret_prev` + `idx_devices_secret_prev_expires` |
   | `016_audit_fixes.cjs` | Fixes from the 2026-09-28 read-only audit: functional index `idx_sensors_device_id_ci` on `sensors (LOWER(device_id), "timestamp" DESC)` built `CONCURRENTLY`; `sms_logs.recipient_phone` integrity via trigger `trg_sms_logs_recipient` (an FK is impossible while 006's partial unique index exists); clears `token`/`token_expires_at` on non-active users; `system_logs.acknowledged_at`, `activity_logs.timestamp`, `last_alerts.timestamp` → `TIMESTAMPTZ` |
+  | `017_token_index.cjs` | Partial composite index `idx_users_token_active` on `users (token, status) WHERE token IS NOT NULL`, built `CONCURRENTLY`. `users.token` had no index at all, so both session guards (`requireAdmin`, `requireAuth`) sequentially scanned the table on every authenticated request and every SSE connect. Partial because signed-out users hold a NULL token and a full index would index them all; composite because the guards match `token` **and** `status` in one predicate, which `idx_users_status` alone cannot serve |
+  | `018_water_level_calibration.cjs` | HC-SR04 geometry: `sensors.water_distance_cm` (+ `chk_sensors_water_distance_valid`); `sensor_calibration` table (`device_id` PK, FK → `devices` `ON DELETE CASCADE`, `empty_cm`/`full_cm` with span + range checks); seeds default empty/full distances for existing devices without overwriting tuned values |
+  | `019_activity_logs_user_id.cjs` | `activity_logs.user_id` + FK → `users.id` `ON DELETE SET NULL`; conservative backfill (exactly one account carries the username **and** the row was written after that account was created — 285 of 3,265 rows linked); partial index `idx_activity_logs_user_id`. Gives the audit trail a real reference without touching the partial-unique `username` model |
+  | `020_deletion_requests_user_fk.cjs` | Drops `user_deletion_requests.user_id` `NOT NULL`, nulls ids whose account was already purged (19 of 20 rows), adds FK → `users.id` `ON DELETE SET NULL`. Resolves the paradox 001 documented: the row survives the hard delete it records, with `user_username` keeping the identity |
+  | `021_status_history_child.cjs` | Creates `user_deletion_request_status_history` (FK → `user_deletion_requests` `ON DELETE CASCADE`), relocates the 40 `status_history` JSONB entries into it, drops the column. The server's deletion flow is updated in the same change; restart the backend after running it |
 
 - **Hash format:** `password_hash = PBKDF2_ITERATIONS:salt_hex:hash_hex` (sha512,
   600,000 iterations, 64-byte key).
@@ -749,19 +821,21 @@ does not. Recipients are archived rather than deleted, so this path is rare.
 ## ERD Source (DBML for dbdiagram.io)
 
 Copy the block below into <https://dbdiagram.io> to render the diagram. It
-contains all **14 tables** and the **4 real foreign keys**, verified against the
-live database.
+contains all **16 tables** and the **8 real foreign keys**, matching the live
+database after migrations 019–021.
 
 Things to know before you paste it:
 
-- **The `users` table will look disconnected.** It is the only table with no
-  foreign keys pointing into it, because `activity_logs.user_name` is
-  unenforced. If you want the intended relationship visible in the diagram, add
-  this line yourself — but know that it is aspirational, not enforced:
-  `Ref: activity_logs.user_name > users.username`
-- **`sms_logs` will also look disconnected** from `authorized_recipients`, and
-  that one is structural — it *cannot* be a foreign key. Integrity is enforced
-  by a trigger, which no ERD tool can draw.
+- **`users` is now connected.** It is the target of two foreign keys
+  (`activity_logs.user_id`, `user_deletion_requests.user_id`), both added by
+  019/020.
+- **`sms_logs` will look disconnected** from `authorized_recipients`, and that
+  is structural — it *cannot* be a foreign key. Integrity is enforced by trigger
+  `trg_sms_logs_recipient`, which no ERD tool can draw.
+- `user_name` (in `activity_logs`), `acknowledged_by`, `archived_by`,
+  `requester_username`, `approver`, `executed_by`, `otp_verified_by` and the new
+  `recorded_by` are **soft references by username**, not foreign keys, and are
+  deliberately not drawn — see the notes at the bottom of the block.
 - `schema_migrations` is bookkeeping and has no relationships; it is included
   only so the table count matches. Delete it freely if you want a cleaner
   diagram.
@@ -789,13 +863,17 @@ Table users {
   pending_deletion_at timestamptz
   pending_deletion_requested_by varchar(100)
 
-  Note: 'Referenced by username (soft reference) from several audit columns. Usernames can be reused after archiving (migration 006).'
+  Note: 'Referenced by id from activity_logs.user_id and user_deletion_requests.user_id (migrations 019/020), and by username (soft reference) from several audit columns. Usernames can be reused after archiving (migration 006).'
 
   Indexes {
     (status) [name: 'idx_users_status']
     // Allows an archived account's username to be reused by a new account.
     (username) [unique, name: 'idx_users_username_active', note: 'PARTIAL: WHERE status IS DISTINCT FROM \'archived\' (migration 006)']
     (email) [unique, name: 'idx_users_email_active', note: 'PARTIAL: WHERE status IS DISTINCT FROM \'archived\'']
+    // Session lookup on every authenticated request and SSE connect. Partial
+    // because signed-out users hold a NULL token; status is in the key because
+    // the guards match token AND status in one predicate.
+    (token, status) [name: 'idx_users_token_active', note: 'PARTIAL: WHERE token IS NOT NULL (migration 017)']
   }
 }
 
@@ -849,6 +927,9 @@ Table sensors {
   water_level decimal(5,2) [default: 0]
   // precision is (5,2), not (5,3) - verified against the live database
   ammonia decimal(5,2) [default: 0]
+  // Raw HC-SR04 distance (migration 018). NULL = not reported by the firmware
+  // or a failed sensor. A lossy percentage alone cannot be recalibrated later.
+  water_distance_cm decimal(6,2)
   timestamp timestamptz [default: `now()`]
 
   // Range checks (migration 009). Each allows NULL - a NULL reading means the
@@ -856,6 +937,7 @@ Table sensors {
   //   chk_sensors_temperature_valid: 0 < temperature <= 100
   //   chk_sensors_water_level_valid:  0 <= water_level <= 200
   //   chk_sensors_ammonia_valid:      0 <= ammonia <= 1000
+  //   chk_sensors_water_distance_valid (migration 018): NULL or 0 < water_distance_cm <= 400
 
   Indexes {
     (timestamp) [name: 'idx_sensors_timestamp']
@@ -865,6 +947,24 @@ Table sensors {
     // Functional index (migration 016) for case-insensitive tank lookups in server.cjs.
     (`lower(device_id)`, timestamp) [name: 'idx_sensors_device_id_ci']
   }
+}
+
+Table sensor_calibration {
+  device_id varchar(50) [pk]
+  // Distance from the sensor to the water surface at MINIMUM fill (0%).
+  empty_cm decimal(6,2) [not null]
+  // Distance from the sensor to the water surface at MAXIMUM fill (100%).
+  full_cm decimal(6,2) [not null]
+  updated_at timestamptz [not null, default: `now()`]
+  updated_by varchar(100)
+
+  // Check constraints (migration 018):
+  //   chk_sensor_calibration_span:  empty_cm > full_cm (the level formula
+  //                                 divides by (empty_cm - full_cm))
+  //   chk_sensor_calibration_range: full_cm >= 2 (HC-SR04 blind spot)
+  //                                 AND empty_cm <= 400 (module ceiling)
+
+  Note: 'HC-SR04 water-level geometry per tank (migration 018). device_id is the PK, so one row per device. Alert thresholds live in sensor_settings / device_threshold_overrides, NOT here.'
 }
 
 Table sensor_settings {
@@ -934,28 +1034,33 @@ Table last_alerts {
 
 Table activity_logs {
   id int [pk, increment]
-  // INTENDED to reference users.username, but NOT enforced (see bottom of file).
+  // Display string, NOT a foreign key (see bottom of file). Kept even when the
+  // account is renamed or purged, so the trail reads as it was written.
   user_name varchar(100)
+  // Real reference added by migration 019. NULL = actor not
+  // resolvable: purged account, pre-019 row, or no account resolved.
+  user_id int
   action_type varchar(50) [not null]
   description text
   module varchar(100)
   // timestamptz since migration 016 (was naive)
   timestamp timestamptz [default: `now()`]
 
-  Note: 'user_name is an intended but unenforced reference to users.username.'
+  Note: 'user_id -> users.id is the enforced link (migration 019); user_name is the unenforced display copy.'
 
   Indexes {
     (timestamp) [name: 'idx_activity_logs_timestamp']
     (action_type) [name: 'idx_activity_logs_action_type']
+    (user_id) [name: 'idx_activity_logs_user_id', note: 'PARTIAL: WHERE user_id IS NOT NULL (migration 019)']
   }
 }
 
 Table user_deletion_requests {
   id int [pk, increment]
-  // TODO: confirm whether the missing FK to users.id is deliberate (e.g. the
-  // audit trail must survive a hard delete). It COULD be enforced, since
-  // users.id is a plain primary key.
-  user_id int [not null]
+  // FK -> users.id ON DELETE SET NULL (migration 020). Drops
+  // the original NOT NULL so the flow can hard-delete the account it documents;
+  // user_username then carries the identity.
+  user_id int
   user_username varchar(100) [not null]
   requester_username varchar(100) [not null]
   requester_email varchar(255) [not null]
@@ -972,13 +1077,34 @@ Table user_deletion_requests {
   approved_at timestamptz
   executed_by varchar(100)
   executed_at timestamptz
-  status_history jsonb [not null, default: "'[]'"]
+  // status_history (jsonb) lived here from migration 001 until migration 021
+  // relocated its entries into user_deletion_request_status_history below.
 
-  Note: 'user_id has no FK to users.id (unenforced). approver / executed_by / otp_verified_by are soft references by username.'
+  Note: 'user_id -> users.id is enforced since migration 020 (SET NULL). approver / executed_by / otp_verified_by are soft references by username.'
 
   Indexes {
     (status) [name: 'idx_deletion_requests_status']
     (user_id) [name: 'idx_deletion_requests_user']
+  }
+}
+
+// One row per state transition of a user_deletion_requests row. Created by
+// migration 021, which moved the old status_history JSONB entries here and
+// dropped that column.
+Table user_deletion_request_status_history {
+  id int [pk, increment]
+  request_id int [not null]
+  // The state entered: PENDING_OTP, EXPIRED, or COMPLETED.
+  status varchar(20) [not null]
+  // From the JSONB entry's `at`, else the request's requested_at.
+  recorded_at timestamptz [not null, default: `now()`]
+  // Soft reference by username.
+  recorded_by varchar(100)
+
+  Note: 'Append-only transition log. ON DELETE CASCADE: a request deleted as "never happened" takes its history with it.'
+
+  Indexes {
+    (request_id) [name: 'idx_deletion_status_history_request']
   }
 }
 
@@ -1005,8 +1131,8 @@ Table system_state {
 }
 
 Table schema_migrations {
-  // Bookkeeping only - no relationships. Included so the diagram matches
-  // the live database's 14 tables.
+  // Bookkeeping only - no relationships. Included so the diagram matches the
+  // database's table count of 16.
   version varchar(50) [pk]
   name varchar(255) [not null]
   applied_at timestamptz [not null, default: `now()`]
@@ -1059,6 +1185,7 @@ Table sms_logs {
 TableGroup monitoring {
   devices
   sensors
+  sensor_calibration
   last_alerts
   system_logs
 }
@@ -1074,6 +1201,7 @@ TableGroup auth_and_users {
   users
   email_otps
   user_deletion_requests
+  user_deletion_request_status_history
   activity_logs
 }
 
@@ -1088,32 +1216,39 @@ TableGroup system {
 }
 
 // ---------------------------------------------------------------------------
-// ENFORCED FOREIGN KEYS
-// The four that actually exist. Verified against
-// information_schema.referential_constraints on 2026-09-28.
-// sensors and last_alerts use NO ACTION (default): devices are archived,
-// never hard-deleted.
+// ENFORCED FOREIGN KEYS (8)
+// All eight verified against information_schema.referential_constraints
+// on 2026-10-15, migrations 019/020/021 applied. sensors and last_alerts use
+// NO ACTION (default): devices are archived, never hard-deleted.
 // ---------------------------------------------------------------------------
 Ref: sensors.device_id > devices.device_id
 Ref: last_alerts.device_id > devices.device_id
 Ref: system_logs.device_id > devices.device_id [delete: set null]
 // device_id is the PK of the overrides table, so this is one-to-one.
 Ref: device_threshold_overrides.device_id - devices.device_id [delete: cascade]
+// sensor_calibration.device_id is the PK too: one row per device.
+Ref: sensor_calibration.device_id - devices.device_id [delete: cascade]
+// Migration 019: the audit trail's real link to its account. SET NULL so the
+// audit row outlives the account it names.
+Ref: activity_logs.user_id > users.id [delete: set null]
+// Migration 020: the deletion request's link to the account it deletes.
+Ref: user_deletion_requests.user_id > users.id [delete: set null]
+// Migration 021: one-to-many transition log.
+Ref: user_deletion_request_status_history.request_id > user_deletion_requests.id [delete: cascade]
 
 // ---------------------------------------------------------------------------
 // DELIBERATELY NOT DRAWN AS A Ref
 // Drawing these would assert something the database does not enforce.
 // ---------------------------------------------------------------------------
 
-// (1) activity_logs.user_name > users.username  -- UNENFORCED, a real gap.
-// Migrations 001 and 002 both add the constraint (activity_logs_user_name_fkey,
-// ON DELETE SET NULL), but no such FK exists on the live database. Audit rows
-// can name a user that no longer exists, or never did.
-// It cannot simply be added: users.username is unique only via the PARTIAL
-// index idx_users_username_active, and a foreign key cannot reference a
-// partial index. Restoring a full UNIQUE would undo migration 006's
-// username-reuse-after-archive design. Needs a decision: leave it unenforced,
-// or change the uniqueness model.
+// (1) activity_logs.user_name > users.username  -- UNENFORCED, by design.
+// This used to be a real gap: migrations 001/002 created
+// activity_logs_user_name_fkey and it was later removed. It cannot be
+// re-created, because users.username is unique only via the PARTIAL index
+// idx_users_username_active, and a foreign key cannot reference a partial
+// index. Migration 019 links activity_logs.user_id -> users.id instead (drawn
+// above), leaving user_name as the display string. The name column stays
+// unenforced on purpose, not by accident.
 
 // (2) sms_logs.recipient_phone > authorized_recipients.phone_number
 //     -- STRUCTURALLY IMPOSSIBLE, not a gap.
@@ -1124,14 +1259,14 @@ Ref: device_threshold_overrides.device_id - devices.device_id [delete: cascade]
 // which rejects INSERT and UPDATE OF recipient_phone when no matching recipient
 // exists. ERD tools do not draw triggers.
 
-// (3) user_deletion_requests.user_id > users.id  -- UNENFORCED, unexplained.
-// Could be enforced (users.id is a plain PK). Confirm whether it is deliberate.
-
-// (4) Soft references by username: activity_logs.user_name,
+// (3) Soft references by username: activity_logs.user_name,
 // system_logs.acknowledged_by, devices.archived_by,
-// users.pending_deletion_requested_by, and approver / executed_by /
-// otp_verified_by in user_deletion_requests. Because usernames can be reused
-// after archiving, an old audit row may point at a different person.
+// users.pending_deletion_requested_by, and requester_username / approver /
+// executed_by / otp_verified_by on user_deletion_requests, plus recorded_by on
+// user_deletion_request_status_history. Because usernames can be reused after
+// archiving, an old audit row may point at a different person.
+// (activity_logs.user_id and user_deletion_requests.user_id ARE drawn above,
+// because those are real foreign keys - just not on the name column.)
 ```
 
 ---

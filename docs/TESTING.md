@@ -225,7 +225,7 @@ npm run mock:profiles
 | `all_sensors_fail` | 1 | Every probe dies at cycle 5 — three "No signal" cards. Simulates a drained tank or an ESP32 powered off mid-read |
 | `disconnect` | 1 | Posts 10 times, then goes silent on its own. After the 30-second heartbeat window the dashboard flips to the offline banner while still showing the last readings |
 | `fleet` | 2 | `ESP32_01` healthy + `ESP32_02` warming, staggered 2.5 s apart. Exercises the fleet view, the per-tank alarm badge and the "N tanks affected" banner. Needs two registered devices |
-| `fleet10` | 10 | Six healthy + warming + ammonia spike + dead probe + disconnect. The full software rehearsal of a ten-tank buildout — see **Part 3** |
+| `fleet10` | 7 | Three healthy (04-06) + warming (07) + ammonia spike (08) + dead probe (09) + disconnect (10). The rehearsal for tanks 4-10 — see **Part 3** |
 
 ### 2.5 Command line options
 
@@ -422,7 +422,7 @@ posts in lockstep.
 
 | Device | Profile | What it proves |
 |---|---|---|
-| `ESP32_01` … `ESP32_06` | `healthy` | Baseline. Six tanks that must **never** raise an alert |
+| `ESP32_04` — `ESP32_06` | `healthy` | Baseline. Three tanks that must **never** raise an alert |
 | `ESP32_07` | `warming` | Temp ramps 25 → 34 °C over 14 cycles. WARNING then CRITICAL vs a 31 °C max |
 | `ESP32_08` | `ammonia_spike` | Ammonia ramps 0.32 → 4.2 ppm over 8 cycles. Critical toxin — **this one sends real SMS** |
 | `ESP32_09` | `failed_ammonia` | Ammonia probe dies at cycle 8, sends `-1`. Must render grey **"No signal"**, not an amber warning |

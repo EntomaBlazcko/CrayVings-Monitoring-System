@@ -1,3 +1,4 @@
+//todo make sure the esp32 is running and connected to the code 
 #include <Arduino.h>
 #include <FS.h>
 #include <TFT_eSPI.h>
@@ -59,26 +60,477 @@ OneWire oneWire(ONE_WIRE_BUS);
 DallasTemperature sensors(&oneWire);
 
 // =============================================================================
-// HC-SR04
+// HC-SR04 + WATER-LEVEL CALIBRATION
 // =============================================================================
+//
+// The single source of truth for the water-level geometry is the TWO constants
+// below. Every percentage the board computes or sends derives from them, and
+// nothing else in this sketch hard-codes a water-level distance.
+//
+//   EMPTY_CM - distance from the sensor face DOWN to the water surface when the
+//              tank is at its minimum level. A reading at or above this is 0%.
+//              Specified as 23.5 cm.
+//   FULL_CM  - distance from the sensor face DOWN to the water surface when the
+//              tank is full. A reading at or below this is 100%.
+//
+//   level% = (EMPTY_CM - distance) / (EMPTY_CM - FULL_CM) * 100, clamped 0-100
+//   Usable water depth = EMPTY_CM - FULL_CM. That span is the only thing the
+//   percentage depends on.
+//
+// The tank's 36 cm wall height is a property of the VESSEL and is deliberately
+// NOT part of this formula: the sensor is not mounted at the rim, so the
+// rim-to-water distance is not the water depth. TANK_HEIGHT_CM and tankHeightCm
+// were removed from the level calculation for exactly that reason.
+//
+// !! MEASURE FULL_CM ON THE REAL TANK BEFORE TRUSTING THE PERCENTAGE !!
+// The value below is a PLACEHOLDER that only has to be in the right ballpark
+// to keep the board reporting something sane. It is not calibrated. Put a ruler
+// on the tank at maximum fill and record the sensor-to-surface distance, then
+// edit this one line (or set it from the config portal / the dashboard's
+// calibration endpoint, which needs no reflash at all).
+#define WATER_EMPTY_CM 23.5f
+#define WATER_FULL_CM  8.0f // <<< PLACEHOLDER - MEASURE THIS. Span = 15.5 cm.
 
+// Pins: GPIO26 (TRIG) and GPIO27 (ECHO) are plain general-purpose I/O on the
+// ESP32 DevKit V1 - not boot-strapping, not input-only. The input-only pins are
+// GPIO34-39 (GPIO34 is already the MQ-137 ADC, correct for it), and GPIO6-11 are
+// bound to the SPI flash. Verified against every pin claimed inside this sketch:
+// GPIO13 = DS18B20, GPIO34 = MQ-137, GPIO19/22/32/33 = XPT2046 touch SPI,
+// GPIO2 = safe-mode LED.
+//
+// NOT verified here: the TFT_eSPI display's own pins. They live in the
+// Arduino library's User_Setup.h, which is installed on the machine that
+// compiles the sketch and is not part of this repository, so this comment
+// cannot claim which pins it claims. Check it once - if your build already
+// works the display, 26/27 are free; the ILI9488 configs that people usually
+// load for this board take 23/19/18/15 plus DC and RST, none of which is 26
+// or 27.
+//
+// ECHO DRIVES 5V: a divider (1k series / 2k to GND -> 3.33V) MUST sit between
+// the HC-SR04 ECHO pin and GPIO27. Without it the pin is over-driven and the
+// board is a reboot away from being dead.
 #define TRIG_PIN 26
 #define ECHO_PIN 27
 
-#define TANK_HEIGHT_CM 36.0
+// Runtime calibration. Loaded from NVS (settable from the config portal without
+// reflashing); falls back to the compiled-in constants above.
+static float emptyDistanceCm = WATER_EMPTY_CM;
+static float fullDistanceCm = WATER_FULL_CM;
 
-float tankHeightCm = TANK_HEIGHT_CM;
+// The HC-SR04 needs ~60ms between pings, so we deliberately do NOT sample
+// back-to-back (that causes echo crosstalk / false readings). One ping per read
+// (every 1s) instead, and the smoothing is a MEDIAN built across those reads.
+#define DISTANCE_MEDIAN_WINDOW 5
 
-// HC-SR04 filtering: the module needs ~60ms between pings, so we do NOT sample
-// back-to-back (that causes echo crosstalk / false readings). Instead we fire one
-// ping per read (every 1s) and smooth across successive reads, with spike
-// rejection and a display deadband so the shown value stays rock-solid.
-#define DISTANCE_JUMP_CM 5.0
-#define DISTANCE_EMA_ALPHA 0.3
-#define WATER_LEVEL_DEADBAND 1.0
+// Deadband applied to the REPORTED percentage. Its job is to stop the board
+// publishing a new number (and the server writing a new sensors row) for a
+// change smaller than the server's own 1% delta tolerance. Set to 0 to report
+// every single read.
+#define WATER_LEVEL_DEADBAND_PCT 1.0f
 
-float filteredDistance = -1.0;
-float lastShownLevel = -1.0;
+// Consecutive invalid reads before the median window is flushed. A single
+// dropped echo is routine on an HC-SR04 and must not reset the filter (that
+// would make the level permanently laggy on a noisy link), but once the sensor
+// is genuinely gone the stale samples must not survive it and be judged as
+// fresh data after it comes back.
+#define WATER_LEVEL_FAULT_FLUSH_READS 3
+
+// Physical validity window for the HC-SR04. Anything outside is not a real
+// reading (too close to resolve reliably, or beyond the module's usable range)
+// and must never reach the filter, the median, or the formula.
+#define DISTANCE_MIN_VALID_CM 2.0f
+#define DISTANCE_MAX_VALID_CM 400.0f
+
+// pulseIn() must have a timeout: with no echo it would otherwise block for the
+// full 30ms on every read. A timeout returns 0, which is an INVALID reading and
+// must never be turned into a percentage.
+#define ECHO_TIMEOUT_US 30000UL
+
+// Sliding window of valid distances, in arrival order, plus a scratch buffer for
+// the median's sorted copy. Declared here, next to the calibration, so every
+// function below can see them - the sketch relies on declaration-before-use
+// because arduino-builder only auto-generates function prototypes.
+float distanceWindow[DISTANCE_MEDIAN_WINDOW];
+float distanceSorted[DISTANCE_MEDIAN_WINDOW];
+int distanceWindowCount = 0;
+
+float lastReportedLevel = -1.0f;
+int consecutiveInvalidReads = 0;
+
+// HC-SR04's two outputs, declared here with the code that produces them rather
+// than in the generic SENSOR VALUES block below: every function in this section
+// writes them, and they are the pair that must always agree with each other.
+float distance = -1.0f;   // measured air gap, cm; -1 = failed
+float waterLevel = -1.0f; // percentage 0-100; -1 = failed, never 0 or 100
+
+// =============================================================================
+// DISTANCE -> PERCENTAGE
+// =============================================================================
+//
+// levelPercentFromDistance() is the ONLY place the percentage is computed, and
+// levelDistanceFromPercent() is its exact inverse (used by the simulator so the
+// virtual tank exercises the same arithmetic as the real one).
+//
+// Both refuse to work on an impossible calibration instead of dividing by zero
+// or producing a sign-flipped span: EMPTY_CM must be strictly greater than
+// FULL_CM, and FULL_CM must sit outside the sensor's 2 cm near-field dead zone.
+
+float levelPercentFromDistance(float distanceCm)
+{
+    const float span = emptyDistanceCm - fullDistanceCm;
+    const float pct = ((emptyDistanceCm - distanceCm) / span) * 100.0f;
+    return constrain(pct, 0.0f, 100.0f);
+}
+
+float levelDistanceFromPercent(float percent)
+{
+    const float span = emptyDistanceCm - fullDistanceCm;
+    return emptyDistanceCm - (percent / 100.0f) * span;
+}
+
+// median -> percentage -> deadband -> the two published globals.
+//
+// Shared by the real and simulated paths in readWaterLevel(). That sharing is the
+// point: the simulator is only useful as a rehearsal if it runs the SAME
+// filtering and the SAME deadband as the hardware, and duplicating this block
+// once per path is exactly how the two would drift apart.
+void publishWaterLevelFromMedian(float medianCm)
+{
+    distance = medianCm;
+    const float level = levelPercentFromDistance(medianCm); // already clamped 0-100
+
+    // Deadband: only publish a new percentage when it has actually moved by at
+    // least WATER_LEVEL_DEADBAND_PCT. This keeps the reported value - and so the
+    // server's 1% delta-logging - from churning on sub-percent noise. It is a
+    // zero-order hold, not hysteresis, so there is no state that can latch.
+    if (WATER_LEVEL_DEADBAND_PCT <= 0.0f ||
+        lastReportedLevel < 0.0f ||
+        fabsf(level - lastReportedLevel) >= WATER_LEVEL_DEADBAND_PCT)
+    {
+        lastReportedLevel = level;
+    }
+
+    waterLevel = lastReportedLevel;
+}
+
+// Guards against a mis-entered calibration (portal typo, NVS corruption) turning
+// every reading into a divide-by-zero NaN or a nonsensical span. Called once per
+// read: the cost is one comparison, the cost of NOT checking is a board that
+// silently reports NaN% for the rest of the day.
+bool waterCalibrationSane(void)
+{
+    if (!(emptyDistanceCm > fullDistanceCm))
+    {
+        Serial.printf("[HC-SR04] CALIBRATION INVALID: empty=%.2f cm must be > full=%.2f cm - water level unavailable\n",
+                      emptyDistanceCm, fullDistanceCm);
+        return false;
+    }
+
+    if (fullDistanceCm < DISTANCE_MIN_VALID_CM)
+    {
+        Serial.printf("[HC-SR04] CALIBRATION INVALID: full=%.2f cm is inside the %.0f cm near-field dead zone\n",
+                      fullDistanceCm, DISTANCE_MIN_VALID_CM);
+        return false;
+    }
+
+    return true;
+}
+
+// Median of the distances currently in the window. Works for ANY window size >=
+// 1 (not just a full one), so the very first read after boot already produces a
+// usable value instead of a 5-second "sensor error". The ACTION A/B state
+// machine below is the thing that insists on a FULL window - see
+// updateThresholdFromDistance().
+//
+// Sorting a copy leaves the arrival-order window intact.
+float medianDistanceCm(void)
+{
+    if (distanceWindowCount < 1)
+    {
+        return -1.0f;
+    }
+
+    for (int i = 0; i < distanceWindowCount; i++)
+    {
+        distanceSorted[i] = distanceWindow[i];
+    }
+
+    // Insertion sort: 5 elements, and far cheaper in flash than pulling in
+    // <algorithm> just for std::sort.
+    for (int i = 1; i < distanceWindowCount; i++)
+    {
+        const float key = distanceSorted[i];
+        int j = i - 1;
+        while (j >= 0 && distanceSorted[j] > key)
+        {
+            distanceSorted[j + 1] = distanceSorted[j];
+            j--;
+        }
+        distanceSorted[j + 1] = key;
+    }
+
+    return distanceSorted[distanceWindowCount / 2];
+}
+
+// Appends one valid reading to the sliding window and returns the new median
+// (-1 only if the window is empty, which cannot happen here). Once full it is a
+// true sliding window, so the median tracks slow drift as well as rejecting
+// single outliers - one spurious long echo cannot move a median the way it can
+// drag an EMA.
+float pushDistanceSample(float sampleCm)
+{
+    if (distanceWindowCount < DISTANCE_MEDIAN_WINDOW)
+    {
+        distanceWindow[distanceWindowCount] = sampleCm;
+        distanceWindowCount++;
+    }
+    else
+    {
+        for (int i = 0; i < DISTANCE_MEDIAN_WINDOW - 1; i++)
+        {
+            distanceWindow[i] = distanceWindow[i + 1];
+        }
+        distanceWindow[DISTANCE_MEDIAN_WINDOW - 1] = sampleCm;
+    }
+
+    return medianDistanceCm();
+}
+
+// Drops every buffered sample. Only called once the sensor has been invalid for
+// WATER_LEVEL_FAULT_FLUSH_READS consecutive reads - see the note there.
+void flushDistanceWindow(void)
+{
+    distanceWindowCount = 0;
+}
+
+// =============================================================================
+// EMPTY-TANK THRESHOLD (ACTION A / ACTION B)
+// =============================================================================
+//
+// This is the "is the tank dry?" switch, and it is NOT the same thing as the
+// reported percentage. It fires when the measured distance is at or beyond the
+// EMPTY reference - i.e. at or beyond emptyDistanceCm (23.5 cm), where the
+// reported percentage is 0%. It used to carry its own hard-coded 23.5
+// (THRESHOLD_CM); it now derives from the calibration, so there is exactly one
+// place in this sketch where that number is written down.
+//
+// Why this is NOT a burst of five pings inside readWaterLevel(): the module
+// needs ~60ms between pings, and readWaterLevel() already fires once per second.
+// Five back-to-back pings would (a) violate that spacing, producing exactly the
+// crosstalk it warns about, and (b) block the loop for up to ~150ms, which would
+// stall the touchscreen and the watchdog.
+//
+// Instead the MEDIAN is built across five SUCCESSIVE 1 Hz reads. One new sample
+// lands per second, so the spacing rule holds, nothing blocks, and after the
+// first five seconds we get a true median.
+
+// The old window-full-only medianDistanceCm() that lived here has been replaced
+// by the any-window-size version up in the DISTANCE -> PERCENTAGE block, so
+// there is exactly one median implementation and the reported percentage and
+// the ACTION state machine cannot drift apart.
+
+// Which side of the minimum water line the tank is on.
+//
+// Read the names against the GEOMETRY, not against the word "within": the sensor
+// is mounted ABOVE the water looking down, so a LARGER distance means LESS water.
+// That inversion is the whole reason this enum is spelled out in comments - the
+// obvious reading of these two names is backwards.
+//
+//   THRESHOLD_BEYOND - measured distance at or beyond emptyDistanceCm (23.5 cm),
+//                      i.e. at or past the 0% reference. Dry: the tank is at or
+//                      below its minimum water line -> ACTION A.
+//   THRESHOLD_WITHIN - measured distance below emptyDistanceCm, i.e. water is
+//                      closer than the 0% reference. The tank is above its
+//                      minimum water line -> ACTION B.
+enum ThresholdState
+{
+    THRESHOLD_BEYOND, // distance >= empty reference -> dry  -> ACTION A
+    THRESHOLD_WITHIN  // distance <  empty reference -> wet  -> ACTION B
+};
+
+// Boots as the dry state, and updateThresholdFromDistance() will not evaluate
+// anything until the median window has filled. So this default means a tank that
+// is genuinely dry produces NO action line at all, rather than firing a dry alert
+// before the board has measured anything. A wet tank logs its actual state on the
+// first full window, which is the useful direction for a startup banner.
+static ThresholdState thresholdState = THRESHOLD_BEYOND;
+
+// =============================================================================
+// ACTION A / ACTION B
+// =============================================================================
+//
+// These are deliberately STUBS. The threshold state machine below is complete and
+// correct, but what physically happens on a transition is application-specific,
+// and guessing at it would risk driving a pin the firmware already owns - GPIO2
+// is already SAFE_LED_PIN (watchdog blink), so it must not be reused here.
+//
+// ACTION A  - the tank is AT OR BELOW its minimum water line: measured distance
+//             at or beyond emptyDistanceCm (23.5 cm by default), reported
+//             percentage at or near 0%. This is the dry-tank alert.
+// ACTION B  - the tank is ABOVE its minimum water line: measured distance below
+//             emptyDistanceCm, reported percentage above 0%.
+//
+// To wire up real hardware, put the actuator code in the two bodies below and
+// call pinMode()/digitalWrite() from setup() or on first use. Until then both
+// actions report on Serial only, so the logic is testable with no extra wiring.
+void actionA(void)
+{
+    Serial.println("[ACTION A] Tank at/below minimum water line");
+    // TODO: real ACTION A here (LED / relay / buzzer), on a free GPIO.
+}
+
+void actionB(void)
+{
+    Serial.println("[ACTION B] Tank above minimum water line");
+    // TODO: real ACTION B here.
+}
+
+// Fires actionA()/actionB() only on an actual state change, so a steady reading
+// does not spam the log. Called with the new state.
+//
+// The mapping below is the load-bearing part: BEYOND (distance at/beyond the
+// empty reference = least water) must raise the DRY alert ACTION A, and WITHIN
+// (water closer than the empty reference) must raise ACTION B. Getting these two
+// the wrong way round reports "tank at/below minimum water line" on a full tank
+// and "above minimum" on a dry one, which is worse than not reporting at all.
+void applyThresholdAction(ThresholdState next)
+{
+    if (next == thresholdState)
+    {
+        return;
+    }
+
+    thresholdState = next;
+
+    if (next == THRESHOLD_BEYOND)
+    {
+        actionA();
+    }
+    else
+    {
+        actionB();
+    }
+}
+
+// Hysteresis band totalling ~0.5 cm around the empty reference. Measured
+// distance has to cross the WHOLE band before the state flips, so a reading
+// sitting exactly on the reference cannot oscillate ACTION A / ACTION B. Half
+// the band sits on each side of emptyDistanceCm. These are runtime expressions
+// rather than #defines because emptyDistanceCm is loaded from NVS at boot.
+//
+// Named for the state each edge PROVES, because the sensor-above-the-water
+// geometry means the wet edge is the SMALLER distance:
+//
+//   WATER_WET_EDGE_CM  (23.25 by default) - distance has to fall to here (or
+//                        below) before the tank is called wet. Below it there is
+//                        demonstrably more water than the 0% reference.
+//   WATER_DRY_EDGE_CM  (23.75 by default) - distance has to rise to here (or
+//                        above) before the tank is called dry. Above it there is
+//                        demonstrably less water than the 0% reference.
+//
+// A median anywhere in between holds whatever state it is already in, which is
+// what stops the dry alert chattering on a surface sitting right at 23.5 cm.
+#define THRESHOLD_HYSTERESIS_CM 0.5f
+#define WATER_WET_EDGE_CM (emptyDistanceCm - (THRESHOLD_HYSTERESIS_CM / 2.0f))
+#define WATER_DRY_EDGE_CM (emptyDistanceCm + (THRESHOLD_HYSTERESIS_CM / 2.0f))
+
+// Re-evaluates the empty-tank threshold against the current median.
+//
+// The window push is NOT done here any more: pushDistanceSample() owns the
+// window, because the reported percentage and this state machine must both
+// judge the SAME filtered distance. Two filters on one physical quantity is how
+// they drift apart.
+//
+// `fromSimulation` only changes the wording of the log line; the arithmetic is
+// identical, so simulated and real readings exercise the same state machine.
+//
+// On a timeout or an out-of-range reading this must NOT be called at all, which
+// is why the caller returns early - an invalid sample neither enters the window
+// nor moves the state. That is what stops a dropped echo from clearing an active
+// action.
+void updateThresholdFromDistance(float medianCm, bool fromSimulation)
+{
+    if (medianCm < 0.0f)
+    {
+        return;
+    }
+
+    // The action only fires once the window has actually filled. The reported
+    // percentage does not wait for that (see medianDistanceCm()), but an
+    // ACTION must not be driven by a single unconfirmed sample.
+    if (distanceWindowCount < DISTANCE_MEDIAN_WINDOW)
+    {
+        // Report progress once so a 5-second wait at boot is not mistaken for a
+        // dead sensor.
+        if (distanceWindowCount == 1)
+        {
+            Serial.printf("[HC-SR04] Priming median window %d/%d (empty reference %.1f cm)\n",
+                          distanceWindowCount,
+                          DISTANCE_MEDIAN_WINDOW,
+                          emptyDistanceCm);
+        }
+        return;
+    }
+
+    // Hysteresis, not a bare comparison against emptyDistanceCm. From the dry
+    // state the tank is only called WET once the median has fallen below the wet
+    // edge; from the wet state it is only called DRY once the median has risen
+    // above the dry edge. Between the edges the state is held, so a median parked
+    // on the reference cannot oscillate.
+    if (thresholdState == THRESHOLD_BEYOND)
+    {
+        if (medianCm <= WATER_WET_EDGE_CM)
+        {
+            applyThresholdAction(THRESHOLD_WITHIN);
+        }
+    }
+    else
+    {
+        if (medianCm >= WATER_DRY_EDGE_CM)
+        {
+            applyThresholdAction(THRESHOLD_BEYOND);
+        }
+    }
+
+    Serial.printf("[HC-SR04]%s median %.2f cm | empty ref %.2f cm | full ref %.2f cm | state %s\n",
+                  fromSimulation ? " [SIM]" : "",
+                  medianCm,
+                  emptyDistanceCm,
+                  fullDistanceCm,
+                  thresholdState == THRESHOLD_BEYOND
+                      ? "BEYOND ref = dry (ACTION A)"
+                      : "WITHIN ref = wet (ACTION B)");
+}
+
+// Marks the HC-SR04 as failed for this read.
+//
+// A failed read must NOT become a percentage. It becomes -1, which is the wire
+// sentinel the backend turns into NULL, and the dashboard renders as "--". It
+// must never become 0% (an empty tank) or 100% (a full one): those are real
+// values that mean something, and faking one of them hides a dry tank.
+//
+// The threshold state is deliberately left alone: a timeout means "do not know",
+// not "the object moved away", so the action must not be cleared on missing
+// data.
+void invalidateWaterLevel(const char *why)
+{
+    distance = -1.0f;
+    waterLevel = -1.0f;
+    lastReportedLevel = -1.0f; // so the first good read after recovery is published
+
+    consecutiveInvalidReads++;
+    if (consecutiveInvalidReads == WATER_LEVEL_FAULT_FLUSH_READS)
+    {
+        flushDistanceWindow();
+    }
+
+    Serial.printf("[HC-SR04] Invalid reading (%s) | %d consecutive | holding state %s\n",
+                  why,
+                  consecutiveInvalidReads,
+                  thresholdState == THRESHOLD_BEYOND
+                      ? "BEYOND ref = dry (ACTION A)"
+                      : "WITHIN ref = wet (ACTION B)");
+}
 
 // =============================================================================
 // MQ-137 AMMONIA (NH3) GAS SENSOR
@@ -142,8 +594,11 @@ int mq137RecalTries = 0;
 // =============================================================================
 
 float temperature = -127.0;
-float distance = -1.0;
-float waterLevel = 0.0;
+// `distance` and `waterLevel` are declared up in the HC-SR04 calibration block,
+// next to the code that owns them. They used to be initialised to -1.0 and 0.0
+// here; 0.0 was wrong: with the calibrated formula a 0% level is a real,
+// actionable value (an empty tank), so a fresh boot - or a tank with no sensor
+// attached - would report a dry tank instead of a failed sensor.
 int mq137Raw = 0;
 float mq137Voltage = 0.0;
 
@@ -156,7 +611,9 @@ float mq137Voltage = 0.0;
 bool safeModeActive = false;    // Set after a watchdog reset; cleared on recovery
 bool safeModeRecovered = false; // Loop redraws the normal UI once set
 float lastGoodTemperature = -127.0;  // Last-known-good snapshot for Safe Mode
-float lastGoodWaterLevel = 0.0;
+// -1 = "never had a good reading", matching the live sentinels, so Safe Mode
+// cannot present a fabricated 0% as the last known good level.
+float lastGoodWaterLevel = -1.0;
 float lastGoodAmmonia = -1.0;
 unsigned long lastGoodMillis = 0;
 bool safeLedOn = false;
@@ -282,6 +739,11 @@ typedef struct
     float temp;
     float level;
     float ammonia;
+    // Raw HC-SR04 distance (cm) alongside the percentage. The distance is the
+    // only value that can be re-calibrated after the fact: a wrong EMPTY_CM /
+    // FULL_CM pair can be corrected server-side from the stored distance, whereas
+    // a stored percentage has already lost the information needed to fix it.
+    float distance;
 } BufferedReading;
 
 BufferedReading sendBuf[SEND_BUFFER_CAP];
@@ -289,7 +751,7 @@ int sendBufWrite = 0;
 int sendBufRead = 0;
 int sendBufCount = 0;
 
-bool sendBufPush(float temp, float level, float ammonia)
+bool sendBufPush(float temp, float level, float ammonia, float distance)
 {
     if (sendBufCount >= SEND_BUFFER_CAP)
     {
@@ -301,19 +763,35 @@ bool sendBufPush(float temp, float level, float ammonia)
     sendBuf[sendBufWrite].temp = temp;
     sendBuf[sendBufWrite].level = level;
     sendBuf[sendBufWrite].ammonia = ammonia;
+    sendBuf[sendBufWrite].distance = distance;
     sendBufWrite = (sendBufWrite + 1) % SEND_BUFFER_CAP;
     sendBufCount++;
     return true;
 }
 
-bool sendBufPop(BufferedReading &out)
+// Reads the oldest buffered reading out of the ring.
+//
+// The three out-params are plain floats rather than a BufferedReading& on
+// purpose. arduino-builder auto-generates prototypes for functions used before
+// they are defined, and its generator mis-parses any signature mentioning a
+// type declared later in the sketch: it emits "bool sendBufPop" (splitting at
+// the "("), which the compiler then rejects with "'BufferedReading' was not
+// declared in this scope" and "'sendBufPop' cannot be used as a function".
+// Keeping user-defined types out of every signature sidesteps the generator
+// entirely. sendBuf[] stays a BufferedReading[] - a global array type never
+// reaches a prototype.
+bool sendBufPop(float &tempOut, float &levelOut, float &ammoniaOut, float &distanceOut)
 {
     if (sendBufCount == 0)
     {
         return false;
     }
 
-    out = sendBuf[sendBufRead];
+    tempOut = sendBuf[sendBufRead].temp;
+    levelOut = sendBuf[sendBufRead].level;
+    ammoniaOut = sendBuf[sendBufRead].ammonia;
+    distanceOut = sendBuf[sendBufRead].distance;
+
     sendBufRead = (sendBufRead + 1) % SEND_BUFFER_CAP;
     sendBufCount--;
     return true;
@@ -448,13 +926,27 @@ void loadSystemConfig()
     strncpy(deviceSecret, val.c_str(), sizeof(deviceSecret) - 1);
     deviceSecret[sizeof(deviceSecret) - 1] = '\0';
 
-    tankHeightCm = prefs.getFloat("tank_height", TANK_HEIGHT_CM);
+    // Water-level calibration. Falls back to the compiled-in constants, so a
+    // board that has never opened the config portal still reports on a sane
+    // scale. A stored value that fails waterCalibrationSane() (typo in the
+    // portal, corrupted NVS) is discarded rather than trusted - a board stuck
+    // reporting NaN% is worse than one reporting the default span.
+    emptyDistanceCm = prefs.getFloat("empty_cm", WATER_EMPTY_CM);
+    fullDistanceCm = prefs.getFloat("full_cm", WATER_FULL_CM);
+    if (emptyDistanceCm <= 0.0f || fullDistanceCm <= 0.0f ||
+        emptyDistanceCm <= fullDistanceCm)
+    {
+        Serial.printf("[CONFIG] Stored water calibration (empty=%.2f full=%.2f) is unusable - reverting to defaults (%.1f / %.1f)\n",
+                      emptyDistanceCm, fullDistanceCm, WATER_EMPTY_CM, WATER_FULL_CM);
+        emptyDistanceCm = WATER_EMPTY_CM;
+        fullDistanceCm = WATER_FULL_CM;
+    }
 
     prefs.end();
     loadStaticIpConfig();
 
-    Serial.printf("[CONFIG] server=%s:%s device_id=%s tank_height=%.1f static_ip=%s\n",
-                  serverIP, serverPort, deviceId, tankHeightCm,
+    Serial.printf("[CONFIG] server=%s:%s device_id=%s water_empty=%.2fcm water_full=%.2fcm static_ip=%s\n",
+                  serverIP, serverPort, deviceId, emptyDistanceCm, fullDistanceCm,
                   staticIpConfigured ? "yes" : "no");
 }
 
@@ -466,7 +958,8 @@ void saveSystemConfig()
     prefs.putString("server_port", serverPort);
     prefs.putString("device_id", deviceId);
     prefs.putString("device_secret", deviceSecret);
-    prefs.putFloat("tank_height", tankHeightCm);
+    prefs.putFloat("empty_cm", emptyDistanceCm);
+    prefs.putFloat("full_cm", fullDistanceCm);
     prefs.end();
 }
 
@@ -764,83 +1257,124 @@ void readTemperature()
 // =============================================================================
 // READ WATER LEVEL
 // =============================================================================
+//
+// One ping per 1 Hz call, ONE filter, ONE formula:
+//
+//   ping -> float cm -> validity window -> median of the last 5 -> distanceCm
+//        -> levelPercentFromDistance() -> waterLevel
+//
+// The percentage and the empty-tank threshold both consume the SAME median. The
+// old code fed the percentage from an EMA + spike-rejection chain and the
+// threshold from a separate median, so the number on the dashboard and the
+// number the ACTION state machine judged could disagree.
+//
+// The EMA is gone: a median of 5 already rejects a single spurious echo (which
+// an EMA lets through by dragging toward it) and, unlike the EMA it also does
+// not lag a genuine level change by a time constant on top of the window.
+//
+// Every failure path calls invalidateWaterLevel(), which sets the sentinels to
+// -1. A failed sensor must never be reported as 0% or 100% - both of those are
+// real, actionable values.
 
 void readWaterLevel()
 {
     if (simulateDevice)
     {
-        // Virtual tank: random walk around ~75% within the 10-100% band.
+        // Virtual tank: random walk around ~75% within the 0-100% band.
         simLevel += ((int)esp_random() % 31 - 15) / 10.0f; // ~ +/-1.5%
-        simLevel = constrain(simLevel, 10.0f, 100.0f);
-        waterLevel = simLevel;
+        simLevel = constrain(simLevel, 0.0f, 100.0f);
+
+        // Drive the threshold from the simulated level too, so the state machine
+        // and ACTION A/B can be exercised with no sensor attached. The inverse
+        // mapping is levelDistanceFromPercent(), i.e. exactly the formula the
+        // real path runs, so simulation and hardware agree by construction.
+        //
+        // The sample MUST go through pushDistanceSample(): updateThresholdFromDistance()
+        // deliberately refuses to assert an action until the median window is
+        // full, so feeding it a raw distance here would leave distanceWindowCount
+        // at 0 forever and ACTION A/B would never fire in the simulator at all.
+        const float simMedianCm = pushDistanceSample(levelDistanceFromPercent(simLevel));
+        if (simMedianCm < 0.0f)
+        {
+            return;
+        }
+        consecutiveInvalidReads = 0;
+
+        publishWaterLevelFromMedian(simMedianCm);
+        updateThresholdFromDistance(simMedianCm, true);
         return;
     }
 
+    // A calibration that cannot produce a percentage makes every read invalid,
+    // but saying so once per second would flood the log. Checked here and cached.
+    static bool calibrationWarned = false;
+    if (!waterCalibrationSane())
+    {
+        invalidateWaterLevel("calibration invalid");
+        if (!calibrationWarned)
+        {
+            Serial.printf("[HC-SR04] Set WATER_EMPTY_CM / WATER_FULL_CM in firmware, or empty_cm / full_cm in the config portal.\n");
+            calibrationWarned = true;
+        }
+        return;
+    }
+    calibrationWarned = false;
+
+    // --- 1. Trigger pulse: LOW 2us -> HIGH 10us -> LOW (HC-SR04 datasheet) ----
+    // Not delay(): delayMicroseconds() is busy-wait but sub-millisecond, so it
+    // costs nothing measurable and the pulse width is actually honoured (the
+    // millis()-based scheduling below is what keeps the OTHER work non-blocking).
     digitalWrite(TRIG_PIN, LOW);
     delayMicroseconds(2);
     digitalWrite(TRIG_PIN, HIGH);
     delayMicroseconds(10);
     digitalWrite(TRIG_PIN, LOW);
 
-    long duration = pulseIn(ECHO_PIN, HIGH, 30000);
-
+    // --- 2. Echo, bounded. unsigned long matches pulseIn()'s return type -----
+    // A timeout returns 0. That means "no echo", NOT "zero distance" and NOT
+    // "empty tank" - it is the single most important distinction in this
+    // function, so it is checked first and reported as a failure.
+    const unsigned long duration = pulseIn(ECHO_PIN, HIGH, ECHO_TIMEOUT_US);
     if (duration == 0)
     {
-        filteredDistance = -1.0;
-        distance = -1.0;
-        waterLevel = -1.0;
+        invalidateWaterLevel("timeout / no echo");
         return;
     }
 
-    float rawDistance = duration * 0.0343 / 2.0;
-    static int spikeStreak = 0;
+    // --- 3. Distance in float centimetres (0.0343 cm/us, halved for the
+    // round trip). Integer math here would lose the sub-cm resolution that
+    // 0.1% of a 15.5 cm span depends on.
+    const float rawDistanceCm = (duration * 0.0343f) / 2.0f;
 
-    if (filteredDistance < 0.0)
+    // --- 4. Physical validity window, BEFORE any filtering. Below 2 cm the
+    // module cannot resolve; above 400 cm the echo is lost or the target is
+    // out of spec. Either way it is not a measurement.
+    if (rawDistanceCm < DISTANCE_MIN_VALID_CM || rawDistanceCm > DISTANCE_MAX_VALID_CM)
     {
-        filteredDistance = rawDistance;
-    }
-    else if (fabsf(rawDistance - filteredDistance) <= DISTANCE_JUMP_CM)
-    {
-        // Normal reading: ease the filtered distance toward it (smooths jitter).
-        spikeStreak = 0;
-        filteredDistance += (rawDistance - filteredDistance) * DISTANCE_EMA_ALPHA;
-    }
-    else
-    {
-        // Big jump: likely a spurious echo. Only accept if it repeats next read.
-        spikeStreak++;
-        if (spikeStreak >= 2)
-        {
-            filteredDistance = rawDistance;
-            spikeStreak = 0;
-        }
+        Serial.printf("[HC-SR04] Rejected %.1f cm (outside %.0f-%.0f cm)\n",
+                      rawDistanceCm,
+                      DISTANCE_MIN_VALID_CM,
+                      DISTANCE_MAX_VALID_CM);
+        invalidateWaterLevel("out of range");
+        return;
     }
 
-    distance = filteredDistance;
-
-    float waterHeight = tankHeightCm - distance;
-
-    if (waterHeight < 0)
+    // --- 5. Median of the last DISTANCE_MEDIAN_WINDOW valid samples ---------
+    // Works from the first sample onwards, so there is no multi-second dead
+    // window at boot where the board claims the sensor has failed.
+    const float medianCm = pushDistanceSample(rawDistanceCm);
+    if (medianCm < 0.0f)
     {
-        waterHeight = 0;
+        return;
     }
+    consecutiveInvalidReads = 0;
 
-    if (waterHeight > tankHeightCm)
-    {
-        waterHeight = tankHeightCm;
-    }
-
-    float level = (waterHeight / tankHeightCm) * 100.0;
-    level = constrain(level, 0.0, 100.0);
-
-    // Deadband: keep showing the last level until a real change of at least
-    // WATER_LEVEL_DEADBAND% happens, so the screen never jitters over noise.
-    if (lastShownLevel < 0.0 || fabsf(level - lastShownLevel) >= WATER_LEVEL_DEADBAND)
-    {
-        lastShownLevel = level;
-    }
-
-    waterLevel = lastShownLevel;
+    // --- 6 & 7. Publish the level, then judge the empty-tank threshold --------
+    // Both consume the SAME median, and publishWaterLevelFromMedian() applies the
+    // deadband, so the reported percentage and the ACTION state machine can never
+    // be looking at different numbers.
+    publishWaterLevelFromMedian(medianCm);
+    updateThresholdFromDistance(medianCm, false);
 }
 
 // =============================================================================
@@ -889,7 +1423,7 @@ void loadLastKnownValues()
     Preferences prefs;
     prefs.begin("safe", true);
     lastGoodTemperature = prefs.getFloat("temp", -127.0);
-    lastGoodWaterLevel = prefs.getFloat("water", 0.0);
+    lastGoodWaterLevel = prefs.getFloat("water", -1.0);
     lastGoodAmmonia = prefs.getFloat("ammonia", -1.0);
     prefs.end();
 }
@@ -1225,9 +1759,24 @@ void readAllSensors()
         Serial.println(" C");
     }
 
+    // Water level: distance AND percentage, as required for calibration. A
+    // failed sensor prints ERROR, never "-1.0 %" - the operator reading the
+    // serial monitor must not have to know that -1 is a sentinel.
     Serial.print("Water Level: ");
-    Serial.print(waterLevel, 1);
-    Serial.println(" %");
+    if (waterLevel < 0.0f)
+    {
+        Serial.print("ERROR");
+        Serial.print(" | Distance: ERROR");
+    }
+    else
+    {
+        Serial.print(waterLevel, 1);
+        Serial.print(" %");
+        Serial.print(" | Distance: ");
+        Serial.print(distance, 2);
+        Serial.print(" cm");
+    }
+    Serial.println();
 
     Serial.print("MQ-137 Raw ADC: ");
     Serial.print(mq137Raw);
@@ -1927,8 +2476,14 @@ void startWifiConfigPortal()
         DEVICE_ID_MAX_LEN
     );
 
-    char tankHeightText[10];
-    snprintf(tankHeightText, sizeof(tankHeightText), "%.1f", tankHeightCm);
+    // Two calibration fields, not one "tank height". The percentage is a
+    // projection between two measured distances, so both ends have to be
+    // configurable - and they are configurable from here (no reflash), which is
+    // what makes recalibrating a moved or re-mounted sensor practical.
+    char emptyDistText[12];
+    snprintf(emptyDistText, sizeof(emptyDistText), "%.2f", emptyDistanceCm);
+    char fullDistText[12];
+    snprintf(fullDistText, sizeof(fullDistText), "%.2f", fullDistanceCm);
 
     char staticIpText[20] = "";
     char staticGwText[20] = "";
@@ -1947,11 +2502,21 @@ void startWifiConfigPortal()
         100
     );
 
-    WiFiManagerParameter tankHeightParam(
-        "tank_height_cm",
-        "Tank Height (cm)",
-        tankHeightText,
-        9
+    // Label wording matters here: these are sensor-to-water-surface distances
+    // (an "air gap"), not the tank's wall height. That distinction is exactly
+    // what the old single "Tank Height (cm)" field got wrong.
+    WiFiManagerParameter emptyDistParam(
+        "empty_distance_cm",
+        "Empty water level: sensor-to-surface distance at minimum fill, cm (23.5)",
+        emptyDistText,
+        11
+    );
+
+    WiFiManagerParameter fullDistParam(
+        "full_distance_cm",
+        "Full water level: sensor-to-surface distance at maximum fill, cm (must be < empty)",
+        fullDistText,
+        11
     );
 
     WiFiManagerParameter staticIpParam(
@@ -1979,7 +2544,8 @@ void startWifiConfigPortal()
     wm.addParameter(&serverPortParam);
     wm.addParameter(&deviceIdParam);
     wm.addParameter(&deviceSecretParam);
-    wm.addParameter(&tankHeightParam);
+    wm.addParameter(&emptyDistParam);
+    wm.addParameter(&fullDistParam);
     wm.addParameter(&staticIpParam);
     wm.addParameter(&staticGwParam);
     wm.addParameter(&staticMaskParam);
@@ -2028,10 +2594,24 @@ void startWifiConfigPortal()
         String previousDeviceId = deviceId;
         applyDeviceIdCandidate(deviceIdParam.getValue(), previousDeviceId.c_str());
 
-        tankHeightCm = atof(tankHeightParam.getValue());
-        if (tankHeightCm < 5.0 || tankHeightCm > 200.0)
+        // Calibration is validated as a PAIR, not field by field. Individually
+        // plausible numbers that make a negative span (full > empty) would divide
+        // by a negative and report an inverted percentage, so an unusable
+        // entry falls back to the firmware defaults with a message rather than
+        // being half-applied.
+        const float newEmpty = atof(emptyDistParam.getValue());
+        const float newFull = atof(fullDistParam.getValue());
+        if (newEmpty > newFull && newFull >= DISTANCE_MIN_VALID_CM && newEmpty <= DISTANCE_MAX_VALID_CM)
         {
-            tankHeightCm = TANK_HEIGHT_CM;
+            emptyDistanceCm = newEmpty;
+            fullDistanceCm = newFull;
+            Serial.printf("[CONFIG] Water calibration set: empty=%.2f cm, full=%.2f cm (usable depth %.2f cm)\n",
+                          emptyDistanceCm, fullDistanceCm, emptyDistanceCm - fullDistanceCm);
+        }
+        else
+        {
+            Serial.printf("[CONFIG] REJECTED water calibration (empty=%.2f cm, full=%.2f cm): empty must be > full, and full must be >= %.0f cm. Keeping %.2f / %.2f.\n",
+                          newEmpty, newFull, DISTANCE_MIN_VALID_CM, emptyDistanceCm, fullDistanceCm);
         }
 
         const bool hasStaticFields =
@@ -2122,7 +2702,14 @@ String buildStatusJson()
     json += "\"wifi_rssi\":" + String(WiFi.RSSI()) + ",";
     json += "\"free_heap\":" + String(ESP.getFreeHeap()) + ",";
     json += "\"temperature\":" + String((temperature == -127.0) ? -1.0 : temperature, 2) + ",";
+    // -1 on a failed sensor, matching the POST /sensor wire sentinels. The raw
+    // distance and the calibration this board is running are published alongside
+    // it so the server (and the health poller) can tell "empty tank" apart from
+    // "board calibrated for a different tank".
     json += "\"water_level\":" + String(waterLevel, 1) + ",";
+    json += "\"water_distance_cm\":" + String(distance, 2) + ",";
+    json += "\"water_empty_cm\":" + String(emptyDistanceCm, 2) + ",";
+    json += "\"water_full_cm\":" + String(fullDistanceCm, 2) + ",";
     json += "\"ammonia\":" + String(ammoniaReady ? ammoniaPpm : -1.0, 3);
     json += "}";
     return json;
@@ -2177,7 +2764,14 @@ void stopStatusServer()
 
 // One POST attempt for a single reading; returns the HTTP response code
 // (>0 success, otherwise a negative/timeout indicator).
-int postReading(const String &url, float tempToSend, float levelToSend, float ammoniaToSend)
+//
+// Sends BOTH water_level (percent) and water_distance_cm (raw air-gap distance).
+// The percent alone is not enough: it is a lossy projection of the distance, so
+// once it is stored the calibration cannot be re-derived. Sending both lets the
+// server re-calibrate EMPTY_CM / FULL_CM from history without reflashing the
+// board, and lets it cross-check our arithmetic (see the server's
+// WATER_LEVEL_MISMATCH_PCT flag).
+int postReading(const String &url, float tempToSend, float levelToSend, float ammoniaToSend, float distanceToSend)
 {
     HTTPClient http;
     http.begin(url);
@@ -2189,10 +2783,14 @@ int postReading(const String &url, float tempToSend, float levelToSend, float am
         http.addHeader("X-Device-Secret", deviceSecret);
     }
 
+    // -1 is the failed-sensor sentinel on BOTH water fields, and the server
+    // turns it into SQL NULL. It is never 0: a real empty tank is 0%, so 0 is a
+    // value the server must store, not discard.
     String payload = "{";
     payload += "\"device_id\":\"" + String(deviceId) + "\",";
     payload += "\"temperature\":" + String(tempToSend, 2) + ",";
     payload += "\"water_level\":" + String(levelToSend, 1) + ",";
+    payload += "\"water_distance_cm\":" + String(distanceToSend, 2) + ",";
     payload += "\"ammonia\":" + String(ammoniaToSend, 3);
     payload += "}";
 
@@ -2239,6 +2837,19 @@ int postReading(const String &url, float tempToSend, float levelToSend, float am
                 Serial.printf("[HTTP] Our current device ID: '%s'\n", deviceId);
             }
         }
+        // The server clamps water_level to 0-100 and echoes back anything it had
+        // to correct. Printing it means a calibration problem surfaces on the
+        // bench instead of only as a subtly wrong chart.
+        if (body.indexOf("\"water_level_clamped\"") >= 0)
+        {
+            Serial.println("[HTTP] Server corrected water_level (was outside 0-100). Check EMPTY_CM / FULL_CM calibration.");
+        }
+        if (body.indexOf("\"water_level_mismatch\"") >= 0)
+        {
+            Serial.println("[HTTP] Server's water_level differs from ours - its stored calibration for this");
+            Serial.println("[HTTP] tank disagrees with this board's. Empty/Full cm are set per-tank on the");
+            Serial.println("[HTTP] dashboard, or in this board's config portal.");
+        }
     }
     http.end();
     return code;
@@ -2249,6 +2860,9 @@ void sendSensorData()
     float tempToSend = (temperature == -127.0) ? -1.0 : temperature;
     float levelToSend = waterLevel;
     float ammoniaToSend = ammoniaReady ? ammoniaPpm : -1.0;
+    // Raw distance rides along so the backend can re-derive the percentage from
+    // a corrected calibration without ever reflashing this board.
+    float distanceToSend = distance;
 
     if (WiFi.status() != WL_CONNECTED)
     {
@@ -2256,7 +2870,7 @@ void sendSensorData()
 
         // Buffer the reading so a WiFi outage never loses samples; the buffer
         // is flushed oldest-first once the link and server are reachable.
-        sendBufPush(tempToSend, levelToSend, ammoniaToSend);
+        sendBufPush(tempToSend, levelToSend, ammoniaToSend, distanceToSend);
 
         // Exponential-backoff reconnection: 1s, 2s, 4s, ... capped at 5 min.
         // Avoids hammering the AP while coverage/power is down and gives the
@@ -2302,13 +2916,18 @@ void sendSensorData()
         int flushed = 0;
         while (sendBufCount > 0 && flushed < 10)
         {
-            BufferedReading r;
-            if (!sendBufPop(r))
+            // Plain floats, not a BufferedReading local: see the note on
+            // sendBufPop() about arduino-builder's prototype generator.
+            float bufferedTemp;
+            float bufferedLevel;
+            float bufferedAmmonia;
+            float bufferedDistance;
+            if (!sendBufPop(bufferedTemp, bufferedLevel, bufferedAmmonia, bufferedDistance))
             {
                 break;
             }
 
-            int code = postReading(baseUrl, r.temp, r.level, r.ammonia);
+            int code = postReading(baseUrl, bufferedTemp, bufferedLevel, bufferedAmmonia, bufferedDistance);
             if (code >= 200 && code < 300)
             {
                 flushed++;
@@ -2336,7 +2955,7 @@ void sendSensorData()
         }
     }
 
-    int httpResponseCode = postReading(baseUrl, tempToSend, levelToSend, ammoniaToSend);
+    int httpResponseCode = postReading(baseUrl, tempToSend, levelToSend, ammoniaToSend, distanceToSend);
 
     if (httpResponseCode >= 200 && httpResponseCode < 300)
     {
@@ -2362,7 +2981,7 @@ void sendSensorData()
         // Leave wifiConnected alone: clearing it here made the header dot blink
         // red and /status report "offline" on a perfectly healthy link. The
         // re-queue below is the actual retry mechanism.
-        sendBufPush(tempToSend, levelToSend, ammoniaToSend);
+        sendBufPush(tempToSend, levelToSend, ammoniaToSend, distanceToSend);
     }
 }
 

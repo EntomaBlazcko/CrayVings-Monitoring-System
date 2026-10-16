@@ -68,6 +68,7 @@ import {
   fetchSmsMuteStatus,
   fetchSmsLogs,
   fetchSmsHealth,
+  resetSmsBreaker,
 } from "../api/client";
 import type { UserEntry, SmsRecipient, MuteStatus, SmsLogEntry, SmsHealth } from "../api/client";
 
@@ -898,6 +899,23 @@ export default function SettingsPage() {
     }
   }, []);
 
+  // Admin pokes the breaker back to CLOSED once the gateway is known healthy
+  // again. Without this a recovered phone can leave the circuit OPEN (and every
+  // send failing as "0/N") until a real alert fires a HALF_OPEN probe.
+  const [breakerResetting, setBreakerResetting] = useState(false);
+  const resetSmsBreakerBtn = useCallback(async () => {
+    setBreakerResetting(true);
+    try {
+      await resetSmsBreaker();
+      showToast("SMS circuit reset — next send will probe HTTPSMS", "success");
+    } catch {
+      showToast("Failed to reset SMS circuit", "error");
+    } finally {
+      setBreakerResetting(false);
+      await refreshSmsHealth();
+    }
+  }, [refreshSmsHealth, showToast]);
+
   const loadSmsLogs = useCallback(
     async (page: number, status: string) => {
       setSmsLogsLoading(true);
@@ -1147,7 +1165,13 @@ export default function SettingsPage() {
     setSmsActionLoading("status");
     try {
       const { sent, total } = await sendStatusSms();
-      showToast(`Status SMS sent to ${sent}/${total} recipient(s)`, "success");
+      // "0/N" means the circuit breaker (or cap) swallowed every send — that is
+      // a failure the operator needs to see, not a green success toast.
+      if (sent === 0) {
+        showToast(`SMS not sent (${sent}/${total} recipient(s)) — check breaker state / SMS logs`, "error");
+      } else {
+        showToast(`Status SMS sent to ${sent}/${total} recipient(s)`, "success");
+      }
       void refreshSmsHealth();
     } catch (err: unknown) {
       showToast(getApiError(err), "error");
@@ -2036,7 +2060,21 @@ export default function SettingsPage() {
                   {smsHealth.circuitBreaker.state === "OPEN" && smsHealth.circuitBreaker.cooldownUntil
                     ? " until the cooldown expires and a probe succeeds"
                     : ""}.
+                  {smsHealth.circuitBreaker.lastError && (
+                    <span className="block mt-0.5 text-xs text-red-500 break-words">
+                      Last error: {smsHealth.circuitBreaker.lastError}
+                    </span>
+                  )}
                 </span>
+                <button
+                  type="button"
+                  onClick={resetSmsBreakerBtn}
+                  disabled={breakerResetting}
+                  className="ml-auto shrink-0 inline-flex items-center gap-1 px-2.5 py-1 rounded-md bg-red-600 text-white text-xs font-bold hover:bg-red-700 disabled:opacity-50 transition"
+                >
+                  <RefreshCw size={12} className={breakerResetting ? "animate-spin" : ""} />
+                  Reset
+                </button>
               </div>
             )}
 
