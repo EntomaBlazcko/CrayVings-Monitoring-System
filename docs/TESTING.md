@@ -60,7 +60,7 @@ Two other things worth knowing:
 - `POST /sensor` uses the **device** secret, not a user session: header
   `X-Device-Secret`. It is only required if `DEVICE_SECRET` is set in `.env`;
   otherwise any registered `device_id` may post.
-- Repeated failed logins trip a rate limiter at **5 attempts per IP per 15 min**.
+- Repeated failed logins trip a rate limiter at **5 failed attempts per IP per 15 min** (correct logins are not counted).
   If a login returns `429`, wait out the window — that is not a regression.
 
 ---
@@ -386,6 +386,37 @@ npm run mock -- --profile healthy --log logs/mock-run.jsonl
   walk), `drift` (slow trend), `bounds` (physical limits), `ramp` (a scripted
   move to a target), `fail` (a probe dying) or `stopAfterCycle` (a simulated
   disconnect).
+
+### 2.10 Backdated history (demo seeding + alert backfill)
+
+The mock only writes from `now` forward, which is useless for demoing a tank
+whose data is all in the past. Two tools cover that; both talk to the database
+directly and need no server:
+
+- `node tools/seed-esp32-01-historical.cjs` — inserts one August-2026 reading
+  every 5 min for `ESP32_01` (8,928 rows) with a daily swing and four ammonia
+  spike windows. Add-only: it aborts if the window already holds rows, so clear
+  it first — `DELETE FROM sensors WHERE device_id='ESP32_01' AND timestamp >=
+  '2026-08-01T00:00:00Z' AND timestamp <= '2026-08-31T23:59:59Z';`
+- `node tools/backfill-esp32-01-alerts.cjs` — replays the server's
+  `getThresholdStatus()` plus 120 s cooldown over those readings and writes the
+  matching `system_logs` rows (`--replace` clears its own output first).
+
+After seeding, use Historical Data's **Custom** From/To range to view August.
+Preset windows (1h/24h/1 Week) anchor to the newest reading, so they show the
+tank's last available data rather than an empty "now" window — the report and
+PDF use the same window as the charts.
+
+**Both need retention off.** The seeder needs `SENSOR_RETENTION_DAYS=0` and the
+backfill needs `SYSTEM_LOGS_RETENTION_DAYS=0`; backdated rows are older than the
+default 30-day windows and would be purged on the next backend start. Each
+script aborts with the reason when its window is active.
+
+**Why the backfill exists:** alerts are only ever logged inside `POST /sensor`
+(`server.cjs:1857`). Readings inserted straight into `sensors` show up as charts
+and as the dashboard's client-side Safe/Warning/Critical badges, but contribute
+nothing to the Alerts page or a report's Alert Summary — so without the backfill
+a month of seemingly critical readings reports zero alerts.
 
 ---
 
@@ -1110,10 +1141,10 @@ afterwards.
 | `npm test` | no | no | Threshold / severity logic (pure functions) |
 | `npm run test:poller` | no | no | Device poller batching, backoff, `device_id` echo guard (34 checks) |
 | `npm run test:migration` | no | **yes** | Migrations against a temp schema |
-| `npm run test:regression` | **yes** | yes | End-to-end ingest → alert → history |
+| `npm run test:regression` | **yes** | yes | End-to-end ingest → alert → history, including `from`/`to` windows and report anchoring |
 | `npm run test:devices` | **yes** | yes | Device registry, RBAC, secrets, archive/restore (104 checks) |
-| `npm run test:secrets` | **yes** | yes | Device-secret auth paths |
-| `npm run test:sessions` | **yes** | yes | Login, cookie session, revocation (59 checks) |
+| `npm run test:secrets` | **yes** | yes | Device-secret auth paths (65 checks) |
+| `npm run test:sessions` | **yes** | yes | Login by username or email, cookie session, revocation (60 checks) |
 
 ### The one command that runs most of them
 
@@ -1176,6 +1207,8 @@ actually true:
 |---|---|
 | `scripts/mock-device.js` | The CLI. Argument parsing, value engine, HTTP posting, logging, shutdown |
 | `scripts/mock-device.config.js` | The scenario profiles. Edit this to add your own — plain data, no code |
+| `tools/seed-esp32-01-historical.cjs` | Backdated demo readings (see 2.10); needs `SENSOR_RETENTION_DAYS=0` |
+| `tools/backfill-esp32-01-alerts.cjs` | Replays thresholds into `system_logs` so history and alerts agree; needs `SYSTEM_LOGS_RETENTION_DAYS=0` |
 | `services/devicePoller.cjs` | `MAX_CONCURRENCY`, `FAILURE_THRESHOLD`, the `ip_address IS NOT NULL` filter |
 | `db/migrations/007_multi_device.cjs` | The multi-tank migration this part verifies |
 | `src/pages/DevicesPage.tsx` | Add Device form, provenance badges, `OnlineDot` |

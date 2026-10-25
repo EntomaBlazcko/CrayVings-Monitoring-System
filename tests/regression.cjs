@@ -88,6 +88,29 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   check("GET /report/weekly?device_id scoped", wS.status === 200 && wS.body.summary.total_readings <= wA.body.summary.total_readings, `${wS.body.summary.total_readings} vs ${wA.body.summary.total_readings}`);
   const rS = await api("get", "/report/range?hours=24&device_id=ESP32_01");
   check("GET /report/range?device_id scoped", rS.status === 200);
+
+  // Explicit from/to bounds - what the dashboard's date picker sends. The window
+  // is echoed back so a caller can prove the report covers the requested span,
+  // and a reversed or malformed pair is a 400 rather than a silently widened one.
+  const dayStart = "2026-08-24T16:00:00Z"; // = Aug 25 00:00 farm (+08)
+  const noonSameDay = "2026-08-25T04:00:00Z"; // = Aug 25 12:00 farm (12h span)
+  const weekEnd = "2026-08-31T16:00:00Z"; // = Sep 1 00:00 farm (+08)
+  r = await api("get", `/report/range?device_id=ESP32_01&from=${dayStart}&to=${weekEnd}`);
+  check(
+    "GET /report/range?from&to echoes the window (day buckets)",
+    r.status === 200 && r.body.bucket === "day" &&
+      r.body.period.start === new Date(dayStart).toISOString() &&
+      r.body.period.end === new Date(weekEnd).toISOString(),
+    `${r.body.period?.start} -> ${r.body.period?.end} (${r.body.bucket})`
+  );
+  r = await api("get", `/report/range?device_id=ESP32_01&from=${dayStart}&to=${noonSameDay}`);
+  check("GET /report/range?from&to <= 24h buckets hourly", r.status === 200 && r.body.bucket === "hour", `${r.body.bucket}`);
+  r = await api("get", `/report/range?device_id=ESP32_01&to=${weekEnd}`);
+  check("GET /report/range?to only = all time up to it", r.status === 200 && r.body.period.end === new Date(weekEnd).toISOString());
+  r = await api("get", `/report/range?device_id=ESP32_01&from=${weekEnd}&to=${dayStart}`);
+  check("GET /report/range reversed range -> 400", r.status === 400, `status=${r.status}`);
+  r = await api("get", `/report/range?device_id=ESP32_01&from=nonsense&to=${weekEnd}`);
+  check("GET /report/range malformed from -> 400", r.status === 400, `status=${r.status}`);
   const dS = await api("get", "/analytics/daily?days=7&device_id=ESP32_01");
   const dA = await api("get", "/analytics/daily?days=7");
   const sumRead = (d) => d.body.daily.reduce((a, b) => a + b.readings, 0);

@@ -56,7 +56,7 @@ function TankDropdown() {
 export default function Header({ user, onLogout }: HeaderProps) {
   const roleLabel = user.owner ? "owner" : user.role;
   return (
-    <div className="sticky top-0 z-50 h-16 bg-gradient-to-r from-brand-500 to-brand-400 text-white flex items-center justify-between px-5 shadow-raised">
+    <div className="shrink-0 h-16 bg-gradient-to-r from-brand-500 to-brand-400 text-white flex items-center justify-between px-5 shadow-raised">
       <div>
         <div className="text-xl font-extrabold">CRAYvings Monitoring System</div>
         <div className="text-xs opacity-90">Smart aquaculture monitoring dashboard</div>

@@ -175,7 +175,7 @@ function DashboardLayout() {
   if (!user) return null;
 
   return (
-    <div className="flex min-h-screen bg-gray-100 font-sans">
+    <div className="flex h-dvh overflow-hidden bg-gray-100 font-sans">
       <button
         onClick={() => setSidebarOpen(!sidebarOpen)}
         className="fixed top-4 left-4 z-50 h-11 w-11 flex items-center justify-center bg-white rounded-lg shadow-lg md:hidden"
@@ -193,7 +193,7 @@ function DashboardLayout() {
       )}
 
       <div
-        className={`fixed md:static inset-y-0 left-0 z-50 w-24 bg-surface-sunken border-r border-surface-sunken-border min-h-screen flex flex-col items-center pt-4 transform transition-transform duration-300 ${
+        className={`fixed md:static inset-y-0 left-0 z-50 w-24 shrink-0 bg-surface-sunken border-r border-surface-sunken-border h-full overflow-y-auto flex flex-col items-center pt-4 transform transition-transform duration-300 ${
           sidebarOpen ? "translate-x-0" : "-translate-x-full md:translate-x-0"
         }`}
       >
@@ -236,13 +236,13 @@ function DashboardLayout() {
         </div>
       </div>
 
-      <div className="flex-1 flex flex-col w-full md:w-auto">
+      <div className="flex-1 flex flex-col min-w-0 h-full">
         <Header user={user} onLogout={() => {
           logActivity("logout", `${user.name} logged out`, "Auth");
           logout();
         }} />
 
-        <div className="p-3 md:p-5">
+        <div className="flex-1 overflow-y-auto p-3 md:p-5">
           <CriticalAlarmBanner onGoToAlerts={() => handleNavigate("Alerts")} />
 
           <div className="text-xl md:text-2xl font-extrabold text-gray-800 mb-4 mt-10 md:mt-0">

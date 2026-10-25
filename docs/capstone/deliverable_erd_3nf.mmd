@@ -1,0 +1,178 @@
+erDiagram
+    devices {
+        varchar device_id PK
+        varchar name
+        bool is_active
+        timestamptz created_at
+        timestamptz last_seen
+        text ip_address
+        varchar tank_name
+        varchar tank_location
+        timestamptz last_health_seen
+        varchar device_secret
+        timestamptz archived_at
+        varchar archived_by
+        varchar registered_via
+        varchar ip_source
+        timestamptz device_secret_rotated_at
+        varchar device_secret_prev
+        timestamptz device_secret_prev_expires_at
+    }
+    sensors {
+        int id PK
+        varchar device_id FK
+        numeric temperature
+        numeric water_level
+        numeric ammonia
+        timestamptz timestamp
+        numeric water_distance_cm
+    }
+    last_alerts {
+        varchar device_id PK, FK
+        varchar sensor_key PK
+        varchar status
+        numeric value
+        timestamptz timestamp
+    }
+    sensor_settings {
+        int id PK
+        numeric temp_min
+        numeric temp_max
+        numeric water_level_min
+        numeric water_level_max
+        numeric ammonia_min
+        numeric ammonia_max
+        timestamptz updated_at
+    }
+    device_threshold_overrides {
+        varchar device_id PK, FK
+        numeric temp_min
+        numeric temp_max
+        numeric water_level_min
+        numeric water_level_max
+        numeric ammonia_min
+        numeric ammonia_max
+        timestamptz updated_at
+    }
+    sensor_calibration {
+        varchar device_id PK, FK
+        numeric empty_cm
+        numeric full_cm
+        timestamptz updated_at
+        varchar updated_by
+    }
+    users {
+        int id PK
+        varchar name
+        varchar username UK
+        varchar email UK
+        text password_hash
+        varchar role
+        varchar token
+        timestamptz created_at
+        timestamptz updated_at
+        timestamptz token_expires_at
+        varchar status
+        timestamptz deleted_at
+        timestamptz pending_deletion_at
+        varchar pending_deletion_requested_by
+    }
+    activity_logs {
+        int id PK
+        varchar user_name
+        varchar action_type
+        text description
+        varchar module
+        timestamptz timestamp
+        int user_id FK
+    }
+    user_deletion_requests {
+        int id PK
+        int user_id FK
+        varchar user_username
+        varchar requester_username
+        varchar requester_email
+        varchar status
+        text reason
+        varchar otp_hash
+        varchar otp_salt
+        timestamptz otp_expires_at
+        int otp_attempts
+        timestamptz otp_verified_at
+        varchar otp_verified_by
+        timestamptz requested_at
+        varchar approver
+        timestamptz approved_at
+        varchar executed_by
+        timestamptz executed_at
+    }
+    user_deletion_request_status_history {
+        int id PK
+        int request_id FK
+        varchar status
+        timestamptz recorded_at
+        varchar recorded_by
+    }
+    email_otps {
+        int id PK
+        varchar email
+        varchar code_hash
+        varchar code_salt
+        timestamptz expires_at
+        int attempts
+        int max_attempts
+        timestamptz used_at
+        timestamptz created_at
+    }
+    sms_logs {
+        int id PK
+        varchar recipient_phone
+        text message
+        varchar status
+        text error_message
+        varchar sms_id
+        timestamptz sent_at
+        timestamptz delivered_at
+        text failure_reason
+    }
+    authorized_recipients {
+        int id PK
+        varchar phone_number UK
+        varchar name
+        bool is_active
+        timestamptz created_at
+        timestamptz updated_at
+        timestamptz archived_at
+    }
+    system_logs {
+        int id PK
+        varchar action
+        varchar parameter
+        varchar old_value
+        varchar new_value
+        timestamptz timestamp
+        varchar ack_status
+        timestamptz acknowledged_at
+        varchar acknowledged_by
+        varchar device_id FK
+    }
+    system_state {
+        varchar key PK
+        text value
+    }
+    schema_migrations {
+        varchar version PK
+        varchar name
+        timestamptz applied_at
+        varchar checksum
+    }
+
+    devices ||--o{ sensors : "receives readings from"
+    devices ||--o{ last_alerts : "holds current alert state for"
+    devices ||--o| device_threshold_overrides : "may have threshold override"
+    devices ||--o| sensor_calibration : "may have calibration row"
+    devices |o--o{ system_logs : "is attributed in"
+    users |o--o{ activity_logs : "is audited in"
+    users ||--o{ user_deletion_requests : "is subject of"
+    user_deletion_requests ||--|{ user_deletion_request_status_history : "transitions through"
+    authorized_recipients ||..o{ sms_logs : "phone matched at insert by trigger (no FK)"

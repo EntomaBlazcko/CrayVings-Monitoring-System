@@ -21,11 +21,11 @@ import TankSelector from "../components/TankSelector";
 import { useSensors } from "../hooks/useSensors";
 import { useAuth } from "../contexts/useAuth";
 import { fmtStat } from "../utils/text";
-import { fetchSensorHistory, fetchWeeklyReport, fetchRangeReport } from "../api/client";
+import { fetchSensorHistory, fetchSensorHistoryWindow, fetchRangeReport } from "../api/client";
 import { isAxiosError } from "axios";
 import { getSettingsThresholds, getThresholdStatus, type ThresholdStatus } from "../types";
 import type { ChartPoint, WeeklyReport } from "../types";
-import { formatFarmTime, formatFarmDate, formatFarmDateTime } from "../utils/time";
+import { formatFarmTime, formatFarmDate, formatFarmDateTime, farmDateToStart, farmDateToEndExclusive, farmDateInputValue } from "../utils/time";
 import { SENSOR_COLORS, BAND_COLORS, hexToRgb } from "../utils/tokens";
 import {
   PDF,
@@ -48,8 +48,30 @@ function isAbortError(err: unknown): boolean {
   return isAxiosError(err) && (err.code === "ERR_CANCELED" || err.name === "CanceledError");
 }
 
-type TimeRange = "1h" | "6h" | "24h" | "1w" | "all";
+type TimeRange = "1h" | "6h" | "24h" | "1w" | "all" | "custom";
 type SensorKey = "temperature" | "water_level" | "ammonia";
+
+// Preset windows are fixed lengths; "custom" is deliberately not a key because
+// its bounds come from the date picker, not a length. Keeping it out of the map
+// makes RANGE_WINDOW_MS[range] type-safe once "custom" has been excluded.
+type PresetRange = Exclude<TimeRange, "custom">;
+
+const HOUR_MS = 60 * 60 * 1000;
+const DAY_MS = 24 * HOUR_MS;
+
+// Window length per preset; null = "everything up to the anchor" (All Time).
+const RANGE_WINDOW_MS: Record<PresetRange, number | null> = {
+  "1h": HOUR_MS,
+  "6h": 6 * HOUR_MS,
+  "24h": DAY_MS,
+  "1w": 7 * DAY_MS,
+  all: null,
+};
+
+// Safety cap on rows returned in a window, not a paging mechanism: ?from/?to
+// bounds the result, so this only stops pathological data. Must not exceed
+// MAX_SENSOR_HISTORY_ROWS in server.cjs or the server silently truncates.
+const HISTORY_FETCH_LIMIT = 20000;
 
 const SENSOR_KEYS: SensorKey[] = ["temperature", "water_level", "ammonia"];
 
@@ -108,6 +130,16 @@ function decimate(data: ChartPoint[], maxPoints: number): ChartPoint[] {
   for (let i = 0; i < data.length; i += step) sampled.push(data[i]);
   if (sampled[sampled.length - 1] !== data[data.length - 1]) sampled.push(data[data.length - 1]);
   return sampled;
+}
+
+// Report bucket labels are farm wall-clock time with no offset attached
+// ("2026-08-25T08:00" for an hourly bucket, "2026-08-25" for a daily one). Pin
+// the +08:00 the farm runs on, otherwise an hour label is parsed in the viewer's
+// own timezone and can render hours off. Plain dates are safe as-is: a date-only
+// ISO string is always parsed as UTC midnight, the same calendar day once the
+// farm's +08:00 is applied.
+function bucketInstant(label: string): string {
+  return /T\d{2}:\d{2}$/.test(label) ? `${label}:00+08:00` : label;
 }
 
 // Trailing moving average per point (window of the last N valid values).
@@ -194,12 +226,19 @@ export default function HistoricalDataPage() {
   const [dynamicHistory, setDynamicHistory] = useState<ChartPoint[]>([]);
   const [dynamicLoading, setDynamicLoading] = useState(false);
   const [historyFetchError, setHistoryFetchError] = useState<string | null>(null);
-  const [weeklyReport, setWeeklyReport] = useState<WeeklyReport | null>(null);
-  const [weeklyReportLoading, setWeeklyReportLoading] = useState(false);
-  const [weeklyReportError, setWeeklyReportError] = useState<string | null>(null);
-  const [weeklyRetry, setWeeklyRetry] = useState(0);
+  const [rangeReport, setRangeReport] = useState<WeeklyReport | null>(null);
+  const [rangeReportLoading, setRangeReportLoading] = useState(false);
+  const [rangeReportError, setRangeReportError] = useState<string | null>(null);
+  const [rangeRetry, setRangeRetry] = useState(0);
   const [historyRetry, setHistoryRetry] = useState(0);
   const [exportingPdf, setExportingPdf] = useState(false);
+
+  // Custom-range draft (what the two date inputs currently hold, as farm dates)
+  // and the committed window. Kept apart so typing a half-finished date never
+  // fires a fetch: nothing is queried until the user presses Apply.
+  const [customFrom, setCustomFrom] = useState("");
+  const [customTo, setCustomTo] = useState("");
+  const [appliedCustom, setAppliedCustom] = useState<{ from: string; to: string } | null>(null);
 
   const timeRanges: { value: TimeRange; label: string }[] = [
     { value: "1h", label: "1 Hour" },
@@ -207,25 +246,43 @@ export default function HistoricalDataPage() {
     { value: "24h", label: "24 Hours" },
     { value: "1w", label: "1 Week" },
     { value: "all", label: "All Time" },
+    { value: "custom", label: "Custom" },
   ];
-
-  const getLimitForRange = (range: TimeRange): number => {
-    switch (range) {
-      case "1h": return 60;
-      case "6h": return 360;
-      case "24h": return 1440;
-      case "1w": return 2000;
-      case "all": return 1000;
-    }
-  };
 
   // Always fetches from server (DB), so it works offline. Provider history is only seed.
   // Scoped to the currently selected tank so each chart reflects one device.
+  //
+  // Two requests on purpose: the first finds the newest reading (the anchor, not
+  // the wall clock - see dataAnchorMs below), the second pulls exactly that
+  // range's window. Asking for "newest N rows" instead meant a week of 5-minute
+  // readings (2016 rows) was cut off at 1000, so 1 Week/All Time only ever drew
+  // the last ~3.5 days.
   const fetchDynamicData = useCallback(async (range: TimeRange, signal: AbortSignal) => {
-    const limit = getLimitForRange(range);
-    const data = await fetchSensorHistory(limit, selectedDeviceId, signal);
-    return data;
-  }, [selectedDeviceId]);
+    // A custom range names both bounds already, so skip the anchor probe and ask
+    // for exactly the chosen days. /sensor's ?to is inclusive while the window
+    // is [start, end), so send one ms below the exclusive end.
+    if (range === "custom") {
+      const start = farmDateToStart(appliedCustom?.from);
+      const end = farmDateToEndExclusive(appliedCustom?.to);
+      if (!start || !end) return [];
+      return fetchSensorHistoryWindow(
+        selectedDeviceId,
+        start.toISOString(),
+        new Date(end.getTime() - 1).toISOString(),
+        HISTORY_FETCH_LIMIT,
+        signal,
+      );
+    }
+
+    const anchorRows = await fetchSensorHistory(1, selectedDeviceId, signal);
+    const newest = anchorRows.length > 0
+      ? new Date(anchorRows[anchorRows.length - 1].timestamp).getTime()
+      : Date.now();
+    const windowMs = RANGE_WINDOW_MS[range];
+    const fromIso = windowMs === null ? null : new Date(newest - windowMs).toISOString();
+    const toIso = new Date(newest).toISOString();
+    return fetchSensorHistoryWindow(selectedDeviceId, fromIso, toIso, HISTORY_FETCH_LIMIT, signal);
+  }, [selectedDeviceId, appliedCustom]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -250,79 +307,173 @@ export default function HistoricalDataPage() {
     };
   }, [timeRange, fetchDynamicData, historyRetry]);
 
+  const activeHistory = dynamicHistory.length > 0 ? dynamicHistory : history;
+  const activeLoading = dynamicLoading || loading;
+
+  // Anchor for every "last N" window on this page: the newest reading we
+  // actually have, not the wall clock. A tank that stopped reporting weeks ago
+  // still has a usable "1 Week"/"24 Hours" window - its final week - instead of
+  // every range computing against now and coming back empty.
+  //
+  // Deliberately NOT lastUpdate: the provider derives that from recv_at, i.e.
+  // devices.last_seen (when the server last heard from the board), which can be
+  // far newer than the stored reading. ESP32_01's last_seen was Oct 16 while its
+  // newest row was Sep 1, so including it pushed the window into an empty week
+  // and every chart/PDF came back blank.
+  const dataAnchorMs = useMemo(() => {
+    let newest = 0;
+    for (const p of activeHistory) {
+      const t = p.timestamp ? new Date(p.timestamp).getTime() : 0;
+      if (t > newest) newest = t;
+    }
+    return newest > 0 ? newest : Date.now();
+  }, [activeHistory]);
+
+  // Window end used by the presets, quantized to the hour. dataAnchorMs advances
+  // with every live reading and the report endpoint is a multi-query round trip,
+  // so quantizing caps that refetch at once an hour. Ceil (not floor) guarantees
+  // the window never ends before the newest point, so the report and the PDF can
+  // never be missing the tail of what the chart shows.
+  const reportEndMs = useMemo(
+    () => Math.ceil(dataAnchorMs / HOUR_MS) * HOUR_MS,
+    [dataAnchorMs],
+  );
+
+  // The one window every part of this page agrees on, as [startMs, endMs):
+  //   preset   -> a fixed length ending at the hour the newest reading falls in
+  //   All Time -> open start (null), same end
+  //   custom   -> the two farm days the user picked; the end is the next
+  //               midnight, so the final day is included without a 23:59:59 fudge
+  // A null result means the custom dates are not (yet) a valid range, which
+  // renders the empty state instead of silently guessing a window.
+  const rangeWindow = useMemo<{ startMs: number | null; endMs: number } | null>(() => {
+    if (timeRange === "custom") {
+      const start = farmDateToStart(appliedCustom?.from);
+      const end = farmDateToEndExclusive(appliedCustom?.to);
+      if (!start || !end || start.getTime() >= end.getTime()) return null;
+      return { startMs: start.getTime(), endMs: end.getTime() };
+    }
+    const windowMs = RANGE_WINDOW_MS[timeRange];
+    return {
+      startMs: windowMs === null ? null : reportEndMs - windowMs,
+      endMs: reportEndMs,
+    };
+  }, [timeRange, appliedCustom, reportEndMs]);
+
+  // Human label for the resolved window. Times alone only when the whole span
+  // fits inside one day, since "8:00 AM -> 7:55 AM" reads as if it ran backwards
+  // once it crosses midnight. endMs is exclusive, so show the last instant in it.
+  const rangeLabel = useMemo(() => {
+    if (!rangeWindow) return null;
+    const { startMs, endMs } = rangeWindow;
+    const short = startMs !== null && endMs - startMs < DAY_MS;
+    const fmt = short ? formatFarmTime : formatFarmDate;
+    const startLabel = startMs === null ? "earliest" : fmt(new Date(startMs));
+    const endLabel = fmt(new Date(endMs - 1));
+    return `${startLabel} → ${endLabel}`;
+  }, [rangeWindow]);
+
+  // One report for the resolved window feeds the on-screen breakdown, the alert
+  // summary and the PDF, so all three describe exactly what the charts show. It
+  // waits for the first history load so the window ends on a real reading rather
+  // than the Date.now() fallback, which would fetch an empty week and never refetch.
   useEffect(() => {
-    if (timeRange !== "1w") {
+    // Reports are admin-gated server-side, so non-admins skip the fetch entirely
+    // rather than collecting a 403 banner on every range. That also leaves the
+    // breakdown and alert summary hidden for them, exactly as when only 1 Week
+    // fetched a report.
+    if (!isAdmin) {
       // eslint-disable-next-line react-hooks/set-state-in-effect
-      setWeeklyReport(null);
-      setWeeklyReportError(null);
+      setRangeReport(null);
+      setRangeReportError(null);
+      return;
+    }
+    if (dynamicLoading) return;
+    if (!rangeWindow) {
+      setRangeReport(null);
+      setRangeReportError(null);
       return;
     }
 
     const controller = new AbortController();
-    setWeeklyReportLoading(true);
-    setWeeklyReportError(null);
+    setRangeReportLoading(true);
+    setRangeReportError(null);
 
-    // Scoped to the selected tank so the weekly table + PDF export match the
-    // on-screen charts (previously this was farm-wide).
-    fetchWeeklyReport(selectedDeviceId, controller.signal)
+    // Scoped to the selected tank so the table + PDF match the on-screen charts.
+    fetchRangeReport({
+      deviceId: selectedDeviceId,
+      signal: controller.signal,
+      fromIso: rangeWindow.startMs !== null ? new Date(rangeWindow.startMs).toISOString() : null,
+      toIso: new Date(rangeWindow.endMs).toISOString(),
+    })
       .then(data => {
-        setWeeklyReport(data);
-        setWeeklyReportLoading(false);
+        setRangeReport(data);
+        setRangeReportLoading(false);
       })
       .catch((err: unknown) => {
         if (!isAbortError(err)) {
-          setWeeklyReportError((err as Error)?.message || 'Failed to load weekly report');
-          setWeeklyReportLoading(false);
+          setRangeReportError((err as Error)?.message || 'Failed to load the period report');
+          setRangeReportLoading(false);
         }
       });
 
     return () => {
       controller.abort();
     };
-  }, [timeRange, weeklyRetry, selectedDeviceId]);
+  }, [rangeWindow, selectedDeviceId, rangeRetry, dynamicLoading, isAdmin]);
 
-  const activeHistory = dynamicHistory.length > 0 ? dynamicHistory : history;
-  const activeLoading = dynamicLoading || loading;
+  // Custom-range draft validity, recomputed each render (two cheap string parses).
+  const customStart = farmDateToStart(customFrom);
+  const customEnd = farmDateToEndExclusive(customTo);
+  const customValid = !!customStart && !!customEnd && customStart.getTime() < customEnd.getTime();
 
-  // Milliseconds since the last recorded reading (0 when not offline / unknown).
-  const offlineForMs =
-    connectionStatus === "offline" && lastUpdate
-      ? Date.now() - new Date(lastUpdate).getTime()
-      : 0;
-
-  // Window length for each range; null = always enabled ("All Time").
-  const rangeWindowMs: Record<TimeRange, number | null> = {
-    "1h": 60 * 60 * 1000,
-    "6h": 6 * 60 * 60 * 1000,
-    "24h": 24 * 60 * 60 * 1000,
-    "1w": 7 * 24 * 60 * 60 * 1000,
-    all: null,
+  const selectRange = (range: TimeRange) => {
+    if (range !== "custom") {
+      setTimeRange(range);
+      return;
+    }
+    // Open the picker on a week of real data the first time (or after a reset);
+    // later clicks keep whatever the user last chose.
+    const fallbackFrom = farmDateInputValue(reportEndMs - 7 * DAY_MS);
+    const fallbackTo = farmDateInputValue(reportEndMs);
+    const from = customFrom || fallbackFrom;
+    const to = customTo || fallbackTo;
+    setCustomFrom(from);
+    setCustomTo(to);
+    setAppliedCustom(prev => prev ?? { from, to });
+    setTimeRange("custom");
   };
 
-  const isRangeUnavailable = (range: TimeRange): boolean => {
-    const window = rangeWindowMs[range];
-    return window !== null && offlineForMs > window;
+  const applyCustomRange = () => {
+    if (!customValid) return;
+    setAppliedCustom({ from: customFrom, to: customTo });
+    setTimeRange("custom");
   };
+
+  // Range buttons are never disabled. A range with no readings shows the
+  // empty-state message and explains why, which is more useful than a greyed-out
+  // button the user cannot press - and disabling used to lock out every range
+  // for an offline tank even when its history covered them.
 
   const filteredHistory = useMemo(() => {
     if (!activeHistory || activeHistory.length === 0) return [];
+    // A custom range with incomplete dates has no window; show nothing rather
+    // than silently falling back to the whole history.
+    if (!rangeWindow) return [];
 
+    const { startMs, endMs } = rangeWindow;
     const sorted = [...activeHistory].sort((a, b) => {
       const ta = new Date(a.timestamp || 0).getTime();
       const tb = new Date(b.timestamp || 0).getTime();
       return ta - tb;
     });
 
-    if (timeRange === "all") return sorted;
-
-    const hours = timeRange === "1h" ? 1 : timeRange === "6h" ? 6 : timeRange === "1w" ? 168 : 24;
-    const cutoff = Date.now() - hours * 60 * 60 * 1000;
-
     return sorted.filter((item) => {
       if (!item.timestamp) return false;
-      return new Date(item.timestamp).getTime() >= cutoff;
+      const t = new Date(item.timestamp).getTime();
+      return (startMs === null || t >= startMs) && t < endMs;
     });
-  }, [activeHistory, timeRange]);
+  }, [activeHistory, rangeWindow]);
 
   const stats = useMemo(() => getStats(filteredHistory), [filteredHistory]);
 
@@ -407,11 +558,12 @@ export default function HistoricalDataPage() {
   }, [filteredHistory]);
 
   // Estimation of expected readings (sensors report ~1/min) for coverage %.
+  // Open-ended (All Time) has no expected count; everything else derives it from
+  // the resolved window's span, so a custom week gets the same measure a preset does.
   const expectedReadings = useMemo(() => {
-    if (timeRange === "all") return null;
-    const hours = timeRange === "1h" ? 1 : timeRange === "6h" ? 6 : timeRange === "1w" ? 168 : 24;
-    return hours * 60;
-  }, [timeRange]);
+    if (!rangeWindow || rangeWindow.startMs === null) return null;
+    return Math.round(((rangeWindow.endMs - rangeWindow.startMs) / HOUR_MS) * 60);
+  }, [rangeWindow]);
 
   const coveragePct =
     expectedReadings && filteredHistory.length > 0
@@ -435,17 +587,33 @@ export default function HistoricalDataPage() {
   const handleExportPdf = useCallback(async () => {
     if (exportingPdf) return;
 
-    const isWeekly = timeRange === "1w";
-    let report = isWeekly ? weeklyReport : null;
+    // Popup blockers only allow window.open during the click's synchronous
+    // stack, but building the PDF needs awaits (report fetch, jsPDF import).
+    // Open the blank preview now and point it at the blob once it exists; if
+    // the browser refused, fall back to a normal download so the export still
+    // completes instead of silently doing nothing.
+    const preview = window.open("", "_blank");
+    if (preview) preview.opener = null;
+
+    // Prefer the report already on screen; only refetch if it hasn't landed yet.
+    let report = rangeReport;
     if (!report) {
+      if (!rangeWindow) {
+        preview?.close();
+        alert("Choose a valid date range first.");
+        return;
+      }
       try {
         setExportingPdf(true);
-        // The exported report is scoped to the selected tank so the PDF matches
-        // the on-screen charts (previously this was farm-wide).
-        report = isWeekly
-          ? await fetchWeeklyReport(selectedDeviceId)
-          : await fetchRangeReport(timeRange === "all" ? null : timeRange === "1h" ? 1 : timeRange === "6h" ? 6 : 24, selectedDeviceId);
+        // Same window as the charts and the on-screen table, so the PDF can never
+        // disagree with what is on screen.
+        report = await fetchRangeReport({
+          deviceId: selectedDeviceId,
+          fromIso: rangeWindow.startMs !== null ? new Date(rangeWindow.startMs).toISOString() : null,
+          toIso: new Date(rangeWindow.endMs).toISOString(),
+        });
       } catch {
+        preview?.close();
         alert("Failed to fetch report data.");
         setExportingPdf(false);
         return;
@@ -488,7 +656,12 @@ export default function HistoricalDataPage() {
       const setText = (c: number[]) => text(doc, c);
       const setStroke = (c: number[]) => stroke(doc, c);
 
-      const documentLabel = isWeekly ? "Weekly Report" : "History Report";
+      // A 7-day window keeps the familiar "Weekly Report" title (the 1 Week
+      // preset and any custom week alike); every other span is a history report.
+      const periodDays = Math.round(
+        (new Date(report.period.end).getTime() - new Date(report.period.start).getTime()) / DAY_MS
+      );
+      const documentLabel = periodDays === 7 ? "Weekly Report" : "History Report";
 
       // Slim branded strip reused on every page after the first.
       const drawSlimHeader = () => {
@@ -618,16 +791,17 @@ export default function HistoricalDataPage() {
 
       const tableStartY = chipY + chipH + 10;
 
-      // Range exports stay compact: smaller font, capped rows and no separate
-      // alert page, so long windows (e.g. "All Time") fit on 1-2 pages.
-      const cappedBuckets = report.bucket ? report.daily.slice(-60) : report.daily;
+      // Every export is now a bounded-window report (the 1 Week preset included),
+      // so keep the table compact: smaller font, capped rows and an inline alert
+      // panel, so long windows (e.g. "All Time") fit on 1-2 pages.
+      const cappedBuckets = report.daily.slice(-60);
       const capNote =
         report.daily.length > cappedBuckets.length
           ? `Showing the last ${cappedBuckets.length} ${report.bucket === "hour" ? "hourly" : "daily"} buckets - the summary above covers the full period.`
           : null;
       const unitLabel = report.bucket === "hour" ? "Hour" : "Date";
-      const fmtBucket = report.bucket === "hour" ? formatFarmDateTime : formatFarmDate;
-      const isRange = !!report.bucket;
+      const fmtBucket = (label: string) =>
+        report.bucket === "hour" ? formatFarmDateTime(bucketInstant(label)) : formatFarmDate(label);
 
       autoTable(doc, {
         startY: tableStartY,
@@ -645,8 +819,8 @@ export default function HistoricalDataPage() {
         ]),
         theme: "grid",
         styles: {
-          fontSize: isRange ? 7.2 : 7.6,
-          cellPadding: isRange ? 1.7 : 2,
+          fontSize: 7.2,
+          cellPadding: 1.7,
           valign: "middle",
           textColor: INK as [number, number, number],
           lineColor: LINE as [number, number, number],
@@ -661,7 +835,7 @@ export default function HistoricalDataPage() {
         },
         alternateRowStyles: { fillColor: ZEBRA as [number, number, number] },
         columnStyles: {
-          0: { cellWidth: isRange ? 46 : 34, halign: "left" },
+          0: { cellWidth: 46, halign: "left" },
           1: { halign: "center" },
           2: { halign: "center" },
           3: { halign: "center" },
@@ -748,18 +922,13 @@ export default function HistoricalDataPage() {
         return panelTop + alertH + 4;
       };
 
-      if (isRange) {
-        if (hasAlerts) {
-          if (currentY + 50 + alertH > pageHeight - 60) {
-            currentY = 24;
-            addBrandedPage();
-          }
-          currentY = drawAlertSection(currentY);
+      // Alert panel flows inline after the table (no dedicated page), keeping the
+      // report to 1-2 pages no matter how long the window is.
+      if (hasAlerts) {
+        if (currentY + 50 + alertH > pageHeight - 60) {
+          currentY = 24;
+          addBrandedPage();
         }
-      } else if (hasAlerts) {
-        // Weekly keeps its dedicated alert page (existing behavior).
-        currentY = 24;
-        addBrandedPage();
         currentY = drawAlertSection(currentY);
       }
 
@@ -789,17 +958,31 @@ export default function HistoricalDataPage() {
         ly += wrapped.length * 5.6 + 4;
       });
 
-      doc.save(
-        isWeekly
-          ? `CRAYvings_Weekly_Report_${new Date().toISOString().split("T")[0]}.pdf`
-          : `CRAYvings_History_Report_${timeRange === "all" ? "All_Time" : timeRange.toUpperCase()}_${new Date().toISOString().split("T")[0]}.pdf`
-      );
+      const pdfBlob = doc.output("blob");
+      const pdfUrl = URL.createObjectURL(pdfBlob);
+      if (preview) {
+        // Blank tab opened in the click handler above - safe from popup blocking.
+        preview.location.href = pdfUrl;
+      } else {
+        // Popup blocked entirely; a download is the next best outcome.
+        const rangeSlug =
+          timeRange === "custom" && appliedCustom
+            ? `${appliedCustom.from}_to_${appliedCustom.to}`
+            : timeRange === "all"
+              ? "all-time"
+              : timeRange;
+        doc.save(`CRAYvings-${selectedDeviceId || "farm"}-${rangeSlug}.pdf`);
+      }
+      setTimeout(() => {
+        URL.revokeObjectURL(pdfUrl);
+      }, 60000);
     } catch {
+      preview?.close();
       alert("Failed to export the PDF. Please try again.");
     } finally {
       setExportingPdf(false);
     }
-  }, [weeklyReport, exportingPdf, timeRange, thresholds, selectedDeviceId]);
+  }, [rangeReport, exportingPdf, rangeWindow, timeRange, thresholds, selectedDeviceId, appliedCustom]);
 
   // Only show loading skeleton on first load; keep previous charts during re-fetch.
   if (activeLoading && (!activeHistory || activeHistory.length === 0)) {
@@ -853,9 +1036,6 @@ export default function HistoricalDataPage() {
 
   const isOnline = connectionStatus === "online";
   const isConnecting = connectionStatus === "connecting";
-
-  const firstTs = filteredHistory[0]?.timestamp;
-  const lastTs = filteredHistory[filteredHistory.length - 1]?.timestamp;
 
   return (
     <div className="space-y-4">
@@ -918,14 +1098,9 @@ export default function HistoricalDataPage() {
           <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded bg-white/10">
             {filteredHistory.length.toLocaleString()} of {activeHistory.length.toLocaleString()} readings
           </span>
-          {firstTs && lastTs && timeRange !== "1w" && (
+          {rangeLabel && (
             <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded bg-white/10">
-              {formatFarmTime(firstTs)} → {formatFarmTime(lastTs)}
-            </span>
-          )}
-          {timeRange === "1w" && weeklyReport && (
-            <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded bg-white/10">
-              {formatFarmDate(weeklyReport.period.start)} → {formatFarmDate(weeklyReport.period.end)}
+              {rangeLabel}
             </span>
           )}
           <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded bg-white/10">
@@ -939,30 +1114,54 @@ export default function HistoricalDataPage() {
         <div className="flex items-center gap-2 flex-wrap">
           <Filter size={16} className="text-gray-400 ml-1" />
           {timeRanges.map((range) => {
-            const unavailable = isRangeUnavailable(range.value);
-            const offlineHours = Math.max(1, Math.floor(offlineForMs / (60 * 60 * 1000)));
             return (
               <button
                 key={range.value}
-                onClick={() => setTimeRange(range.value)}
-                disabled={unavailable}
-                title={
-                  unavailable
-                    ? `Device has been offline for ${offlineHours}h — no readings in this window`
-                    : undefined
-                }
+                onClick={() => selectRange(range.value)}
                 className={`px-3 py-1.5 rounded-lg text-sm font-medium transition ${
                   timeRange === range.value
                     ? "bg-orange-500 text-white shadow-sm"
-                    : unavailable
-                      ? "bg-gray-50 border border-gray-200 text-gray-300 cursor-not-allowed"
-                      : "bg-gray-50 border border-gray-200 text-gray-600 hover:bg-gray-100"
+                    : "bg-gray-50 border border-gray-200 text-gray-600 hover:bg-gray-100"
                 }`}
               >
                 {range.label}
               </button>
             );
           })}
+          {timeRange === "custom" && (
+            <>
+              <label className="flex items-center gap-1.5 text-xs font-medium text-gray-500">
+                From
+                <input
+                  type="date"
+                  value={customFrom}
+                  max={customTo || undefined}
+                  onChange={(e) => setCustomFrom(e.target.value)}
+                  className="px-2 py-1.5 rounded-lg border border-gray-200 bg-white text-sm text-gray-700"
+                />
+              </label>
+              <label className="flex items-center gap-1.5 text-xs font-medium text-gray-500">
+                To
+                <input
+                  type="date"
+                  value={customTo}
+                  min={customFrom || undefined}
+                  onChange={(e) => setCustomTo(e.target.value)}
+                  className="px-2 py-1.5 rounded-lg border border-gray-200 bg-white text-sm text-gray-700"
+                />
+              </label>
+              <button
+                onClick={applyCustomRange}
+                disabled={!customValid}
+                className="px-3 py-1.5 rounded-lg text-sm font-semibold bg-orange-500 text-white hover:bg-orange-600 disabled:opacity-50 disabled:cursor-not-allowed transition"
+              >
+                Apply
+              </button>
+              {!customValid && (
+                <span className="text-micro text-amber-600">Pick a start date on or before the end date</span>
+              )}
+            </>
+          )}
         </div>
         <div className="flex items-center gap-2">
           <button
@@ -977,10 +1176,10 @@ export default function HistoricalDataPage() {
             <Activity size={14} />
             Trend overlay
           </button>
-          {isAdmin && (timeRange === "1w" ? true : filteredHistory.length > 0) && (
+          {isAdmin && filteredHistory.length > 0 && (
             <button
               onClick={handleExportPdf}
-              disabled={exportingPdf || (timeRange === "1w" && weeklyReportLoading)}
+              disabled={exportingPdf || rangeReportLoading}
               className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-semibold bg-brand-600 text-white hover:bg-brand-700 disabled:opacity-50 disabled:cursor-not-allowed transition"
             >
             <Download size={14} />
@@ -990,13 +1189,13 @@ export default function HistoricalDataPage() {
         </div>
       </div>
 
-      {/* Weekly report error banner */}
-      {timeRange === "1w" && weeklyReportError && (
+      {/* Period report error banner */}
+      {rangeReportError && (
         <div className="bg-red-50 border border-red-200 text-red-700 rounded-xl p-4 text-sm flex items-center gap-2">
           <AlertTriangle size={16} className="shrink-0" />
-          <span>{weeklyReportError}</span>
+          <span>{rangeReportError}</span>
           <button
-            onClick={() => setWeeklyRetry(n => n + 1)}
+            onClick={() => setRangeRetry(n => n + 1)}
             className="ml-auto text-red-600 font-medium underline hover:text-red-800"
           >
             Retry
@@ -1017,16 +1216,16 @@ export default function HistoricalDataPage() {
                 </span>
               )}
             </div>
-            {timeRange === "1w" && weeklyReport ? (
+            {rangeReport ? (
               <div className="flex gap-3 text-xs">
                 <span className="text-orange-600" title="Min">
-                  <TrendingDown size={12} className="inline" /> {fmtStat(weeklyReport.summary.temp_min, 1)}°
+                  <TrendingDown size={12} className="inline" /> {fmtStat(rangeReport.summary.temp_min, 1)}°
                 </span>
                 <span className="text-green-600" title="Average">
-                  <Activity size={12} className="inline" /> {fmtStat(weeklyReport.summary.temp_avg, 1)}°
+                  <Activity size={12} className="inline" /> {fmtStat(rangeReport.summary.temp_avg, 1)}°
                 </span>
                 <span className="text-red-600" title="Max">
-                  <TrendingUp size={12} className="inline" /> {fmtStat(weeklyReport.summary.temp_max, 1)}°
+                  <TrendingUp size={12} className="inline" /> {fmtStat(rangeReport.summary.temp_max, 1)}°
                 </span>
               </div>
             ) : stats?.temperature && (
@@ -1083,16 +1282,16 @@ export default function HistoricalDataPage() {
                 </span>
               )}
             </div>
-            {timeRange === "1w" && weeklyReport ? (
+            {rangeReport ? (
               <div className="flex gap-3 text-xs">
                 <span className="text-orange-600" title="Min">
-                  <TrendingDown size={12} className="inline" /> {fmtStat(weeklyReport.summary.water_min, 0)}%
+                  <TrendingDown size={12} className="inline" /> {fmtStat(rangeReport.summary.water_min, 0)}%
                 </span>
                 <span className="text-green-600" title="Average">
-                  <Activity size={12} className="inline" /> {fmtStat(weeklyReport.summary.water_avg, 0)}%
+                  <Activity size={12} className="inline" /> {fmtStat(rangeReport.summary.water_avg, 0)}%
                 </span>
                 <span className="text-red-600" title="Max">
-                  <TrendingUp size={12} className="inline" /> {fmtStat(weeklyReport.summary.water_max, 0)}%
+                  <TrendingUp size={12} className="inline" /> {fmtStat(rangeReport.summary.water_max, 0)}%
                 </span>
               </div>
             ) : stats?.water_level && (
@@ -1149,16 +1348,16 @@ export default function HistoricalDataPage() {
                 </span>
               )}
             </div>
-            {timeRange === "1w" && weeklyReport ? (
+            {rangeReport ? (
               <div className="flex gap-3 text-xs">
                 <span className="text-orange-600" title="Min">
-                  <TrendingDown size={12} className="inline" /> {fmtStat(weeklyReport.summary.ammonia_min, 2)}
+                  <TrendingDown size={12} className="inline" /> {fmtStat(rangeReport.summary.ammonia_min, 2)}
                 </span>
                 <span className="text-green-600" title="Average">
-                  <Activity size={12} className="inline" /> {fmtStat(weeklyReport.summary.ammonia_avg, 2)}
+                  <Activity size={12} className="inline" /> {fmtStat(rangeReport.summary.ammonia_avg, 2)}
                 </span>
                 <span className="text-red-600" title="Max">
-                  <TrendingUp size={12} className="inline" /> {fmtStat(weeklyReport.summary.ammonia_max, 2)}
+                  <TrendingUp size={12} className="inline" /> {fmtStat(rangeReport.summary.ammonia_max, 2)}
                 </span>
               </div>
             ) : stats?.ammonia && (
@@ -1321,8 +1520,8 @@ export default function HistoricalDataPage() {
         </div>
       )}
 
-      {/* Reading Breakdown - recent readings table for non-weekly ranges */}
-      {timeRange !== "1w" && filteredHistory.length > 0 && (
+      {/* Reading Breakdown - the most recent raw readings in the window */}
+      {filteredHistory.length > 0 && (
         <div className="bg-white rounded-xl border border-gray-100 p-5">
           <h2 className="text-lg font-bold text-gray-800 flex items-center gap-2 mb-4">
             <History size={20} className="text-orange-500" />
@@ -1384,8 +1583,8 @@ export default function HistoricalDataPage() {
         </div>
       )}
 
-      {/* Weekly Report Breakdown */}
-      {timeRange === "1w" && weeklyReportLoading && (
+      {/* Period Breakdown - one row per hour/day bucket for the selected window */}
+      {rangeReportLoading && !rangeReport && (
         <div className="bg-white rounded-xl border border-gray-100 p-5 animate-pulse">
           <div className="h-6 bg-gray-200 rounded w-48 mb-4"></div>
           <div className="h-4 bg-gray-100 rounded w-full mb-2"></div>
@@ -1394,18 +1593,25 @@ export default function HistoricalDataPage() {
         </div>
       )}
 
-      {timeRange === "1w" && weeklyReport && !weeklyReportLoading && (
+      {rangeReport && (
         <div className="space-y-4">
           <div className="bg-white rounded-xl border border-gray-100 p-5">
             <h2 className="text-lg font-bold text-gray-800 flex items-center gap-2 mb-4">
               <Calendar size={20} className="text-orange-500" />
-              Weekly Breakdown
+              Period Breakdown
+              <span className="ml-auto text-xs font-semibold text-gray-500">
+                {rangeReport.bucket === "hour" ? "Hourly" : "Daily"} ·{" "}
+                {rangeReport.daily.length} {rangeReport.bucket === "hour" ? "hour" : "day"}
+                {rangeReport.daily.length === 1 ? "" : "s"}
+              </span>
             </h2>
             <div className="overflow-x-auto">
               <table className="w-full text-sm">
                 <thead>
                   <tr className="bg-gray-50 border-b border-gray-200">
-                    <th className="px-3 py-2.5 text-left text-xs font-bold text-gray-500 uppercase">Date</th>
+                    <th className="px-3 py-2.5 text-left text-xs font-bold text-gray-500 uppercase">
+                      {rangeReport.bucket === "hour" ? "Hour" : "Date"}
+                    </th>
                     <th className="px-3 py-2.5 text-center text-xs font-bold text-gray-500 uppercase">Avg Temp</th>
                     <th className="px-3 py-2.5 text-center text-xs font-bold text-gray-500 uppercase">Temp Range</th>
                     <th className="px-3 py-2.5 text-center text-xs font-bold text-gray-500 uppercase">Avg Water</th>
@@ -1417,10 +1623,12 @@ export default function HistoricalDataPage() {
                   </tr>
                 </thead>
                 <tbody>
-                  {weeklyReport.daily.map((day) => (
+                  {rangeReport.daily.map((day) => (
                     <tr key={day.date} className="border-b border-gray-100 last:border-0 hover:bg-gray-50">
                       <td className="px-3 py-2.5 font-medium text-gray-800 whitespace-nowrap">
-                        {formatFarmDate(day.date)}
+                        {rangeReport.bucket === "hour"
+                          ? formatFarmDateTime(bucketInstant(day.date))
+                          : formatFarmDate(day.date)}
                       </td>
                       <td className="px-3 py-2.5 text-center text-gray-600">{fmtStat(day.temp_avg, 1)}°C</td>
                       <td className="px-3 py-2.5 text-center text-gray-500 text-xs">
@@ -1459,10 +1667,10 @@ export default function HistoricalDataPage() {
             </h2>
             <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
               <div className="bg-gray-50 rounded-lg p-4 text-center">
-                <div className="text-2xl font-bold text-gray-800">{weeklyReport.alerts.total}</div>
+                <div className="text-2xl font-bold text-gray-800">{rangeReport.alerts.total}</div>
                 <div className="text-xs text-gray-500 mt-1">Total Alerts</div>
               </div>
-              {Object.entries(weeklyReport.alerts.by_parameter).map(([param, count]) => (
+              {Object.entries(rangeReport.alerts.by_parameter).map(([param, count]) => (
                 <div key={param} className="bg-gray-50 rounded-lg p-4 text-center">
                   <div className="text-2xl font-bold text-gray-800">{count}</div>
                   <div className="text-xs text-gray-500 mt-1">{param}</div>

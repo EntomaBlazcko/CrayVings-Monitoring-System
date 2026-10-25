@@ -2,13 +2,22 @@
 
 **Database:** `crayvings_monitoring_system_db` (PostgreSQL)
 
-> **Verified against the live database 2026-10-15**, after applying migrations
-> through 021. Every table, column, type, nullability, default, index, check
-> constraint, and foreign key below was read back from `information_schema` /
-> `pg_catalog` — not inferred from the migration scripts.
+> **Verified against the live database 2026-10-18**, after applying migrations
+> through 025. Every table, column, type, nullability, default, index, check
+> constraint, foreign key, and trigger below was read back from a
+> `pg_dump --schema-only` of the live database (PostgreSQL 18.3) — not inferred
+> from the migration scripts. An earlier verification on 2026-10-15 used
+> `information_schema` / `pg_catalog` directly; migrations 022–025 (defects
+> D1–D5) were applied on 2026-10-18 and every table below reflects them.
 >
-> **16 tables. 8 foreign keys.** The DBML block near the bottom is ready to
-> paste into <https://dbdiagram.io>.
+> **16 tables. 8 foreign keys. 1 trigger** (`trg_sms_logs_recipient`). The DBML
+> block near the bottom is ready to paste into <https://dbdiagram.io>, and the
+> Mermaid block after it renders the same schema.
+>
+> **Known schema defects** are listed in their own section before the ERD.
+> D1–D7 were fixed on 2026-10-18 by migrations `000` and `022`–`025`; only
+> D8 (a redundant index) and D9 (an unused `schema_migrations.checksum`
+> column) remain open.
 >
 > **One relationship that looks like it should be a foreign key but is not:**
 >
@@ -39,12 +48,12 @@ tokens.
 | `username` | VARCHAR(50) | NOT NULL | Login name. Not an FK target: the audit link is `activity_logs.user_id` → `users.id` (migration 019), and `user_name` stays a display string. UNIQUE only while active (partial index `idx_users_username_active`) |
 | `email` | VARCHAR(255) | NOT NULL | UNIQUE only while active (partial index `idx_users_email_active`) |
 | `password_hash` | TEXT | NOT NULL | PBKDF2 (`iterations:salt:hash`) |
-| `role` | VARCHAR(20) | NOT NULL DEFAULT `'user'` | `admin` or `user` |
+| `role` | VARCHAR(20) | NOT NULL DEFAULT `'user'`, CHECK `chk_users_role` IN (`'admin'`, `'user'`) (migration 024) | `admin` or `user`. "Owner" is *not* a stored value: the server derives it at runtime by matching `username`/`email` against the `ADMIN_USERNAME` / `ADMIN_EMAIL` env vars (`isOwnerUser()` in `server.cjs`), and returns it as a separate `owner: boolean` on the session payload — so the column itself never holds `'owner'` |
 | `token` | VARCHAR(255) | | Active session token, stored **hashed** as SHA-256 (migration 013) — never the raw value, so a DB read cannot impersonate a user. Clients keep the raw 64-char hex token and every comparison hashes it first |
-| `created_at` | **TIMESTAMP** | DEFAULT CURRENT_TIMESTAMP | Timezone-naive |
-| `updated_at` | **TIMESTAMP** | DEFAULT CURRENT_TIMESTAMP | Timezone-naive |
+| `created_at` | TIMESTAMPTZ | DEFAULT CURRENT_TIMESTAMP | Account creation. Converted from naive `TIMESTAMP` by migration 025 |
+| `updated_at` | TIMESTAMPTZ | DEFAULT CURRENT_TIMESTAMP | Last change. Converted from naive `TIMESTAMP` by migration 025 |
 | `token_expires_at` | TIMESTAMPTZ | | 24-hour session token expiry (timezone-aware so `new Date()` checks are unambiguous) |
-| `status` | VARCHAR(20) | NOT NULL DEFAULT `'active'` | `active`, `pending_deletion`, `deleted` (legacy), or `archived` (soft-delete lifecycle). Login only succeeds for `active` |
+| `status` | VARCHAR(20) | NOT NULL DEFAULT `'active'`, CHECK `chk_users_status` IN (`'active'`, `'pending_deletion'`, `'deleted'`, `'archived'`) (migration 024) | Soft-delete lifecycle. Login only succeeds for `active` |
 | `deleted_at` | TIMESTAMPTZ | | Set when the account is archived (soft-deleted); cleared on restore |
 | `pending_deletion_at` | TIMESTAMPTZ | | When a deletion request was made (account kept working until approval) |
 | `pending_deletion_requested_by` | VARCHAR(100) | | Username of the admin who requested deletion |
@@ -60,14 +69,17 @@ tokens.
 
 **Archiving (migration 006)**
 
-- Deleting an account is a **soft delete**: `status` flips to `archived` and
-  `deleted_at = NOW()` (the row is kept so it can be restored).
-- Restore sets `status='active'` and clears `deleted_at`.
+- Archiving an account (the flow still labelled "deletion") sets
+  `status = 'archived'` and `deleted_at = NOW()`; the row is kept so it can be
+  restored. The approval OTP is emailed to the **owner**.
+- Restore sets `status='active'` and clears `deleted_at`
+  (`POST /auth/users/:id/restore`).
 - Permanently purging an archived account is the only irreversible action
-  (`DELETE FROM users WHERE status = 'archived'`).
+  (`DELETE /auth/users/archived/:id`; `DELETE FROM users WHERE status = 'archived'`).
 - The full-column UNIQUE constraints are replaced by the two **partial** unique
   indexes above, so a new active account may reuse a username/email held by an
-  archived row. The owner account is guarded from archiving.
+  archived row. The owner account and the last remaining admin are guarded from
+  archiving.
 
 ---
 
@@ -230,10 +242,10 @@ unchanged heartbeats write no row).
 |---|---|---|---|
 | `id` | SERIAL | PRIMARY KEY | |
 | `device_id` | VARCHAR(50) | NOT NULL, FK → `devices.device_id` | ESP32 device identifier |
-| `temperature` | DECIMAL(5,2) | DEFAULT 0, NULLABLE | Degrees Celsius. `NULL` when the DS18B20 failed (firmware reports −1 / 0) |
-| `water_level` | DECIMAL(5,2) | DEFAULT 0, NULLABLE | Percent (%), **0-100** — `level% = (empty_cm − water_distance_cm) / (empty_cm − full_cm) × 100`, clamped; see `sensor_calibration`. `NULL` when the HC-SR04 failed (firmware reports −1). Note `0` is a *real* value (an empty tank), never a failure sentinel |
+| `temperature` | DECIMAL(5,2) | NULLABLE (no DEFAULT since migration 022) | Degrees Celsius. `NULL` when the DS18B20 failed (firmware reports −1 / 0) |
+| `water_level` | DECIMAL(5,2) | NULLABLE (no DEFAULT since migration 022) | Percent (%), **0-100** — `level% = (empty_cm − water_distance_cm) / (empty_cm − full_cm) × 100`, clamped; see `sensor_calibration`. `NULL` when the HC-SR04 failed (firmware reports −1). Note `0` is a *real* value (an empty tank), never a failure sentinel |
 | `water_distance_cm` | DECIMAL(6,2) | NULLABLE (migration 018) | Raw HC-SR04 distance, sensor to water surface. `NULL` = not reported by the firmware, or a failed sensor. Stored so a corrected calibration can be re-applied to history |
-| `ammonia` | DECIMAL(5,2) | DEFAULT 0, NULLABLE | ppm (MQ-137 sensor). `NULL` when the MQ-137 failed (firmware reports −1). **Precision is (5,2)**, verified against the live database — it was previously documented here as (5,3) |
+| `ammonia` | DECIMAL(5,2) | NULLABLE (no DEFAULT since migration 022) | ppm (MQ-137 sensor). `NULL` when the MQ-137 failed (firmware reports −1). **Precision is (5,2)**, verified against the live database — it was previously documented here as (5,3) |
 | `timestamp` | TIMESTAMPTZ | DEFAULT CURRENT_TIMESTAMP | Reading time (migration 007) |
 
 Since migration 009 the server converts firmware failure sentinels to `NULL`
@@ -267,14 +279,14 @@ permit NULL.
 | `idx_sensors_valid_readings` | `(device_id, timestamp DESC) WHERE temperature IS NOT NULL OR water_level IS NOT NULL OR ammonia IS NOT NULL` | PARTIAL: rows with at least one valid reading (migration 009) |
 | `idx_sensors_device_id_ci` | `(LOWER(device_id), timestamp DESC)` | The app resolves tanks case-insensitively (`lower(device_id)` in `server.cjs`), which the plain btree indexes above cannot serve — `EXPLAIN` showed a `Seq Scan` on every history query. Built `CONCURRENTLY` by migration 016 so ingest is never blocked. Verified: the planner now reports `Bitmap Index Scan on idx_sensors_device_id_ci` |
 
-**Check constraints** (migration 009) — each permits `NULL`, because a NULL
-reading records a failed sensor rather than a valid one:
-
-| Constraint | Rule |
-|---|---|
-| `chk_sensors_temperature_valid` | `0 < temperature <= 100` |
-| `chk_sensors_water_level_valid` | `0 <= water_level <= 200` |
-| `chk_sensors_ammonia_valid` | `0 <= ammonia <= 1000` |
+**Former defect (fixed by migration 022, 2026-10-18) — the `DEFAULT 0`
+values contradicted the CHECK constraints.** `temperature`, `water_level` and
+`ammonia` carried a vestigial `DEFAULT 0` from before migration 009, and
+`chk_sensors_temperature_valid` requires `temperature > 0`, so any `INSERT`
+that omitted `temperature` wrote `0` and was then rejected — the default could
+never legally fire. Migration 022 dropped all three defaults (the server has
+always written explicit values or `NULL`), and the boot DDL in `server.cjs`
+no longer recreates them.
 
 ---
 
@@ -284,18 +296,19 @@ Singleton row of current alert thresholds for each sensor parameter.
 
 | Column | Type | Constraints | Notes |
 |---|---|---|---|
-| `id` | SERIAL | PRIMARY KEY | |
+| `id` | SERIAL | PRIMARY KEY, CHECK (id = 1) (migration 023) | Singleton guard — a second row would silently redefine every tank's global thresholds |
 | `temp_min` | DECIMAL(5,2) | NULLABLE, DEFAULT 20.0 | Min temperature (°C) |
 | `temp_max` | DECIMAL(5,2) | NULLABLE, DEFAULT 31.0 | Max temperature (°C) |
 | `water_level_min` | DECIMAL(5,2) | NULLABLE, DEFAULT 10.0 | Min water level (%) |
 | `water_level_max` | DECIMAL(5,2) | NULLABLE, DEFAULT 100.0 | Max water level (%) |
 | `ammonia_min` | DECIMAL(5,2) | NULLABLE, DEFAULT 0.25 | Min ammonia (ppm) |
 | `ammonia_max` | DECIMAL(5,2) | NULLABLE, DEFAULT 1.00 | Max ammonia (ppm) |
-| `updated_at` | **TIMESTAMP** | DEFAULT CURRENT_TIMESTAMP | Timezone-naive |
+| `updated_at` | TIMESTAMPTZ | DEFAULT CURRENT_TIMESTAMP | Last write. Converted from naive `TIMESTAMP` by migration 025 |
 
 All six range columns have defaults but **no `NOT NULL` constraint** — verified
 against `information_schema.columns`. This document previously listed them as
-`NOT NULL`.
+`NOT NULL`. Migration 023 enforces the singleton itself with `CHECK (id = 1)`,
+so the row can no longer be duplicated by hand.
 
 ---
 
@@ -326,6 +339,12 @@ nullable and `NULL` means "inherit the global value"**, resolved at read time as
   `temp_min` on the global value.
 - These are **alert thresholds**, not geometry. Retuning a sensor must not move
   the alert lines; that is what `sensor_calibration` is for.
+- If the table is missing (migration 012 not applied), `getThresholdsForDevice`
+  catches the query and degrades quietly to the global thresholds, so alerting
+  keeps working on a server started without migrations.
+- `server.cjs` also runs `CREATE TABLE IF NOT EXISTS` for **this** table on boot
+  (line ~1702), mirroring migration 012, so a fresh database is usable before
+  the migration is run manually. This is the only table the boot DDL creates.
 
 ### `sensor_calibration` (migration 018)
 
@@ -357,15 +376,12 @@ we warn", not "what distance is 0%".
   falls back to `server.cjs`'s `WATER_LEVEL_EMPTY_CM` / `WATER_LEVEL_FULL_CM`.
 - Because `sensors.water_distance_cm` keeps the raw measurement, a calibration
   corrected today can be applied to history — no reflash, no trip to the tank.
-- If the table is missing (migration 012 not applied), `getThresholdsForDevice`
-  catches the query and degrades quietly to the global thresholds, so alerting
-  keeps working on a server started without migrations.
-- `server.cjs` also runs `CREATE TABLE IF NOT EXISTS` for this table on boot,
-  mirroring migration 012, so a fresh database is usable before the migration is
-  run manually.
-- This is the one FK into `devices` with `ON DELETE CASCADE`: overrides are
-  configuration, not history, so they go when the device does. There is no hard
-  delete of a device in this system, so in practice it never fires.
+- This FK into `devices` uses `ON DELETE CASCADE` together with the matching
+  FK on `device_threshold_overrides`: both tables are configuration, not
+  history, so they go when the device does. (Two CASCADE FKs into `devices`
+  exist — 012 and 018 — not one; this section previously claimed it was the
+  only one.) There is no hard delete of a device in this system, so in
+  practice neither fires.
 
 ---
 
@@ -420,8 +436,8 @@ deduplication/cooldown and restored from DB on server start).
 | Column | Type | Constraints | Notes |
 |---|---|---|---|
 | `device_id` | VARCHAR(50) | PRIMARY KEY (composite), FK → `devices.device_id` | ESP32 device identifier |
-| `sensor_key` | VARCHAR(50) | PRIMARY KEY (composite) | e.g. `Temperature`, `Water Level`, `Ammonia` |
-| `status` | VARCHAR(20) | | `good`, `warning`, or `critical` |
+| `sensor_key` | VARCHAR(50) | PRIMARY KEY (composite), CHECK `chk_lastalerts_sensor_key` IN (`Temperature`, `Water Level`, `Ammonia`) (migration 024) | e.g. `Temperature`, `Water Level`, `Ammonia` |
+| `status` | VARCHAR(20) | CHECK `chk_lastalerts_status` IN (`good`, `warning`, `critical`), or NULL (migration 024) | `good`, `warning`, or `critical` |
 | `value` | DECIMAL(5,2) | | Reading that triggered / cleared the state |
 | `timestamp` | TIMESTAMPTZ | | Alert state change time. Converted from naive `TIMESTAMP` by migration 016 |
 
@@ -472,18 +488,19 @@ action to another — worse in an audit trail than an honest NULL.
 
 ## Table: `user_deletion_requests`
 
-Audit chain for the secure account-deletion flow: WHO requested, WHO the OTP was
-sent to, WHO verified it, WHO approved, and WHO executed the hard delete. Set up
-by migration 001.
+Audit chain for the secure account-archive flow: WHO requested, WHO the OTP was
+sent to (always the owner), WHO verified it, WHO approved, and WHO executed the
+archive. A separate purge can remove the archived account later; this row
+survives with `user_id = NULL`. Set up by migration 001.
 
 | Column | Type | Constraints | Notes |
 |---|---|---|---|
 | `id` | SERIAL | PRIMARY KEY | |
-| `user_id` | INTEGER | NULLABLE. FK → `users.id` `ON DELETE SET NULL` (migration 020) | Target account. Migration 020 drops the original `NOT NULL` so the flow can hard-delete the account this row documents — then `user_id` goes NULL and `user_username` keeps the identity |
+| `user_id` | INTEGER | NULLABLE. FK → `users.id` `ON DELETE SET NULL` (migration 020) | Target account. Migration 020 drops the original `NOT NULL` so an archived account can be purged without destroying the audit row — then `user_id` goes NULL and `user_username` keeps the identity |
 | `user_username` | VARCHAR(100) | NOT NULL | Target username |
 | `requester_username` | VARCHAR(100) | NOT NULL | Admin who requested |
-| `requester_email` | VARCHAR(255) | NOT NULL | Admin's email (OTP destination) |
-| `status` | VARCHAR(20) | NOT NULL DEFAULT `'pending_otp'` | `PENDING_OTP`, `EXPIRED`, `COMPLETED` |
+| `requester_email` | VARCHAR(255) | NOT NULL | Admin's email (audit snapshot; the OTP itself goes to the owner) |
+| `status` | VARCHAR(20) | NOT NULL DEFAULT `'PENDING_OTP'`, CHECK `chk_deletion_requests_status` IN (`PENDING_OTP`, `EXPIRED`, `COMPLETED`) (migration 024) | Lifecycle state; the default's case matches the stored values since migration 024 |
 | `reason` | TEXT | | Deletion reason |
 | `otp_hash` | VARCHAR(64) | | SHA-256 hash of OTP |
 | `otp_salt` | VARCHAR(32) | | Per-row salt |
@@ -539,10 +556,10 @@ transition too, which the JSONB log never captured.
 
 ## Table: `email_otps`
 
-Second-factor store for deletion OTPs. The code is stored **hashed** (SHA-256
-with a per-row salt), never in plaintext; expires after 10 minutes; capped at 5
-attempts. No FK to `users` so it still works for an account already marked
-pending. Set up by migration 001.
+Second-factor store for account-archive approval OTPs (always addressed to the
+owner). The code is stored **hashed** (SHA-256 with a per-row salt), never in
+plaintext; expires after 10 minutes; capped at 5 attempts. No FK to `users` so it
+still works for an account already marked pending. Set up by migration 001.
 
 | Column | Type | Constraints | Notes |
 |---|---|---|---|
@@ -587,8 +604,8 @@ SMS recipients allowed to receive alert notifications.
 | `name` | VARCHAR(100) | | Recipient display name |
 | `is_active` | BOOLEAN | DEFAULT true | Whether alerts are sent here |
 | `archived_at` | TIMESTAMPTZ | | `NULL` = active. Set when the recipient is archived (soft-deleted); cleared on restore |
-| `created_at` | **TIMESTAMP** | DEFAULT NOW() | Timezone-naive, unlike `archived_at` on this same row |
-| `updated_at` | **TIMESTAMP** | DEFAULT NOW() | Timezone-naive |
+| `created_at` | TIMESTAMPTZ | DEFAULT NOW() | Recipient added. Converted from naive `TIMESTAMP` by migration 025, ending the mixed naive/aware pair with `archived_at` on this row |
+| `updated_at` | TIMESTAMPTZ | DEFAULT NOW() | Last write. Converted from naive `TIMESTAMP` by migration 025 |
 
 **Indexes**
 
@@ -620,7 +637,7 @@ down `delivered_at` / `failure_reason` so every SMS reaches a terminal state.
 | `id` | SERIAL | PRIMARY KEY | |
 | `recipient_phone` | VARCHAR(20) | NOT NULL; no FK (see note below) | Phone SMS was sent to |
 | `message` | TEXT | NOT NULL | Full message body |
-| `status` | VARCHAR(20) | NOT NULL | `queued`, `delivered`, `failed`, or `capped` |
+| `status` | VARCHAR(20) | NOT NULL, CHECK `chk_sms_logs_status` IN (`queued`, `delivered`, `failed`, `capped`) (migration 024) | `queued`, `delivered`, `failed`, or `capped` |
 | `error_message` | TEXT | | Failure reason |
 | `sms_id` | VARCHAR(100) | | httpsms message identifier |
 | `delivered_at` | TIMESTAMPTZ | | Set when the delivery poller confirms receipt |
@@ -657,8 +674,7 @@ deleting or reassigning them would fabricate a delivery record.
 
 Version tracking for the `db/migrations/*.cjs` scripts (migration 010). Seeded
 with the history of migrations 001-010 so operators can see which structural
-changes have been applied. Verified present: versions `001`–`016`, with `016`
-applied 2026-09-28.
+changes have been applied. Verified present 2026-10-18: versions `000`–`025`, no gaps.
 
 | Column | Type | Constraints | Notes |
 |---|---|---|---|
@@ -671,8 +687,8 @@ applied 2026-09-28.
 
 ## Foreign Key Relationships (enforced)
 
-Verified against `information_schema.referential_constraints` on 2026-10-15,
-after migrations 019–021 were applied. **Eight** foreign keys:
+Verified against a `pg_dump --schema-only` of the live catalog on 2026-10-18,
+migrations through 025. **Eight** foreign keys:
 
 | Constraint (live name) | Column(s) | References | Delete rule |
 |---|---|---|---|
@@ -747,13 +763,13 @@ does not. Recipients are archived rather than deleted, so this path is rare.
 
 - `activity_logs.user_name` **and** `user_id` are both derived from the session
   server-side. `user_id` is the enforced reference (migration 019, `SET NULL` so
-  the audit row survives account deletion); `user_name` is the display copy and
+  the audit row survives account archive and purge); `user_name` is the display copy and
   is intentionally left unenforced — see the section above.
 - `email_otps` deliberately defines **no** foreign key constraints, so a code can
-  still be verified for an account that has already been hard-deleted.
+  still be verified for an account that has already been archived or purged.
   `user_deletion_requests` now has one (migration 020) rather than none; its
   `SET NULL` rule preserves the same pipeline — the request survives the target's
-  hard delete, with the identity kept in `user_username`.
+  archive/purge, with the identity kept in `user_username`.
 - `last_alerts` is keyed by `(device_id, sensor_key)` so each device keeps its
   own alert state; derived from the latest `sensors` reading by the alert engine.
 - `users.token` + `users.token_expires_at` implement 24-hour session
@@ -768,24 +784,66 @@ does not. Recipients are archived rather than deleted, so this path is rare.
 
 ## Data Retention
 
-- `system_logs` older than 30 days are purged and `sms_logs` older than
-  `SMS_RETENTION_DAYS` (default 30) are purged; cleanup runs on server startup and
-  periodically (see `runSmsMaintenance` in `server.cjs`).
-- The alert engine enforces SMS cooldowns (warning vs critical intervals) and a
-  daily SMS cap (`SMS_DAILY_CAP`, 0 = unlimited) stored in the server config.
+Four tables are purged on a schedule (`runRetentionPurge` in `server.cjs`,
+run at startup and periodically). Each limit is an env var; **0 disables that
+purge**. Verified against `.env.example` and `server.cjs` 2026-10-18:
+
+| Table | Env var | Default | Column compared |
+|---|---|---|---|
+| `sensors` | `SENSOR_RETENTION_DAYS` | 30 days | `timestamp` |
+| `system_logs` | `SYSTEM_LOGS_RETENTION_DAYS` | 30 days | `timestamp` |
+| `activity_logs` | `ACTIVITY_LOGS_RETENTION_DAYS` | 90 days | `timestamp` |
+| `sms_logs` | `SMS_RETENTION_DAYS` | 30 days | `sent_at` (purged by `runSmsMaintenance`) |
+
+The purge of `sensors` at 30 days means the UI's "all time" range is at most
+30 days unless the retention env var is raised — a known gap between the
+label and the data (capstone finding E3).
+
+The alert engine enforces SMS cooldowns (warning vs critical intervals) and a
+daily SMS cap (`SMS_DAILY_CAP`, 0 = unlimited) stored in the server config.
+`email_otps` rows are not purged by the schedule; expired rows are simply
+ignored and overwritten by newer codes.
 
 ---
 
+## Setup and provisioning
+
+On a **fresh** database, create it, run the baseline, then replay `001`..`025` in
+order. Every migration is idempotent and records itself in `schema_migrations`,
+but the loop below is for a fresh database — do not blindly replay the whole
+chain against a live one.
+
+```powershell
+createdb -U postgres crayvings_monitoring_system_db
+node db/migrations/000_baseline.cjs
+Get-ChildItem db/migrations/*.cjs |
+  Where-Object { $_.Name -match '^\d{3}_.*\.cjs$' -and $_.Name -notmatch '^000_' } |
+  Sort-Object Name |
+  ForEach-Object { node $_.FullName }
+```
+
+The server's additive boot DDL is a safety net for an existing database, not a
+substitute for this chain.
+
 ## Notes
 
-- **Schema creation:** tables are created outside this repository (e.g. manual
-  setup in pgAdmin / SQL shell). The server only creates `system_state` and
-  applies additive migrations (`ADD COLUMN IF NOT EXISTS`) for columns like
-  `ammonia`, `ammonia_min/max`, `token_expires_at`, and the alert ack columns.
-  Structural changes ship as idempotent migration scripts in `db/migrations/`:
+- **Schema creation:** the eight base tables (`users`, `devices`, `sensors`,
+  `sensor_settings`, `system_logs`, `last_alerts`, `activity_logs`,
+  `system_state`) were originally created **outside this repository** (manual
+  setup in pgAdmin / SQL shell). Migration `000_baseline.cjs` (defect D7,
+  2026-10-18) closes that gap: `createdb` + `000` + `001`..`025` is now a
+  complete provisioning path, and on the live database every statement in it
+  is a no-op. The server's boot DDL (`server.cjs` ~1669–1720)
+  creates **`device_threshold_overrides`** (mirroring migration 012) and
+  applies additive self-healing `ADD COLUMN IF NOT EXISTS` / index statements
+  for columns like `ammonia`, `token_expires_at`, and the alert-ack columns —
+  it does **not** create `system_state` (this document previously said it did;
+  no such statement exists in the current `server.cjs`). Structural changes
+  ship as idempotent migration scripts in `db/migrations/`:
 
   | Migration | What it does |
   |---|---|
+  | `000_baseline.cjs` | Genesis schema for the eight base tables + `schema_migrations`, so a fresh database can replay the whole chain. Keeps the full-UNIQUE `users.username`/`email` (needed by 002's FK; 006 replaces them) and omits every object later migrations create. No-op on live |
   | `001_user_deletion.cjs` | `users` soft-delete columns + indexes, `user_deletion_requests`, `email_otps`, `activity_logs.user_name` nullable + FK `ON DELETE SET NULL` |
   | `002_owner_admin.cjs` | `activity_logs` FK `ON UPDATE CASCADE`; converts legacy `admin` account into the owner; seeds owner from env on fresh DBs |
   | `003_sms_integration.cjs` | `authorized_recipients` + `sms_logs` tables |
@@ -805,8 +863,12 @@ does not. Recipients are archived rather than deleted, so this path is rare.
   | `017_token_index.cjs` | Partial composite index `idx_users_token_active` on `users (token, status) WHERE token IS NOT NULL`, built `CONCURRENTLY`. `users.token` had no index at all, so both session guards (`requireAdmin`, `requireAuth`) sequentially scanned the table on every authenticated request and every SSE connect. Partial because signed-out users hold a NULL token and a full index would index them all; composite because the guards match `token` **and** `status` in one predicate, which `idx_users_status` alone cannot serve |
   | `018_water_level_calibration.cjs` | HC-SR04 geometry: `sensors.water_distance_cm` (+ `chk_sensors_water_distance_valid`); `sensor_calibration` table (`device_id` PK, FK → `devices` `ON DELETE CASCADE`, `empty_cm`/`full_cm` with span + range checks); seeds default empty/full distances for existing devices without overwriting tuned values |
   | `019_activity_logs_user_id.cjs` | `activity_logs.user_id` + FK → `users.id` `ON DELETE SET NULL`; conservative backfill (exactly one account carries the username **and** the row was written after that account was created — 285 of 3,265 rows linked); partial index `idx_activity_logs_user_id`. Gives the audit trail a real reference without touching the partial-unique `username` model |
-  | `020_deletion_requests_user_fk.cjs` | Drops `user_deletion_requests.user_id` `NOT NULL`, nulls ids whose account was already purged (19 of 20 rows), adds FK → `users.id` `ON DELETE SET NULL`. Resolves the paradox 001 documented: the row survives the hard delete it records, with `user_username` keeping the identity |
-  | `021_status_history_child.cjs` | Creates `user_deletion_request_status_history` (FK → `user_deletion_requests` `ON DELETE CASCADE`), relocates the 40 `status_history` JSONB entries into it, drops the column. The server's deletion flow is updated in the same change; restart the backend after running it |
+  | `020_deletion_requests_user_fk.cjs` | Drops `user_deletion_requests.user_id` `NOT NULL`, nulls ids whose account was already purged (19 of 20 rows), adds FK → `users.id` `ON DELETE SET NULL`. Resolves the paradox 001 documented: the row survives the account's archive/purge, with `user_username` keeping the identity |
+  | `021_status_history_child.cjs` | Creates `user_deletion_request_status_history` (FK → `user_deletion_requests` `ON DELETE CASCADE`), relocates the 40 `status_history` JSONB entries into it, drops the column. The server's flow was updated in the same change (it now archives); restart the backend after running it |
+  | `022_sensor_defaults.cjs` | Defect D1: `DROP DEFAULT` on `sensors.temperature`/`water_level`/`ammonia` — the vestigial `DEFAULT 0` contradicted `chk_sensors_temperature_valid` and could never legally fire |
+  | `023_sensor_settings_singleton.cjs` | Defect D2: renumbers the `sensor_settings` row onto `id = 1` if needed, resets the sequence, adds `CHECK (id = 1)`. Paired with `server.cjs` INSERTs that now supply `id = 1 ... ON CONFLICT (id) DO UPDATE` |
+  | `024_enum_checks.cjs` | Defects D3 + D4: upper-cases `user_deletion_requests.status` and corrects its default to `'PENDING_OTP'`; adds CHECK constraints on `users.role`, `users.status`, `last_alerts.status`, `last_alerts.sensor_key`, `sms_logs.status`, `user_deletion_requests.status`. Aborts (rolling back) if any row holds an unexpected value |
+  | `025_timestamps_timestamptz.cjs` | Defect D5: converts the last five `timestamp without time zone` columns (`users.created_at`/`updated_at`, `sensor_settings.updated_at`, `authorized_recipients.created_at`/`updated_at`) to `TIMESTAMPTZ`, interpreting stored wall-clock values in the **server process's** zone so every displayed time is unchanged |
 
 - **Hash format:** `password_hash = PBKDF2_ITERATIONS:salt_hex:hash_hex` (sha512,
   600,000 iterations, 64-byte key).
@@ -818,11 +880,44 @@ does not. Recipients are archived rather than deleted, so this path is rare.
 
 ---
 
+## Known schema defects (audited 2026-10-18)
+
+Verified against a `pg_dump --schema-only` of the live database. D1–D7 were
+**fixed on 2026-10-18** by migrations `000` and `022`–`025` (plus the paired
+`server.cjs` edits); D8–D9 remain open. None of these defects ever caused
+incorrect behaviour in the current server code (which always writes explicit
+values). Listed worst-first.
+
+| # | Defect | Location | Why it matters | Fix |
+|---|---|---|---|---|
+| D1 | `DEFAULT 0` contradicts `chk_sensors_temperature_valid` (`temperature > 0`) | `sensors.temperature`, also `water_level`, `ammonia` | Any `INSERT` omitting `temperature` writes `0` and is rejected — the default can never legally fire | **Fixed** — migration 022 `DROP DEFAULT` on all three; boot DDL no longer recreates them |
+| D2 | Singleton unenforced | `sensor_settings` | A second row silently redefines every tank's global thresholds; `getThresholdsForDevice` assumes exactly one row | **Fixed** — migration 023 renumbers/verifies the row, resets the sequence, adds `CHECK (id = 1)`; `server.cjs` INSERTs supply `id = 1` with `ON CONFLICT` |
+| D3 | Enum columns with no CHECK | `users.role`, `users.status`, `last_alerts.status`, `last_alerts.sensor_key`, `sms_logs.status`, `user_deletion_requests.status` | A typo (`'admn'`, `'PENDING'`) inserts cleanly; `devices.registered_via`/`ip_source` and all four `sensors` ranges *do* have CHECKs, so coverage is inconsistent | **Fixed** — migration 024 adds one CHECK per column (value sets verified against the code first; the migration aborts on unexpected data) |
+| D4 | Default/stored case mismatch | `user_deletion_requests.status` DEFAULT is lowercase `'pending_otp'`; stored values are documented uppercase `PENDING_OTP` / `EXPIRED` / `COMPLETED` | A default-written row would not match the application's uppercase comparisons | **Fixed** — migration 024 upper-cases existing rows and sets the default to `'PENDING_OTP'` before adding D3's CHECK |
+| D5 | Naive timestamps | `users.created_at`/`updated_at`, `sensor_settings.updated_at`, `authorized_recipients.created_at`/`updated_at` | The only **5** columns still `timestamp without time zone` (this table previously said 7 — wrong); `authorized_recipients` mixes naive `created_at` with timestamptz `archived_at` **on the same row**. Migrations 005/007/016 converted every other timestamp | **Fixed** — migration 025 converts all five to `TIMESTAMPTZ`, interpreting stored values in the server process's zone so displayed times are unchanged |
+| D6 | Boot DDL drift | `server.cjs` ~1673: `ammonia DECIMAL(5,3) DEFAULT 0` in an `IF NOT EXISTS` block; live column is `DECIMAL(5,2)` and should have no default | No-op on the live DB, but a truly fresh database would get the wrong precision **and** the D1 defect from boot | **Fixed** — boot DDL now says `DECIMAL(5,2)` with no `DEFAULT`, and `acknowledged_at` was aligned to `TIMESTAMPTZ` (016's live type) in the same pass |
+| D7 | No baseline schema in the repo | 8 of 16 tables had no `CREATE TABLE` anywhere | A fresh database could not be provisioned from this repository (capstone finding E1) | **Fixed** — `000_baseline.cjs` creates the eight base tables + `schema_migrations` in final live shape (with the genesis artifacts the 001→002→006 replay chain needs); no-op on live |
+| D8 | Redundant index | `idx_sensors_device_id` on `(device_id)` | Strictly a prefix of `idx_sensors_device_timestamp (device_id, timestamp DESC)`; write cost, no read benefit | Open — drop (deferred: F1-style judgement call, low impact) |
+| D9 | Unused column | `schema_migrations.checksum` | Written by nothing, read by nothing | Open — either populate it on apply (tamper detection) or drop |
+
+Soft-reference columns (`activity_logs.user_name`, `user_deletion_requests.user_username`,
+`acknowledged_by`, `archived_by`, `updated_by`, `recorded_by`, `otp_verified_by`,
+`approver`, `executed_by`) are **not** listed as defects: they are deliberate,
+documented display strings paired with real FKs where enforcement matters
+(migrations 019/020). See the FK notes above.
+
+---
+
 ## ERD Source (DBML for dbdiagram.io)
 
 Copy the block below into <https://dbdiagram.io> to render the diagram. It
 contains all **16 tables** and the **8 real foreign keys**, matching the live
-database after migrations 019–021.
+database after migrations through `025`.
+
+The same DBML and Mermaid blocks are appended to eight sibling schema documents
+(`docs/capstone/01`–`06`, `docs/TESTING_SCHEMA_FIX.md`, `docs/ARCHITECTURE.md`)
+as a copy-paste appendix, so each of them can be checked standalone against this
+file.
 
 Things to know before you paste it:
 
@@ -851,14 +946,17 @@ Table users {
   username varchar(50) [not null]
   email varchar(255) [not null]
   password_hash text [not null]
-  role varchar(20) [not null, default: "'user'"]
+  role varchar(20) [not null, default: 'user']
+  // CHECK (migration 024): role IN ('admin', 'user'). 'owner' is derived at
+  // runtime by isOwnerUser() and never stored in this column.
   token varchar(255)
-  // NOTE: created_at/updated_at are `timestamp` (naive) in the live database,
-  // not timestamptz. token_expires_at was converted by migration 005.
-  created_at timestamp [default: `now()`]
-  updated_at timestamp [default: `now()`]
+  // created_at/updated_at were the last naive columns here; migration 025
+  // converted both to timestamptz (token_expires_at was converted by 005).
+  created_at timestamptz [default: `now()`]
+  updated_at timestamptz [default: `now()`]
   token_expires_at timestamptz
-  status varchar(20) [not null, default: "'active'"]
+  status varchar(20) [not null, default: 'active']
+  // CHECK (migration 024): status IN ('active', 'pending_deletion', 'deleted', 'archived')
   deleted_at timestamptz
   pending_deletion_at timestamptz
   pending_deletion_requested_by varchar(100)
@@ -888,8 +986,8 @@ Table devices {
   tank_location varchar(100)
   last_health_seen timestamptz
   device_secret varchar(255)
-  registered_via varchar(20) [not null, default: "'auto'"]
-  ip_source varchar(10) [not null, default: "'auto'"]
+  registered_via varchar(20) [not null, default: 'auto']
+  ip_source varchar(10) [not null, default: 'auto']
   archived_at timestamptz
   archived_by varchar(100)
   // Secret rotation (migration 015). Of the four secret columns, the API only
@@ -923,10 +1021,13 @@ Table devices {
 Table sensors {
   id int [pk, increment]
   device_id varchar(50) [not null]
-  temperature decimal(5,2) [default: 0]
-  water_level decimal(5,2) [default: 0]
+  // No DEFAULT since migration 022 (defect D1, fixed): a failed sensor is NULL,
+  // which the CHECKs below accept — the old vestigial DEFAULT 0 was rejected by
+  // chk_sensors_temperature_valid, so it could never legally fire anyway.
+  temperature decimal(5,2)
+  water_level decimal(5,2)
   // precision is (5,2), not (5,3) - verified against the live database
-  ammonia decimal(5,2) [default: 0]
+  ammonia decimal(5,2)
   // Raw HC-SR04 distance (migration 018). NULL = not reported by the firmware
   // or a failed sensor. A lossy percentage alone cannot be recalibrated later.
   water_distance_cm decimal(6,2)
@@ -969,6 +1070,8 @@ Table sensor_calibration {
 
 Table sensor_settings {
   id int [pk, increment]
+  // CHECK (id = 1), migration 023: the singleton is enforced by the database,
+  // not by convention. server.cjs inserts id = 1 with ON CONFLICT (id).
   // All six range columns are NULLABLE in the live database (defaults, but no
   // NOT NULL constraint) - verified against information_schema.columns
   temp_min decimal(5,2) [default: 20.00]
@@ -977,8 +1080,8 @@ Table sensor_settings {
   water_level_max decimal(5,2) [default: 100.00]
   ammonia_min decimal(5,2) [default: 0.25]
   ammonia_max decimal(5,2) [default: 1.00]
-  // NOTE: naive `timestamp` in the live database, not timestamptz
-  updated_at timestamp [default: `now()`]
+  // timestamptz since migration 025 (converted from naive timestamp)
+  updated_at timestamptz [default: `now()`]
 
   Note: 'Global thresholds. Per-tank values live in device_threshold_overrides (NULL there = inherit from here). Not linked by FK.'
 }
@@ -1022,6 +1125,8 @@ Table last_alerts {
   // Composite PK: each device keeps its own alert state per sensor_key.
   device_id varchar(50) [not null]
   sensor_key varchar(50) [not null]
+  // CHECKs (migration 024): sensor_key IN ('Temperature','Water Level','Ammonia')
+  //                         status IS NULL OR IN ('good','warning','critical')
   status varchar(20)
   value decimal(5,2)
   // timestamptz since migration 016 (was naive)
@@ -1058,13 +1163,14 @@ Table activity_logs {
 Table user_deletion_requests {
   id int [pk, increment]
   // FK -> users.id ON DELETE SET NULL (migration 020). Drops
-  // the original NOT NULL so the flow can hard-delete the account it documents;
+  // the original NOT NULL so the account can be archived and later purged;
   // user_username then carries the identity.
   user_id int
   user_username varchar(100) [not null]
   requester_username varchar(100) [not null]
   requester_email varchar(255) [not null]
-  status varchar(20) [not null, default: "'pending_otp'"]
+  status varchar(20) [not null, default: 'PENDING_OTP']
+  // CHECK (migration 024): status IN ('PENDING_OTP', 'EXPIRED', 'COMPLETED')
   reason text
   otp_hash varchar(64)
   otp_salt varchar(32)
@@ -1145,9 +1251,9 @@ Table authorized_recipients {
   name varchar(100)
   is_active boolean [default: true]
   archived_at timestamptz
-  // NOTE: naive `timestamp` in the live database, not timestamptz
-  created_at timestamp [default: `now()`]
-  updated_at timestamp [default: `now()`]
+  // timestamptz since migration 025 — no longer naive beside archived_at
+  created_at timestamptz [default: `now()`]
+  updated_at timestamptz [default: `now()`]
 
   Note: 'sms_logs.recipient_phone matches phone_number via trigger trg_sms_logs_recipient, not an FK (see bottom of file).'
 
@@ -1165,6 +1271,7 @@ Table sms_logs {
   recipient_phone varchar(20) [not null]
   message text [not null]
   status varchar(20) [not null]
+  // CHECK (migration 024): status IN ('queued', 'delivered', 'failed', 'capped')
   error_message text
   sms_id varchar(100)
   delivered_at timestamptz
@@ -1217,9 +1324,9 @@ TableGroup system {
 
 // ---------------------------------------------------------------------------
 // ENFORCED FOREIGN KEYS (8)
-// All eight verified against information_schema.referential_constraints
-// on 2026-10-15, migrations 019/020/021 applied. sensors and last_alerts use
-// NO ACTION (default): devices are archived, never hard-deleted.
+// All eight verified against a pg_dump of the live catalog on 2026-10-18,
+// ledger through 025. sensors and last_alerts use NO ACTION (default):
+// devices are archived, never hard-deleted.
 // ---------------------------------------------------------------------------
 Ref: sensors.device_id > devices.device_id
 Ref: last_alerts.device_id > devices.device_id
@@ -1231,7 +1338,7 @@ Ref: sensor_calibration.device_id - devices.device_id [delete: cascade]
 // Migration 019: the audit trail's real link to its account. SET NULL so the
 // audit row outlives the account it names.
 Ref: activity_logs.user_id > users.id [delete: set null]
-// Migration 020: the deletion request's link to the account it deletes.
+// Migration 020: the archive request's link to the account it archives.
 Ref: user_deletion_requests.user_id > users.id [delete: set null]
 // Migration 021: one-to-many transition log.
 Ref: user_deletion_request_status_history.request_id > user_deletion_requests.id [delete: cascade]
@@ -1268,6 +1375,221 @@ Ref: user_deletion_request_status_history.request_id > user_deletion_requests.id
 // (activity_logs.user_id and user_deletion_requests.user_id ARE drawn above,
 // because those are real foreign keys - just not on the name column.)
 ```
+
+---
+
+## ERD Source (Mermaid)
+
+The same 16-table schema as the DBML above, in Mermaid `erDiagram` notation —
+paste into <https://mermaid.live> (or any Markdown renderer with Mermaid
+support) to render it and cross-check it against the DBML. Verified against
+the live dump of 2026-10-18 (migrations through `025`).
+
+```mermaid
+erDiagram
+    devices {
+        varchar device_id PK
+        varchar name
+        bool is_active
+        timestamptz created_at
+        timestamptz last_seen
+        text ip_address
+        varchar tank_name
+        varchar tank_location
+        timestamptz last_health_seen
+        varchar device_secret
+        timestamptz archived_at
+        varchar archived_by
+        varchar registered_via
+        varchar ip_source
+        timestamptz device_secret_rotated_at
+        varchar device_secret_prev
+        timestamptz device_secret_prev_expires_at
+    }
+    sensors {
+        int id PK
+        varchar device_id FK
+        numeric temperature
+        numeric water_level
+        numeric ammonia
+        timestamptz timestamp
+        numeric water_distance_cm
+    }
+    last_alerts {
+        varchar device_id PK, FK
+        varchar sensor_key PK
+        varchar status
+        numeric value
+        timestamptz timestamp
+    }
+    sensor_settings {
+        int id PK
+        numeric temp_min
+        numeric temp_max
+        numeric water_level_min
+        numeric water_level_max
+        numeric ammonia_min
+        numeric ammonia_max
+        timestamptz updated_at
+    }
+    device_threshold_overrides {
+        varchar device_id PK, FK
+        numeric temp_min
+        numeric temp_max
+        numeric water_level_min
+        numeric water_level_max
+        numeric ammonia_min
+        numeric ammonia_max
+        timestamptz updated_at
+    }
+    sensor_calibration {
+        varchar device_id PK, FK
+        numeric empty_cm
+        numeric full_cm
+        timestamptz updated_at
+        varchar updated_by
+    }
+    users {
+        int id PK
+        varchar name
+        varchar username UK
+        varchar email UK
+        text password_hash
+        varchar role
+        varchar token
+        timestamptz created_at
+        timestamptz updated_at
+        timestamptz token_expires_at
+        varchar status
+        timestamptz deleted_at
+        timestamptz pending_deletion_at
+        varchar pending_deletion_requested_by
+    }
+    activity_logs {
+        int id PK
+        varchar user_name
+        varchar action_type
+        text description
+        varchar module
+        timestamptz timestamp
+        int user_id FK
+    }
+    user_deletion_requests {
+        int id PK
+        int user_id FK
+        varchar user_username
+        varchar requester_username
+        varchar requester_email
+        varchar status
+        text reason
+        varchar otp_hash
+        varchar otp_salt
+        timestamptz otp_expires_at
+        int otp_attempts
+        timestamptz otp_verified_at
+        varchar otp_verified_by
+        timestamptz requested_at
+        varchar approver
+        timestamptz approved_at
+        varchar executed_by
+        timestamptz executed_at
+    }
+    user_deletion_request_status_history {
+        int id PK
+        int request_id FK
+        varchar status
+        timestamptz recorded_at
+        varchar recorded_by
+    }
+    email_otps {
+        int id PK
+        varchar email
+        varchar code_hash
+        varchar code_salt
+        timestamptz expires_at
+        int attempts
+        int max_attempts
+        timestamptz used_at
+        timestamptz created_at
+    }
+    sms_logs {
+        int id PK
+        varchar recipient_phone
+        text message
+        varchar status
+        text error_message
+        varchar sms_id
+        timestamptz sent_at
+        timestamptz delivered_at
+        text failure_reason
+    }
+    authorized_recipients {
+        int id PK
+        varchar phone_number UK
+        varchar name
+        bool is_active
+        timestamptz created_at
+        timestamptz updated_at
+        timestamptz archived_at
+    }
+    system_logs {
+        int id PK
+        varchar action
+        varchar parameter
+        varchar old_value
+        varchar new_value
+        timestamptz timestamp
+        varchar ack_status
+        timestamptz acknowledged_at
+        varchar acknowledged_by
+        varchar device_id FK
+    }
+    system_state {
+        varchar key PK
+        text value
+    }
+    schema_migrations {
+        varchar version PK
+        varchar name
+        timestamptz applied_at
+        varchar checksum
+    }
+
+    devices ||--o{ sensors : "receives readings from"
+    devices ||--o{ last_alerts : "holds current alert state for"
+    devices ||--o| device_threshold_overrides : "may have threshold override"
+    devices ||--o| sensor_calibration : "may have calibration row"
+    devices |o--o{ system_logs : "is attributed in"
+    users |o--o{ activity_logs : "is audited in"
+    users ||--o{ user_deletion_requests : "is subject of"
+    user_deletion_requests ||--|{ user_deletion_request_status_history : "transitions through"
+    authorized_recipients ||..o{ sms_logs : "phone matched at insert by trigger (no FK)"
+```
+
+---
+
+## Doc corrections
+
+| Date | Section | What was wrong | Corrected to |
+|---|---|---|---|
+| 2026-10-18 | Header + defect callout | Said "migrations through 021" and "defects documented not yet fixed (D1/D2)"; duplicated `sms_logs` FK paragraph | Through 025; D1–D7 fixed same day by `000`/`022`–`025`, only D8–D9 open; duplicate removed |
+| 2026-10-18 | Column tables | `sensors` still listed `DEFAULT 0` ×3 after the D1 fix; naive **TIMESTAMP** on `users.created_at`/`updated_at`, `sensor_settings.updated_at`, `authorized_recipients.created_at`/`updated_at` after the D5 fix | Defaults dropped (022); all five columns documented as `TIMESTAMPTZ` (025) |
+| 2026-10-18 | CHECK coverage | `users.role` claimed "No CHECK constraint"; CHECKs on `users.status`, `last_alerts.status`/`sensor_key`, `sms_logs.status`, `user_deletion_requests.status` (default still `'pending_otp'`), and `sensor_settings.id` undocumented | Documented from the live dump: `chk_users_role`/`chk_users_status`/`chk_lastalerts_*`/`chk_sms_logs_status`/`chk_deletion_requests_status` (024) and `chk_sensor_settings_singleton` (023); default corrected to `'PENDING_OTP'` |
+| 2026-10-18 | FK intro, DBML intro, `schema_migrations` | FK verification dated 2026-10-15 "after 019–021"; DBML intro said "after migrations 019–021"; versions listed `001`–`021` | pg_dump 2026-10-18, migrations through 025; versions `000`–`025`, no gaps |
+| 2026-10-18 | Header | "Verified 2026-10-15" via `information_schema` | Re-verified 2026-10-18 against a full `pg_dump --schema-only` (PostgreSQL 18.3); no structural drift found between the two dates |
+| 2026-10-18 | `users.role` | Listed only `admin` or `user` with no context on "owner" | Clarified: the column only stores `admin`/`user`; "owner" is derived at runtime from `ADMIN_USERNAME`/`ADMIN_EMAIL` by `isOwnerUser()` and returned as a separate boolean |
+| 2026-10-18 | `sensors` | Check-constraints block was duplicated verbatim; the `DEFAULT 0` vs CHECK contradiction was undocumented | Duplicate removed; the contradiction recorded as known defect D1 |
+| 2026-10-18 | `sensor_calibration` | Three bullets describing `device_threshold_overrides` (missing-table fallback, boot `CREATE TABLE`, "the one CASCADE FK") sat in this section | Threshold bullets moved to `device_threshold_overrides`; the CASCADE claim corrected — two CASCADE FKs into `devices` exist (012 and 018) |
+| 2026-10-18 | Data Retention | Omitted the 30-day `sensors` purge and the 90-day `activity_logs` purge entirely (capstone finding E3); "all time" is at most 30 days | Full four-table purge table with env vars and defaults |
+| 2026-10-18 | Notes → Schema creation | "The server only creates `system_state`" — the current `server.cjs` contains no such statement, and it *does* create `device_threshold_overrides` | Boot DDL described accurately; the 8-table provisioning gap (E1) stated explicitly |
+| 2026-10-18 | `schema_migrations` | "Verified present: 001–016" | 000–025, no gaps (000 records itself in `000_baseline.cjs`) |
+| 2026-10-18 | — | No "Known schema defects" section existed | Added, listing D1–D9 with planned fixes |
+| 2026-10-18 | Defects D1–D7 | Listed as open with "planned fix" columns; D5 claimed **7** naive timestamp columns | Fixed by migrations `000`/`022`–`025` + paired `server.cjs` edits; D5 corrected to the verified **5** columns (`users.created_at`/`updated_at`, `sensor_settings.updated_at`, `authorized_recipients.created_at`/`updated_at`) |
+| 2026-10-18 | Schema creation | "The eight base tables have no `CREATE TABLE` anywhere in the repo" | Closed by `000_baseline.cjs`: `createdb` + `000` + `001`..`025` now provisions a fresh database |
+| 2026-10-25 | `user_deletion_requests` | Described the flow as a hard delete and the OTP destination as the requester | The flow now **archives** the account (restorable, separate purge) and the OTP always goes to the owner; `SET NULL` remains so a later purge keeps the audit row |
+| 2026-10-15 | `sensor_settings` | Range columns listed as NOT NULL | Corrected to NULLABLE (defaults, no NOT NULL) |
+| 2026-10-15 | `sms_logs` FK | Documented `fk_sms_logs_recipient ... ON DELETE CASCADE` | Corrected: no such FK has ever existed; trigger `trg_sms_logs_recipient` is the enforcement |
+| 2026-10-15 | `sensors.ammonia` | Precision documented as (5,3) | Corrected to (5,2), live-verified |
 
 ---
 

@@ -3,6 +3,7 @@
 // PURPOSE: Add per-device secret column for ESP32 authentication
 // =============================================================================
 
+require("dotenv").config();
 const { Pool } = require("pg");
 
 const db = new Pool({

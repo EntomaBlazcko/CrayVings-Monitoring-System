@@ -294,6 +294,10 @@ async function main() {
   const sharedWorks = await ingest(`${PREFIX}NEWAUTODEVICE`, DEVICE_SECRET);
   check("the shared secret still auto-registers new boards", sharedWorks.status < 400, `status=${sharedWorks.status}`);
   await pool.query("DELETE FROM sensors WHERE device_id = $1", [`${PREFIX}NEWAUTODEVICE`]);
+  // last_alerts must go before devices: fk_lastalerts_device is NO ACTION, and
+  // every successful ingest writes an alert row whenever ammonia_min > 0 (the
+  // ingest body omits ammonia, which evaluates as 0 -> Low -> critical).
+  await pool.query("DELETE FROM last_alerts WHERE device_id = $1", [`${PREFIX}NEWAUTODEVICE`]);
   await pool.query("DELETE FROM devices WHERE device_id = $1", [`${PREFIX}NEWAUTODEVICE`]);
 
   // Now that the device owns a secret, a plain rotation works again.
@@ -329,6 +333,7 @@ async function main() {
   check("the correct shared secret still authenticates after the change", stillAuthenticates.status < 400, `status=${stillAuthenticates.status}`);
   for (const id of [`${PREFIX}SHORT`, `${PREFIX}EMPTY`, `${PREFIX}SAMELEN`, `${PREFIX}GOODSECRET`]) {
     await pool.query("DELETE FROM sensors WHERE device_id = $1", [id]).catch(() => {});
+    await pool.query("DELETE FROM last_alerts WHERE device_id = $1", [id]).catch(() => {});
     await pool.query("DELETE FROM devices WHERE device_id = $1", [id]).catch(() => {});
   }
 
@@ -376,6 +381,9 @@ async function main() {
   console.log("\n--- J. Cleanup ---");
   for (const id of [rotId, noSecretId, archId]) {
     await pool.query("DELETE FROM sensors WHERE device_id = $1", [id]).catch(() => {});
+    // Same FK order as above: without this line the .catch below silently
+    // swallowed the fk_lastalerts_device violation and left the device behind.
+    await pool.query("DELETE FROM last_alerts WHERE device_id = $1", [id]).catch(() => {});
     await pool.query("DELETE FROM devices WHERE device_id = $1", [id]).catch(() => {});
   }
   await pool.query("DELETE FROM users WHERE username = $1", [plainUser]).catch(() => {});

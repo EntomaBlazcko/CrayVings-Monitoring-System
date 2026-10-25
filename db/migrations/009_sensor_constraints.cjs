@@ -4,6 +4,7 @@
 // constraints and a partial index to the sensors table.
 // =============================================================================
 
+require("dotenv").config();
 const { Pool } = require("pg");
 
 const db = new Pool({

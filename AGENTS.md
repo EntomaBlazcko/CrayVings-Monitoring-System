@@ -158,7 +158,7 @@ curl http://localhost:3000/health
 ## 4. Folder structure
 
 ```
-server.cjs                  # Express backend (~4500 lines): auth, sensors, SSE,
+server.cjs                  # Express backend (~5600 lines): auth, sensors, SSE,
                             #   logs, SMS, analytics, settings. The main API.
 services/
   devicePoller.cjs          # star-topology health poller (GET /status, 5s)
@@ -183,7 +183,7 @@ water_monitoring_system/
   ESP32_main_code/          # tank-1 firmware, device_id ESP32_01
   NODE_main_code/           # NodeMCU spare firmware, device_id ESP32_02
 public/                     # static assets, alert sounds
-tools/                      # restart-server.ps1, watch-connection.cjs
+tools/                      # restart-server.ps1, watch-connection.cjs, demo seed/backfill
 ```
 
 Conventions worth knowing:

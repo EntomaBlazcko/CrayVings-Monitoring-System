@@ -1,4 +1,4 @@
-//todo make sure the esp32 is running and connected to the code 
+
 #include <Arduino.h>
 #include <FS.h>
 #include <TFT_eSPI.h>
@@ -583,7 +583,13 @@ int mq137SpikeStreak = 0;   // Consecutive spike count for spike rejection
 // except a reflash. Instead, quietly re-probe on a long interval. Capped so a
 // genuinely absent module costs a handful of serial lines over ~an hour rather
 // than an endless retry loop, and skipped entirely in simulation.
-#define MQ137_RECAL_RETRY_MS  240000UL
+//
+// The interval doubles as the warm-up gate: an MQ-137's heater needs minutes to
+// stabilise after power-up, so a calibration run in the first minutes reads a
+// far too high Rs (Vout collapses toward 0 V) and fails. The first retry must
+// therefore land AFTER the warm-up window, not before it.
+#define MQ137_WARMUP_MS       300000UL
+#define MQ137_RECAL_RETRY_MS  300000UL
 #define MQ137_RECAL_MAX_TRIES 12
 
 unsigned long lastMq137RecalMs = 0;
@@ -1473,7 +1479,11 @@ float mq137RsFromVoltage()
 // Returns true (and persists) only when a sane R0 is derived.
 bool probeMq137R0Quietly()
 {
-    const int samples = 5;
+    // 12 samples over ~0.6 s. The boot-time calibration was removed (a cold
+    // heater always failed it), so this probe is usually the call that actually
+    // derives R0 - it samples more than the original 5 quick reads, still far
+    // too short to disturb touch or the display.
+    const int samples = 12;
     float sum = 0.0f;
     int good = 0;
 
@@ -1489,7 +1499,7 @@ bool probeMq137R0Quietly()
             good++;
         }
 
-        vTaskDelay(20 / portTICK_PERIOD_MS);
+        vTaskDelay(50 / portTICK_PERIOD_MS);
     }
 
     if (good == 0)
@@ -2311,10 +2321,13 @@ void handleTouch()
             Serial.print(" Y=");
             Serial.println(y);
 
-            if (
-                (x < 80 && y > 240 && y < 305) ||
-                (x > 400 && y > 240 && y < 305)
-            )
+            // No arrow highlight in Safe Mode: drawNavigation() would paint
+            // the nav arrows over the SAFE MODE recovery screen.
+            if (!safeModeActive &&
+                (
+                    (x < 80 && y > 240 && y < 305) ||
+                    (x > 400 && y > 240 && y < 305)
+                ))
             {
                 drawNavigation(true);
                 navButtonHighlighted = true;
@@ -2346,13 +2359,19 @@ void handleTouch()
         drawNavigation();
     }
 
-    if (millis() - lastPageChange < PAGE_CHANGE_COOLDOWN)
+    // Safe Mode: touch stays live so the board can still be recovered, but the
+    // only gesture honoured is the triple-tap WiFi config below. Page navigation
+    // and MQ-137 recalibration both repaint the normal UI, which would hide the
+    // SAFE MODE screen and the last-known-good values it exists to show. The
+    // config portal is the recovery path for a board stuck without an uplink,
+    // so it must not be locked out too.
+    if (!safeModeActive && millis() - lastPageChange < PAGE_CHANGE_COOLDOWN)
     {
         return;
     }
 
     // Left arrow button region (bottom-left)
-    if (endX < 80 && endY > 240 && endY < 305)
+    if (!safeModeActive && endX < 80 && endY > 240 && endY < 305)
     {
         Serial.println("[NAV] LEFT ARROW -> PREVIOUS PAGE");
         previousPage();
@@ -2360,7 +2379,7 @@ void handleTouch()
     }
 
     // Right arrow button region (bottom-right)
-    if (endX > 400 && endY > 240 && endY < 305)
+    if (!safeModeActive && endX > 400 && endY > 240 && endY < 305)
     {
         Serial.println("[NAV] RIGHT ARROW -> NEXT PAGE");
         nextPage();
@@ -2391,8 +2410,10 @@ void handleTouch()
         }
     }
 
-    // Triple tap on top-right corner to recalibrate the MQ-137 (clean air)
-    if (endX > 420 && endY < 60)
+    // Triple tap on top-right corner to recalibrate the MQ-137 (clean air).
+    // Skipped in Safe Mode: calibrateMq137R0() ends by repainting the normal
+    // UI, which would erase the SAFE MODE screen.
+    if (!safeModeActive && endX > 420 && endY < 60)
     {
         static uint8_t calTapCount = 0;
         static unsigned long lastCalTapTime = 0;
@@ -2682,7 +2703,19 @@ void startWifiConfigPortal()
     if (!headlessMode)
     {
         tft.fillScreen(TFT_WHITE);
-        drawCurrentPage();
+        // If Safe Mode is still active, the normal UI must not be painted here:
+        // updateCurrentPage() is gated on !safeModeActive, so the drawn page
+        // would freeze stale while the SAFE MODE screen is what the operator
+        // needs. enterSafeMode() redraws it; once the first POST succeeds the
+        // loop restores the normal UI on its own.
+        if (safeModeActive)
+        {
+            enterSafeMode();
+        }
+        else
+        {
+            drawCurrentPage();
+        }
     }
 }
 
@@ -3048,6 +3081,9 @@ void enterSafeMode()
     tft.drawString(line, 240, 195, 2);
     tft.setTextColor(TFT_ORANGE, TFT_WHITE);
     tft.drawString("Waiting for uplink to auto-resume...", 240, 240, 2);
+    tft.setTextColor(TFT_DARKGREY, TFT_WHITE);
+    tft.drawString("No uplink? Tap top-left corner 3x", 240, 270, 2);
+    tft.drawString("to open WiFi setup", 240, 292, 2);
 }
 
 void setup()
@@ -3247,11 +3283,16 @@ void setup()
     // Expose GET /status (and /) so the central server can read this device.
     startStatusServer();
 
-    // Load a previously calibrated MQ-137 R0, or run the clean-air calibration
-    // on first boot (needs the display up, since it shows progress on screen).
-    // refreshMq137R0Once() forces one fresh calibration the first boot after a
-    // firmware update, so an R0 stored under the old RL value is thrown away
-    // instead of being loaded silently.
+    // Load a previously calibrated MQ-137 R0. refreshMq137R0Once() discards a
+    // stale R0 the first boot after a firmware update so it cannot be loaded
+    // silently.
+    //
+    // No calibration runs here, deliberately: at power-up the heater is still
+    // cold, Rs reads far too high, Vout collapses below the 5 mV floor, and the
+    // attempt always failed with the misleading "check wiring/power" screen.
+    // The automatic re-probe in loop() takes the first attempt after
+    // MQ137_WARMUP_MS instead, and the triple-tap gesture stays available for
+    // an immediate manual run once the sensor is warm.
     if (simulateDevice)
     {
         // Virtual tank: no MQ-137 module attached, so there is nothing to
@@ -3260,8 +3301,8 @@ void setup()
     }
     else if (refreshMq137R0Once() || !loadMq137R0())
     {
-        Serial.println("[MQ-137] No valid R0 - starting clean-air calibration...");
-        calibrateMq137R0();
+        Serial.printf("[MQ-137] No valid R0 - automatic calibration starts after warm-up (%lu ms)\n",
+                      (unsigned long)MQ137_WARMUP_MS);
     }
     else
     {
@@ -3411,11 +3452,12 @@ void loop()
 
     // Touch is serviced FIRST on every tick so a tap never waits behind
     // sensor reads, screen redraws, or Wi-Fi sends. Skipped in headless mode
-    // (no touch panel attached - a floating CS pin can register phantom taps)
-    // and while Safe Mode is up: a tap there used to navigate to a normal page
-    // and paint over the SAFE MODE recovery screen, hiding the last-known-good
-    // values. Safe Mode always leaves on its own, via the first good uplink.
-    if (!headlessMode && !safeModeActive)
+    // (no touch panel attached - a floating CS pin can register phantom taps).
+    // Safe Mode still services touch so a board stuck without an uplink can be
+    // recovered via the triple-tap config portal; handleTouch() itself blocks
+    // the navigation and MQ-137 gestures there so they cannot paint over the
+    // SAFE MODE recovery screen.
+    if (!headlessMode)
     {
         handleTouch();
     }

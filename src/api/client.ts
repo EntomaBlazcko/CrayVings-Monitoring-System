@@ -129,15 +129,11 @@ export async function fetchLatestSensor(deviceId?: string | null, signal?: Abort
   }
 }
 
-// GET /sensor - fetch sensor history sorted oldest-first as ChartPoints for charts.
-// Optional deviceId scopes the query to one tank.
-export async function fetchSensorHistory(limit = 1000, deviceId?: string | null, signal?: AbortSignal): Promise<ChartPoint[]> {
-  const response = await client.get<SensorEntry[]>("/sensor", {
-    params: deviceId ? { limit, device_id: deviceId } : { limit },
-    signal,
-  });
-  
-  const data = (response.data || [])
+// Maps raw /sensor rows to ChartPoints, oldest-first. Shared by the plain
+// history fetch and the windowed one below so sentinel/null handling can never
+// drift between them.
+function toChartPoints(rows: SensorEntry[]): ChartPoint[] {
+  return (rows || [])
     .slice()
     .sort((a, b) => {
       const ta = new Date(a.timestamp || 0).getTime();
@@ -167,8 +163,34 @@ export async function fetchSensorHistory(limit = 1000, deviceId?: string | null,
         ammonia: toNum(item.ammonia),
       };
     });
-  
-  return data;
+}
+
+// GET /sensor - fetch sensor history sorted oldest-first as ChartPoints for charts.
+// Optional deviceId scopes the query to one tank.
+export async function fetchSensorHistory(limit = 1000, deviceId?: string | null, signal?: AbortSignal): Promise<ChartPoint[]> {
+  const response = await client.get<SensorEntry[]>("/sensor", {
+    params: deviceId ? { limit, device_id: deviceId } : { limit },
+    signal,
+  });
+  return toChartPoints(response.data);
+}
+
+// GET /sensor with an explicit [from, to] window. The Historical Data page uses
+// this instead of "newest N rows": N truncated a week of 5-minute readings to
+// ~3.5 days, and it downloaded rows older than the selected range only to throw
+// them away client-side. `from` is null for All Time (everything up to `to`).
+export async function fetchSensorHistoryWindow(
+  deviceId: string | null | undefined,
+  fromIso: string | null,
+  toIso: string,
+  limit: number,
+  signal?: AbortSignal,
+): Promise<ChartPoint[]> {
+  const params: Record<string, string | number> = { limit, to: toIso };
+  if (deviceId) params.device_id = deviceId;
+  if (fromIso) params.from = fromIso;
+  const response = await client.get<SensorEntry[]>("/sensor", { params, signal });
+  return toChartPoints(response.data);
 }
 
 
@@ -300,22 +322,28 @@ export async function fetchDeviceStatus(deviceId: string, signal?: AbortSignal):
 }
 
 
-// GET /report/weekly - fetch 7-day aggregate report stats.
-// Optional deviceId scopes the whole report (summary, daily, alerts) to one tank.
-export async function fetchWeeklyReport(deviceId?: string | null, signal?: AbortSignal): Promise<WeeklyReport> {
-  const response = await client.get<WeeklyReport>("/report/weekly", {
-    params: deviceId ? { device_id: deviceId } : undefined,
-    signal,
-  });
-  return response.data;
-}
-
-// GET /report/range - aggregate report for a custom window.
-// hours: positive int (last N hours, hourly buckets when <= 24) or null (all time).
+// GET /report/range - aggregate report for an explicitly named window.
+// Every range the dashboard offers goes through this one call, so the chart,
+// the on-screen breakdown and the PDF export always describe the same span:
+//   fromIso + toIso -> that exact window (`to` exclusive)
+//   toIso only      -> all time up to `to` (the "All Time" preset, whose period
+//                      label still ends at the newest reading instead of today)
+//   neither         -> the server falls back to all time
 // Optional deviceId scopes the report to one tank.
-export async function fetchRangeReport(hours: number | null, deviceId?: string | null, signal?: AbortSignal): Promise<WeeklyReport> {
-  const params: Record<string, string | number> = { ...(hours && hours > 0 ? { hours } : {}), ...(deviceId ? { device_id: deviceId } : {}) };
-  const response = await client.get<WeeklyReport>("/report/range", { params, signal });
+export async function fetchRangeReport(options: {
+  deviceId?: string | null;
+  signal?: AbortSignal;
+  fromIso?: string | null;
+  toIso?: string | null;
+} = {}): Promise<WeeklyReport> {
+  const params: Record<string, string> = {};
+  if (options.fromIso) params.from = options.fromIso;
+  if (options.toIso) params.to = options.toIso;
+  if (options.deviceId) params.device_id = options.deviceId;
+  const response = await client.get<WeeklyReport>("/report/range", {
+    params: Object.keys(params).length > 0 ? params : undefined,
+    signal: options.signal,
+  });
   return response.data;
 }
 
@@ -643,9 +671,9 @@ export async function createUser(
 }
 
 // -----------------------------------------------------------------------------
-// SECURE USER DELETION (EMAIL OTP 2-STEP) — replaces the old hard delete.
-// POST /auth/users/:id/deletion-request  (password + reason) -> emails OTP
-// POST /auth/users/:id/deletion-verify   (request_id + code) -> hard deletes
+// SECURE USER ARCHIVE (EMAIL OTP 2-STEP) — replaces the old hard delete.
+// POST /auth/users/:id/deletion-request  (password + reason) -> emails OTP to the OWNER
+// POST /auth/users/:id/deletion-verify   (request_id + code) -> archives (soft delete)
 // -----------------------------------------------------------------------------
 
 export interface DeletionRequestResponse {
@@ -670,7 +698,7 @@ export interface DeletionRequestEntry {
 }
 
 // STEP 1 - Admin confirms their own password; server emails a 6-digit OTP to the
-// target user's address and returns an opaque request_id.
+// OWNER's address (never the target user's) and returns an opaque request_id.
 export async function requestUserDeletion(
   userId: number,
   password: string,

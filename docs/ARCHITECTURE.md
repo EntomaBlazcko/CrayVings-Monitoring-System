@@ -12,7 +12,7 @@ printed thesis.
 | Document | Covers |
 |---|---|
 | **ARCHITECTURE.md** (this file) | Topology, stack, diagram, data flow, offline handling, resilience, alerting, SMS behaviour, API map, frontend architecture, hardware, running, env vars, debugging, performance, security |
-| [DATABASE.md](DATABASE.md) | Every table, column, index, constraint, FK, the 001–016 migration table, and a DBML ERD |
+| [DATABASE.md](DATABASE.md) | Every table, column, index, constraint, FK, the 000–025 migration table, and a DBML ERD |
 | [DEVICES.md](DEVICES.md) | Registering, hiding, archiving and rotating the fleet; the design decisions behind it |
 | [TESTING.md](TESTING.md) | Static checks, the mock simulator, and the 2-tank and 10-tank verification runbooks |
 | [INTEGRATIONS.md](INTEGRATIONS.md) | SMS gateway setup and troubleshooting |
@@ -88,7 +88,7 @@ chips and the farm grid (with an on-demand "Live check" per device).
 | Icons | lucide-react | 1.8 |
 | PDF Export | jsPDF + autoTable | 4.2 + 5.0 |
 | Backend | Express.js | 5.2 |
-| Database | PostgreSQL | 15+ |
+| Database | PostgreSQL | 15+ (live: 18.3) |
 | Query layer | pg | 8.20 |
 | Validation | Zod | 4.3 |
 | HTTP Client | Axios | 1.15 |
@@ -134,7 +134,7 @@ grouping legible. If you need a version that fits a portrait page, use
   │  2. NETWORK — HTTP / JSON over LAN  192.168.4.0/24              │
   │     .1 router · .10 server · .100–.105 ESP32                     │
   └───────────────────────────┬──────────────────────────────────────┘
-                              │ 57 routes (56 REST + SSE)
+                              │ 60 routes (59 REST + SSE)
   ┌───────────────────────────▼──────────────────────────────────────┐
   │  3. APPLICATION LAYER — Express 5 API (server.cjs)               │
   │                                                                  │
@@ -156,7 +156,7 @@ grouping legible. If you need a version that fits a portrait page, use
          ▼                                     ▼
   ┌────────────────────────┐          ┌──────────────────────────┐
   │  4. DATA LAYER         │          │  5. PRESENTATION LAYER   │
-  │     PostgreSQL 15      │          │     React 19 + TS + Vite │
+   │     PostgreSQL 15+    │          │     React 19 + TS + Vite │
   │                        │          │                          │
   │  Time-Series           │◀──reads─▶│  [AuthContext]          │
   │   sensors              │          │  [SensorProvider]        │
@@ -235,7 +235,7 @@ Two flows run in opposite directions:
 | `smsService.cjs` | Circuit breaker: CLOSED / OPEN / HALF_OPEN, 5 consecutive failures trip it, 60 s cooldown, then a single probe. The delivery-reconciliation poller runs outside the breaker |
 | Cross-cutting middleware | helmet CSP, CORS allowlist, rate limiting (global 300 req/min/IP, login 5 **failed** attempts / 15 min, sensor ingest 12/s per device), Zod validation, JSON 404/error envelope |
 
-### 4 · Data layer — PostgreSQL 15
+### 4 · Data layer — PostgreSQL 15+ (live database: 18.3)
 
 16 tables (`sensor_calibration` arrived with 018;
 `user_deletion_request_status_history` with 021). Accessed through a single
@@ -244,7 +244,7 @@ by function:
 
 | Group | Tables |
 |---|---|
-| Time-series | `sensors` — the hot table; NULL records a failed sensor; keyset pagination up to 1000 rows |
+| Time-series | `sensors` — the hot table; NULL records a failed sensor; window queries up to 20 000 rows, plus a keyset cursor (`before`) for paging older data |
 | Configuration & registry | `devices`, `sensor_settings`, `device_threshold_overrides`, `sensor_calibration` |
 | Identity & audit | `users`, `email_otps`, `user_deletion_requests`, `user_deletion_request_status_history`, `activity_logs` |
 | Alerting state | `system_logs`, `last_alerts` |
@@ -270,8 +270,8 @@ Full column-level detail is in [DATABASE.md](DATABASE.md).
 | HTTPSMS Cloud API | `httpsms.com`. The send POST is breaker-guarded; the delivery-status GET is not, so queued messages still reconcile |
 | Android SMS Gateway | A phone running the HttpSms app relays API requests onto the mobile network |
 | SMS Recipients | Operators and farm staff, managed from Settings, stored in `authorized_recipients` |
-| SMTP / Nodemailer | Account-deletion OTP codes only — not general alerting. Falls back to console output in development |
-| Schema migrations | `db/migrations/` — 21 standalone scripts (001–021), run manually and tracked in `schema_migrations` |
+| SMTP / Nodemailer | Account-archive OTP codes only (always addressed to the owner) — not general alerting. Falls back to console output in development |
+| Schema migrations | `db/migrations/` — 26 standalone scripts (000–025), run manually and tracked in `schema_migrations` |
 | Test harness | `tests/` — 6 standalone suites, plus `tools/watch-connection.cjs` |
 
 ---
@@ -364,8 +364,9 @@ The Express server (`server.cjs`) performs these operations:
   are treated as failed sensors (−1 from the ESP32) and skipped
 - **d) Alert generation:** creates alerts for out-of-range values
 - **e) Logging:** records all alerts to the `system_logs` table
-- **f) History API:** accepts a `limit` parameter (1-1000, default: 300) for
-  flexible data retrieval
+- **f) History API:** accepts a `limit` parameter (1-20 000, default: 300) and
+  optional `from`/`to` bounds, so a window query returns only the rows being
+  charted instead of "the newest N" (which silently truncated long ranges)
 
 ### 4. Frontend display
 
@@ -464,17 +465,24 @@ The system actively monitors ESP32 connectivity:
 
 ### 4. Data-driven insights & analytics
 
-- Historical data analysis with time range filtering (1h, 6h, 24h, 1w, all time)
+- Historical data analysis with preset windows (1h, 6h, 24h, 1w, all time) plus a
+  custom From/To date range
 - Trend charts for Temperature, Water Level, and Ammonia using Recharts
 - Statistical summaries on dashboard
-- Export capability via PDF (LogsPage exports system logs, Historical Data
-  exports weekly report)
-- Weekly report: 7-day summary (min/avg/max per sensor), daily breakdown, and
-  alert counts
-- Flexible history fetching: backend supports up to 1000 records (default: 300)
+- Export capability via PDF (LogsPage exports system logs; Historical Data exports
+  the exact window shown on screen, presets and custom alike)
+- Window report: summary (min/avg/max per sensor), hourly or daily breakdown, and
+  alert counts for whichever window is selected; a 7-day span keeps the
+  "Weekly Report" title
+- Flexible history fetching: window queries support up to 20 000 rows (default:
+  300), and `GET /sensor` takes `from`/`to` so the dashboard downloads only the
+  selected range
+- **Windows anchor to the newest reading, not the wall clock:** a tank that stopped
+  reporting weeks ago still has a usable "1 Week"/"24 Hours" window (its final
+  week) instead of every range computing against today and coming back empty
 - **Available while device is offline:** history is read from the database, so it
   stays viewable when the ESP32 disconnects (an amber banner shows the last
-  recorded data time; short ranges that would be empty are dimmed)
+  recorded data time; every preset remains selectable)
 - **Failed-sensor sentinel filtering:** readings the ESP32 marks as failed (−1,
   and 0 for temperature) are excluded from charts and statistics
 
@@ -531,8 +539,9 @@ The system actively monitors ESP32 connectivity:
 - Auto-table formatting with pagination support (correct page numbers on
   multi-page exports)
 - Available in LogsPage
-- Weekly report export: Historical Data page (1 Week range) exports the summary,
-  daily table, and alert breakdown to PDF
+- History report export: the Historical Data page exports the summary, breakdown
+  table, and alert panel for the current preset or custom range; the report opens
+  in a preview tab, with a normal download if the popup is blocked
 
 ---
 
@@ -644,9 +653,11 @@ remains available when the ESP32 is offline:
   every range change — it does not depend on the live connection state
 - While offline, an amber banner shows "Device offline — showing recorded data up
   to {last recorded time}"
-- Range buttons that would contain no readings during a long outage (e.g.
-  1h/6h/24h) are dimmed with an explanatory tooltip; 1 Week and All Time stay
-  enabled
+- Every preset anchors its window to the newest stored reading rather than "now",
+  so 1h/6h/24h show the tank's final available data instead of an empty window
+  after a long outage. Nothing is dimmed or disabled.
+- The on-screen summary, alert counts, and PDF all use one report for that same
+  window, so they cannot disagree with the charts
 - A hard error is only shown if the server itself is unreachable (no DB access)
 
 ---
@@ -890,7 +901,7 @@ Manage SMS recipients through the Settings page:
 
 ## API Map
 
-`server.cjs` defines **57 route handlers**: 56 JSON REST endpoints plus the SSE
+`server.cjs` defines **60 route handlers**: 59 JSON REST endpoints plus the SSE
 stream at `GET /sensor/stream`. The full per-endpoint reference — parameters,
 response shapes, status codes — is the
 [README](../README.md#api-endpoints). What follows is the map by domain, which is
@@ -908,26 +919,25 @@ what the architecture actually cares about.
 
 | Endpoint | Method | Notes |
 |---|---|---|
-| `/auth/login` | POST | Sets the `crayvings_session` cookie; rate-limited on failures |
+| `/auth/login` | POST | Accepts `username` or `email`; sets the `crayvings_session` cookie; only failed attempts are rate-limited |
 | `/auth/logout` | POST | Revokes the session |
 | `/auth/me/password` | PUT | Self-service change; requires the current password |
 | `/auth/users` | GET | List users (admin) |
 | `/auth/users` | POST | Create user (admin) |
-| `/auth/users/:id` | DELETE | Delete user (admin) |
 | `/auth/users/:id/password` | PUT | Admin reset; `currentPassword` required when self-targeting |
 | `/auth/users/archived` | GET | Archived users (admin) |
 | `/auth/users/archived/:id` | DELETE | Purge an archived user (admin) |
-| `/auth/users/:id/deletion-request` | POST | Request self-deletion (OTP) |
-| `/auth/users/:id/deletion-verify` | POST | Confirm with the OTP |
-| `/auth/users/:id/restore` | POST | Cancel a pending deletion (admin) |
-| `/auth/users/deletion-requests` | GET | Pending deletion requests (admin) |
+| `/auth/users/:id/deletion-request` | POST | Request account archive; OTP emailed to the **owner** (admin) |
+| `/auth/users/:id/deletion-verify` | POST | Verify the OTP; archives the account (restorable) |
+| `/auth/users/:id/restore` | POST | Restore an archived account (admin) |
+| `/auth/users/deletion-requests` | GET | Archive-request audit trail (admin) |
 
 ### Sensor data
 
 | Endpoint | Method | Notes |
 |---|---|---|
 | `/sensor` | POST | Ingest; `X-Device-Secret` when `DEVICE_SECRET` is set |
-| `/sensor` | GET | History, `limit` 1-1000, optional `device_id` |
+| `/sensor` | GET | History, `limit` 1-20 000 (default 300), optional `device_id`, `from`/`to` window (`to` inclusive), `before` keyset cursor |
 | `/sensor/latest` | GET | Latest reading incl. the `recv_at` heartbeat |
 
 ### Devices
@@ -954,6 +964,7 @@ what the architecture actually cares about.
 | `/settings/device/:deviceId` | PUT | Set per-device threshold override |
 | `/settings/device/:deviceId` | DELETE | Clear per-device threshold override |
 | `/settings/reset` | POST | Restore default thresholds |
+| `/calibration/water-level` | GET / PUT | Read / update the per-device tank geometry used for water-level percentages |
 
 ### SMS & recipients
 
@@ -972,6 +983,7 @@ what the architecture actually cares about.
 | `/alert/mute-status` | GET | Current mute state |
 | `/alert/status` | POST | Send an hourly status SMS to recipients — admin only |
 | `/alert/sms-health` | GET | Circuit-breaker snapshot |
+| `/alert/sms-breaker/reset` | POST | Force the SMS circuit breaker closed (admin) |
 
 ### Analytics & reports
 
@@ -980,8 +992,8 @@ what the architecture actually cares about.
 | `/analytics/overview` | GET | Per-tank summary |
 | `/analytics/daily` | GET | Daily aggregation |
 | `/analytics/insights` | GET | Rule-based insights |
-| `/report/weekly` | GET | Weekly report |
-| `/report/range` | GET | Arbitrary-range report |
+| `/report/weekly` | GET | Weekly report; optional `end_at` anchors the 7-day window to a reading instead of now |
+| `/report/range` | GET | Range report - `?from&to` (either bound optional, `to` exclusive), `?hours&end_at`, or both omitted for all time |
 
 ### Logs
 
@@ -1240,7 +1252,7 @@ server.cjs                         Express backend
 services/
 +-- devicePoller.cjs              Star-topology health poller
 +-- smsService.cjs                HTTPSMS client + circuit breaker
-db/migrations/                    001–016, idempotent, tracked in schema_migrations
+db/migrations/                    000–025, idempotent, tracked in schema_migrations
 tests/                            6 standalone suites
 water_monitoring_system/
 +-- ESP32_main_code/ESP32_main_code.ino   ESP32 tank-1 firmware (WiFiManager), device ID ESP32_01
@@ -1304,7 +1316,7 @@ from the name.
 | `DEVICE_SECRET` | — | Shared ingestion secret. When set, `POST /sensor` requires the `X-Device-Secret` header |
 | `DEVICE_SECRET_GRACE_MS` | — | Window during which a rotated per-device secret is still accepted. A **security control**: `0` locks out any board not yet re-provisioned, non-zero keeps a stolen pre-rotation secret valid until the window closes. Unset falls back to the caller's default (24h, capped at 7 days by `grace_hours`) |
 | `COOKIE_SECURE` | off | Set `true` when serving over HTTPS |
-| `OTP_EMAIL` / `SMTP_HOST` / `SMTP_PORT` / `SMTP_USER` / `SMTP_PASS` / `SMTP_SECURE` / `SMTP_FROM` | — | Account-deletion OTP email only |
+| `OTP_EMAIL` / `SMTP_HOST` / `SMTP_PORT` / `SMTP_USER` / `SMTP_PASS` / `SMTP_SECURE` / `SMTP_FROM` | — | Archive-request OTP email. The code always goes to the **owner**; `OTP_EMAIL` is only an optional override of that mailbox (default: `ADMIN_EMAIL`, or the owner account's email looked up by `ADMIN_USERNAME`). `SMTP_*` configure the mailer itself |
 | `DEV_OTP_CONSOLE_FALLBACK` | — | Print OTPs to the console instead of sending mail. Only in non-production; with no `SMTP_HOST` the server always falls back and warns at startup |
 | `DELTA_LOGGING_ENABLED` | `true` | Change-only sensor logging |
 | `TEMP_DELTA_TOLERANCE` / `WATER_LEVEL_DELTA_TOLERANCE` / `AMMONIA_DELTA_TOLERANCE` | `0.1` / `1.0` / `0.05` | Per-sensor change thresholds |
@@ -1475,7 +1487,7 @@ curl http://localhost:3000/alert/mute-status
 5. **WebSocket** — real-time updates instead of SSE + polling
 6. **Multi-user** — role-based access beyond `owner` / `admin` / `user`
 7. **Export API** — public API for integrations
-8. **Email Alerts** — SMTP-based notifications beyond deletion OTPs
+8. **Email Alerts** — SMTP-based notifications beyond archive OTPs
 9. **Dashboard Widgets** — customizable home page
 
 ---
@@ -1496,14 +1508,645 @@ before this merge.
 | SSE authentication | `?token=` query parameter | **cookie**, same-origin | `server.cjs:476`, `src/contexts/SensorProvider.tsx:295` |
 | SSE client | `src/hooks/useSSE.ts` | **inside `SensorProvider.tsx`** | `src/contexts/SensorProvider.tsx:273-299` |
 | Fleet grid component | `FleetGrid` | **`FarmOverview`** | `src/pages/DashboardPage.tsx:13` |
-| Handler count | 61 | **57** (56 REST + 1 SSE) | `server.cjs` |
-| Migrations | 17 (001–017) | **16 (001–016)** | `db/migrations/` |
-| Test suites | 5 | **6** | `tests/` |
+| Handler count | 61 | **60** (59 REST + 1 SSE) | `server.cjs` |
+| Migrations | 17 (001–017) | **26 (000–025)** | `db/migrations/` |
+| Test suites | 5 | **6 in `tests/`** (+ the threshold suite in `src/types/`) | `tests/` |
 | Pages | 9 | **10** (Auth included) | `src/pages/` |
 | Deployment | `dist/` served by an external host | **`server.cjs` serves `dist/` and strips `/api`** | `server.cjs` |
 | Ammonia default threshold | 0 – 25 ppm | **0.25 – 1.00 ppm** | `server.cjs:1417` |
-| The per-table SQL block | 6 tables inline | **removed** — [DATABASE.md](DATABASE.md) covers all 14 | — |
+| The per-table SQL block | 6 tables inline | **removed** — [DATABASE.md](DATABASE.md) covers all 16 | — |
 
 ---
 
 *End of architecture.*
+
+---
+
+## Appendix — full-schema ERD (copy-paste check blocks)
+
+Both blocks below encode all **16 tables** — every column, primary key, unique
+index, and foreign key of the live schema, verified against a
+`pg_dump --schema-only` on 2026-10-18 (migrations through `025`). Paste the
+DBML into <https://dbdiagram.io> and the Mermaid into <https://mermaid.live>
+(or any Mermaid renderer) and compare them with the rest of this document.
+
+### DBML — paste into dbdiagram.io
+```dbml
+// Full schema and enforcement notes: see DATABASE.md
+
+Table users {
+  id int [pk, increment]
+  name varchar(100) [not null]
+  username varchar(50) [not null]
+  email varchar(255) [not null]
+  password_hash text [not null]
+  role varchar(20) [not null, default: 'user']
+  // CHECK (migration 024): role IN ('admin', 'user'). 'owner' is derived at
+  // runtime by isOwnerUser() and never stored in this column.
+  token varchar(255)
+  // created_at/updated_at were the last naive columns here; migration 025
+  // converted both to timestamptz (token_expires_at was converted by 005).
+  created_at timestamptz [default: `now()`]
+  updated_at timestamptz [default: `now()`]
+  token_expires_at timestamptz
+  status varchar(20) [not null, default: 'active']
+  // CHECK (migration 024): status IN ('active', 'pending_deletion', 'deleted', 'archived')
+  deleted_at timestamptz
+  pending_deletion_at timestamptz
+  pending_deletion_requested_by varchar(100)
+
+  Note: 'Referenced by id from activity_logs.user_id and user_deletion_requests.user_id (migrations 019/020), and by username (soft reference) from several audit columns. Usernames can be reused after archiving (migration 006).'
+
+  Indexes {
+    (status) [name: 'idx_users_status']
+    // Allows an archived account's username to be reused by a new account.
+    (username) [unique, name: 'idx_users_username_active', note: 'PARTIAL: WHERE status IS DISTINCT FROM \'archived\' (migration 006)']
+    (email) [unique, name: 'idx_users_email_active', note: 'PARTIAL: WHERE status IS DISTINCT FROM \'archived\'']
+    // Session lookup on every authenticated request and SSE connect. Partial
+    // because signed-out users hold a NULL token; status is in the key because
+    // the guards match token AND status in one predicate.
+    (token, status) [name: 'idx_users_token_active', note: 'PARTIAL: WHERE token IS NOT NULL (migration 017)']
+  }
+}
+
+Table devices {
+  device_id varchar(50) [pk]
+  name varchar(100)
+  is_active boolean [not null, default: true]
+  created_at timestamptz [default: `now()`]
+  last_seen timestamptz
+  ip_address text
+  tank_name varchar(100)
+  tank_location varchar(100)
+  last_health_seen timestamptz
+  device_secret varchar(255)
+  registered_via varchar(20) [not null, default: 'auto']
+  ip_source varchar(10) [not null, default: 'auto']
+  archived_at timestamptz
+  archived_by varchar(100)
+  // Secret rotation (migration 015). Of the four secret columns, the API only
+  // ever projects the two *_rotated_at / *_prev_expires_at metadata fields.
+  device_secret_rotated_at timestamptz
+  device_secret_prev varchar(255)
+  device_secret_prev_expires_at timestamptz
+
+  // Check constraints (migrations 014 / 015):
+  //   chk_devices_registered_via: registered_via IN ('manual','auto')
+  //   chk_devices_ip_source:      ip_source IN ('manual','auto')
+  //   chk_devices_archived_pair:   (archived_at IS NULL) = (archived_by IS NULL)
+  //   chk_devices_secret_prev_pair:(device_secret_prev IS NULL)
+  //                               = (device_secret_prev_expires_at IS NULL)
+  //
+  // idx_devices_device_id_folded is NOT listed: migration 014 creates it only
+  // when case-variant duplicates block the unique index. It does not exist live.
+
+  Note: 'Devices are archived (archived_at), not deleted. FKs from sensors and last_alerts therefore use the default NO ACTION.'
+
+  Indexes {
+    // 'esp32-01' and 'ESP32-01' collide. This is the UNIQUE guarantee, not devices_pkey.
+    (`lower(device_id)`) [unique, name: 'idx_devices_device_id_ci']
+    (archived_at) [name: 'idx_devices_archived_at']
+    (device_secret) [name: 'idx_devices_device_secret', note: 'PARTIAL: WHERE device_secret IS NOT NULL']
+    (device_secret_prev) [name: 'idx_devices_secret_prev', note: 'PARTIAL: WHERE device_secret_prev IS NOT NULL']
+    (device_secret_prev_expires_at) [name: 'idx_devices_secret_prev_expires', note: 'PARTIAL: WHERE device_secret_prev_expires_at IS NOT NULL']
+  }
+}
+
+Table sensors {
+  id int [pk, increment]
+  device_id varchar(50) [not null]
+  // No DEFAULT since migration 022 (defect D1, fixed): a failed sensor is NULL,
+  // which the CHECKs below accept — the old vestigial DEFAULT 0 was rejected by
+  // chk_sensors_temperature_valid, so it could never legally fire anyway.
+  temperature decimal(5,2)
+  water_level decimal(5,2)
+  // precision is (5,2), not (5,3) - verified against the live database
+  ammonia decimal(5,2)
+  // Raw HC-SR04 distance (migration 018). NULL = not reported by the firmware
+  // or a failed sensor. A lossy percentage alone cannot be recalibrated later.
+  water_distance_cm decimal(6,2)
+  timestamp timestamptz [default: `now()`]
+
+  // Range checks (migration 009). Each allows NULL - a NULL reading means the
+  // sensor failed, which is recorded rather than rejected.
+  //   chk_sensors_temperature_valid: 0 < temperature <= 100
+  //   chk_sensors_water_level_valid:  0 <= water_level <= 200
+  //   chk_sensors_ammonia_valid:      0 <= ammonia <= 1000
+  //   chk_sensors_water_distance_valid (migration 018): NULL or 0 < water_distance_cm <= 400
+
+  Indexes {
+    (timestamp) [name: 'idx_sensors_timestamp']
+    (device_id) [name: 'idx_sensors_device_id']
+    (device_id, timestamp) [name: 'idx_sensors_device_timestamp']
+    (device_id, timestamp) [name: 'idx_sensors_valid_readings', note: 'PARTIAL: WHERE temperature IS NOT NULL OR water_level IS NOT NULL OR ammonia IS NOT NULL']
+    // Functional index (migration 016) for case-insensitive tank lookups in server.cjs.
+    (`lower(device_id)`, timestamp) [name: 'idx_sensors_device_id_ci']
+  }
+}
+
+Table sensor_calibration {
+  device_id varchar(50) [pk]
+  // Distance from the sensor to the water surface at MINIMUM fill (0%).
+  empty_cm decimal(6,2) [not null]
+  // Distance from the sensor to the water surface at MAXIMUM fill (100%).
+  full_cm decimal(6,2) [not null]
+  updated_at timestamptz [not null, default: `now()`]
+  updated_by varchar(100)
+
+  // Check constraints (migration 018):
+  //   chk_sensor_calibration_span:  empty_cm > full_cm (the level formula
+  //                                 divides by (empty_cm - full_cm))
+  //   chk_sensor_calibration_range: full_cm >= 2 (HC-SR04 blind spot)
+  //                                 AND empty_cm <= 400 (module ceiling)
+
+  Note: 'HC-SR04 water-level geometry per tank (migration 018). device_id is the PK, so one row per device. Alert thresholds live in sensor_settings / device_threshold_overrides, NOT here.'
+}
+
+Table sensor_settings {
+  id int [pk, increment]
+  // CHECK (id = 1), migration 023: the singleton is enforced by the database,
+  // not by convention. server.cjs inserts id = 1 with ON CONFLICT (id).
+  // All six range columns are NULLABLE in the live database (defaults, but no
+  // NOT NULL constraint) - verified against information_schema.columns
+  temp_min decimal(5,2) [default: 20.00]
+  temp_max decimal(5,2) [default: 31.00]
+  water_level_min decimal(5,2) [default: 10.00]
+  water_level_max decimal(5,2) [default: 100.00]
+  ammonia_min decimal(5,2) [default: 0.25]
+  ammonia_max decimal(5,2) [default: 1.00]
+  // timestamptz since migration 025 (converted from naive timestamp)
+  updated_at timestamptz [default: `now()`]
+
+  Note: 'Global thresholds. Per-tank values live in device_threshold_overrides (NULL there = inherit from here). Not linked by FK.'
+}
+
+Table device_threshold_overrides {
+  device_id varchar(50) [pk]
+  // Every range column is nullable; NULL = inherit the global sensor_settings value.
+  temp_min decimal(5,2)
+  temp_max decimal(5,2)
+  water_level_min decimal(5,2)
+  water_level_max decimal(5,2)
+  ammonia_min decimal(5,2)
+  ammonia_max decimal(5,2)
+  updated_at timestamptz [not null, default: `now()`]
+}
+
+Table system_logs {
+  id int [pk, increment]
+  action varchar(100) [not null]
+  parameter varchar(100) [not null]
+  old_value varchar(50)
+  new_value varchar(50)
+  ack_status varchar(20)
+  // timestamptz since migration 016 (was naive)
+  acknowledged_at timestamptz
+  // Soft reference by username, not an FK. Ambiguous if a username is reused.
+  acknowledged_by varchar(100)
+  timestamp timestamptz [default: `now()`]
+  // Per-tank attribution (migration 011). NULL = farm-wide / pre-011 history.
+  device_id varchar(50)
+
+  Indexes {
+    (timestamp) [name: 'idx_system_logs_timestamp']
+    (action) [name: 'idx_system_logs_action']
+    (ack_status) [name: 'idx_system_logs_ack_status']
+    (device_id, timestamp) [name: 'idx_system_logs_device_ts']
+  }
+}
+
+Table last_alerts {
+  // Composite PK: each device keeps its own alert state per sensor_key.
+  device_id varchar(50) [not null]
+  sensor_key varchar(50) [not null]
+  // CHECKs (migration 024): sensor_key IN ('Temperature','Water Level','Ammonia')
+  //                         status IS NULL OR IN ('good','warning','critical')
+  status varchar(20)
+  value decimal(5,2)
+  // timestamptz since migration 016 (was naive)
+  timestamp timestamptz
+
+  Indexes {
+    (device_id, sensor_key) [pk]
+  }
+}
+
+Table activity_logs {
+  id int [pk, increment]
+  // Display string, NOT a foreign key (see bottom of file). Kept even when the
+  // account is renamed or purged, so the trail reads as it was written.
+  user_name varchar(100)
+  // Real reference added by migration 019. NULL = actor not
+  // resolvable: purged account, pre-019 row, or no account resolved.
+  user_id int
+  action_type varchar(50) [not null]
+  description text
+  module varchar(100)
+  // timestamptz since migration 016 (was naive)
+  timestamp timestamptz [default: `now()`]
+
+  Note: 'user_id -> users.id is the enforced link (migration 019); user_name is the unenforced display copy.'
+
+  Indexes {
+    (timestamp) [name: 'idx_activity_logs_timestamp']
+    (action_type) [name: 'idx_activity_logs_action_type']
+    (user_id) [name: 'idx_activity_logs_user_id', note: 'PARTIAL: WHERE user_id IS NOT NULL (migration 019)']
+  }
+}
+
+Table user_deletion_requests {
+  id int [pk, increment]
+  // FK -> users.id ON DELETE SET NULL (migration 020). Drops
+  // the original NOT NULL so the account can be archived and later purged;
+  // user_username then carries the identity.
+  user_id int
+  user_username varchar(100) [not null]
+  requester_username varchar(100) [not null]
+  requester_email varchar(255) [not null]
+  status varchar(20) [not null, default: 'PENDING_OTP']
+  // CHECK (migration 024): status IN ('PENDING_OTP', 'EXPIRED', 'COMPLETED')
+  reason text
+  otp_hash varchar(64)
+  otp_salt varchar(32)
+  otp_expires_at timestamptz
+  otp_attempts int [not null, default: 0]
+  otp_verified_at timestamptz
+  otp_verified_by varchar(100)
+  requested_at timestamptz [default: `now()`]
+  approver varchar(100)
+  approved_at timestamptz
+  executed_by varchar(100)
+  executed_at timestamptz
+  // status_history (jsonb) lived here from migration 001 until migration 021
+  // relocated its entries into user_deletion_request_status_history below.
+
+  Note: 'user_id -> users.id is enforced since migration 020 (SET NULL). approver / executed_by / otp_verified_by are soft references by username.'
+
+  Indexes {
+    (status) [name: 'idx_deletion_requests_status']
+    (user_id) [name: 'idx_deletion_requests_user']
+  }
+}
+
+// One row per state transition of a user_deletion_requests row. Created by
+// migration 021, which moved the old status_history JSONB entries here and
+// dropped that column.
+Table user_deletion_request_status_history {
+  id int [pk, increment]
+  request_id int [not null]
+  // The state entered: PENDING_OTP, EXPIRED, or COMPLETED.
+  status varchar(20) [not null]
+  // From the JSONB entry's `at`, else the request's requested_at.
+  recorded_at timestamptz [not null, default: `now()`]
+  // Soft reference by username.
+  recorded_by varchar(100)
+
+  Note: 'Append-only transition log. ON DELETE CASCADE: a request deleted as "never happened" takes its history with it.'
+
+  Indexes {
+    (request_id) [name: 'idx_deletion_status_history_request']
+  }
+}
+
+Table email_otps {
+  id int [pk, increment]
+  email varchar(255) [not null]
+  code_hash varchar(64) [not null]
+  code_salt varchar(32) [not null]
+  expires_at timestamptz [not null]
+  attempts int [not null, default: 0]
+  max_attempts int [not null, default: 5]
+  used_at timestamptz
+  created_at timestamptz [default: `now()`]
+
+  Indexes {
+    (email) [name: 'idx_email_otps_email']
+    (expires_at) [name: 'idx_email_otps_expires']
+  }
+}
+
+Table system_state {
+  key varchar(255) [pk]
+  value text
+}
+
+Table schema_migrations {
+  // Bookkeeping only - no relationships. Included so the diagram matches the
+  // database's table count of 16.
+  version varchar(50) [pk]
+  name varchar(255) [not null]
+  applied_at timestamptz [not null, default: `now()`]
+  checksum varchar(64)
+}
+
+Table authorized_recipients {
+  id int [pk, increment]
+  phone_number varchar(20) [not null]
+  name varchar(100)
+  is_active boolean [default: true]
+  archived_at timestamptz
+  // timestamptz since migration 025 — no longer naive beside archived_at
+  created_at timestamptz [default: `now()`]
+  updated_at timestamptz [default: `now()`]
+
+  Note: 'sms_logs.recipient_phone matches phone_number via trigger trg_sms_logs_recipient, not an FK (see bottom of file).'
+
+  Indexes {
+    (archived_at) [name: 'idx_recipients_archived_at']
+    // An archived recipient's number can be reused by a new recipient.
+    (phone_number) [unique, name: 'idx_recipients_phone_active', note: 'PARTIAL: WHERE archived_at IS NULL (migration 006)']
+  }
+}
+
+Table sms_logs {
+  id int [pk, increment]
+  // NOT a foreign key and cannot be one. Integrity is enforced by trigger
+  // trg_sms_logs_recipient (migration 016).
+  recipient_phone varchar(20) [not null]
+  message text [not null]
+  status varchar(20) [not null]
+  // CHECK (migration 024): status IN ('queued', 'delivered', 'failed', 'capped')
+  error_message text
+  sms_id varchar(100)
+  delivered_at timestamptz
+  failure_reason text
+  sent_at timestamptz [default: `now()`]
+
+  Note: 'recipient_phone is validated by trigger trg_sms_logs_recipient, not an FK.'
+
+  Indexes {
+    (sent_at) [name: 'idx_sms_logs_sent_at']
+    (status) [name: 'idx_sms_logs_status']
+  }
+}
+
+// ---------------------------------------------------------------------------
+// TABLE GROUPS
+// ---------------------------------------------------------------------------
+TableGroup monitoring {
+  devices
+  sensors
+  sensor_calibration
+  last_alerts
+  system_logs
+}
+
+// Threshold configuration, not measurements. Per-tank values inherit from
+// sensor_settings when the matching override column is NULL.
+TableGroup config {
+  sensor_settings
+  device_threshold_overrides
+}
+
+TableGroup auth_and_users {
+  users
+  email_otps
+  user_deletion_requests
+  user_deletion_request_status_history
+  activity_logs
+}
+
+TableGroup sms_alerts {
+  authorized_recipients
+  sms_logs
+}
+
+TableGroup system {
+  system_state
+  schema_migrations
+}
+
+// ---------------------------------------------------------------------------
+// ENFORCED FOREIGN KEYS (8)
+// All eight verified against a pg_dump of the live catalog on 2026-10-18,
+// ledger through 025. sensors and last_alerts use NO ACTION (default):
+// devices are archived, never hard-deleted.
+// ---------------------------------------------------------------------------
+Ref: sensors.device_id > devices.device_id
+Ref: last_alerts.device_id > devices.device_id
+Ref: system_logs.device_id > devices.device_id [delete: set null]
+// device_id is the PK of the overrides table, so this is one-to-one.
+Ref: device_threshold_overrides.device_id - devices.device_id [delete: cascade]
+// sensor_calibration.device_id is the PK too: one row per device.
+Ref: sensor_calibration.device_id - devices.device_id [delete: cascade]
+// Migration 019: the audit trail's real link to its account. SET NULL so the
+// audit row outlives the account it names.
+Ref: activity_logs.user_id > users.id [delete: set null]
+// Migration 020: the archive request's link to the account it archives.
+Ref: user_deletion_requests.user_id > users.id [delete: set null]
+// Migration 021: one-to-many transition log.
+Ref: user_deletion_request_status_history.request_id > user_deletion_requests.id [delete: cascade]
+
+// ---------------------------------------------------------------------------
+// DELIBERATELY NOT DRAWN AS A Ref
+// Drawing these would assert something the database does not enforce.
+// ---------------------------------------------------------------------------
+
+// (1) activity_logs.user_name > users.username  -- UNENFORCED, by design.
+// This used to be a real gap: migrations 001/002 created
+// activity_logs_user_name_fkey and it was later removed. It cannot be
+// re-created, because users.username is unique only via the PARTIAL index
+// idx_users_username_active, and a foreign key cannot reference a partial
+// index. Migration 019 links activity_logs.user_id -> users.id instead (drawn
+// above), leaving user_name as the display string. The name column stays
+// unenforced on purpose, not by accident.
+
+// (2) sms_logs.recipient_phone > authorized_recipients.phone_number
+//     -- STRUCTURALLY IMPOSSIBLE, not a gap.
+// phone_number is unique only via the PARTIAL index idx_recipients_phone_active,
+// and PostgreSQL requires a foreign key to reference a UNIQUE constraint or a
+// NON-PARTIAL unique index. Integrity is enforced instead by trigger
+// trg_sms_logs_recipient (function check_sms_logs_recipient, migration 016),
+// which rejects INSERT and UPDATE OF recipient_phone when no matching recipient
+// exists. ERD tools do not draw triggers.
+
+// (3) Soft references by username: activity_logs.user_name,
+// system_logs.acknowledged_by, devices.archived_by,
+// users.pending_deletion_requested_by, and requester_username / approver /
+// executed_by / otp_verified_by on user_deletion_requests, plus recorded_by on
+// user_deletion_request_status_history. Because usernames can be reused after
+// archiving, an old audit row may point at a different person.
+// (activity_logs.user_id and user_deletion_requests.user_id ARE drawn above,
+// because those are real foreign keys - just not on the name column.)
+```
+### Mermaid — paste into mermaid.live
+```mermaid
+erDiagram
+    devices {
+        varchar device_id PK
+        varchar name
+        bool is_active
+        timestamptz created_at
+        timestamptz last_seen
+        text ip_address
+        varchar tank_name
+        varchar tank_location
+        timestamptz last_health_seen
+        varchar device_secret
+        timestamptz archived_at
+        varchar archived_by
+        varchar registered_via
+        varchar ip_source
+        timestamptz device_secret_rotated_at
+        varchar device_secret_prev
+        timestamptz device_secret_prev_expires_at
+    }
+    sensors {
+        int id PK
+        varchar device_id FK
+        numeric temperature
+        numeric water_level
+        numeric ammonia
+        timestamptz timestamp
+        numeric water_distance_cm
+    }
+    last_alerts {
+        varchar device_id PK, FK
+        varchar sensor_key PK
+        varchar status
+        numeric value
+        timestamptz timestamp
+    }
+    sensor_settings {
+        int id PK
+        numeric temp_min
+        numeric temp_max
+        numeric water_level_min
+        numeric water_level_max
+        numeric ammonia_min
+        numeric ammonia_max
+        timestamptz updated_at
+    }
+    device_threshold_overrides {
+        varchar device_id PK, FK
+        numeric temp_min
+        numeric temp_max
+        numeric water_level_min
+        numeric water_level_max
+        numeric ammonia_min
+        numeric ammonia_max
+        timestamptz updated_at
+    }
+    sensor_calibration {
+        varchar device_id PK, FK
+        numeric empty_cm
+        numeric full_cm
+        timestamptz updated_at
+        varchar updated_by
+    }
+    users {
+        int id PK
+        varchar name
+        varchar username UK
+        varchar email UK
+        text password_hash
+        varchar role
+        varchar token
+        timestamptz created_at
+        timestamptz updated_at
+        timestamptz token_expires_at
+        varchar status
+        timestamptz deleted_at
+        timestamptz pending_deletion_at
+        varchar pending_deletion_requested_by
+    }
+    activity_logs {
+        int id PK
+        varchar user_name
+        varchar action_type
+        text description
+        varchar module
+        timestamptz timestamp
+        int user_id FK
+    }
+    user_deletion_requests {
+        int id PK
+        int user_id FK
+        varchar user_username
+        varchar requester_username
+        varchar requester_email
+        varchar status
+        text reason
+        varchar otp_hash
+        varchar otp_salt
+        timestamptz otp_expires_at
+        int otp_attempts
+        timestamptz otp_verified_at
+        varchar otp_verified_by
+        timestamptz requested_at
+        varchar approver
+        timestamptz approved_at
+        varchar executed_by
+        timestamptz executed_at
+    }
+    user_deletion_request_status_history {
+        int id PK
+        int request_id FK
+        varchar status
+        timestamptz recorded_at
+        varchar recorded_by
+    }
+    email_otps {
+        int id PK
+        varchar email
+        varchar code_hash
+        varchar code_salt
+        timestamptz expires_at
+        int attempts
+        int max_attempts
+        timestamptz used_at
+        timestamptz created_at
+    }
+    sms_logs {
+        int id PK
+        varchar recipient_phone
+        text message
+        varchar status
+        text error_message
+        varchar sms_id
+        timestamptz sent_at
+        timestamptz delivered_at
+        text failure_reason
+    }
+    authorized_recipients {
+        int id PK
+        varchar phone_number UK
+        varchar name
+        bool is_active
+        timestamptz created_at
+        timestamptz updated_at
+        timestamptz archived_at
+    }
+    system_logs {
+        int id PK
+        varchar action
+        varchar parameter
+        varchar old_value
+        varchar new_value
+        timestamptz timestamp
+        varchar ack_status
+        timestamptz acknowledged_at
+        varchar acknowledged_by
+        varchar device_id FK
+    }
+    system_state {
+        varchar key PK
+        text value
+    }
+    schema_migrations {
+        varchar version PK
+        varchar name
+        timestamptz applied_at
+        varchar checksum
+    }
+
+    devices ||--o{ sensors : "receives readings from"
+    devices ||--o{ last_alerts : "holds current alert state for"
+    devices ||--o| device_threshold_overrides : "may have threshold override"
+    devices ||--o| sensor_calibration : "may have calibration row"
+    devices |o--o{ system_logs : "is attributed in"
+    users |o--o{ activity_logs : "is audited in"
+    users ||--o{ user_deletion_requests : "is subject of"
+    user_deletion_requests ||--|{ user_deletion_request_status_history : "transitions through"
+    authorized_recipients ||..o{ sms_logs : "phone matched at insert by trigger (no FK)"
+```

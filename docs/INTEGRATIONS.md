@@ -237,8 +237,8 @@ most recent failure with its reason, and the circuit breaker's current state.
   confirms it.
 - Keep the API key and the gateway phone private. Anyone logged in as admin can
   send a test SMS and view SMS logs.
-- The account-deletion OTP flow stays **email-only** and is untouched by the SMS
-  system.
+- The account-archive approval OTP stays **email-only**, is always addressed to
+  the owner, and is untouched by the SMS system.
 - SMS recipient list, mute, per-recipient test, and SMS Logs (delivery history)
   are all managed from `Settings > SMS Alerts`.
 - `sms_logs.recipient_phone` has **no foreign key** to `authorized_recipients` —

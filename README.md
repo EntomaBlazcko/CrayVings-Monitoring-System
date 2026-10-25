@@ -31,7 +31,7 @@ This can help reduce risks caused by poor water conditions and improve overall m
 ## Features
 
 ### Core Features
-- **Authentication & roles** - Login-based access control (owner/admin/user). The session is an **HttpOnly cookie** (`SameSite=Lax`, 24-hour expiry) so no credential is ever readable by JavaScript or `localStorage`; login is rate-limited (5 attempts / 15 min / IP)
+- **Authentication & roles** - Login-based access control (owner/admin/user) using either the username or the account email. The session is an **HttpOnly cookie** (`SameSite=Lax`, 24-hour expiry) so no credential is ever readable by JavaScript or `localStorage`; only failed logins count toward the 5-per-15-minute limit
 - **Multi-tank star topology** - One ESP32 per tank (up to 6) pushing to a central server; the server health-polls each device's `GET /status`, and the dashboard scopes live/history/analytics to a selected tank with a tank-selector chip bar and farm overview grid
 - **Real-time sensor monitoring** - Temperature, water level, and ammonia (3 parameters via ESP32)
 - **Server-Sent Events (SSE) push** - Live readings stream to every open dashboard over `GET /sensor/stream` (no 1s polling); history refreshes every 30s and the fleet registry every 5s, both with exponential backoff on failure
@@ -47,9 +47,9 @@ This can help reduce risks caused by poor water conditions and improve overall m
 - **SMS mute/sleep** - Pause SMS alerts for 1, 2, 4, 6, 8, 12, or 24 hours
 - **Disconnect/reconnect alerts** - Floating popup, sound, and activity log when ESP32 goes offline or comes back online
 - **Recipient management** - Manage SMS alert recipients with archive/restore/purge
-- **User management** - Create users, reset passwords, and soft-delete/restore accounts; deletion is verified via email OTP
+- **User management** - Create users, reset passwords, and archive/restore accounts; archiving is approved with an email OTP sent to the owner, and a separate purge removes an archived account for good
 - **Custom alert sounds** - Audio alerts via Web Audio API
-- **PDF export** - Export system logs to PDF (LogsPage) and weekly reports to PDF (Historical Data)
+- **PDF export** - Export system logs to PDF (LogsPage) and history reports to PDF (Historical Data) for any preset or custom date range
 - **Analytics** - Period overviews, trends, daily breakdowns, and rule-based insights
 - **Activity logging** - Track user interactions including device connect/disconnect events
 - **Hardened ingestion** - Sensor-failure sentinels (temp -1/0, water/ammonia -1) are stored as NULL, per-device secrets are supported alongside the shared `DEVICE_SECRET`, ingestion is rate-limited (12/sec/device, burst headroom for the offline-buffer flush), and DB CHECK constraints keep bad rows out
@@ -70,7 +70,7 @@ This can help reduce risks caused by poor water conditions and improve overall m
 - **Analytics** - Period overview, trends, daily breakdowns, and insights (farm-wide or selected tank)
 - **Sensors** - Individual sensor details with threshold info and connection status
 - **Alerts** - Alert history with filtering (Alert/Change) and acknowledgment
-- **Historical Data** - Selected-tank trend charts with time filtering (1h, 6h, 24h, 1 week, all time) and weekly report PDF export
+- **Historical Data** - Selected-tank trend charts with time filtering (1h, 6h, 24h, 1 week, all time, or a custom From/To date range), window-anchored summaries, and PDF export of the exact window on screen
 - **Activity Logs** - User activity tracking including device connect/disconnect events
 - **Sensor Logs** - System event logs with parameter filtering and PDF export
 - **Settings** - Thresholds, SMS recipients and mute/sleep, SMS logs, user management (owner/admin)
@@ -124,7 +124,7 @@ connected dashboards over SSE, so the UI updates instantly without polling.
 
 ### Data Flow
 1. **Sensors** read environmental data
-2. **ESP32** collects and sends data via HTTP POST (rate-limited to 3/sec/device; failed-sensor sentinels stored as NULL)
+2. **ESP32** collects and sends data via HTTP POST (rate-limited to 12/sec/device; failed-sensor sentinels stored as NULL)
 3. **Express API** validates, stores in PostgreSQL, and pushes the reading to all SSE clients
 4. **React Dashboard** receives live readings over SSE; chart history refreshes every 30s and the fleet registry every 5s (both back off exponentially on failure)
 5. **Connection check** compares sensor data timestamp against current time
@@ -178,7 +178,7 @@ HTTPSMS_FROM=+639XXXXXXXXXX
 ADMIN_INITIAL_PASSWORD=your_strong_password
 ```
 
-The server auto-applies additive schema columns and indexes on startup. Structural migrations live in `db/migrations/` (run them with `node db/migrations/xxx.cjs` when upgrading).
+The server auto-applies additive schema columns and indexes on startup. Structural migrations live in `db/migrations/` and are run manually with `node db/migrations/xxx.cjs`. On a fresh database, run `000_baseline.cjs` first, then `001` through `025` in order; on an existing database, run only the migrations not yet listed in `schema_migrations`. See [docs/DATABASE.md](docs/DATABASE.md#setup-and-provisioning).
 
 ### 3. Create Initial Admin
 
@@ -206,7 +206,7 @@ Dashboard opens at http://localhost:5173
 
 ### 6. Connect ESP32
 
-Flash each device with its matching sketch: `water_monitoring_system/ESP32_main_code/ESP32_main_code.ino` (tank 1, defaults to device ID `ESP32_01`) or `water_monitoring_system/NODE_main_code/NODE_main_code.ino` (spare / NodeMCU, defaults to device ID `ESP32_02`). On boot it first tries the saved network; if that fails it automatically opens the "Aquaculture-Setup" WiFi access point so you can configure credentials, backend server IP/port/device ID, device secret, tank height, and the device's static IP via the captive portal at http://192.168.4.1 (or serial command `W`, or triple-tap the top-left corner). The firmware's default backend address is `192.168.4.10:3000` (`SERVER_IP_DEFAULT` in the sketches) — set it to your backend machine's LAN IP if it differs. If you set `DEVICE_SECRET` in `.env`, enter the same value on the device so the backend accepts its readings. The firmware now requires the **ESPAsyncWebServer** and **AsyncTCP** libraries (it serves read-only `GET /status` on port 80 for fleet health checks). Apply the multi-tank DB migration once (`node db/migrations/007_multi_device.cjs`). Each sketch ships its own device ID default so the server always knows which tank is which — the ID shown in the config portal is what gets persisted to NVS and reported to the backend.
+Flash each device with its matching sketch: `water_monitoring_system/ESP32_main_code/ESP32_main_code.ino` (tank 1, defaults to device ID `ESP32_01`) or `water_monitoring_system/NODE_main_code/NODE_main_code.ino` (spare / NodeMCU, defaults to device ID `ESP32_02`). On boot it first tries the saved network; if that fails it automatically opens the "Aquaculture-Setup" WiFi access point so you can configure credentials, backend server IP/port/device ID, device secret, tank height, and the device's static IP via the captive portal at http://192.168.4.1 (or serial command `W`, or triple-tap the top-left corner). The firmware's default backend address is `192.168.4.10:3000` (`SERVER_IP_DEFAULT` in the sketches) — set it to your backend machine's LAN IP if it differs. If you set `DEVICE_SECRET` in `.env`, enter the same value on the device so the backend accepts its readings. The firmware now requires the **ESPAsyncWebServer** and **AsyncTCP** libraries (it serves read-only `GET /status` on port 80 for fleet health checks). Apply the structural migrations in order (`000`–`025`) before using a new database. Each sketch ships its own device ID default so the server always knows which tank is which — the ID shown in the config portal is what gets persisted to NVS and reported to the backend.
 
 ---
 
@@ -231,7 +231,7 @@ While muted, disconnect alerts still show as popups and are logged, but SMS is n
 ### User Management
 - Owner/admin accounts with full access; regular users see monitoring pages only
 - Create accounts, reset passwords, and revoke access
-- Account deletion requires a 6-digit OTP via email (emailed with SMTP, or printed to the console in dev)
+- Archiving an account requires a 6-digit OTP emailed to the **owner** (with SMTP, or printed to the console in dev); the archived account can be restored or purged later
 
 ---
 
@@ -240,15 +240,15 @@ While muted, disconnect alerts still show as popups and are logged, but SMS is n
 ### Auth & Users (admin-gated unless noted)
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/auth/login` | POST | Log in, sets the session cookie (HttpOnly, SameSite=Lax) and returns the user |
+| `/auth/login` | POST | Log in with `username` or `email`, set the session cookie (HttpOnly, SameSite=Lax) and return the user |
 | `/auth/logout` | POST | Log out, revokes the session and clears the cookie |
 | `/auth/users` | GET | List active users |
 | `/auth/users` | POST | Create a user |
-| `/auth/users/archived` | GET | List soft-deleted users |
-| `/auth/users/:id/deletion-request` | POST | Start deletion; emails OTP |
-| `/auth/users/:id/deletion-verify` | POST | Verify OTP and soft-delete |
-| `/auth/users/deletion-requests` | GET | List pending deletion requests |
-| `/auth/users/:id/restore` | POST | Restore a soft-deleted user |
+| `/auth/users/archived` | GET | List archived users |
+| `/auth/users/:id/deletion-request` | POST | Start archive (soft-delete); OTP emailed to the owner |
+| `/auth/users/:id/deletion-verify` | POST | Verify OTP and archive (restorable) |
+| `/auth/users/deletion-requests` | GET | List archive-request audit trail |
+| `/auth/users/:id/restore` | POST | Restore an archived user |
 | `/auth/users/archived/:id` | DELETE | Permanently purge archived user |
 | `/auth/me/password` | PUT | Change your own password (needs the current one; signs other sessions out and keeps you signed in) |
 | `/auth/users/:id/password` | PUT | Reset another user's password (admin; signs that account out; requires the current password when the target is yourself) |
@@ -258,14 +258,15 @@ While muted, disconnect alerts still show as popups and are logged, but SMS is n
 |----------|--------|-------------|
 | `/sensor` | POST | Submit sensor data (shared `DEVICE_SECRET` or per-device `devices.device_secret`; 12 posts/sec/device rate limit; failure sentinels stored as NULL) |
 | `/sensor/latest` | GET | Latest reading as `{ data, deviceExists }` — HTTP 200 even when no readings exist yet; `recv_at` = live device heartbeat; optional `device_id` filter |
-| `/sensor` | GET | Get history (`limit`: 1-1000; optional `device_id` filter, per-tank; `?before=<ISO timestamp>` keyset cursor for paging older data) |
+| `/sensor` | GET | Get history (`limit`: 1-20000, default 300; optional `device_id`; `?from=<ISO>&to=<ISO>` for an exact window, `to` inclusive; `?before=<ISO timestamp>` keyset cursor for paging older data) |
 | `/sensor/stream` | GET | **SSE** live-reading stream (auth via the session cookie - EventSource is same-origin so it cannot leak a token in the URL; keep-alive pings every 25s) |
+| `/calibration/water-level` | GET/PUT | Read/update the per-device tank geometry used for water-level percentages (PUT is admin-only) |
 | `/devices` | GET | Fleet registry + online flags (name, tank_name, tank_location, ip_address, last_health_seen) |
 | `/devices/latest` | GET | Freshest in-memory reading per active tank in one call (drives the Live Tank Bar; no DB hit) |
 | `/devices/:deviceId/status` | GET | Live on-demand poll of one ESP32's `GET /status` (3s timeout) |
 | `/devices/:deviceId/rotate-secret` | POST | Issue a new per-device `device_secret` (admin). The old one keeps working for a grace window (`grace_hours`, default 24h, capped at 7d). The new secret is returned **once**, in this response, and never leaves the DB again |
-| `/report/weekly` | GET | Weekly report (summary, daily breakdown, alert counts) |
-| `/report/range` | GET | Aggregated report for `?hours=N` (hourly buckets when ≤24h, daily otherwise; admin) |
+| `/report/weekly` | GET | Weekly report (summary, daily breakdown, alert counts); optional `?end_at=<ISO>` anchors the 7-day window to the newest reading instead of "now" |
+| `/report/range` | GET | Aggregated report for `?from=<ISO>&to=<ISO>` (either bound may be omitted; `to` exclusive) or `?hours=N` + optional `?end_at=` (hourly buckets when ≤24h, daily otherwise; admin) |
 
 ### Settings & Recipients
 | Endpoint | Method | Description |
@@ -301,6 +302,7 @@ routes manage one tank.
 | `/alert/mute` | POST | Mute SMS alerts (`{ hours }`) |
 | `/alert/mute-status` | GET | Check mute status |
 | `/alert/sms-health` | GET | SMS health (configured, today's count, cap) |
+| `/alert/sms-breaker/reset` | POST | Force the SMS circuit breaker closed (admin) |
 | `/sms-logs` | GET | SMS delivery logs (`page`, `pageSize`, `status` filters) |
 
 ### Logs
@@ -375,18 +377,23 @@ src/
 server.cjs                     # Express backend (auth, sensors, SSE, logs, SMS, analytics)
 services/                      # smsService.cjs (circuit breaker), devicePoller.cjs (health checks)
 seed-admin.cjs                 # Bootstrap the initial owner/admin account
-db/migrations/                 # Structural SQL migrations 001-016 (run manually, tracked in schema_migrations)
-tests/                         # Custom-harness suites: regression, devices, devicePoller, migration014, deviceSecretRotation
+db/migrations/                 # Structural SQL migrations 000-025 (run manually, tracked in schema_migrations)
+tests/                         # Custom-harness suites: poller, devices, migration, secrets, sessions, regression (threshold suite lives in src/types/)
+tools/                         # restart-server.ps1, watch-connection.cjs, demo seed/backfill scripts
 water_monitoring_system/ESP32_main_code/ESP32_main_code.ino  # ESP32 tank-1 firmware (WiFiManager), device ID ESP32_01
 water_monitoring_system/NODE_main_code/NODE_main_code.ino    # NodeMCU spare firmware (WiFiManager), device ID ESP32_02
 ```
 
-Migrations of note: `007_multi_device.cjs` (star topology), `008_device_secrets.cjs`
+Migrations of note: `000_baseline.cjs` (genesis schema so a fresh database can
+replay the whole chain), `007_multi_device.cjs` (star topology), `008_device_secrets.cjs`
 (opt-in per-device secrets), `009_sensor_constraints.cjs` (NULLs stored
 sentinels, adds CHECK constraints + a partial index), `010_schema_migrations.cjs`
-(version-tracking table), `014_device_registration.cjs` and
-`015_device_secret_rotation.cjs`. The full set is 001-016; `010` seeds the
-version table and later migrations record themselves as they run.
+(version-tracking table), `014_device_registration.cjs`,
+`015_device_secret_rotation.cjs`, `018_water_level_calibration.cjs`, and the
+2026-10 schema fixes `022`–`025` (no fake-0 sensor defaults, one-row
+`sensor_settings`, enum CHECKs, and the last naive timestamps converted to
+`timestamptz`). The full set is 000–025; `000` creates the ledger on a fresh
+database and later migrations record themselves as they run.
 
 ---
 
@@ -467,8 +474,8 @@ a capstone demo can fail a component and show automatic recovery.
   error middleware logs every unhandled failure and never leaks internal error
   messages to production clients.
 - **Security hardening**: `helmet` CSP/security headers; CORS allowlist required
-  in production (`ALLOWED_ORIGINS`); login limited to 5 attempts/15 min/IP;
-  sensor ingestion limited to 3/sec/device with per-device or shared secrets.
+  in production (`ALLOWED_ORIGINS`); login limited to 5 **failed** attempts/15 min/IP;
+  sensor ingestion limited to 12/sec/device with per-device or shared secrets.
 - Why: a farm dashboard must survive DB restarts and deploys without losing
   readings, and must not expose internals when things do go wrong.
 
@@ -574,6 +581,8 @@ Start at [docs/README.md](docs/README.md) for the full index.
 | [DEVICES.md](docs/DEVICES.md) | Device registration, rename/hide/archive/restore, secret rotation, the star topology and the health poller |
 | [TESTING.md](docs/TESTING.md) | Static checks, the mock simulator, a ten-device fleet rehearsal, the hardware star-topology run, and the automated suites |
 | [INTEGRATIONS.md](docs/INTEGRATIONS.md) | SMS configuration: gateway phone, `.env` keys, recipients, circuit breaker, delivery tracking, troubleshooting |
+| [STRESS_TEST_PROCEDURE.md](docs/STRESS_TEST_PROCEDURE.md) | Executable system/web stress-test procedure for a throwaway database |
+| [capstone/README.md](docs/capstone/README.md) | Capstone defense package: data dictionary, ERDs, business rules, normalization, panel Q&A, hostile audit |
 
 Repository-level guides live outside `docs/`: [AGENTS.md](AGENTS.md) (conventions
 and constraints) and [TESTING_GUIDE.md](TESTING_GUIDE.md) (the ordered A–H manual

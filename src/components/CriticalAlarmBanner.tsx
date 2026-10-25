@@ -50,7 +50,7 @@ export default function CriticalAlarmBanner({ onGoToAlerts }: { onGoToAlerts?: (
       <div
         role="alert"
         aria-live="assertive"
-        className="sticky top-16 z-30 -mx-3 md:-mx-5 px-3 md:px-5 pt-3 md:pt-4 pb-3 bg-gradient-to-r from-red-600 via-red-600 to-red-700 shadow-lg"
+        className="relative z-30 -mt-3 md:-mt-5 -mx-3 md:-mx-5 px-3 md:px-5 pt-3 md:pt-4 pb-3 bg-gradient-to-r from-red-600 via-red-600 to-red-700 shadow-lg"
       >
         <div className="max-w-[1600px]">
           {/* Headline row */}

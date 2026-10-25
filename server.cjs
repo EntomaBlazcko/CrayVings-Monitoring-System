@@ -763,18 +763,37 @@ function isOwnerUser(user) {
   );
 }
 
-// Returns an error message when a user must NOT be deleted (the owner, or the
+// Returns an error message when a user must NOT be archived (the owner, or the
 // last remaining admin), otherwise null. `executor` lets the guard run inside a
 // caller's transaction without leaking reads out of that transaction.
 async function assertUserDeletable(userRow, executor = pool) {
   if (isOwnerUser(userRow)) {
-    return "The owner account cannot be deleted.";
+    return "The owner account cannot be archived.";
   }
   if (userRow.role === "admin") {
     const count = await executor.query(
       "SELECT COUNT(*)::int AS n FROM users WHERE role = 'admin' AND status = 'active'"
     );
-    if (count.rows[0].n <= 1) return "Cannot delete the last admin account.";
+    if (count.rows[0].n <= 1) return "Cannot archive the last admin account.";
+  }
+  return null;
+}
+
+// Resolves where the archive-OTP code must be emailed. The code proves the
+// OWNER approved removing an account, so it must land in the owner's inbox —
+// never in the target user's (they are the party being removed, not the
+// approver). Order: OTP_EMAIL override -> ADMIN_EMAIL env -> the owner
+// account's email looked up by ADMIN_USERNAME -> null (caller rejects).
+async function resolveOtpRecipient() {
+  const override = (process.env.OTP_EMAIL || "").trim();
+  if (override) return override;
+  if (OWNER_EMAIL) return OWNER_EMAIL;
+  if (OWNER_USERNAME) {
+    const ownerRow = await pool.query(
+      "SELECT email FROM users WHERE username = $1 AND status = 'active' AND COALESCE(email, '') <> '' LIMIT 1",
+      [OWNER_USERNAME]
+    );
+    if (ownerRow.rows.length > 0) return ownerRow.rows[0].email;
   }
   return null;
 }
@@ -1669,8 +1688,10 @@ const ALERT_COOLDOWN_MS = 120000;
 (async () => {
   try {
     // Ammonia columns (added after pH was removed): real NH3 ppm reading (MQ-137),
-    // default range 0-25 ppm (ACGIH 8h TWA)
-    await pool.query(`ALTER TABLE sensors ADD COLUMN IF NOT EXISTS ammonia DECIMAL(5,3) DEFAULT 0`);
+    // default range 0-25 ppm (ACGIH 8h TWA). Precision is (5,2) to match the live
+    // column and migration 022's story: no DEFAULT, because a failed sensor is
+    // NULL (migration 009), never the 0 the old default would write.
+    await pool.query(`ALTER TABLE sensors ADD COLUMN IF NOT EXISTS ammonia DECIMAL(5,2)`);
     await pool.query(`ALTER TABLE sensor_settings ADD COLUMN IF NOT EXISTS ammonia_min DECIMAL(5,2) DEFAULT 0.25`);
     await pool.query(`ALTER TABLE sensor_settings ADD COLUMN IF NOT EXISTS ammonia_max DECIMAL(5,2) DEFAULT 1.00`);
 
@@ -1685,9 +1706,11 @@ const ALERT_COOLDOWN_MS = 120000;
     await pool.query(`ALTER TABLE devices ADD COLUMN IF NOT EXISTS device_secret VARCHAR(255)`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_devices_device_secret ON devices(device_secret) WHERE device_secret IS NOT NULL`);
 
-    // Alert acknowledgement (Confirm / Allow) tracked directly on each alert row
+    // Alert acknowledgement (Confirm / Allow) tracked directly on each alert row.
+    // TIMESTAMPTZ matches migration 016's conversion of the live column - the
+    // previous naive TIMESTAMP here would have created drift on a fresh boot.
     await pool.query(`ALTER TABLE system_logs ADD COLUMN IF NOT EXISTS ack_status VARCHAR(20)`);
-    await pool.query(`ALTER TABLE system_logs ADD COLUMN IF NOT EXISTS acknowledged_at TIMESTAMP`);
+    await pool.query(`ALTER TABLE system_logs ADD COLUMN IF NOT EXISTS acknowledged_at TIMESTAMPTZ`);
     await pool.query(`ALTER TABLE system_logs ADD COLUMN IF NOT EXISTS acknowledged_by VARCHAR(100)`);
 
     // Per-tank log attribution + override table (migrations 011/012 mirror
@@ -2358,13 +2381,20 @@ app.put("/calibration/water-level", requireAuth, requireAdmin, async (req, res) 
   }
 });
 
-// GET /sensor - sensor history, newest first; ?limit (default 300, max 1000),
+// GET /sensor - sensor history, newest first; ?limit (default 300, max 20000),
 // optional ?device_id to scope to one tank, optional ?from & ?to (ISO dates),
 // optional ?before (ISO timestamp cursor: return rows strictly older than it —
 // keyset pagination for efficient deep history paging, audit 2.3.3)
+// Upper bound for GET /sensor. The old cap was 1000, which silently truncated
+// the Historical Data page: a week of 5-minute readings is 2016 rows and a
+// month is ~8928, so "1 Week"/"All Time" only ever received the newest ~3.5
+// days. This is a safety ceiling, not a paging mechanism - callers that want a
+// specific window pass ?from/?to so the row count is bounded by the data.
+const MAX_SENSOR_HISTORY_ROWS = 20000;
+
 app.get("/sensor", requireAuth, async (req, res) => {
   try {
-    const limit = Math.min(1000, Math.max(1, parseInt(req.query.limit) || 300));
+    const limit = Math.min(MAX_SENSOR_HISTORY_ROWS, Math.max(1, parseInt(req.query.limit) || 300));
     const deviceId = req.query.device_id ? String(req.query.device_id) : null;
     const from = req.query.from ? new Date(String(req.query.from)) : null;
     const to = req.query.to ? new Date(String(req.query.to)) : null;
@@ -3039,9 +3069,18 @@ app.get("/devices/:deviceId/status", requireAuth, async (req, res) => {
 // GET /report/weekly - 7-day aggregated report (summary, daily breakdown, alert counts).
 // Optional ?device_id scopes every query to one tank so the report (and the
 // PDF export built from it) matches the selected tank's on-screen charts.
+// Optional ?end_at (ISO timestamp) anchors the window's end; the window is then
+// [end_at - 7 days, end_at). Without it the window ends at "now", which is what
+// a live tank wants - but a tank whose last reading is weeks old would report an
+// empty week, so the dashboard passes the anchor of the data it is displaying.
 app.get("/report/weekly", requireAuth, async (req, res) => {
   try {
     const deviceId = req.query.device_id ? String(req.query.device_id) : null;
+    // Window bounds are parameters, never string-interpolated, so a malformed
+    // ?end_at falls back to "now" instead of reaching SQL as text.
+    const parsedEnd = req.query.end_at ? new Date(String(req.query.end_at)) : new Date();
+    const windowEnd = Number.isNaN(parsedEnd.getTime()) ? new Date() : parsedEnd;
+    const windowStart = new Date(windowEnd.getTime() - 7 * 24 * 60 * 60 * 1000);
     let summaryResult;
     try {
       summaryResult = await pool.query(`
@@ -3057,9 +3096,9 @@ app.get("/report/weekly", requireAuth, async (req, res) => {
           (MAX(ammonia) FILTER (WHERE ammonia >= 0))::float AS ammonia_max,
           COUNT(*) AS total_readings
         FROM sensors
-        WHERE timestamp >= NOW() - INTERVAL '7 days'
+        WHERE timestamp >= $2 AND timestamp < $3
           AND ($1::text IS NULL OR device_id = $1)
-      `, [deviceId]);
+      `, [deviceId, windowStart, windowEnd]);
     } catch (err) {
       console.error(`[${new Date().toISOString()}] Weekly summary query failed:`, err.message);
       // The query failed, so there is no aggregate to report. Handing back zeros
@@ -3084,11 +3123,11 @@ app.get("/report/weekly", requireAuth, async (req, res) => {
           (MAX(ammonia) FILTER (WHERE ammonia >= 0))::float AS ammonia_max,
           COUNT(*) AS readings
         FROM sensors
-        WHERE timestamp >= NOW() - INTERVAL '7 days'
+        WHERE timestamp >= $2 AND timestamp < $3
           AND ($1::text IS NULL OR device_id = $1)
         GROUP BY DATE(timestamp)
         ORDER BY date
-      `, [deviceId]);
+      `, [deviceId, windowStart, windowEnd]);
     } catch (err) {
       console.error(`[${new Date().toISOString()}] Weekly daily query failed:`, err.message);
       dailyResult = { rows: [] };
@@ -3099,10 +3138,10 @@ app.get("/report/weekly", requireAuth, async (req, res) => {
       const dailyAlertsResult = await pool.query(`
         SELECT DATE(timestamp) AS date, COUNT(*) AS count
         FROM system_logs
-        WHERE timestamp >= NOW() - INTERVAL '7 days' AND action = 'Alert'
+        WHERE timestamp >= $2 AND timestamp < $3 AND action = 'Alert'
           AND ($1::text IS NULL OR device_id = $1)
         GROUP BY DATE(timestamp)
-      `, [deviceId]);
+      `, [deviceId, windowStart, windowEnd]);
       dailyAlertsResult.rows.forEach(row => {
         const d = typeof row.date === 'string' ? row.date.split('T')[0] : String(row.date);
         dailyAlertsMap[d] = parseInt(row.count) || 0;
@@ -3117,10 +3156,10 @@ app.get("/report/weekly", requireAuth, async (req, res) => {
       const alertsByParamResult = await pool.query(`
         SELECT parameter, COUNT(*) AS count
         FROM system_logs
-        WHERE timestamp >= NOW() - INTERVAL '7 days' AND action = 'Alert'
+        WHERE timestamp >= $2 AND timestamp < $3 AND action = 'Alert'
           AND ($1::text IS NULL OR device_id = $1)
         GROUP BY parameter
-      `, [deviceId]);
+      `, [deviceId, windowStart, windowEnd]);
       alertsByParamResult.rows.forEach(row => { byParameter[row.parameter] = parseInt(row.count) || 0; });
     } catch (err) {
       console.error(`[${new Date().toISOString()}] Weekly alerts by param query failed:`, err.message);
@@ -3132,18 +3171,15 @@ app.get("/report/weekly", requireAuth, async (req, res) => {
       const logActionsResult = await pool.query(`
         SELECT action, COUNT(*)::int AS count
         FROM system_logs
-        WHERE timestamp >= NOW() - INTERVAL '7 days'
+        WHERE timestamp >= $2 AND timestamp < $3
           AND ($1::text IS NULL OR device_id = $1)
         GROUP BY action
-      `, [deviceId]);
+      `, [deviceId, windowStart, windowEnd]);
       logActionsResult.rows.forEach(row => { byAction[row.action] = row.count; });
     } catch (err) {
       console.error(`[${new Date().toISOString()}] Weekly log actions query failed:`, err.message);
       byAction = {};
     }
-
-    const now = new Date();
-    const weekAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
 
     const summary = summaryResult.rows[0] || {};
 
@@ -3170,8 +3206,8 @@ app.get("/report/weekly", requireAuth, async (req, res) => {
 
     res.json({
       period: {
-        start: weekAgo.toISOString(),
-        end: now.toISOString(),
+        start: windowStart.toISOString(),
+        end: windowEnd.toISOString(),
       },
       summary: {
         temp_avg: numOrNull(summary.temp_avg),
@@ -3203,22 +3239,75 @@ app.get("/report/weekly", requireAuth, async (req, res) => {
 // ========================
 
 // GET /report/range - aggregated report for a custom window.
-// ?hours=N (positive int) -> last N hours (hourly buckets when N <= 24);
-// omitted/0 -> all time (daily buckets). Optional ?device_id scopes the
-// aggregation (and the alert counts) to one tank. Exact DB aggregates,
-// admin gated.
+// Two ways to name the window, explicit bounds winning when both are present:
+//   ?from=<ISO>&to=<ISO>   exact window, `to` exclusive (the dashboard's date
+//                          picker; lets a specific week/month be queried as-is)
+//   ?hours=N               last N hours (hourly buckets when N <= 24) with an
+//                          optional ?end_at=<ISO> anchor, defaulting to now
+// Omitted entirely -> all time (daily buckets). Optional ?device_id scopes the
+// aggregation (and the alert counts) to one tank. Exact DB aggregates, admin
+// gated.
 app.get("/report/range", requireAdmin, async (req, res) => {
   try {
-    const parsedHours = parseInt(req.query.hours);
-    const hasHours = Number.isFinite(parsedHours) && parsedHours > 0;
-    const hours = hasHours ? parsedHours : null;
     const deviceId = req.query.device_id ? String(req.query.device_id) : null;
-    const bucket = hasHours && hours <= 24 ? "hour" : "day";
-    const timeFilter = hasHours ? `timestamp >= NOW() - INTERVAL '${hours} hours'` : "TRUE";
-    const logTimeFilter = hasHours
-      ? ` AND timestamp >= NOW() - INTERVAL '${hours} hours'`
-      : "";
+
+    // ?from / ?to are each optional but must be valid ISO when present:
+    //   both      -> that exact window (`to` exclusive)
+    //   ?to only  -> all time up to `to` (the dashboard's "All Time" preset,
+    //                which still wants the period label to end at the last
+    //                reading rather than today)
+    //   ?from only-> from then until now
+    // Absent entirely -> fall through to the ?hours / ?end_at form below.
+    const rawFrom = req.query.from !== undefined ? String(req.query.from) : null;
+    const rawTo = req.query.to !== undefined ? String(req.query.to) : null;
+    const hasExplicit = rawFrom !== null || rawTo !== null;
+
+    let windowStart = null;
+    let windowEnd = null;
+    if (hasExplicit) {
+      const fromDate = rawFrom ? new Date(rawFrom) : null;
+      const toDate = rawTo ? new Date(rawTo) : null;
+      const invalidFrom = rawFrom !== null && (!fromDate || Number.isNaN(fromDate.getTime()));
+      const invalidTo = rawTo !== null && (!toDate || Number.isNaN(toDate.getTime()));
+      if (invalidFrom || invalidTo) {
+        return res.status(400).json({
+          message: "Invalid range: from and to must be valid ISO timestamps",
+        });
+      }
+      windowStart = fromDate;
+      windowEnd = toDate;
+      // ?from alone means "from then until now"; an unbounded end would let the
+      // daily bucket label run to the newest row instead.
+      if (windowStart && !windowEnd) windowEnd = new Date();
+      if (windowStart && windowEnd && windowStart.getTime() >= windowEnd.getTime()) {
+        return res.status(400).json({ message: "Invalid range: from must be before to" });
+      }
+    } else {
+      const parsedHours = parseInt(req.query.hours);
+      const hasHours = Number.isFinite(parsedHours) && parsedHours > 0;
+      const hours = hasHours ? parsedHours : null;
+      // Optional ?end_at anchors the window end (defaults to now). Same reason as
+      // /report/weekly: a tank with no recent readings would otherwise export an
+      // empty "last 24 hours" report even though the range on screen has data.
+      const parsedEnd = req.query.end_at ? new Date(String(req.query.end_at)) : new Date();
+      windowEnd = Number.isNaN(parsedEnd.getTime()) ? new Date() : parsedEnd;
+      windowStart = hasHours
+        ? new Date(windowEnd.getTime() - hours * 60 * 60 * 1000)
+        : null;
+    }
+
+    const hasWindow = windowStart !== null;
+    const spanMs =
+      hasWindow && windowEnd ? windowEnd.getTime() - windowStart.getTime() : null;
+    const bucket = spanMs !== null && spanMs <= 24 * 60 * 60 * 1000 ? "hour" : "day";
+    // Bounds travel as bind parameters, never interpolated into SQL text. Both
+    // are written as "IS NULL OR ..." so one filter string covers a bounded
+    // window, an open-ended one, and all time, keeping the $2/$3 slot count
+    // stable across every query below.
+    const timeFilter = `($2::timestamptz IS NULL OR timestamp >= $2) AND ($3::timestamptz IS NULL OR timestamp < $3)`;
+    const logTimeFilter = ` AND ${timeFilter}`;
     const deviceFilter = `($1::text IS NULL OR device_id = $1)`;
+    const queryParams = [deviceId, windowStart, windowEnd];
 
     const bucketExpr =
       bucket === "hour"
@@ -3241,7 +3330,7 @@ app.get("/report/range", requireAdmin, async (req, res) => {
           COUNT(*) AS total_readings
         FROM sensors
         WHERE ${deviceFilter} AND ${timeFilter}
-      `, [deviceId]);
+      `, queryParams);
     } catch (err) {
       console.error(`[${new Date().toISOString()}] Range summary query failed:`, err.message);
       // The query failed, so there is no aggregate to report. Handing back zeros
@@ -3270,7 +3359,7 @@ app.get("/report/range", requireAdmin, async (req, res) => {
         GROUP BY label
         ORDER BY label DESC
         LIMIT 1000
-      `, [deviceId]);
+      `, queryParams);
     } catch (err) {
       console.error(`[${new Date().toISOString()}] Range buckets query failed:`, err.message);
       bucketsResult = { rows: [] };
@@ -3284,7 +3373,7 @@ app.get("/report/range", requireAdmin, async (req, res) => {
         FROM system_logs
         WHERE action = 'Alert' AND ${deviceFilter}${logTimeFilter}
         GROUP BY label
-      `, [deviceId]);
+      `, queryParams);
       bucketAlertsResult.rows.forEach(row => {
         bucketAlertsMap[row.label] = parseInt(row.count) || 0;
       });
@@ -3300,7 +3389,7 @@ app.get("/report/range", requireAdmin, async (req, res) => {
         FROM system_logs
         WHERE action = 'Alert' AND ${deviceFilter}${logTimeFilter}
         GROUP BY parameter
-      `, [deviceId]);
+      `, queryParams);
       alertsByParamResult.rows.forEach(row => { byParameter[row.parameter] = parseInt(row.count) || 0; });
     } catch (err) {
       console.error(`[${new Date().toISOString()}] Range alerts by param query failed:`, err.message);
@@ -3314,15 +3403,15 @@ app.get("/report/range", requireAdmin, async (req, res) => {
         FROM system_logs
         WHERE ${deviceFilter}${logTimeFilter}
         GROUP BY action
-      `, [deviceId]);
+      `, queryParams);
       logActionsResult.rows.forEach(row => { byAction[row.action] = row.count; });
     } catch (err) {
       console.error(`[${new Date().toISOString()}] Range log actions query failed:`, err.message);
       byAction = {};
     }
 
-    const now = new Date();
-    let startIso = hasHours ? new Date(now.getTime() - hours * 60 * 60 * 1000).toISOString() : null;
+    const now = windowEnd || new Date();
+    let startIso = windowStart ? windowStart.toISOString() : null;
     if (!startIso) {
       try {
         const earliest = await pool.query("SELECT MIN(timestamp) AS first_ts FROM sensors WHERE ($1::text IS NULL OR device_id = $1)", [deviceId]);
@@ -3390,10 +3479,18 @@ app.get("/report/range", requireAdmin, async (req, res) => {
 // POST /auth/login - verify credentials and issue a session token (24h expiry)
 app.post("/auth/login", loginLimiter, async (req, res) => {
   try {
-    const { username, password } = req.body;
-    if (!username || !password) return res.status(400).json({ message: "Username and password required" });
+    const { username, email, password } = req.body;
+    // Accept either a username or an email address as the identifier. Both
+    // columns are unique among active accounts (migration 006's partial indexes
+    // idx_users_username_active / idx_users_email_active), so one identifier
+    // resolves to at most one active row — email login cannot be ambiguous.
+    const identifier = (username || email || "").trim();
+    if (!identifier || !password) return res.status(400).json({ message: "Username/email and password required" });
 
-    const result = await pool.query("SELECT * FROM users WHERE username = $1 AND status = 'active'", [username]);
+    const result = await pool.query(
+      "SELECT * FROM users WHERE (username = $1 OR email = $1) AND status = 'active'",
+      [identifier]
+    );
     if (result.rows.length === 0) return res.status(401).json({ message: "Invalid credentials" });
 
     const user = result.rows[0];
@@ -3592,18 +3689,22 @@ app.post("/auth/users", requireAdmin, async (req, res) => {
 });
 
 // -----------------------------------------------------------------------------
-// SECURE USER DELETION (EMAIL-OTP 2-STEP)
+// SECURE USER ARCHIVE (EMAIL-OTP 2-STEP)
 // -----------------------------------------------------------------------------
-// The real account is never deleted without proof that a human admin both knows
-// the requester's own password AND has access to the requester's email inbox.
+// The real account is never archived without proof that a human admin both
+// knows the requester's own password AND has access to the OWNER's email
+// inbox. The OTP always goes to the owner (never to the target user): the code
+// is the owner's approval to remove the account, so it must land in the
+// owner's mailbox.
 //
 //   STEP 1  POST /auth/users/:id/deletion-request   admin password + reason
-//           -> generates a 6-digit OTP, emails it, stores a hashed copy in
-//              user_deletion_requests (PENDING_OTP).
+//           -> generates a 6-digit OTP, emails it to the owner, stores a
+//              hashed copy in user_deletion_requests (PENDING_OTP).
 //   STEP 2  POST /auth/users/:id/deletion-verify    OTP code from the email
-//           -> constant-time OTP check; on success the user row is deleted and
-//              the request flips to COMPLETED with the full audit chain. Returns
-//              the OTP handler result (email REDACTED if SMTP was not configured).
+//           -> constant-time OTP check; on success the user row is ARCHIVED
+//              (status='archived', deleted_at=NOW(), restorable via
+//              POST /auth/users/:id/restore) and the request flips to
+//              COMPLETED with the full audit chain.
 
 // POST /auth/users/:id/deletion-request (Admin only)
 // Validates the admin's own password, creates a user_deletion_request, emails OTP.
@@ -3619,18 +3720,18 @@ app.post("/auth/users/:id/deletion-request", requireAdmin, async (req, res) => {
     if (targetResult.rows.length === 0) return res.status(404).json({ message: "Target user not found" });
     const target = targetResult.rows[0];
 
-    // The owner and the last remaining admin can never be deleted — reject the
+    // The owner and the last remaining admin can never be archived — reject the
     // request here (before any OTP is generated) so protected accounts don't
     // even reach the mailbox step.
     const guardError = await assertUserDeletable(target);
     if (guardError) return res.status(400).json({ message: guardError });
 
-    // OTP recipient: OTP_EMAIL overrides the target user's own address so the
-    // confirmation code always lands in the owner's inbox (the mailbox the farm
-    // admin actually checks), falling back to the target account's email.
-    const otpRecipient = (process.env.OTP_EMAIL || "").trim() || target.email;
+    // OTP recipient: always the owner's mailbox (see resolveOtpRecipient).
+    // Never the target user's own address — they are the party being removed,
+    // not the approver.
+    const otpRecipient = await resolveOtpRecipient();
     if (!otpRecipient) {
-      return res.status(400).json({ message: "No OTP recipient email configured and the target user has no email address." });
+      return res.status(400).json({ message: "No owner email configured — set ADMIN_EMAIL in .env so archive OTPs reach the owner." });
     }
 
     const passwordOk = verifyPassword(password, req.adminUser.password_hash);
@@ -4051,7 +4152,17 @@ app.post("/settings", requireAdmin, async (req, res) => {
       }
     } else {
       const result = await pool.query(
-        `INSERT INTO sensor_settings (temp_min, temp_max, water_level_min, water_level_max, ammonia_min, ammonia_max) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+        `INSERT INTO sensor_settings (id, temp_min, temp_max, water_level_min, water_level_max, ammonia_min, ammonia_max)
+         VALUES (1, $1, $2, $3, $4, $5, $6)
+         ON CONFLICT (id) DO UPDATE SET
+           temp_min = EXCLUDED.temp_min,
+           temp_max = EXCLUDED.temp_max,
+           water_level_min = EXCLUDED.water_level_min,
+           water_level_max = EXCLUDED.water_level_max,
+           ammonia_min = EXCLUDED.ammonia_min,
+           ammonia_max = EXCLUDED.ammonia_max,
+           updated_at = NOW()
+         RETURNING *`,
         [temp_min, temp_max, water_level_min, water_level_max, ammonia_min, ammonia_max]
       );
       savedSettings = result.rows[0];
@@ -4076,7 +4187,17 @@ app.post("/settings/reset", requireAdmin, async (req, res) => {
       savedSettings = result.rows[0];
     } else {
       const result = await pool.query(
-        `INSERT INTO sensor_settings (temp_min, temp_max, water_level_min, water_level_max, ammonia_min, ammonia_max) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+        `INSERT INTO sensor_settings (id, temp_min, temp_max, water_level_min, water_level_max, ammonia_min, ammonia_max)
+         VALUES (1, $1, $2, $3, $4, $5, $6)
+         ON CONFLICT (id) DO UPDATE SET
+           temp_min = EXCLUDED.temp_min,
+           temp_max = EXCLUDED.temp_max,
+           water_level_min = EXCLUDED.water_level_min,
+           water_level_max = EXCLUDED.water_level_max,
+           ammonia_min = EXCLUDED.ammonia_min,
+           ammonia_max = EXCLUDED.ammonia_max,
+           updated_at = NOW()
+         RETURNING *`,
         [defaults.temp_min, defaults.temp_max, defaults.water_level_min, defaults.water_level_max, defaults.ammonia_min, defaults.ammonia_max]
       );
       savedSettings = result.rows[0];

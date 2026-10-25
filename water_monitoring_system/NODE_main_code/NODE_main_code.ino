@@ -131,7 +131,13 @@ int mq137SpikeStreak = 0;   // Consecutive spike count for spike rejection
 // except a reflash. Instead, quietly re-probe on a long interval. Capped so a
 // genuinely absent module costs a handful of serial lines over ~an hour rather
 // than an endless retry loop, and skipped entirely in simulation.
-#define MQ137_RECAL_RETRY_MS  240000UL
+//
+// The interval doubles as the warm-up gate: an MQ-137's heater needs minutes to
+// stabilise after power-up, so a calibration run in the first minutes reads a
+// far too high Rs (Vout collapses toward 0 V) and fails. The first retry must
+// therefore land AFTER the warm-up window, not before it.
+#define MQ137_WARMUP_MS       300000UL
+#define MQ137_RECAL_RETRY_MS  300000UL
 #define MQ137_RECAL_MAX_TRIES 12
 
 unsigned long lastMq137RecalMs = 0;
@@ -544,26 +550,51 @@ void autoDeriveServerIp()
 //   H = headless: skip TFT + touch init and all screen drawing. Use on a bare
 //                 dev kit with no display, so a floating touch panel can never
 //                 register phantom taps or launch the config portal.
-// Both flags default OFF (real sensors + full UI) so an ordinary flash of the
-// real tank stays identical.
+// Headless defaults OFF (full UI). Simulation is controlled by FORCE_SIMULATION
+// below: this board is the no-sensor bring-up unit, so it boots straight into
+// the virtual tank. `S` over serial still toggles it OFF for the current power
+// cycle (so attached sensors can be exercised without a reflash), and the
+// forced value wins again on the next boot.
 // =============================================================================
+
+// Set true to boot into the virtual tank on every power-up regardless of the
+// persisted `S` state. Set false to make simulation an ordinary `S`-only toggle
+// (the original behaviour) so an ordinary flash of a real tank stays identical.
+#define FORCE_SIMULATION true
 
 bool simulateDevice = false; // true = virtual tank (no sensors attached)
 bool headlessMode = false;   // true = no TFT / touch attached (skip display UI)
 
-// Synthetic reading state for the virtual tank. The random-walk step sizes are
-// chosen to exceed the server's delta-logging tolerances (0.1C / 1% / 0.05ppm)
-// so the dashboard charts keep collecting live rows, while the values stay
-// inside safe thresholds so no false alerts fire.
-float simTemp = 25.0;
-float simLevel = 90.0;
-float simAmmonia = 0.5;
+// Synthetic reading state for the virtual tank: a realistic bounded drift
+// around safe baselines. The baselines sit at believable, alert-free levels
+// (25C mid of 20-31, 90% inside 10-100, 0.5ppm between 0.25 and 1), and the
+// per-second steps are large enough to occasionally clear the server's
+// delta-logging tolerances (0.1C / 1% / 0.05ppm) so the dashboard charts keep
+// collecting live rows instead of one flat point, while the swing caps keep
+// every value well inside the safe thresholds.
+#define SIM_TEMP_C            25.0f
+#define SIM_LEVEL_PCT         90.0f
+#define SIM_AMMONIA_PPM       0.50f
+#define SIM_TEMP_SWING_C       0.5f
+#define SIM_LEVEL_SWING_PCT    2.5f
+#define SIM_AMMONIA_SWING_PPM  0.08f
+
+float simTemp = SIM_TEMP_C;
+float simLevel = SIM_LEVEL_PCT;
+float simAmmonia = SIM_AMMONIA_PPM;
 
 void loadDeviceModes()
 {
     Preferences prefs;
     prefs.begin("config", true);
+#if FORCE_SIMULATION
+    // Forced boot value: ignore whatever `S` left in NVS so a power cycle always
+    // comes back as the virtual tank. The runtime `S` toggle still works until
+    // the next reboot.
+    simulateDevice = true;
+#else
     simulateDevice = prefs.getBool("simulate", false);
+#endif
     headlessMode = prefs.getBool("headless", false);
     prefs.end();
 
@@ -737,10 +768,10 @@ void readTemperature()
 {
     if (simulateDevice)
     {
-        // Virtual tank: random walk around ~25C within a narrow band, well
-        // inside the server's 20-31C safe range.
-        simTemp += ((int)esp_random() % 211 - 105) / 100.0f; // ~ +/-1.05C
-        simTemp = constrain(simTemp, 23.0f, 27.0f);
+        // Virtual tank: bounded drift around SIM_TEMP_C, capped at +/-0.5C so
+        // it stays well inside the server's 20-31C safe range.
+        simTemp += ((int)esp_random() % 31 - 15) / 100.0f; // ~ +/-0.15C per step
+        simTemp = constrain(simTemp, SIM_TEMP_C - SIM_TEMP_SWING_C, SIM_TEMP_C + SIM_TEMP_SWING_C);
         temperature = simTemp;
         return;
     }
@@ -770,10 +801,10 @@ void readWaterLevel()
 {
     if (simulateDevice)
     {
-        // Virtual tank: random walk around ~90% within a narrow band, well
-        // inside the server's 10-100% safe range.
-        simLevel += ((int)esp_random() % 31 - 15) / 10.0f; // ~ +/-1.5%
-        simLevel = constrain(simLevel, 85.0f, 95.0f);
+        // Virtual tank: bounded drift around SIM_LEVEL_PCT, capped at +/-2.5% so
+        // it stays well inside the server's 10-100% safe range.
+        simLevel += ((int)esp_random() % 141 - 70) / 100.0f; // ~ +/-0.70% per step
+        simLevel = constrain(simLevel, SIM_LEVEL_PCT - SIM_LEVEL_SWING_PCT, SIM_LEVEL_PCT + SIM_LEVEL_SWING_PCT);
         waterLevel = simLevel;
         return;
     }
@@ -941,7 +972,11 @@ float mq137RsFromVoltage()
 // Returns true (and persists) only when a sane R0 is derived.
 bool probeMq137R0Quietly()
 {
-    const int samples = 5;
+    // 12 samples over ~0.6 s. The boot-time calibration was removed (a cold
+    // heater always failed it), so this probe is usually the call that actually
+    // derives R0 - it samples more than the original 5 quick reads, still far
+    // too short to disturb touch or the display.
+    const int samples = 12;
     float sum = 0.0f;
     int good = 0;
 
@@ -957,7 +992,7 @@ bool probeMq137R0Quietly()
             good++;
         }
 
-        vTaskDelay(20 / portTICK_PERIOD_MS);
+        vTaskDelay(50 / portTICK_PERIOD_MS);
     }
 
     if (good == 0)
@@ -1088,16 +1123,12 @@ void readAmmonia()
 {
     if (simulateDevice)
     {
-        // Virtual tank: random walk around ~0.5 ppm, bounded 0.3-0.8. The floor
-        // must stay ABOVE the server's default ammonia_min threshold (0.25):
-        // the old 0.2 floor let the walk drift below min and fire false
-        // "low ammonia" warnings. The 0.8 cap keeps readings below ammonia_max.
-        simAmmonia += ((int)esp_random() % 21 - 10) / 100.0f; // ~ +/-0.1 ppm
-        if (simAmmonia < 0.3f)
-        {
-            simAmmonia = 0.3f;
-        }
-        simAmmonia = constrain(simAmmonia, 0.3f, 0.8f);
+        // Virtual tank: bounded drift around SIM_AMMONIA_PPM, capped at
+        // +/-0.08ppm so it stays ABOVE the server's default ammonia_min
+        // threshold (0.25) and below ammonia_max (1.0) - no false low/high
+        // ammonia warnings.
+        simAmmonia += ((int)esp_random() % 41 - 20) / 1000.0f; // ~ +/-0.02 ppm per step
+        simAmmonia = constrain(simAmmonia, SIM_AMMONIA_PPM - SIM_AMMONIA_SWING_PPM, SIM_AMMONIA_PPM + SIM_AMMONIA_SWING_PPM);
         ammoniaPpm = simAmmonia;
         ammoniaReady = true;
         lastShownPpm = simAmmonia;
@@ -1767,10 +1798,13 @@ void handleTouch()
             Serial.print(" Y=");
             Serial.println(y);
 
-            if (
-                (x < 80 && y > 240 && y < 305) ||
-                (x > 400 && y > 240 && y < 305)
-            )
+            // No arrow highlight in Safe Mode: drawNavigation() would paint
+            // the nav arrows over the SAFE MODE recovery screen.
+            if (!safeModeActive &&
+                (
+                    (x < 80 && y > 240 && y < 305) ||
+                    (x > 400 && y > 240 && y < 305)
+                ))
             {
                 drawNavigation(true);
                 navButtonHighlighted = true;
@@ -1802,13 +1836,19 @@ void handleTouch()
         drawNavigation();
     }
 
-    if (millis() - lastPageChange < PAGE_CHANGE_COOLDOWN)
+    // Safe Mode: touch stays live so the board can still be recovered, but the
+    // only gesture honoured is the triple-tap WiFi config below. Page navigation
+    // and MQ-137 recalibration both repaint the normal UI, which would hide the
+    // SAFE MODE screen and the last-known-good values it exists to show. The
+    // config portal is the recovery path for a board stuck without an uplink,
+    // so it must not be locked out too.
+    if (!safeModeActive && millis() - lastPageChange < PAGE_CHANGE_COOLDOWN)
     {
         return;
     }
 
     // Left arrow button region (bottom-left)
-    if (endX < 80 && endY > 240 && endY < 305)
+    if (!safeModeActive && endX < 80 && endY > 240 && endY < 305)
     {
         Serial.println("[NAV] LEFT ARROW -> PREVIOUS PAGE");
         previousPage();
@@ -1816,7 +1856,7 @@ void handleTouch()
     }
 
     // Right arrow button region (bottom-right)
-    if (endX > 400 && endY > 240 && endY < 305)
+    if (!safeModeActive && endX > 400 && endY > 240 && endY < 305)
     {
         Serial.println("[NAV] RIGHT ARROW -> NEXT PAGE");
         nextPage();
@@ -1847,8 +1887,10 @@ void handleTouch()
         }
     }
 
-    // Triple tap on top-right corner to recalibrate the MQ-137 (clean air)
-    if (endX > 420 && endY < 60)
+    // Triple tap on top-right corner to recalibrate the MQ-137 (clean air).
+    // Skipped in Safe Mode: calibrateMq137R0() ends by repainting the normal
+    // UI, which would erase the SAFE MODE screen.
+    if (!safeModeActive && endX > 420 && endY < 60)
     {
         static uint8_t calTapCount = 0;
         static unsigned long lastCalTapTime = 0;
@@ -2107,7 +2149,19 @@ void startWifiConfigPortal()
     if (!headlessMode)
     {
         tft.fillScreen(TFT_WHITE);
-        drawCurrentPage();
+        // If Safe Mode is still active, the normal UI must not be painted here:
+        // updateCurrentPage() is gated on !safeModeActive, so the drawn page
+        // would freeze stale while the SAFE MODE screen is what the operator
+        // needs. enterSafeMode() redraws it; once the first POST succeeds the
+        // loop restores the normal UI on its own.
+        if (safeModeActive)
+        {
+            enterSafeMode();
+        }
+        else
+        {
+            drawCurrentPage();
+        }
     }
 }
 
@@ -2434,6 +2488,9 @@ void enterSafeMode()
     tft.drawString(line, 240, 195, 2);
     tft.setTextColor(TFT_ORANGE, TFT_WHITE);
     tft.drawString("Waiting for uplink to auto-resume...", 240, 240, 2);
+    tft.setTextColor(TFT_DARKGREY, TFT_WHITE);
+    tft.drawString("No uplink? Tap top-left corner 3x", 240, 270, 2);
+    tft.drawString("to open WiFi setup", 240, 292, 2);
 }
 
 void setup()
@@ -2633,11 +2690,16 @@ void setup()
     // Expose GET /status (and /) so the central server can read this device.
     startStatusServer();
 
-    // Load a previously calibrated MQ-137 R0, or run the clean-air calibration
-    // on first boot (needs the display up, since it shows progress on screen).
-    // refreshMq137R0Once() forces one fresh calibration the first boot after a
-    // firmware update, so an R0 stored under the old RL value is thrown away
-    // instead of being loaded silently.
+    // Load a previously calibrated MQ-137 R0. refreshMq137R0Once() discards a
+    // stale R0 the first boot after a firmware update so it cannot be loaded
+    // silently.
+    //
+    // No calibration runs here, deliberately: at power-up the heater is still
+    // cold, Rs reads far too high, Vout collapses below the 5 mV floor, and the
+    // attempt always failed with the misleading "check wiring/power" screen.
+    // The automatic re-probe in loop() takes the first attempt after
+    // MQ137_WARMUP_MS instead, and the triple-tap gesture stays available for
+    // an immediate manual run once the sensor is warm.
     if (simulateDevice)
     {
         // Virtual tank: no MQ-137 module attached, so there is nothing to
@@ -2646,8 +2708,8 @@ void setup()
     }
     else if (refreshMq137R0Once() || !loadMq137R0())
     {
-        Serial.println("[MQ-137] No valid R0 - starting clean-air calibration...");
-        calibrateMq137R0();
+        Serial.printf("[MQ-137] No valid R0 - automatic calibration starts after warm-up (%lu ms)\n",
+                      (unsigned long)MQ137_WARMUP_MS);
     }
     else
     {
@@ -2797,11 +2859,12 @@ void loop()
 
     // Touch is serviced FIRST on every tick so a tap never waits behind
     // sensor reads, screen redraws, or Wi-Fi sends. Skipped in headless mode
-    // (no touch panel attached - a floating CS pin can register phantom taps)
-    // and while Safe Mode is up: a tap there used to navigate to a normal page
-    // and paint over the SAFE MODE recovery screen, hiding the last-known-good
-    // values. Safe Mode always leaves on its own, via the first good uplink.
-    if (!headlessMode && !safeModeActive)
+    // (no touch panel attached - a floating CS pin can register phantom taps).
+    // Safe Mode still services touch so a board stuck without an uplink can be
+    // recovered via the triple-tap config portal; handleTouch() itself blocks
+    // the navigation and MQ-137 gestures there so they cannot paint over the
+    // SAFE MODE recovery screen.
+    if (!headlessMode)
     {
         handleTouch();
     }

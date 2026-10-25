@@ -52,8 +52,9 @@ Expect `TcpTestSucceeded : True`.
 
 ### A.3 Migrations applied and idempotent
 
-Migrations 010-015 must be recorded. Re-running is safe by design - every one of
-them is idempotent, and 014 is the one that used to fail open.
+Migrations `000`–`025` must be recorded. Re-running is safe by design - every one
+of them is idempotent, and 014 is the one that used to fail open. On a fresh
+database, run `000_baseline.cjs` first, then `001`..`025` in order.
 
 ```bash
 node db/migrations/014_device_registration.cjs
@@ -65,13 +66,14 @@ node db/migrations/015_device_secret_rotation.cjs
       "present").
 - [ ] Run 014 a **second** time and confirm it is still clean. A migration that
       only works once is a defect, not a pass.
-- [ ] Confirm the ledger has all 15 rows with real timestamps:
+- [ ] Confirm the ledger has all 26 rows (versions `000`–`025`, no gaps) with real
+      timestamps:
 
 ```bash
 node -e "require('dotenv').config();const{Pool}=require('pg');const p=new Pool();p.query('SELECT version,name,applied_at FROM schema_migrations ORDER BY version').then(r=>{console.table(r.rows);return p.end()})"
 ```
 
-Expect versions `001`-`015`, every `applied_at` populated.
+Expect versions `000`-`025`, every `applied_at` populated.
 
 ### A.4 Server up
 
@@ -106,7 +108,7 @@ Run from the project root. Record the counts - they are the baseline.
 | `npm run test:devices` | `104 checks` | registration, uniqueness, claiming, archiving, IP provenance, the `auto_registered` contract |
 | `npm run test:migration` | `15 checks` | the case-insensitive unique index, 23505 rejection, blocked path, re-run path |
 | `npm run test:secrets` | `65 checks` | per-device secret rotation, grace window, revocation, no secret leaks, wrong-length secret rejection |
-| `npm run test:sessions` | `59 checks` | cookie session: issued, HttpOnly/SameSite, no token in body, cookie-only auth, logout revocation, re-login invalidation, CSRF, activity-log attribution, dead-cookie clearing on both guards, correct logins not throttled, self-service + admin password change (policy, current-password proof, 404 on unknown id, session revocation, audit) |
+| `npm run test:sessions` | `60 checks` | username-or-email login; cookie session issued, HttpOnly/SameSite, no token in body, cookie-only auth, logout revocation, re-login invalidation, CSRF, activity-log attribution, dead-cookie clearing on both guards, correct logins not throttled, self-service + admin password change (policy, current-password proof, 404 on unknown id, session revocation, audit) |
 | `npm run test:all` | all of the above except `test:sessions`, then `test:regression` | see B.7 for the expected final failure |
 
 ```bash
@@ -544,7 +546,7 @@ Everything below must be ticked before the system is called verified.
 
 **Automated**
 - [ ] `npm test` 4/4 · `test:poller` 34/34 · `test:devices` 104/104 ·
-      `test:migration` 15/15 · `test:secrets` 60/60
+      `test:migration` 15/15 · `test:secrets` 65/65
 - [ ] `npm run build` clean · `eslint` clean · `check:encoding` clean
 - [ ] `test:regression` either passes, or skips with the documented
       `No sensor history` message

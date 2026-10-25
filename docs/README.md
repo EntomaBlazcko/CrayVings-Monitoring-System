@@ -1,6 +1,6 @@
 # Documentation
 
-Reference documentation for the CRAYvings aquaculture monitoring system. Five
+Reference documentation for the CRAYvings aquaculture monitoring system. Six
 topic-based documents, each self-contained:
 
 | Document | Read it when you need to… |
@@ -10,6 +10,29 @@ topic-based documents, each self-contained:
 | **[DEVICES.md](DEVICES.md)** | Register, rename, hide, archive or restore a device; rotate a device secret; understand the star topology and the health poller |
 | **[TESTING.md](TESTING.md)** | Verify a change — static checks, the mock simulator, a ten-device fleet rehearsal, the hardware/star-topology run, and the automated suites |
 | **[INTEGRATIONS.md](INTEGRATIONS.md)** | Set up or debug SMS delivery through HTTPSMS |
+| **[STRESS_TEST_PROCEDURE.md](STRESS_TEST_PROCEDURE.md)** | Run a measured stress test of the API and dashboard against a throwaway database |
+
+## Capstone defense package
+
+Topic documents for the capstone presentation, written against the live database after
+migrations `000` + `022`–`025` (verified 2026-10-18). Index, readiness verdict and
+score table: **[capstone/README.md](capstone/README.md)**.
+
+| Document | Deliverable |
+|---|---|
+| **[capstone/01_data_dictionary.md](capstone/01_data_dictionary.md)** | Data dictionary — all 16 tables, every column with type, nullability, default, constraints, real example |
+| **[capstone/02_erd.md](capstone/02_erd.md)** | Three Crow's Foot ERDs (subject areas) + 9-relationship master list with cardinality, participation, enforcement |
+| **[capstone/03_business_rules.md](capstone/03_business_rules.md)** | Four actors, eleven business rules, `owner`-not-a-role footnote |
+| **[capstone/04_normalization.md](capstone/04_normalization.md)** | UNF → 1NF → 2NF → 3NF from a real Fleet Status Report SMS, with 3NF check and defense sentence |
+| **[capstone/05_mapping.md](capstone/05_mapping.md)** | Normalized relations vs actual tables (mapping table + completeness check) |
+| **[capstone/06_panel_qa.md](capstone/06_panel_qa.md)** | Fifteen likely panel questions with catalog/code-verified answers |
+| **[capstone/07_hostile_defense_audit.md](capstone/07_hostile_defense_audit.md)** | Three-examiner hostile defense drill — findings table, 30 panel questions, fix plan, self-quiz, with a dated status addendum for findings resolved by `000`/`022`–`025` |
+
+Verification records (point-in-time, kept for history):
+**[TESTING_SCHEMA_FIX.md](TESTING_SCHEMA_FIX.md)** — the checklist that proved
+migrations 019–021 were applied and the then-changed deletion-flow code worked end
+to end (the flow now archives accounts); its status note explains which literals
+have since drifted.
 
 ## Where to start
 

@@ -5,7 +5,7 @@ import { useAuth } from "../contexts/useAuth";
 import logo from "../assets/crayvings.png";
 
 const loginSchema = z.object({
-  username: z.string().min(3, "Username must be at least 3 characters").max(50),
+  username: z.string().min(3, "Username or email must be at least 3 characters").max(255),
   password: z.string().min(6, "Password must be at least 6 characters").max(100),
 });
 
@@ -56,7 +56,7 @@ export default function AuthPage() {
         if (err instanceof Error && err.message) {
           setApiError(err.message);
         } else {
-          setApiError("Invalid username or password. Please try again.");
+          setApiError("Invalid username/email or password. Please try again.");
         }
       }
     }
@@ -84,7 +84,7 @@ export default function AuthPage() {
             <form onSubmit={handleLoginSubmit} className="space-y-4" noValidate>
               <div>
                 <label htmlFor="login-username" className="block text-sm font-medium text-gray-700 mb-1">
-                  Username
+                  Username or Email
                 </label>
                 <div className="relative">
                   <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none text-gray-400">
@@ -102,7 +102,7 @@ export default function AuthPage() {
                     className={`w-full pl-10 pr-4 py-2.5 border rounded-lg focus:outline-none focus:ring-2 focus:ring-brand-500/20 focus:border-brand-500 transition-colors ${
                       loginErrors.username ? "border-red-500 bg-red-50" : "border-gray-300"
                     }`}
-                    placeholder="Enter your username"
+                    placeholder="Enter your username or email"
                     autoComplete="username"
                   />
                 </div>

@@ -3,6 +3,7 @@
 // PURPOSE: Create schema_migrations tracking table for version management
 // =============================================================================
 
+require("dotenv").config();
 const { Pool } = require("pg");
 
 const db = new Pool({

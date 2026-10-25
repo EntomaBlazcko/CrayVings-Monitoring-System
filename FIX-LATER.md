@@ -4,8 +4,18 @@ CRAYvings Aquaculture Monitoring System
 Audit date: 2026-10-04
 Branch audited: `docs/consolidate` (HEAD `6bf8a7b`) · also compared against `master` (`93705ab`) and `origin`
 
-> **Status:** audit only. No fixes have been applied. Every item below is a
-> description of a problem and a suggested fix — none of it is implemented.
+> **STATUS ADDENDUM (2026-10-25):** the findings below are the original
+> 2026-10-04 audit, kept verbatim. Since then: **#3 is resolved** (`000_baseline.cjs`
+> plus a database-provisioning step in Quick Start), **#9 and #14 are resolved**
+> (the `VITE_API_BASE` comment and the stale `AGENTS.md` claims now match the code),
+> and **#12 is largely resolved** (`.env.example` documents the secret-grace,
+> poller, retention and owner-OTP variables). **#4 is only partly resolved** — the
+> baseline covers the schema, but `server.cjs` still runs an additive startup DDL
+> block. **#1/#2 are git-history findings** and cannot be closed by a code/doc
+> commit; they require credential rotation and history cleanup. Everything not
+> named here still stands as written.
+>
+> **Status at audit time (2026-10-04):** audit only; no fixes had been applied.
 >
 > **Secret hygiene:** this document intentionally contains **no credential
 > values, hashes, phone numbers or emails**. Findings that involve secrets cite

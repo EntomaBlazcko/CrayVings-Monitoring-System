@@ -451,8 +451,10 @@ export type WeeklyReportDaily = {
 };
 
 export type WeeklyReport = {
-  // "hour" | "day" when produced by /report/range; undefined for /report/weekly.
-  bucket?: "hour" | "day";
+  // "hour" for windows <= 24h, "day" otherwise. Set by /report/range, which is
+  // the only report endpoint the dashboard calls: every range (presets and the
+  // custom date picker alike) resolves to explicit from/to bounds.
+  bucket: "hour" | "day";
   period: { start: string; end: string };
   summary: {
     temp_avg: number | null;

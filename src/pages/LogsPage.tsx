@@ -114,6 +114,12 @@ export default function LogsPage() {
       return;
     }
 
+    // Popup blockers only allow window.open during the click's synchronous
+    // stack; the jsPDF import below is async. Open the blank preview now and
+    // point it at the blob later, falling back to a download if it was blocked.
+    const preview = window.open("", "_blank");
+    if (preview) preview.opener = null;
+
     setExporting(true);
     // Lazy-load jspdf (~150kB+) only when user actually exports.
     let jsPDFModule: typeof import("jspdf");
@@ -124,6 +130,7 @@ export default function LogsPage() {
         import("jspdf-autotable"),
       ]);
     } catch {
+      preview?.close();
       alert("Failed to load the PDF library. Please try again.");
       setExporting(false);
       return;
@@ -235,7 +242,16 @@ export default function LogsPage() {
       drawFooter(doc, pageWidth, pageHeight, margin, i, exportedOn, finalPageCount);
     }
 
-    doc.save(`${BRAND_NAME}_System_Logs_${new Date().toISOString().split("T")[0]}.pdf`);
+    const pdfBlob = doc.output("blob");
+    const pdfUrl = URL.createObjectURL(pdfBlob);
+    if (preview) {
+      preview.location.href = pdfUrl;
+    } else {
+      doc.save(`CRAYvings-system-logs-${new Date().toISOString().slice(0, 10)}.pdf`);
+    }
+    setTimeout(() => {
+      URL.revokeObjectURL(pdfUrl);
+    }, 60000);
     setExporting(false);
   }, [logs, isAdmin, tankLabelFor]);
 

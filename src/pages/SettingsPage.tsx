@@ -777,8 +777,8 @@ export default function SettingsPage() {
     if (!deleteConfirm || deletionRequestId === null || !deletionOtpCode) return;
     setActionLoading(`verify-${deleteConfirm.id}`);
     try {
-      await verifyUserDeletion(deleteConfirm.id, deletionRequestId, deletionOtpCode);
-      showToast("User deleted successfully", "success");
+      const res = await verifyUserDeletion(deleteConfirm.id, deletionRequestId, deletionOtpCode);
+      showToast(res.message || "User archived (restorable)", "success");
       setDeleteConfirm(null);
       setDeletionStep(null);
       setDeletionPassword("");
@@ -1882,12 +1882,12 @@ export default function SettingsPage() {
                                 className={
                                   u.protected
                                     ? "p-1.5 text-gray-300 cursor-not-allowed rounded-md"
-                                    : "p-1.5 text-gray-400 hover:text-red-600 hover:bg-red-50 rounded-md transition-colors"
+                                    : "p-1.5 text-gray-400 hover:text-sky-600 hover:bg-sky-50 rounded-md transition-colors"
                                 }
-                                title={u.protected ? "This account is protected and cannot be deleted" : "Delete User"}
+                                title={u.protected ? "This account is protected and cannot be archived" : "Archive User (restorable from Archived Accounts)"}
                                 disabled={u.protected}
                               >
-                                <Trash2 size={16} />
+                                <Archive size={16} />
                               </button>
                             )}
                           </div>
@@ -2648,7 +2648,7 @@ export default function SettingsPage() {
               </div>
               <div>
                 <h3 className="text-lg font-bold text-gray-800">
-                  {deletionStep === "verify" ? "Verify Deletion" : "Delete User"}
+                  {deletionStep === "verify" ? "Verify Archive" : "Archive User"}
                 </h3>
                 <p className="text-sm text-gray-500">
                   {deletionStep === "verify" ? "Enter the emailed OTP code" : "This action requires email verification"}
@@ -2677,7 +2677,8 @@ export default function SettingsPage() {
             ) : (
               <div className="mb-6 space-y-3">
                 <p className="text-sm text-gray-600">
-                  Are you sure you want to delete the account <span className="font-semibold">{deleteConfirm.username}</span>?
+                  Archive the account <span className="font-semibold">{deleteConfirm.username}</span>? It will be
+                  hidden from the active list and moved to Archived Accounts — you can restore it there at any time.
                 </p>
                 <div>
                   <label className="block text-sm font-medium text-gray-700 mb-1">
@@ -2703,7 +2704,7 @@ export default function SettingsPage() {
                     value={deletionReason}
                     onChange={(e) => setDeletionReason(e.target.value)}
                     className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-red-500/20 focus:border-red-500"
-                    placeholder="Why is this account being deleted?"
+                    placeholder="Why is this account being archived?"
                   />
                 </div>
               </div>
@@ -2723,7 +2724,7 @@ onClick={() => { setDeleteConfirm(null); setDeletionStep(null); setDeletionPassw
                   className="flex items-center gap-2 bg-red-600 text-white px-4 py-2 rounded-lg text-sm font-semibold hover:bg-red-700 disabled:opacity-50"
                 >
                   {actionLoading === `verify-${deleteConfirm.id}` ? <Loader2 size={16} className="animate-spin" /> : <CheckCircle2 size={16} />}
-                  Verify & Delete
+                  Verify &amp; Archive
                 </button>
               ) : (
                 <button
@@ -2731,8 +2732,8 @@ onClick={() => { setDeleteConfirm(null); setDeletionStep(null); setDeletionPassw
                   disabled={actionLoading === `delete-${deleteConfirm.id}` || !deletionPassword}
                   className="flex items-center gap-2 bg-red-600 text-white px-4 py-2 rounded-lg text-sm font-semibold hover:bg-red-700 disabled:opacity-50"
                 >
-                  {actionLoading === `delete-${deleteConfirm.id}` ? <Loader2 size={16} className="animate-spin" /> : <Trash2 size={16} />}
-                  Request Deletion
+                  {actionLoading === `delete-${deleteConfirm.id}` ? <Loader2 size={16} className="animate-spin" /> : <Archive size={16} />}
+                  Request Archive
                 </button>
               )}
             </div>
